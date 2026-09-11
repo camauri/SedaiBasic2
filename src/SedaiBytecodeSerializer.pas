@@ -334,6 +334,9 @@ begin
         4: RegType := RegType or (3 shl 3);
       end;
       if ArrInfo.ElemSigned then RegType := RegType or 32;
+      // ...and bit 6: the elements are POINTERS (DIVERGENZE 257 B). Same byte, same reasoning: an older
+      // file reads back False, which is what it meant.
+      if ArrInfo.ElemIsPtr then RegType := RegType or 64;
       Stream.WriteBuffer(RegType, SizeOf(RegType));
     except
       on E: Exception do
@@ -521,6 +524,7 @@ begin
           ArrInfo.ElemWidth := 0;
         end;
         ArrInfo.ElemSigned := (RegType and 32) <> 0;
+        ArrInfo.ElemIsPtr := (RegType and 64) <> 0;          // written by the writer above, in the same change
       end;
       Result.AddArrayInfo(ArrInfo);
     end;

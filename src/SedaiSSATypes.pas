@@ -133,6 +133,13 @@ const
   RAWPTR_FB_PAGE_MASK  = Int64($FF) shl RAWPTR_FB_PAGE_SHIFT;
 
   RAWPTR_OFS_MASK = RAWPTR_REGION_IMG - 1;  // byte offset occupies the low 60 bits
+  { ⭐ A raw SLOT THAT HOLDS A POINTER (DIVERGENZE 257, option B): an @-taken ZString Ptr local lives in
+    an 8-byte raw block, and the marshaller must know, at a call, that the block holds a pointer.
+    RAW_PTRCELL_REQ rides on the SIZE the SSA asks RawAlloc for (no allocation is ever 2^62 bytes), so no
+    opcode and no .basc field change; RawAlloc strips it and stamps RAW_HDR_PTRFLAG on the block's size
+    header, which every reader of the header masks off. }
+  RAW_PTRCELL_REQ = Int64(1) shl 62;
+  RAW_HDR_PTRFLAG = QWord(1) shl 63;
 
   { ⭐ A POINTER THAT CAME FROM OUTSIDE (DIVERGENZE 183). Everything above is a VM-internal offset - no
     machine address is ever handed to a BASIC program - but a C function RETURNS one, and the program
@@ -823,6 +830,12 @@ type
       have. They refuse such an array the way they already refuse a multi-dimensional one. }
     ElemWidth: Byte;
     ElemSigned: Boolean;
+    { ⭐ AN ELEMENT THAT IS A POINTER (DIVERGENZE 257, option B). A cell handed to C that points at one of
+      these holds a VM-domain pointer C cannot follow: libffi's "values(0) = @s", with s a ZString Ptr.
+      Asked at the call, by the marshaller, so it can hand C a translated copy for the length of the
+      call. Declared type, never guessed from the value: an integer that looks like a pointer would be
+      corrupted in silence. }
+    ElemIsPtr: Boolean;
   end;
 
   TSSAProgram = class
@@ -893,6 +906,7 @@ type
     function FindArray(const ArrName: string): Integer;
     procedure SetArrayMultiDim(ArrayIdx: Integer);   // mark: this name is multi-dimensional somewhere
     procedure SetArrayElemWidth(ArrayIdx, Width: Integer; Signed: Boolean);  // packed storage for a narrow type
+    procedure SetArrayElemIsPtr(ArrayIdx: Integer);                          // its elements are pointers (257 B)
     procedure SetArrayPrivate(ArrayIdx: Integer);    // mark: proc-local, needs one storage PER THREAD
     procedure SetArrayDynamicShape(ArrayIdx: Integer; Dynamic: Boolean);  // mark: DYNAMIC slot (ERASE frees it)
     function GetArray(Index: Integer): TSSAArrayInfo;
@@ -1913,6 +1927,13 @@ begin
   if (ArrayIdx < 0) or (ArrayIdx >= FNextArrayIndex) then Exit;
   FArrays[ArrayIdx].ElemWidth := Byte(Width);
   FArrays[ArrayIdx].ElemSigned := Signed;
+end;
+
+procedure TSSAProgram.SetArrayElemIsPtr(ArrayIdx: Integer);
+// The elements of this array are POINTERS - see TSSAArrayInfo.ElemIsPtr.
+begin
+  if (ArrayIdx < 0) or (ArrayIdx >= FNextArrayIndex) then Exit;
+  FArrays[ArrayIdx].ElemIsPtr := True;
 end;
 
 procedure TSSAProgram.SetArrayMultiDim(ArrayIdx: Integer);

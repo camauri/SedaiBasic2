@@ -85,6 +85,10 @@ type
   TForeignCellResolver = function(ACtx: TObject; Value: Int64; out ACells: PtrUInt;
                                   out AIsFloat: Boolean): Pointer of object;
 
+  { ⭐ The SECOND level of a pointer handed to C (DIVERGENZE 257, option B): for a cell of an array of
+    pointers, the program cell it points at when that cell's content is itself a pointer - nil otherwise. }
+  TForeignDeepCell = function(ACtx: TObject; Value: Int64): PInt64 of object;
+
   TForeignBinding = record
     Decl: TForeignDecl;
     ArgKinds: array of TForeignKind;
@@ -109,6 +113,7 @@ type
     FNoteRegion: TForeignRegionNote;    // optional: without it no C memory is ever readable
     FRecBytes: TForeignRecResolver;     // optional: without it a record's address cannot reach C
     FCellRun: TForeignCellResolver;     // optional: without it a narrow value's cells reach C at 8 bytes
+    FDeepCell: TForeignDeepCell;        // optional: without it a pointer to a pointer reaches C one level deep
     // ⛔⛔ ONE LOCK, AND IT COVERS PREPARATION ONLY. Two threads can reach the same foreign call for the
     // FIRST time at the same moment - a web request handler is exactly that shape - and preparation
     // opens libraries, resolves symbols and builds type descriptors, all of it writing shared state
@@ -116,10 +121,21 @@ type
     // outside the lock: AbiCall keeps its whole frame in locals, so it is re-entrant, and holding a
     // lock across a call that leaves the process would serialise every database query in the program.
     FPrepLock: TRTLCriticalSection;
+    // ⭐ THE TRANSLATED COPY OF AN ARRAY OF POINTERS OUTLIVES THE CALL (DIVERGENZE 257 B). libffi's
+    // ffi_prep_cif KEEPS the "atypes" pointer it is given - it stores it in the cif - and ffi_call reads it
+    // later: a copy that died with the call left C a dangling pointer. One buffer per program array (the
+    // key is its VM pointer), allocated once, NEVER moved, refreshed at every call that hands it to C.
+    // A longer run gets a new buffer and the old one is kept (C may still hold it) until the table dies.
+    FW8Key: array of Int64;
+    FW8Buf: array of PByte;
+    FW8Cap: array of PtrUInt;
+    FW8Count: Integer;
+    FW8Old: array of PByte;
     function OpenLib(const AName: string): TLibHandle;
     function ResolveSymbol(var B: TForeignBinding): Pointer;
     procedure Prepare(var B: TForeignBinding);
     procedure PrepareLocked(var B: TForeignBinding);   // the body of Prepare, with FPrepLock held
+    function W8Buffer(Key: Int64; Need: PtrUInt): PByte;   // the persistent copy for one program array
   public
     constructor Create;
     destructor Destroy; override;
@@ -139,6 +155,7 @@ type
     property NoteRegion: TForeignRegionNote read FNoteRegion write FNoteRegion;
     property RecBytes: TForeignRecResolver read FRecBytes write FRecBytes;
     property CellRun: TForeignCellResolver read FCellRun write FCellRun;
+    property DeepCell: TForeignDeepCell read FDeepCell write FDeepCell;
   end;
 
 { La mappa dai nostri tipi a quelli della ABI. ⛔ Esportata perche' chi costruisce una CHIUSURA ha
@@ -372,10 +389,47 @@ begin
   InitCriticalSection(FPrepLock);
 end;
 
+function TForeignTable.W8Buffer(Key: Int64; Need: PtrUInt): PByte;
+// The persistent translated copy for the program array whose VM pointer is Key - see FW8Key. Zeroed when
+// new; never moved. ⛔ Under FPrepLock: two threads handing C their first array at once must not both
+// grow the table.
+var
+  k: Integer;
+begin
+  EnterCriticalSection(FPrepLock);
+  try
+    for k := 0 to FW8Count - 1 do
+      if FW8Key[k] = Key then
+      begin
+        if FW8Cap[k] >= Need then Exit(FW8Buf[k]);
+        SetLength(FW8Old, Length(FW8Old) + 1);
+        FW8Old[High(FW8Old)] := FW8Buf[k];         // C may still hold it: kept, not freed
+        FW8Buf[k] := AllocMem(Need);
+        FW8Cap[k] := Need;
+        Exit(FW8Buf[k]);
+      end;
+    if FW8Count >= Length(FW8Key) then
+    begin
+      SetLength(FW8Key, FW8Count * 2 + 8);
+      SetLength(FW8Buf, FW8Count * 2 + 8);
+      SetLength(FW8Cap, FW8Count * 2 + 8);
+    end;
+    FW8Key[FW8Count] := Key;
+    FW8Buf[FW8Count] := AllocMem(Need);
+    FW8Cap[FW8Count] := Need;
+    Result := FW8Buf[FW8Count];
+    Inc(FW8Count);
+  finally
+    LeaveCriticalSection(FPrepLock);
+  end;
+end;
+
 destructor TForeignTable.Destroy;
 var
   i, j: Integer;
 begin
+  for i := 0 to FW8Count - 1 do FreeMem(FW8Buf[i]);
+  for i := 0 to High(FW8Old) do FreeMem(FW8Old[i]);
   for i := 0 to High(FEntries) do
   begin
     FEntries[i].RetRef.Free;
@@ -573,6 +627,14 @@ var
   NCnt: array[0..63] of PtrUInt;         // how many cells were copied
   NCode: array[0..63] of Integer;        // the width code (1..7)
   NVM: array[0..63] of Int64;            // the VM pointer, to map a returned pointer back
+  NBuf: array[0..63] of PByte;           // W8: the PERSISTENT translated copy C gets (see W8Buffer)
+  W8B: PByte;
+  Sh: PInt64;                            // W8: the translated copies of pointed POINTER cells (257 B)
+  RPAddr: array[0..127] of PInt64;       // REC: a pointer FIELD of a record handed to C (259 b)
+  RPOrig, RPTr: array[0..127] of Int64;  // ...its program value, and what C was given
+  NRP, RPk, RPo: Integer;
+  RPS: string;
+  DTgt: array[0..63] of array of PInt64; // W8: the program cell that copy stands for (nil = one level)
   NN, nwid: Integer;
   nk: PtrUInt;
   NIsF: Boolean;
@@ -639,7 +701,7 @@ begin
     Exit;
   end;
 
-  SlotI := 0; SlotF := 0; NReg := 0; NOut := 0; NRec := 0; NN := 0;
+  SlotI := 0; SlotF := 0; NReg := 0; NOut := 0; NRec := 0; NN := 0; NRP := 0;
   FillChar(Buf, SizeOf(Buf), 0);
   for i := 0 to NArgs - 1 do
   begin
@@ -676,6 +738,7 @@ begin
               nwid := ForeignNarrowBytes(NCode1);
               SetLength(NTmp[NN], nk * PtrUInt(nwid) + 8);    // a spare word: C may read one past the end
               FillChar(NTmp[NN][0], Length(NTmp[NN]), 0);
+              NBuf[NN] := nil;
               case NCode1 of
                 1, 2: for r := 0 to Integer(nk) - 1 do NTmp[NN][r] := Byte(PInt64(P)[r]);
                 3, 4: for r := 0 to Integer(nk) - 1 do PWord(@NTmp[NN][0])[r] := Word(PInt64(P)[r]);
@@ -686,11 +749,36 @@ begin
                 // cell is translated exactly as a pointer ARGUMENT is (FResolvePtr), so no cell reaches C
                 // that the same value passed on its own would not.
                 8:    if Assigned(FResolvePtr) then
+                      begin
+                        // ⭐ ...and the copy PERSISTS: ffi_prep_cif keeps the pointer it is given and
+                        // ffi_call reads it later (see FW8Key). Cells first, a spare zero word (C may read
+                        // one past the end), then the second-level copies.
+                        // ⭐ ...and ONE LEVEL DEEPER where the cell points at a program cell that holds a
+                        // POINTER (DIVERGENZE 257 B): libffi's "values(0) = @s", s a ZString Ptr, where C
+                        // reads *values(0) and follows it. C gets the address of a translated COPY of s;
+                        // what C changes there comes back after the call.
+                        W8B := W8Buffer(XferInt[SlotI], (2 * nk + 1) * 8);
+                        Sh := PInt64(W8B + (nk + 1) * 8);
+                        SetLength(DTgt[NN], nk);
                         for r := 0 to Integer(nk) - 1 do
-                          PInt64(@NTmp[NN][0])[r] := Int64(PtrUInt(FResolvePtr(ACtx, PInt64(P)[r])));
+                        begin
+                          DTgt[NN][r] := nil;
+                          if Assigned(FDeepCell) then DTgt[NN][r] := FDeepCell(ACtx, PInt64(P)[r]);
+                          if DTgt[NN][r] <> nil then
+                          begin
+                            Sh[r] := Int64(PtrUInt(FResolvePtr(ACtx, DTgt[NN][r]^)));
+                            PInt64(W8B)[r] := Int64(PtrUInt(@Sh[r]));
+                          end
+                          else
+                            PInt64(W8B)[r] := Int64(PtrUInt(FResolvePtr(ACtx, PInt64(P)[r])));
+                        end;
+                        PInt64(W8B)[nk] := 0;
+                        NBuf[NN] := W8B;
+                      end;
               end;
               NCell[NN] := P; NCnt[NN] := nk; NCode[NN] := NCode1; NVM[NN] := XferInt[SlotI];
-              PPointer(Vals[i])^ := @NTmp[NN][0];
+              if (NCode1 = 8) and (NBuf[NN] <> nil) then PPointer(Vals[i])^ := NBuf[NN]
+              else PPointer(Vals[i])^ := @NTmp[NN][0];
               Inc(NN);
               Inc(SlotI);
               Continue;
@@ -716,6 +804,30 @@ begin
               raise EForeignCallError.CreateFmt('%s: argument %d is the address of a record that does not exist',
                                                 [B^.Decl.Name, i + 1]);
             PPointer(Vals[i])^ := P;
+            // ⭐ ...and its POINTER FIELDS (DIVERGENZE 259 b), listed by the call site as "REC:<T>@o1/o2".
+            // In the image they hold the PROGRAM's values - a tagged C address, a VM pointer - and C reads
+            // machine pointers there: each becomes one for the call. After it, see the loop below AbiCall.
+            RPS := B^.Decl.ParamTypeNames[i];
+            RPk := Pos('@', RPS);
+            if RPk > 0 then
+            begin
+              RPS := Copy(RPS, RPk + 1, MaxInt) + '/';
+              while (RPS <> '') and (NRP <= High(RPAddr)) do
+              begin
+                RPk := Pos('/', RPS);
+                RPo := StrToIntDef(Copy(RPS, 1, RPk - 1), -1);
+                Delete(RPS, 1, RPk);
+                if (RPo < 0) or (PtrUInt(RPo) + 8 > Avail) then Continue;
+                RPAddr[NRP] := PInt64(PByte(P) + RPo);
+                RPOrig[NRP] := RPAddr[NRP]^;
+                if (RPOrig[NRP] <> 0) and Assigned(FResolvePtr) then
+                  RPTr[NRP] := Int64(PtrUInt(FResolvePtr(ACtx, RPOrig[NRP])))
+                else
+                  RPTr[NRP] := RPOrig[NRP];
+                RPAddr[NRP]^ := RPTr[NRP];
+                Inc(NRP);
+              end;
+            end;
             if NRec <= High(RecBase) then
             begin
               RecBase[NRec] := PtrUInt(P); RecVM[NRec] := XferInt[SlotI]; Inc(NRec);
@@ -806,6 +918,17 @@ begin
 
   FillChar(RetBuf, SizeOf(RetBuf), 0);
   AbiCall(B^.Fn, B^.RetRef, Slice(B^.ArgRefs, NArgs), Slice(Vals, NArgs), @RetBuf[0]);
+  // ...and the POINTER FIELDS of every record handed to C come back (DIVERGENZE 259 b): one C left alone
+  // gets the program's own value again (its tag, its domain); one C CHANGED holds a machine address, and
+  // becomes one the program can see as such - "cif.rtype = @ffi_type_uint64" answered 0 in silence.
+  for RPk := 0 to NRP - 1 do
+    if RPAddr[RPk]^ = RPTr[RPk] then
+      RPAddr[RPk]^ := RPOrig[RPk]
+    else if RPAddr[RPk]^ <> 0 then
+    begin
+      if Assigned(FNoteRegion) then FNoteRegion(ACtx, PtrUInt(RPAddr[RPk]^), 0, True, False);
+      RPAddr[RPk]^ := RPAddr[RPk]^ or FGNPTR_TAG;
+    end;
   if Assigned(FNoteRegion) then FgnNoteReleases(ACtx, B^.Decl.Symbol, @Vals[0], NArgs, FNoteRegion);
 
   // ...and each narrow copy goes back into the program's cells at the program's width, SIGN-EXTENDED
@@ -823,19 +946,42 @@ begin
       7: for r := 0 to Integer(NCnt[nwid]) - 1 do PDouble(NCell[nwid])[r] := PSingle(@NTmp[nwid][0])[r];
       // ...a pointer cell C left alone keeps the program's own value (its tag, its domain); one C
       // CHANGED now holds a machine address, and becomes one the program can see as such.
-      8: if Assigned(FResolvePtr) then
+      8: if Assigned(FResolvePtr) and (NBuf[nwid] <> nil) then
+         begin
+           Sh := PInt64(NBuf[nwid] + (NCnt[nwid] + 1) * 8);
            for r := 0 to Integer(NCnt[nwid]) - 1 do
-             if PInt64(@NTmp[nwid][0])[r] <> Int64(PtrUInt(FResolvePtr(ACtx, PInt64(NCell[nwid])[r]))) then
+           begin
+             // The SECOND level first (257 B): a pointer C changed THROUGH the copy goes back to the
+             // program cell as a machine address the program can see; one C left alone keeps its value.
+             if (r <= High(DTgt[nwid])) and (DTgt[nwid][r] <> nil) then
              begin
-               if PInt64(@NTmp[nwid][0])[r] = 0 then
+               if Sh[r] <> Int64(PtrUInt(FResolvePtr(ACtx, DTgt[nwid][r]^))) then
+               begin
+                 if Sh[r] = 0 then
+                   DTgt[nwid][r]^ := 0
+                 else
+                 begin
+                   if Assigned(FNoteRegion) then
+                     FNoteRegion(ACtx, PtrUInt(Sh[r]), 0, True, False);
+                   DTgt[nwid][r]^ := Sh[r] or FGNPTR_TAG;
+                 end;
+               end;
+               // ...and the cell itself still points at the copy, unless C rewrote it.
+               if PInt64(NBuf[nwid])[r] = Int64(PtrUInt(@Sh[r])) then Continue;
+             end;
+             if PInt64(NBuf[nwid])[r] <> Int64(PtrUInt(FResolvePtr(ACtx, PInt64(NCell[nwid])[r]))) then
+             begin
+               if PInt64(NBuf[nwid])[r] = 0 then
                  PInt64(NCell[nwid])[r] := 0
                else
                begin
                  if Assigned(FNoteRegion) then
-                   FNoteRegion(ACtx, PtrUInt(PInt64(@NTmp[nwid][0])[r]), 0, True, False);
-                 PInt64(NCell[nwid])[r] := PInt64(@NTmp[nwid][0])[r] or FGNPTR_TAG;
+                   FNoteRegion(ACtx, PtrUInt(PInt64(NBuf[nwid])[r]), 0, True, False);
+                 PInt64(NCell[nwid])[r] := PInt64(NBuf[nwid])[r] or FGNPTR_TAG;
                end;
              end;
+           end;
+         end;
     end;
 
   {$IFDEF WINDOWS}

@@ -690,6 +690,11 @@ type
       const LibName: string = ''): TSSAValue;  // an Extern of a C library: its address (DIVERGENZE 253)
     function TryForeignFuncAddr(const NameU: string; out V: TSSAValue): Boolean;  // "@f" of a declared C function (261)
     function TryEmitForeignElemField(Node: TASTNode; out Value: TSSAValue): Boolean;  // "a(i)->f", a(i) a C address (259)
+    function TryEmitForeignElemFieldStore(MemberNode, ExprNode: TASTNode): Boolean;    // ...its WRITE half (259)
+    function ForeignElemObject(Node: TASTNode; out Obj: TASTNode; out TypeName: string): Boolean;  // the shape both ask
+    function EmitForeignElemTemps(Obj: TASTNode; const TypeName: string): string;      // the temporaries both use
+    function ForeignRecPtrOffsets(ArgNode: TASTNode): string;                          // "@o1/o2": a REC's pointer fields (259 b)
+    function DeclTypeIsPointer(const T: string): Boolean;                              // "T Ptr" / "T Pointer", aliases resolved
     function ProcPtrSigNameOfProc(const NameU: string): string;   // "SUB(BYTE)" / "FUNCTION(LONG)AS INTEGER"  // decl has exactly N parameters
     procedure PreProcessData(Node: TASTNode);  // Pre-scan AST to collect all DATA statements first
     procedure ProcessStatement(Node: TASTNode);
@@ -13139,6 +13144,10 @@ begin
         // reads/writes/@ route through the record. Type from the AS-type child.
         if FAddrLocalVars.IndexOfName(UpperFast(ArrName)) < 0 then
           FAddrLocalVars.Add(UpperFast(ArrName) + '=' + RecTypeName);
+        // ⭐ ...and its PRINT FORM, as every other Dim records it (DIVERGENZE 263): this branch leaves by
+        // its own road, so "Dim b As ULongInt : p = @b : Print b" printed " 16" where fbc prints "16" -
+        // an unsigned with the sign column, only because its address was taken.
+        RecordVarWidth(UpperFast(ArrName), RecTypeName);
         // Back it with an 8-byte RAW byte-heap slot (a fresh block per frame → recursion-safe), and keep the
         // block's address in the hidden handle. Reads/writes/@ of the name go through this raw address, so
         // @x is a real byte pointer and a pointer of a DIFFERENT bank can reinterpret x's bytes (type-punning
@@ -13183,7 +13192,11 @@ begin
         else
           InitBytes := 8;
         UbReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-        EmitInstruction(ssaLoadConstInt, UbReg, MakeSSAConstInt(InitBytes), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // ...a slot holding a POINTER carries RAW_PTRCELL_REQ, as the local case does (DIVERGENZE 257 B).
+        if (InitBytes = 8) and DeclTypeIsPointer(ArrayDeclNode.GetChild(1).ValueUpper) then
+          EmitInstruction(ssaLoadConstInt, UbReg, MakeSSAConstInt(RAW_PTRCELL_REQ or 8), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        else
+          EmitInstruction(ssaLoadConstInt, UbReg, MakeSSAConstInt(InitBytes), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         RecHandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaRawAlloc, RecHandleVal, UbReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         // ... stored into "<name>$RA"[0] (ssaArrayStore takes value first, then array ref, then index).
@@ -13199,6 +13212,9 @@ begin
           ProcessAssignment(InitAssign);
           InitAssign.Free;
         end;
+        // ...and its PRINT FORM, as the SHARED branch below records it (RecordSharedScalarType) - this
+        // branch left without it, so an @-taken module ULongInt printed with a sign column (DIVERGENZE 263).
+        RecordVarWidth(UpperFast(ArrName), ArrayDeclNode.GetChild(1).ValueUpper);
         Continue;
       end;
       // Refinement #2: a SHARED scalar is backed by a 1-element global array (registered in
@@ -37565,6 +37581,7 @@ begin
           else
             ElemBank := TypeNameToBank(TypeNameU, VNameU);
           ai := FProgram.DeclareArray(VNameU, ElemBank, [1]);   // 1-element global array, same name
+          if DeclTypeIsPointer(TypeNameU) then FProgram.SetArrayElemIsPtr(ai);   // it holds a pointer (257 B)
           FSharedScalarArr.AddObject(VNameU, TObject(PtrInt(ai)));
           // ...and if the value was folded, remember WHICH array backs it: DropUnreadConstArrays asks
           // whether anything in the emitted code ever reads it.
@@ -42675,7 +42692,13 @@ begin
   NBytes := RawZStringBufBytes(Name);
   if NBytes <= 0 then NBytes := 8;
   CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaLoadConstInt, CountReg, MakeSSAConstInt(NBytes), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  // ⭐ ...and a slot whose content is a POINTER says so (DIVERGENZE 257 B): the request carries
+  // RAW_PTRCELL_REQ, RawAlloc stamps the block, and a call that hands C "@s" inside an array of pointers
+  // can give C a translated copy of what s holds.
+  if (NBytes = 8) and DeclTypeIsPointer(AddrLocalType(UpperFast(Name))) then
+    EmitInstruction(ssaLoadConstInt, CountReg, MakeSSAConstInt(RAW_PTRCELL_REQ or 8), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+  else
+    EmitInstruction(ssaLoadConstInt, CountReg, MakeSSAConstInt(NBytes), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   EmitInstruction(ssaRawAlloc, AddrLocalHandle(UpperFast(Name)), CountReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
@@ -47041,6 +47064,8 @@ begin
   // "h->field = expr" where h is a UDT pointer holding a RAW ADDRESS: write at the C-layout byte
   // offset. Asked BEFORE ResolveRecordObject, which would read the address as a record handle.
   if TryEmitRawUDTFieldStore(MemberNode.GetChild(0), VarToStr(MemberNode.Value), ExprNode) then Exit;
+  // ...and "a(i)->field = v" / "r.p->field = v" where the object may hold a C address (DIVERGENZE 259).
+  if TryEmitForeignElemFieldStore(MemberNode, ExprNode) then Exit;
   // Evaluate the RHS first, then resolve the target (object handle). Order matters only for
   // side effects; both are emitted before the store.
   if not ResolveRecordObject(MemberNode.GetChild(0), HandleVal, TypeName) then Exit;
@@ -48120,7 +48145,7 @@ begin
       T := BasicProcCallbackSig(ArgListNode.GetChild(i));
       // ...and one handed the address of a BASIC RECORD says so, for the runtime cannot (DIVERGENZE 245).
       if (T = '') and ForeignRecordArg(ArgListNode.GetChild(i)) then
-        T := 'REC:' + Decl.ParamTypeNames[i];
+        T := 'REC:' + Decl.ParamTypeNames[i] + ForeignRecPtrOffsets(ArgListNode.GetChild(i));
       // ...and one handed the address of a NARROW value writes the width it was declared with (247).
       if (T = '') then
       begin
@@ -48137,7 +48162,7 @@ begin
     if T <> '' then
       // gia' pronta: la coda variadica puo' portare un callback quanto un parametro dichiarato
     else if ForeignRecordArg(ArgListNode.GetChild(i)) then
-      T := 'REC:ANY PTR'                   // a record's address, in the tail as anywhere (DIVERGENZE 245)
+      T := 'REC:ANY PTR' + ForeignRecPtrOffsets(ArgListNode.GetChild(i))   // a record's address, in the tail as anywhere (245)
     else if ForeignNarrowArg(ArgListNode.GetChild(i), NarrowT) > 0 then
       // "sscanf(s, "%d", @n)": the tail is where C's out-parameters live (DIVERGENZE 247)
       T := 'W' + IntToStr(ForeignNarrowArg(ArgListNode.GetChild(i), NarrowT)) + ':ANY PTR'
@@ -48164,6 +48189,204 @@ begin
     if FProgram.GetForeignDecl(k) = Line then Exit(k);
   FProgram.AddForeignDecl(Line);
   Result := FProgram.ForeignDeclCount - 1;
+end;
+
+function TSSAGenerator.ForeignElemObject(Node: TASTNode; out Obj: TASTNode; out TypeName: string): Boolean;
+// The OBJECT of "obj->field" when obj may hold a C address that only its value can reveal (DIVERGENZE 259):
+//   (a) "a(i)"      an element of an array of UDT POINTERS - the program stored "@rec" or a C address;
+//   (b) "r.p"       a UDT-POINTER field of a record variable - C wrote it (ffi_prep_cif fills cif.rtype).
+// Answers the pointee type, which must have a C layout. ⛔ Only side-effect-free objects: the object is
+// evaluated twice (the tag test, then the managed branch).
+var
+  ArrU, BaseT: string;
+  Idx: TASTNode;
+  i, UDTIdx, BIdx: Integer;
+  Offsets: TInt64Array;
+  TotalSize: Int64;
+begin
+  Result := False;
+  TypeName := '';
+  Obj := nil;
+  if (Node = nil) or (Node.ChildCount < 1) then Exit;
+  Obj := Node.GetChild(0);
+  while (Obj <> nil) and (Obj.NodeType in [antParentheses, antDeref]) and (Obj.ChildCount >= 1) do
+    Obj := Obj.GetChild(0);
+  if Obj = nil then Exit;
+  if (Obj.NodeType = antArrayAccess) and (Obj.ChildCount >= 2) and
+     (Obj.Attributes.Values['BRACKET'] <> '1') and (Obj.GetChild(0) <> nil) and
+     (Obj.GetChild(0).NodeType = antIdentifier) then
+  begin
+    ArrU := Obj.GetChild(0).ValueUpper;
+    if (ArrayIndexOf(ArrU) < 0) or IsSharedScalar(ArrU) or IsAddrLocal(ArrU) then Exit;
+    if ArrayRecordTypeOf(ArrU) <> '' then Exit;
+    TypeName := ArrayPointerUDTType(ArrU);
+    Idx := Obj.GetChild(1);
+    if Idx = nil then Exit;
+    if Idx.NodeType in [antArgumentList, antExpressionList] then
+    begin
+      for i := 0 to Idx.ChildCount - 1 do
+        if not (Idx.GetChild(i).NodeType in [antLiteral, antIdentifier]) then Exit;
+    end
+    else if not (Idx.NodeType in [antLiteral, antIdentifier]) then Exit;
+  end
+  else if (Obj.NodeType = antMemberAccess) and (Obj.ChildCount >= 1) and (Obj.GetChild(0) <> nil) and
+          (Obj.GetChild(0).NodeType = antIdentifier) then
+  begin
+    BaseT := ObjectTypeName(Obj.GetChild(0));
+    BIdx := FindUDT(BaseT);
+    if BIdx < 0 then Exit;
+    for i := 0 to High(FUDTs[BIdx].Fields) do
+      if UpperFast(FUDTs[BIdx].Fields[i].Name) = Obj.ValueUpper then
+      begin
+        if not FUDTs[BIdx].Fields[i].IsArray then TypeName := FUDTs[BIdx].Fields[i].PtrPointee;
+        Break;
+      end;
+  end
+  // (c) "p" - a UDT-POINTER VARIABLE the C address was copied into ("Dim t As ffi_type Ptr = cif.rtype").
+  // ⚠️ Not one the raw path already owns (a pointer C handed back is registered there), and not a record.
+  else if Obj.NodeType = antIdentifier then
+  begin
+    if (RawUDTPtrType(Obj.ValueUpper) <> '') or IsRawPtr(VarToStr(Obj.Value)) then Exit;
+    if VarRecordTypeName(VarToStr(Obj.Value)) <> '' then Exit;
+    TypeName := PointerUDTType(VarToStr(Obj.Value));
+  end
+  else
+    Exit;
+  if TypeName = '' then Exit;
+  UDTIdx := FindUDT(TypeName);
+  if UDTIdx < 0 then Exit;
+  if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then Exit;
+  Result := True;
+end;
+
+function TSSAGenerator.EmitForeignElemTemps(Obj: TASTNode; const TypeName: string): string;
+// Evaluate Obj once into a temporary registered as a "T Ptr" over RAW memory (so the raw path reads its
+// fields at their C offsets), and its C-tag test into "<temp>_T". Answers the temporary's name.
+var
+  ElT, TstT: string;
+  ElemVal, Masked, Tst: TSSAValue;
+begin
+  ElT := UpperFast(GenerateUniqueLabel('FGNEL'));
+  TstT := ElT + '_T';
+  RegisterTypedVar(ElT, 'INTEGER');
+  RegisterTypedVar(TstT, 'INTEGER');
+  ProcessExpression(Obj, ElemVal);
+  ElemVal := EnsureIntRegister(ElemVal);
+  EmitInstruction(ssaCopyInt, GetOrAllocateVariable(ElT), ElemVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Masked := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, Masked, ElemVal, EnsureIntRegister(MakeSSAConstInt(FGNPTR_TAG)),
+                  MakeSSAValue(svkNone));
+  Tst := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpNeInt, Tst, Masked, EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
+  EmitInstruction(ssaCopyInt, GetOrAllocateVariable(TstT), Tst, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  if FRawUDTPtrs.IndexOfName(ElT) < 0 then FRawUDTPtrs.Add(ElT + '=' + TypeName);
+  if FPointerVars.IndexOfName(ElT) < 0 then FPointerVars.Add(ElT + '=' + TypeName);
+  Result := ElT;
+end;
+
+function TSSAGenerator.TryEmitForeignElemFieldStore(MemberNode, ExprNode: TASTNode): Boolean;
+// ⭐ The WRITE half of TryEmitForeignElemField (DIVERGENZE 259): "a(i)->field = v" / "r.p->field = v" where
+// the object may hold a C address. Lowered as "If tagged Then tmp->field = v Else <original> = v" through
+// ProcessIfStatement - the proven IF path, exactly as EmitIif builds its branches. Only one branch runs,
+// so v is evaluated once.
+var
+  Obj, IfNode, ThenNode, ElseNode, Asn, RawAcc, MgdAcc: TASTNode;
+  TypeName, ElT, NestedT: string;
+  UDTIdx, Slot: Integer;
+  Bank: TSSARegisterType;
+begin
+  Result := False;
+  if (MemberNode = nil) or (MemberNode.ChildCount < 1) or (ExprNode = nil) then Exit;
+  if FProgram.ForeignDeclCount = 0 then Exit;
+  if MemberNode.Attributes.Values['FGNELEM'] = '1' then Exit;
+  if not ForeignElemObject(MemberNode, Obj, TypeName) then Exit;
+  UDTIdx := FindUDT(TypeName);
+  if not UDTFieldBankSlot(UDTIdx, VarToStr(MemberNode.Value), Bank, Slot, NestedT) then Exit;
+  if (Bank = srtString) or (NestedT <> '') then Exit;
+  ElT := EmitForeignElemTemps(Obj, TypeName);
+  IfNode := TASTNode.Create(antIf, MemberNode.Token);
+  try
+    IfNode.AddChild(TASTNode.CreateWithValue(antIdentifier, ElT + '_T', MemberNode.Token));
+    ThenNode := TASTNode.Create(antThen, MemberNode.Token);
+    Asn := TASTNode.Create(antAssignment, MemberNode.Token);
+    RawAcc := TASTNode.CreateWithValue(antMemberAccess, VarToStr(MemberNode.Value), MemberNode.Token);
+    RawAcc.AddChild(TASTNode.CreateWithValue(antIdentifier, ElT, MemberNode.Token));
+    Asn.AddChild(RawAcc);
+    Asn.AddChild(ExprNode.Clone);
+    ThenNode.AddChild(Asn);
+    IfNode.AddChild(ThenNode);
+    ElseNode := TASTNode.Create(antElse, MemberNode.Token);
+    Asn := TASTNode.Create(antAssignment, MemberNode.Token);
+    MgdAcc := MemberNode.Clone;
+    MgdAcc.Attributes.Values['FGNELEM'] := '1';
+    Asn.AddChild(MgdAcc);
+    Asn.AddChild(ExprNode.Clone);
+    ElseNode.AddChild(Asn);
+    IfNode.AddChild(ElseNode);
+    ProcessIfStatement(IfNode);
+  finally
+    IfNode.Free;
+  end;
+  Result := True;
+end;
+
+function TSSAGenerator.ForeignRecPtrOffsets(ArgNode: TASTNode): string;
+// ⭐ The C offsets of the POINTER fields of the record an argument hands to C (DIVERGENZE 259 b), spelled
+// "@o1/o2/..." after the REC: parameter - no commas, which separate the parameters of an entry. The
+// runtime translates those fields on the way in and, after the call, gives an unchanged one back its
+// program value and tags a CHANGED one as a C address: ffi_prep_cif writes cif.rtype and cif.arg_types,
+// and the program read 0 there in silence. '' when the record has no C layout or no pointer field.
+var
+  TypeName: string;
+  Child: TASTNode;
+  UDTIdx, i: Integer;
+  Offsets: TInt64Array;
+  TotalSize: Int64;
+begin
+  Result := '';
+  if ArgNode = nil then Exit;
+  while (ArgNode.NodeType = antParentheses) and (ArgNode.ChildCount >= 1) do ArgNode := ArgNode.GetChild(0);
+  TypeName := '';
+  if ArgNode.NodeType = antProcAddress then
+  begin
+    if ArgNode.ChildCount = 0 then
+      TypeName := VarRecordTypeName(VarToStr(ArgNode.Value))
+    else
+    begin
+      Child := ArgNode.GetChild(0);
+      while (Child.NodeType = antParentheses) and (Child.ChildCount >= 1) do Child := Child.GetChild(0);
+      TypeName := ObjectTypeName(Child);
+    end;
+  end
+  else if ArgNode.NodeType = antIdentifier then
+    TypeName := PointerUDTType(VarToStr(ArgNode.Value));
+  if TypeName = '' then Exit;
+  UDTIdx := FindUDT(TypeName);
+  if UDTIdx < 0 then Exit;
+  if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then Exit;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+  begin
+    if i > High(Offsets) then Break;
+    if FUDTs[UDTIdx].Fields[i].IsArray then Continue;
+    if (FUDTs[UDTIdx].Fields[i].PtrPointee <> '') or (FUDTs[UDTIdx].Fields[i].MultiPtrPointee <> '') or
+       (FUDTs[UDTIdx].Fields[i].RawPtrPointee <> '') then
+      Result := Result + '/' + IntToStr(Offsets[i]);
+  end;
+  if Result <> '' then Result := '@' + Copy(Result, 2, MaxInt);
+end;
+
+function TSSAGenerator.DeclTypeIsPointer(const T: string): Boolean;
+// Is this DECLARED type a pointer ("ZString Ptr", "Any Ptr", "T Pointer", or an alias of one)? Asked where
+// a storage slot is declared, to mark the slots whose content is a pointer (DIVERGENZE 257 B).
+var
+  U: string;
+begin
+  Result := False;
+  U := UpperFast(Trim(T));
+  if U = '' then Exit;
+  U := UpperFast(CanonicalType(U));
+  Result := ((Length(U) > 4) and (Copy(U, Length(U) - 3, 4) = ' PTR')) or
+            ((Length(U) > 8) and (Copy(U, Length(U) - 7, 8) = ' POINTER'));
 end;
 
 function TSSAGenerator.TryForeignFuncAddr(const NameU: string; out V: TSSAValue): Boolean;
@@ -48208,47 +48431,12 @@ begin
   if (Node = nil) or (Node.ChildCount < 1) then Exit;
   if FProgram.ForeignDeclCount = 0 then Exit;
   if Node.Attributes.Values['FGNELEM'] = '1' then Exit;
-  Obj := Node.GetChild(0);
-  while (Obj <> nil) and (Obj.NodeType in [antParentheses, antDeref]) and (Obj.ChildCount >= 1) do
-    Obj := Obj.GetChild(0);
-  if (Obj = nil) or (Obj.NodeType <> antArrayAccess) or (Obj.ChildCount < 2) or
-     (Obj.Attributes.Values['BRACKET'] = '1') or (Obj.GetChild(0) = nil) or
-     (Obj.GetChild(0).NodeType <> antIdentifier) then Exit;
-  ArrU := Obj.GetChild(0).ValueUpper;
-  if (ArrayIndexOf(ArrU) < 0) or IsSharedScalar(ArrU) or IsAddrLocal(ArrU) then Exit;
-  if ArrayRecordTypeOf(ArrU) <> '' then Exit;
-  TypeName := ArrayPointerUDTType(ArrU);
-  if TypeName = '' then Exit;
+  if not ForeignElemObject(Node, Obj, TypeName) then Exit;
   UDTIdx := FindUDT(TypeName);
-  if UDTIdx < 0 then Exit;
-  if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then Exit;
   if not UDTFieldBankSlot(UDTIdx, VarToStr(Node.Value), Bank, Slot, NestedT) then Exit;   // a method
   if (Bank = srtString) or (NestedT <> '') then Exit;
-  Idx := Obj.GetChild(1);
-  if Idx = nil then Exit;
-  if Idx.NodeType in [antArgumentList, antExpressionList] then
-  begin
-    for i := 0 to Idx.ChildCount - 1 do
-      if not (Idx.GetChild(i).NodeType in [antLiteral, antIdentifier]) then Exit;
-  end
-  else if not (Idx.NodeType in [antLiteral, antIdentifier]) then Exit;
-
-  ElT := UpperFast(GenerateUniqueLabel('FGNEL'));
+  ElT := EmitForeignElemTemps(Obj, TypeName);
   TstT := ElT + '_T';
-  RegisterTypedVar(ElT, 'INTEGER');
-  RegisterTypedVar(TstT, 'INTEGER');
-  ProcessExpression(Obj, ElemVal);
-  ElemVal := EnsureIntRegister(ElemVal);
-  EmitInstruction(ssaCopyInt, GetOrAllocateVariable(ElT), ElemVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-  Masked := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaBitwiseAnd, Masked, ElemVal, EnsureIntRegister(MakeSSAConstInt(FGNPTR_TAG)),
-                  MakeSSAValue(svkNone));
-  Tst := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaCmpNeInt, Tst, Masked, EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
-  EmitInstruction(ssaCopyInt, GetOrAllocateVariable(TstT), Tst, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-  // The temporary is a "T Ptr" over RAW memory: the raw path reads it, and type inference sees its type.
-  if FRawUDTPtrs.IndexOfName(ElT) < 0 then FRawUDTPtrs.Add(ElT + '=' + TypeName);
-  if FPointerVars.IndexOfName(ElT) < 0 then FPointerVars.Add(ElT + '=' + TypeName);
 
   ArgsN := TASTNode.Create(antArgumentList, Node.Token);
   try
@@ -48598,6 +48786,8 @@ procedure TSSAGenerator.NoteArrayElemStorage(ArrayIdx: Integer; ET: TSSARegister
                                              const ArrElemTypeName: string);
 begin
   if (ArrayIdx < 0) or (ET <> srtInt) or (ArrElemTypeName = '') then Exit;
+  // An array of POINTERS says so: a cell handed to C may point into it (DIVERGENZE 257 B).
+  if DeclTypeIsPointer(ArrElemTypeName) then FProgram.SetArrayElemIsPtr(ArrayIdx);
   case TypeNameWidthCode(ArrElemTypeName) of
     1: FProgram.SetArrayElemWidth(ArrayIdx, 1, True);
     2: FProgram.SetArrayElemWidth(ArrayIdx, 1, False);

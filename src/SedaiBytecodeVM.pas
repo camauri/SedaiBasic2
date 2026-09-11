@@ -842,6 +842,7 @@ type
     function VMPointerForMachineAddr(ACtx: TExecutionContext; A: PtrUInt): Int64;  // ...e la strada inversa
     function ForeignPtrHome(ACtx: TObject; A: PtrUInt): Int64;   // la stessa, per la FFI
     function ForeignRecBytes(ACtx: TObject; Value: Int64; out ALen: PtrUInt): Pointer;  // the C image of a record (DIVERGENZE 245)
+    function ForeignDeepCell(ACtx: TObject; Value: Int64): PInt64;   // the pointed cell, if it holds a pointer (257 B)
     function ForeignCellRun(ACtx: TObject; Value: Int64; out ACells: PtrUInt;
                             out AIsFloat: Boolean): Pointer;   // the 8-byte cells of a narrow value (DIVERGENZE 247)
     procedure ForeignNoteRegion(ACtx: TObject; ABase, ALen: PtrUInt; AAdd, AWide: Boolean);
@@ -5133,7 +5134,12 @@ var
   i, best: Integer;
   dataOfs, need, newCap: PtrUInt;
   mem: Pointer;
+  PtrCell: Boolean;
 begin
+  // ⭐ A slot that holds a POINTER (DIVERGENZE 257 B): the request carries RAW_PTRCELL_REQ, and the block
+  // is stamped below. Stripped first: it is a mark, not a size.
+  PtrCell := (ByteCount and PtrUInt(RAW_PTRCELL_REQ)) <> 0;
+  ByteCount := ByteCount and not PtrUInt(RAW_PTRCELL_REQ);
   if ByteCount = 0 then ByteCount := 1;
   ByteCount := (ByteCount + 7) and not PtrUInt(7);   // round payload up to 8
   EnterCriticalSection(FRawHeapLock);
@@ -5141,7 +5147,10 @@ begin
     // first-fit reuse
     best := -1;
     for i := 0 to FRawFreeCount - 1 do
-      if FRawFreeSz[i] >= ByteCount then begin best := i; Break; end;
+      // ...a pointer slot takes only a block of EXACTLY its size, so its header reads exactly
+      // RAW_HDR_PTRFLAG or 8 - the value ForeignDeepCell recognises, and that data cannot imitate.
+      if (FRawFreeSz[i] >= ByteCount) and ((not PtrCell) or (FRawFreeSz[i] = ByteCount)) then
+      begin best := i; Break; end;
     if best >= 0 then
     begin
       dataOfs := FRawFreeOfs[best];
@@ -5149,7 +5158,9 @@ begin
       FRawFreeOfs[best] := FRawFreeOfs[FRawFreeCount - 1];
       FRawFreeSz[best] := FRawFreeSz[FRawFreeCount - 1];
       Dec(FRawFreeCount);
-      // keep the recorded size (block stays its original size); header already holds it
+      // keep the recorded size (block stays its original size); header already holds it - without the
+      // pointer mark of a previous life (DIVERGENZE 257 B)
+      PtrUInt((@FRawHeap[dataOfs - 8])^) := PtrUInt((@FRawHeap[dataOfs - 8])^) and not PtrUInt(RAW_HDR_PTRFLAG);
     end
     else
     begin
@@ -5202,6 +5213,8 @@ begin
       FRawHeapTop := dataOfs + ByteCount;
     end;
     FillChar(FRawHeap[dataOfs], PtrUInt((@FRawHeap[dataOfs - 8])^), 0);  // zero the payload
+    if PtrCell then
+      PtrUInt((@FRawHeap[dataOfs - 8])^) := PtrUInt((@FRawHeap[dataOfs - 8])^) or PtrUInt(RAW_HDR_PTRFLAG);
   finally
     LeaveCriticalSection(FRawHeapLock);
   end;
@@ -5618,7 +5631,7 @@ begin
   if (dataOfs < 8) or (dataOfs > PtrUInt(FRawHeapCap)) then Exit;
   EnterCriticalSection(FRawHeapLock);
   try
-    sz := PtrUInt((@FRawHeap[dataOfs - 8])^);
+    sz := PtrUInt((@FRawHeap[dataOfs - 8])^) and not PtrUInt(RAW_HDR_PTRFLAG);   // the size, not the mark
     if FRawFreeCount >= Length(FRawFreeOfs) then
     begin
       SetLength(FRawFreeOfs, (FRawFreeCount + 1) * 2);
@@ -5641,7 +5654,7 @@ begin
   if (RawPtr and RAWPTR_REGION_FB) <> 0 then
     raise ERangeError.Create('Reallocate: SCREENPTR does not point to allocated memory');
   oldOfs := RawPtr and RAWPTR_OFS_MASK;
-  oldSz := PtrUInt((@FRawHeap[oldOfs - 8])^);
+  oldSz := PtrUInt((@FRawHeap[oldOfs - 8])^) and not PtrUInt(RAW_HDR_PTRFLAG);   // the size, not the mark
   Result := RawAlloc(ByteCount);
   newOfs := Result and RAWPTR_OFS_MASK;
   copySz := oldSz;
@@ -6593,6 +6606,7 @@ begin
       T.NoteRegion := @ForeignNoteRegion;
       T.RecBytes := @ForeignRecBytes;
       T.CellRun := @ForeignCellRun;
+      T.DeepCell := @ForeignDeepCell;
       FForeignTable := T;
     finally
       LeaveCriticalSection(FWorkerLock);
@@ -7146,6 +7160,39 @@ begin
   if (R = nil) or (Ofs >= PtrUInt(Length(R^.Bytes))) then Exit;
   ALen := PtrUInt(Length(R^.Bytes)) - Ofs;
   Result := @R^.Bytes[Ofs];
+end;
+
+function TBytecodeVM.ForeignDeepCell(ACtx: TObject; Value: Int64): PInt64;
+// ⭐ THE SECOND LEVEL (DIVERGENZE 257, option B). Value is a cell of an array of pointers handed to C -
+// libffi's "values(0) = @s". When it points at a program cell whose content is itself a POINTER (s is a
+// ZString Ptr), answer that cell, so the marshaller can hand C a translated copy of what it holds.
+// ⛔ Decided by the DECLARED type, never by the value: a raw slot stamped RAW_HDR_PTRFLAG by RawAlloc (an
+// @-taken pointer local or module scalar - its header is exactly "mark or 8"), or an element of an array
+// the SSA marked ElemIsPtr. Anything else is nil and keeps the one-level translation.
+var
+  ofs: PtrUInt;
+  Logical, ArrayIdx: Integer;
+  Ofs64: Int64;
+begin
+  Result := nil;
+  if (Value <= 0) or ((Value and FGNPTR_TAG) <> 0) then Exit;
+  if (Value and RAWPTR_TAG) <> 0 then
+  begin
+    if (Value and (RAWPTR_REGION_IMG or RAWPTR_REGION_FB)) <> 0 then Exit;
+    ofs := PtrUInt(Value and RAWPTR_OFS_MASK);
+    if (ofs < 8) or (ofs + 8 > FRawHeapCap) then Exit;
+    if PtrUInt((@FRawHeap[ofs - 8])^) <> (PtrUInt(RAW_HDR_PTRFLAG) or 8) then Exit;
+    Exit(PInt64(@FRawHeap[ofs]));
+  end;
+  Logical := Integer((Value shr POINTER_ARRAY_SHIFT) - 1);
+  if (Logical < 0) or (Logical >= FProgram.GetArrayCount) then Exit;
+  if not FProgram.GetArray(Logical).ElemIsPtr then Exit;
+  ArrayIdx := MapArrDyn(TExecutionContext(ACtx), Logical);
+  Ofs64 := Value and POINTER_OFFSET_MASK;
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (Ofs64 < 0) then Exit;
+  if (FArrays[ArrayIdx].ElemWidth <> 0) or (FArrays[ArrayIdx].ElementType <> 0) then Exit;
+  if Ofs64 >= Length(FArrays[ArrayIdx].IntData) then Exit;
+  Result := @FArrays[ArrayIdx].IntData[Ofs64];
 end;
 
 function TBytecodeVM.ForeignCellRun(ACtx: TObject; Value: Int64; out ACells: PtrUInt;
