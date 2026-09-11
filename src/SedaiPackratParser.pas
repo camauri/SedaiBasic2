@@ -260,6 +260,7 @@ type
     procedure CheckByRefReturn(ProcNode: TASTNode);
     procedure CheckRedimTargetIsAName(Node: TASTNode);
     procedure RejectReservedDeclNames(Node: TASTNode);   // MODERN: fbc's reserved words, per context (264)
+    procedure RejectNonConstSharedRef(Root: TASTNode);   // MODERN: a Shared/Static reference on a constant address (260)
     function InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
@@ -1645,6 +1646,8 @@ begin
  RejectStaticVarLenStringInit(Result, False);
   // ⛔ MODERN names nothing FreeBASIC reserves (committente, 11 set 2026 - DIVERGENZE 264).
   if FModernMode then RejectReservedDeclNames(Result);
+  // ⛔ ...and a Shared or Static reference binds to a CONSTANT address, as in fbc (DIVERGENZE 260).
+  if FModernMode then RejectNonConstSharedRef(Result);
 
  // The module-level FORWARD declarations, handed to the namespace pass on the root: a name the program
  // declares that way is one of its own and beats a "Using" import, and it emitted no node to say so.
@@ -12151,6 +12154,117 @@ const
 
 begin
   Walk(Node, False);
+end;
+
+procedure TPackratParser.RejectNonConstSharedRef(Root: TASTNode);
+// ⛔ A SHARED OR STATIC REFERENCE BINDS WHEN THE PROGRAM IS COMPILED (DIVERGENZE 260, the owner's decision
+// on 11 Sep 2026: conform to fbc). "Dim Shared ByRef As Integer r = *gp" bound here when the program reached
+// the Dim, and fbc answers "error 11: Expected constant". A reference bound before its pointer was set
+// stayed on the old target when the pointer moved - the class of surprise fbc's rule excludes.
+// ⭐ THE RULE IS MEASURED, form by form, against fbc 1.10.1. Accepted: a Shared variable ("= v"), an
+// element at a constant index ("= a(1)"), a dereference of such an address ("= *@v", "= *@a(2)"), a cast
+// of a literal ("= *cptr(Integer Ptr, 0)"), an address plus a constant ("= *(@v + 0)"). Refused: a module
+// variable that is NOT Shared, a variable index ("a(k)"), a FIELD ("t.f"), "*gp", a ByRef function.
+// A LOCAL reference (Dim ByRef inside a procedure) takes anything, in fbc as here.
+// ⚠️ Left alone: the entries the parser synthesizes for a C library's variables (FGNDATA, ledger 253), and
+// a static member's definition ("Dim ByRef As T1 T2.R1 = t"), which is not this form.
+var
+  Shared: TStringList;
+
+  procedure Collect(N: TASTNode);
+  // The names a constant address can be taken of: Shared and Static variables that are not references.
+  var
+    i: Integer;
+  begin
+    if N = nil then Exit;
+    if (N.NodeType = antArrayDecl) and (N.Attributes.Values['BYREF'] <> '1') and
+       ((N.Attributes.Values['SHARED'] = '1') or (N.Attributes.Values['STATIC'] = '1')) and
+       (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antIdentifier) then
+      Shared.Add(N.GetChild(0).ValueUpper);
+    for i := 0 to N.ChildCount - 1 do Collect(N.GetChild(i));
+  end;
+
+  function IsNum(N: TASTNode): Boolean;
+  begin
+    while (N <> nil) and (N.NodeType = antParentheses) and (N.ChildCount >= 1) do N := N.GetChild(0);
+    Result := (N <> nil) and (N.NodeType = antLiteral);
+  end;
+
+  function ConstAddr(N: TASTNode): Boolean;
+  // Does N evaluate to an address known when the program is compiled? The parser writes a reference's
+  // initializer as "@(target)", so the entry point is an antProcAddress.
+  var
+    C, L: TASTNode;
+    i: Integer;
+  begin
+    Result := False;
+    if N = nil then Exit;
+    case N.NodeType of
+      antParentheses:
+        Result := (N.ChildCount >= 1) and ConstAddr(N.GetChild(0));
+      antProcAddress:
+        if N.ChildCount = 0 then
+          Result := Shared.IndexOf(N.ValueUpper) >= 0             // @v, v Shared
+        else
+        begin
+          C := N.GetChild(0);
+          while (C.NodeType = antParentheses) and (C.ChildCount >= 1) do C := C.GetChild(0);
+          if (C.NodeType = antArrayAccess) and (C.ChildCount >= 2) and
+             (C.GetChild(0).NodeType = antIdentifier) and (Shared.IndexOf(C.GetChild(0).ValueUpper) >= 0) then
+          begin
+            L := C.GetChild(1);                                     // @a(1): every index a constant
+            if L.NodeType in [antExpressionList, antArgumentList] then
+            begin
+              Result := L.ChildCount > 0;
+              for i := 0 to L.ChildCount - 1 do
+                if not IsNum(L.GetChild(i)) then Result := False;
+            end
+            else
+              Result := IsNum(L);
+          end
+          else if (C.NodeType = antDeref) and (C.ChildCount >= 1) then
+            Result := ConstAddr(C.GetChild(0));                   // @(*X): X itself
+        end;
+      antCast:                                                    // cptr(T Ptr, 0), cast of an address
+        Result := (N.ChildCount >= 1) and (ConstAddr(N.GetChild(0)) or IsNum(N.GetChild(0)));
+      antBinaryOp:                                                // @v + 0
+        Result := (N.ChildCount = 2) and
+                  ((ConstAddr(N.GetChild(0)) and IsNum(N.GetChild(1))) or
+                   (IsNum(N.GetChild(0)) and ConstAddr(N.GetChild(1))));
+    end;
+  end;
+
+  procedure Check(N: TASTNode);
+  var
+    i: Integer;
+    Init: TASTNode;
+  begin
+    if N = nil then Exit;
+    if (N.NodeType = antArrayDecl) and (N.Attributes.Values['BYREF'] = '1') and
+       ((N.Attributes.Values['SHARED'] = '1') or (N.Attributes.Values['STATIC'] = '1')) and
+       (N.Attributes.Values['FGNDATA'] = '') and (N.ChildCount >= 3) and
+       (N.GetChild(0).NodeType = antIdentifier) and (Pos('.', N.GetChild(0).ValueUpper) = 0) then
+    begin
+      Init := N.GetChild(2);
+      if (Init <> nil) and (Init.NodeType = antProcAddress) and not ConstAddr(Init) then
+        HandleError(Format('Expected constant: the Shared or Static reference %s is bound when the program ' +
+          'is compiled, so its target must be a constant address (a Shared variable, an element at a ' +
+          'constant index, or a dereference of such an address)', [N.GetChild(0).ValueUpper]),
+          N.GetChild(0).Token);
+    end;
+    for i := 0 to N.ChildCount - 1 do Check(N.GetChild(i));
+  end;
+
+begin
+  Shared := TStringList.Create;
+  try
+    Shared.Sorted := True;
+    Shared.Duplicates := dupIgnore;
+    Collect(Root);
+    Check(Root);
+  finally
+    Shared.Free;
+  end;
 end;
 
 procedure TPackratParser.CheckRedimTargetIsAName(Node: TASTNode);
