@@ -14568,7 +14568,12 @@ begin
            (UpperFast(Context.CurrentToken.Value) = DimTypeName) and
            (not IsBuiltinTypeName(DimTypeName)) and
            Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
-          Context.Advance                    // RHS == declared UDT: ctor form (block below reads '(')
+        begin
+          Context.Advance;                   // RHS == declared UDT: ctor form (block below reads '(')
+          // ...and the name was WRITTEN: fbc accepts "T( args )" only when T declares a constructor, and
+          // past this point nothing else remembers the spelling (DIVERGENZE 283).
+          ArrayDecl.Attributes.Values['CTORNAME'] := '1';
+        end
         else if Context.Check(ttDelimParOpen) then
         begin
           // FreeBASIC aggregate init "Dim As T v = (a, b, c)": a parenthesised comma-tuple sets the UDT's

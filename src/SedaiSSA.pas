@@ -574,6 +574,8 @@ type
     // La memoria di IsSingleExpr, viva solo dentro una domanda: vedi la nota su 2^profondita'.
     FSingleMemo: specialize TDictionary<PtrUInt, Byte>;
     FArrowOps: Integer;   // DIVERGENZE 285: 0 = not asked yet, 1 = no "Operator ->" in the program, 2 = some
+    FCtorTypes: TIndexedStringList;   // DIVERGENZE 283: the types that DECLARE a constructor...
+    FCtorTypesCount: Integer;         // ...built when FProcDecls had this many entries
     FSingleMemoDepth: Integer;
     FBlockManagedTypes: TStringList;     // types whose "New T[n]" must be MANAGED records (ctor/dtor)
     FConstDeclSeen: TStringList;         // CONST names already seen: a name declared TWICE must not fold
@@ -1339,6 +1341,7 @@ type
     procedure ProcessExpressionFull(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
     function IsTypeCtorTemporary(Node: TASTNode): Boolean;   // "type<T>(args)" / "T(args)" anonymous temporary
     procedure RewriteArrowOperators(Node: TASTNode);        // "f->x" over an overloaded Operator -> (285)
+    function TypeDeclaresConstructor(const TypeName: string): Boolean;   // bare "T(args)" is legal only then (283)
     procedure ProcessAssignment(Node: TASTNode);
     function TryCompoundSelfOp(Node, VarNode, ExprNode: TASTNode): Boolean;
     procedure FillInferredCtorType(VarNode, ExprNode: TASTNode);
@@ -2080,6 +2083,7 @@ begin
   FreeAndNil(FDeclProcNames);
   FreeAndNil(FBareTypeNames);
   FreeAndNil(FSingleMemo);
+  FreeAndNil(FCtorTypes);
   FStaticMembers.Free;
   FStaticRefMembers.Free;
   FCtorDtorTypes.Free;
@@ -2594,6 +2598,17 @@ begin
   if TypeName = 'ZSTRING' then Result := N
   else if TypeName = 'STRING' then Result := N + 1
   else if TypeName = 'WSTRING' then Result := N * 4;
+end;
+
+var
+  GCtorCheckOff: Integer = -1;      // SB_NO_CTOR_CHECK, the A/B knob for the bare "T(args)" rule (283)
+
+function SB_NoCtorCheck: Integer;
+// A/B on one binary for DIVERGENZE 283: SB_NO_CTOR_CHECK=1 builds a temporary for "T(args)" on ANY type
+// again, so a net can tell "this refusal broke a valid program" from anything else. Asked once.
+begin
+  if GCtorCheckOff < 0 then GCtorCheckOff := Ord(GetEnvironmentVariable('SB_NO_CTOR_CHECK') = '1');
+  Result := GCtorCheckOff;
 end;
 
 function OperatorArityCode(NParams: Integer): string;
@@ -9905,6 +9920,30 @@ begin
   {$ENDIF}
 end;
 
+function TSSAGenerator.TypeDeclaresConstructor(const TypeName: string): Boolean;
+// Does this TYPE ITSELF declare a constructor? That is what makes the bare "T( args )" a construction in
+// fbc: on a plain type it is "error 42: Variable not declared, T", on a type with only a DESTRUCTOR too
+// (so FCtorDtorTypes, which holds both, is the wrong question), and a derived type does not borrow its
+// base's - fbc refuses such a type before any call is written (DIVERGENZE 287). The constructors are the
+// "T.CONSTRUCTOR#<sig>" labels; the set is rebuilt whenever FProcDecls has grown since it was built.
+var
+  K: string;
+  p, Idx: Integer;
+begin
+  if (FCtorTypes = nil) or (FCtorTypesCount <> FProcDecls.Count) then
+  begin
+    if FCtorTypes = nil then FCtorTypes := TIndexedStringList.Create else FCtorTypes.Clear;
+    for K in FProcDecls.Keys do
+    begin
+      p := Pos('.CONSTRUCTOR#', K);
+      if (p > 1) and (FCtorTypes.IndexOf(Copy(K, 1, p - 1)) < 0) then FCtorTypes.Add(Copy(K, 1, p - 1));
+    end;
+    FCtorTypesCount := FProcDecls.Count;
+  end;
+  Idx := FindUDT(TypeName);
+  Result := (Idx >= 0) and (FCtorTypes.IndexOf(UpperFast(FUDTs[Idx].Name)) >= 0);
+end;
+
 procedure TSSAGenerator.RewriteArrowOperators(Node: TASTNode);
 // ⭐ AN OVERLOADED "OPERATOR ->" IS APPLIED (DIVERGENZE 285). "operator -> ( byref lhs as foo ) as bar"
 // makes "f->data" mean "(operator->(f)).data": the name belongs to the operator's RESULT type. It was
@@ -9967,9 +10006,19 @@ begin
   // index, so a pointer variable that shares its name with a type ("Type P2 ... : Dim P2 As Integer
   // Ptr : Print P2[1]") read a temporary P2 built from the index - " 1" where fbc prints the element.
   // DIVERGENZE 281.
-  Result := (Node.Attributes.Values['TYPECTOR'] = '1') or
+  // ⛔ ...AND THE BARE SPELLING NEEDS A DECLARED CONSTRUCTOR (DIVERGENZE 283). "P2(9)" on a plain type
+  // built a temporary here and printed 9; fbc says "Variable not declared, P2". Only "type<T>( ... )"
+  // (TYPECTOR) names a type on purpose without one. SB_NO_CTOR_CHECK=1 restores the old reading.
+  // A node this compiler SYNTHESIZED for an aggregate ("{ (a, b) }" over an array of records) carries
+  // SYNTHCTOR, and names the type on purpose exactly as TYPECTOR does.
+  Result := (Node.Attributes.Values['TYPECTOR'] = '1') or (Node.Attributes.Values['SYNTHCTOR'] = '1') or
             ((FindUDT(Nm) >= 0) and (ArrayIndexOf(Nm) < 0) and (FProcedureNames.IndexOf(Nm) < 0) and
-             (Node.Attributes.Values['BRACKET'] <> '1'));
+             (Node.Attributes.Values['BRACKET'] <> '1') and
+             // ...but "T( )" with NO arguments is the DEFAULT construction, legal on any type: fbc's
+             // own structs/anon-access writes "UDT().getI()" and structs/derived-cast "Dim d1 As A = A()"
+             // on types that declare no constructor. Only ARGUMENTS need a declared one.
+             ((SB_NoCtorCheck <> 0) or (Node.ChildCount < 2) or (Node.GetChild(1).ChildCount = 0) or
+              TypeDeclaresConstructor(Nm)));
 end;
 
 procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
@@ -13653,6 +13702,18 @@ begin
           if (ArrayDeclNode.GetChild(2).Attributes.Values['TUPLEINIT'] = '1') and
              (ArrayDeclNode.GetChild(2).Attributes.Values['TUPLE1'] <> '1') then
             EmitUDTAggregateInit(RecHandleVal, RecUDTIdx, ArrayDeclNode.GetChild(2))  // = (a,b,c) field init
+          // ⛔ "Dim v As T = T( args )" WRITTEN on a type that declares no constructor: EmitConstructorCall
+          // falls back to the fields and "P2(9)" gave v = 9, where fbc says "Variable not declared, P2".
+          // The parser marks the spelling (CTORNAME); "= ( 9 )" and "= Type<T>( 9 )" keep working.
+          // DIVERGENZE 283.
+          // "= T( )" with no arguments is the default construction and legal on any type (see
+          // IsTypeCtorTemporary): only a NON-EMPTY list needs a declared constructor.
+          else if (ArrayDeclNode.Attributes.Values['CTORNAME'] = '1') and (SB_NoCtorCheck = 0) and
+                  (ArrayDeclNode.GetChild(2).ChildCount > 0) and
+                  not TypeDeclaresConstructor(RecTypeName) then
+            raise Exception.CreateFmt('Variable not declared, %s (type %s declares no constructor, so ' +
+                                      '"%s( ... )" is not a construction; "Type<%s>( ... )" is)',
+                                      [LowerCase(RecTypeName), RecTypeName, RecTypeName, RecTypeName])
           else
             EmitConstructorCall(RecHandleVal, RecTypeName, ArrayDeclNode.GetChild(2));
         end
@@ -14341,6 +14402,9 @@ begin
              or ((InitElemNode.NodeType = antParentheses) and (InitElemNode.ChildCount = 1)) then
           begin
             TupleCtor := TASTNode.Create(antArrayAccess, Node.Token);
+            // SYNTHESIZED from "( ... )", not written as "T( ... )": it constructs whether or not the type
+            // declares a constructor (DIVERGENZE 283 refuses only the spelling the PROGRAM wrote).
+            TupleCtor.Attributes.Values['SYNTHCTOR'] := '1';
             TupleCtor.AddChild(TASTNode.CreateWithValue(antIdentifier, ArrElemTypeName, Node.Token));
             TupleArgs := TASTNode.Create(antExpressionList, Node.Token);
             for m := 0 to InitElemNode.ChildCount - 1 do
@@ -14357,6 +14421,7 @@ begin
                   (FindCtorWithDefaults(ArrElemTypeName, 1) <> '') then
           begin
             TupleCtor := TASTNode.Create(antArrayAccess, Node.Token);
+            TupleCtor.Attributes.Values['SYNTHCTOR'] := '1';   // synthesized, see the arm above (283)
             TupleCtor.AddChild(TASTNode.CreateWithValue(antIdentifier, ArrElemTypeName, Node.Token));
             TupleArgs := TASTNode.Create(antExpressionList, Node.Token);
             TupleArgs.AddChild(InitElemNode.Clone);
