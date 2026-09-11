@@ -8258,6 +8258,12 @@ begin
             begin
               Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
               EmitInstruction(ssaRawLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(TempStr)));
+              // ...and on a ZSTRING/WSTRING field the same TWO readings as on a named pointer (the
+              // by-NAME branch notes the register the same way): a string context - PRINT, "&", an
+              // assignment to a STRING - takes the TEXT from that offset. Missing here, "t.p[1]"
+              // printed the byte " 98" where fbc prints "bcd". DIVERGENZE 252.
+              if (TempStr = 'ZSTRING') or (TempStr = 'WSTRING') then
+                NoteZStrCharRead(Result, Left, Ord(TempStr = 'WSTRING'));
             end;
             Exit;
           end;
@@ -9905,8 +9911,13 @@ begin
   // threw it away - the call SILENTLY did not happen, with no diagnostic anywhere. It took a module
   // constructor to notice, because there the missing call is all the constructor did. The explicit
   // "type<T>( ... )" spelling carries TYPECTOR and is unaffected: that one names a type on purpose.
+  // ⛔ ...AND BRACKETS NEVER CONSTRUCT. A constructor is written with PARENTHESES; "p[i]" is a pointer
+  // index, so a pointer variable that shares its name with a type ("Type P2 ... : Dim P2 As Integer
+  // Ptr : Print P2[1]") read a temporary P2 built from the index - " 1" where fbc prints the element.
+  // DIVERGENZE 281.
   Result := (Node.Attributes.Values['TYPECTOR'] = '1') or
-            ((FindUDT(Nm) >= 0) and (ArrayIndexOf(Nm) < 0) and (FProcedureNames.IndexOf(Nm) < 0));
+            ((FindUDT(Nm) >= 0) and (ArrayIndexOf(Nm) < 0) and (FProcedureNames.IndexOf(Nm) < 0) and
+             (Node.Attributes.Values['BRACKET'] <> '1'));
 end;
 
 procedure TSSAGenerator.ProcessAssignment(Node: TASTNode);
@@ -14229,7 +14240,12 @@ begin
           begin
             ProcessExpression(InitVals.GetChild(k), InitElemVal);
             case ElementType of
-              srtFloat:  InitElemReg := EnsureFloatRegister(InitElemVal);
+              // ...rounded to the element's WIDTH, as "a(k) = v" rounds it (ProcessArrayStore): a SINGLE
+              // array initialised with "{2.2, 3.3}" kept both values in double precision, so
+              // "Dim z As Double = a(1)" printed 3.3 where fbc prints 3.299999952316284, and every read
+              // through a pointer into the array saw the same unrounded value. DIVERGENZE 282.
+              srtFloat:  InitElemReg := ApplyNarrowCode(TypeNameWidthCode(ArrElemTypeName),
+                                                        EnsureFloatRegister(InitElemVal));
               srtString: InitElemReg := EnsureStringRegister(InitElemVal);
             else         InitElemReg := EnsureIntRegister(InitElemVal);
             end;
@@ -28765,10 +28781,26 @@ begin
           // A call to an intrinsic parses as an array access too ("Sqr(s)" is name + argument list).
           if (not Result) and (Node.ChildCount >= 2) then
             Result := IntrinsicCallIsSingle(Node.GetChild(0).ValueUpper, Node.GetChild(1));
+          // ...or "p[i]" through a SINGLE PTR: the element is the POINTEE, a Single. DIVERGENZE 248:
+          // without it "q[0]" over "@x" printed 1.100000023841858 where fbc prints 1.1, and "q[0] * 2"
+          // was computed as a Double.
+          if (not Result) and (Node.ChildCount >= 2) and
+             (not NameIsRealArray(Node.GetChild(0).ValueUpper)) then
+            Result := (UpperFast(PointeeTypeOf(Node.GetChild(0).ValueUpper)) = 'SINGLE') or
+                      (UpperFast(ManagedPtrPointee(Node.GetChild(0).ValueUpper)) = 'SINGLE');
         end
         else if Node.GetChild(0).NodeType = antMemberAccess then
-          Result := MethodReturnIsSingle(Node);   // "obj.method(args)" returning a SINGLE
+          // "obj.method(args)" returning a SINGLE, or "obj.sp[i]" on a SINGLE PTR field (248)
+          Result := MethodReturnIsSingle(Node) or
+                    ((Node.ChildCount >= 2) and
+                     (UpperFast(MemberRawPtrPointee(Node.GetChild(0))) = 'SINGLE'));
       end;
+    antDeref:
+      // "*p" through a SINGLE PTR is a Single, whatever p is - a variable, a field, a cast, pointer
+      // arithmetic: DerefedType resolves all of them (the print-kind twin of this arm already uses it).
+      // DIVERGENZE 248.
+      if Node.ChildCount >= 1 then
+        Result := UpperFast(DerefedType(Node.GetChild(0))) = 'SINGLE';
     antMemberAccess:
       // Either a SINGLE field, or a no-argument method returning one ("obj.method" with the "()" dropped).
       Result := MemberFieldIsSingle(Node) or MethodReturnIsSingle(Node);
