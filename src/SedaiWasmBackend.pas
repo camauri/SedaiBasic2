@@ -299,6 +299,7 @@ type
     FArrTabAddr: LongWord;
     FArrTabBytes: AnsiString;
     FRefLoad, FRefStore: array[TSSARegisterType] of LongWord;
+    FRecAddrFunc: LongWord;   // recAddr(handle|VIEW) -> linear address (DIVERGENZE 226); with FUsesPtr
 
     { --- FUNCTION POINTERS ------------------------------------------------
       ⛔ THE TABLE WAS NEVER THE HARD PART - THE SIGNATURE IS. Natively an
@@ -5918,6 +5919,28 @@ begin
       B.Free;
     end;
   end;
+
+  { ---- recAddr: (handle) -> the linear address a record op offsets from ----
+    DIVERGENZE 226: a nested member that lives in its container's bytes is reached
+    through a VIEW - the record-field pointer of the member, width 0 - and every
+    record op may be handed one. A plain handle IS the address; a view names the
+    container in bits 24..55 and the member's byte offset in its slot, so the
+    address is container + offset, and the field's own offset is added after, as
+    for any handle. The header (8 bytes) stays the caller's to add. }
+  T := FModule.TypeIndex([wvtI64], [wvtI32]);
+  B := TWasmBuf.Create;
+  try
+    B.LocalGet(0); B.I64Const(RECPTR_SLOT_BITS); B.Op(wopI64ShrU); B.Op(wopI32WrapI64);
+    B.LocalGet(0); B.Op(wopI32WrapI64);
+    B.I32Const(LongInt(RECPTR_SLOT_MASK and not Int64($F))); B.Op(wopI32And);
+    B.I32Const(4); B.Op(wopI32ShrU); B.Op(wopI32Add);        // a view: container + offset
+    B.LocalGet(0); B.Op(wopI32WrapI64);                       // a handle: itself
+    B.LocalGet(0); B.I64Const(0); B.Op(wopI64LtS);
+    B.Op(wopSelect);
+    FRecAddrFunc := FModule.AddFunction(T, [], B);
+  finally
+    B.Free;
+  end;
 end;
 
 { ---------------- PRINT of a float ----------------
@@ -9003,7 +9026,10 @@ begin
         Enc := Instr.Src3.ConstInt;
         Loaded32 := False;
         LoadReg(B, Instr.Src1);                     // the handle
-        B.Op(wopI32WrapI64);
+        // ...or a VIEW of a nested member (DIVERGENZE 226), which only a program that builds
+        // record-field pointers can hold - and such a program has the helper that decodes one.
+        if FUsesPtr then B.Call(FRecAddrFunc)
+        else B.Op(wopI32WrapI64);
         // ⭐ The mirror of the load above: a value that LIVES in an i32 local is stored FROM an i32,
         // which saves the widening the bank would otherwise force on the way out.
         Stored32 := (Instr.OpCode = ssaRecordStoreInt) and RegIs32(Instr.Src2) and
@@ -9474,10 +9500,16 @@ begin
           Exit(Fail('ssaRefAddrField without a constant field encoding'));
         if (Instr.Src3.ConstInt < 0) or (Instr.Src3.ConstInt > RECPTR_SLOT_MASK) then
           Exit(Fail('ssaRefAddrField with a field encoding too wide to pack'));
+        // ...and from a VIEW (DIVERGENZE 226), a member of a member: its slot has width 0, so adding
+        // the field's slot adds the byte offsets and keeps the field's width - the interpreter's rule.
+        LoadReg(B, Instr.Src1);
+        B.I64Const(Instr.Src3.ConstInt); B.Op(wopI64Add);
         LoadReg(B, Instr.Src1);
         B.I64Const(RECPTR_SLOT_BITS); B.Op(wopI64Shl);
         B.I64Const(RECPTR_TAG or Instr.Src3.ConstInt);
         B.Op(wopI64Or);
+        LoadReg(B, Instr.Src1); B.I64Const(0); B.Op(wopI64LtS);
+        B.Op(wopSelect);
         StoreReg(B, Instr.Dest);
       end;
 
@@ -11611,11 +11643,15 @@ begin
     them in. Conditional like the two above, and numbered sequentially for the
     same reason. }
   if FUsesPtr then
+  begin
     for RT := Low(TSSARegisterType) to High(TSSARegisterType) do
     begin
       FRefLoad[RT] := Next; FRefStore[RT] := Next + 1;
       Inc(Next, 2);
     end;
+    FRecAddrFunc := Next;         // EmitRefHelpers adds it after the load/store pairs
+    Inc(Next);
+  end;
 
   if FUsesFlt then
   begin

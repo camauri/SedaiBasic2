@@ -1404,15 +1404,15 @@ EventPollCounter := 0;
           end;
         // M5.2c: ResolveRec routes the handle to its record (per-thread heap or the shared region).
         bcRecordLoadInt:
-          begin Ctx.IntRegs[Instr^.Dest] := RecFieldInt(ResolveRec(Ctx, Ctx.IntRegs[Instr^.Src1]), Instr^.Immediate); Inc(CurPC); end;
+          begin Ctx.IntRegs[Instr^.Dest] := RecLoadI(Ctx, Ctx.IntRegs[Instr^.Src1], Instr^.Immediate); Inc(CurPC); end;
         bcRecordLoadFloat:
-          begin Ctx.FloatRegs[Instr^.Dest] := RecFieldFloat(ResolveRec(Ctx, Ctx.IntRegs[Instr^.Src1]), Instr^.Immediate); Inc(CurPC); end;
+          begin Ctx.FloatRegs[Instr^.Dest] := RecLoadF(Ctx, Ctx.IntRegs[Instr^.Src1], Instr^.Immediate); Inc(CurPC); end;
         bcRecordLoadString:
           begin Ctx.StringRegs[Instr^.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr^.Src1])^.StringData[Instr^.Immediate]; Inc(CurPC); end;
         bcRecordStoreInt:
-          begin RecSetFieldInt(ResolveRec(Ctx, Ctx.IntRegs[Instr^.Src1]), Instr^.Immediate, Ctx.IntRegs[Instr^.Src2]); Inc(CurPC); end;
+          begin RecStoreI(Ctx, Ctx.IntRegs[Instr^.Src1], Instr^.Immediate, Ctx.IntRegs[Instr^.Src2]); Inc(CurPC); end;
         bcRecordStoreFloat:
-          begin RecSetFieldFloat(ResolveRec(Ctx, Ctx.IntRegs[Instr^.Src1]), Instr^.Immediate, Ctx.FloatRegs[Instr^.Src2]); Inc(CurPC); end;
+          begin RecStoreF(Ctx, Ctx.IntRegs[Instr^.Src1], Instr^.Immediate, Ctx.FloatRegs[Instr^.Src2]); Inc(CurPC); end;
         bcRecordStoreString:
           begin ResolveRec(Ctx, Ctx.IntRegs[Instr^.Src1])^.StringData[Instr^.Immediate] := Ctx.StringRegs[Instr^.Src2]; Inc(CurPC); end;
         bcRecordTypeId:

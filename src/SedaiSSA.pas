@@ -104,6 +104,7 @@ type
     Bank: TSSARegisterType;
     Slot: Integer;          // index within that bank's slot array of the instance
     NestedType: string;     // UDT type name if this field is itself a record (else ''); held as an int handle
+    InlineNested: Boolean;  // DIVERGENZE 226: ...unless the record is plain data, which LIVES in our bytes at ByteOffset
     PtrPointee: string;     // pointee UDT type if this field is a "T PTR" (else ''); held as an int handle
     MultiPtrPointee: string;// ⛔ THE THIRD SHAPE, AND NOTHING RECORDED IT. A field declared "As T Ptr Ptr"
                             // is neither of the two below: stripping one PTR leaves "T PTR", which is not
@@ -348,6 +349,7 @@ type
     FStaticMembers: TStringList;         // OOP: static member variables "TYPE.FIELD" (UPPER), backed by a shared global scalar
     FStaticRefMembers: TStringList;      // "Static ByRef" members "TYPE.FIELD=type": a Shared REFERENCE under the dotted name (269)
     FWantByrefRetAddr: Boolean;          // "@(fp( ))": the next indirect ByRef call hands back the ADDRESS, not the value
+    FCtorDtorTypes: TStringList;         // DIVERGENZE 226: the types that DEFINE a constructor or destructor (anywhere)
     // ...and the static member PROCEDURES, "TYPE.NAME" (UPPER). The parser stamps the definition
     // with STATICMETH (it is the only place that sees "Declare STATIC Sub" in the type body);
     // gathered here so a call through an OBJECT EXPRESSION can skip evaluating the object.
@@ -932,6 +934,9 @@ type
     function AnyHoistedDim(DimNode: TASTNode): Boolean;          // ...this antDim holds one such declaration
     // The TYPE a static-member access names - written directly, through an instance, or through an ALIAS.
     function StaticMemberOwnerType(ObjNode: TASTNode): string;
+    function UDTInlinePOD(UIdx: Integer): Boolean;   // DIVERGENZE 226: may this type LIVE inside its container?
+    procedure CollectCtorDtorTypes(N: TASTNode);      // ...fills FCtorDtorTypes from the procedures DEFINED
+    function NestedMemberHandle(const Parent: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;  // ...the member's handle or VIEW
     function StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;  // "TYPE.FIELD" backing name, or '' if not static
     function StaticMemberArrayName(ObjNode: TASTNode; const FieldName: string): string;    // ...the ARRAY backing, or ''
     function StaticMemberAddrName(MemberNode: TASTNode): string;   // the name "@<static member>" resolves to, or ''
@@ -2048,6 +2053,7 @@ begin
   FreeAndNil(FSingleMemo);
   FStaticMembers.Free;
   FStaticRefMembers.Free;
+  FCtorDtorTypes.Free;
   FStaticMemberProcs.Free;
   FStaticMemberArrays.Free;
   FStaticMemberTypes.Free;
@@ -27799,9 +27805,7 @@ var
       begin
         SubIdx := FindUDT(FUDTs[AUdt].Fields[NIdx].NestedType);
         if SubIdx < 0 then Exit(False);
-        SubRec := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-        EmitInstruction(ssaRecordLoadInt, SubRec, ARec, MakeSSAValue(svkNone),
-                        MakeSSAConstInt(FUDTs[AUdt].Fields[NIdx].Slot));
+        SubRec := NestedMemberHandle(ARec, AUdt, NIdx);   // its handle, or its VIEW (DIVERGENZE 226)
         if not EmitRecordImage(SubIdx, SubRec, ABase + Offs[NIdx]) then Exit(False);
         Continue;
       end;
@@ -30894,6 +30898,7 @@ begin
       FUDTs[Idx].Fields[n].Name := UpperFast(FieldName);
       FUDTs[Idx].Fields[n].Bank := Bank;
       FUDTs[Idx].Fields[n].NestedType := NestedT;
+      FUDTs[Idx].Fields[n].InlineNested := False;   // decided by ComputeUDTLiveLayout (DIVERGENZE 226)
       // FreeBASIC field default "field AS T = expr": the parser attaches the expression as the last child
       // and marks HASDEFAULT. Kept for EmitRecordInit to apply on each instantiation (not for array/nested
       // members, which manage their own storage).
@@ -31144,6 +31149,95 @@ begin
   Continues := False;
 end;
 
+function TSSAGenerator.UDTInlinePOD(UIdx: Integer): Boolean;
+// ⭐⭐ DIVERGENZE 226 - MAY THIS TYPE LIVE INSIDE THE BYTES OF A RECORD THAT CONTAINS IT? A nested member used
+// to be its own record, reached through a handle kept after the image, so a UNION could not overlap it
+// ("LARGE_INTEGER.u" read 0 after "QuadPart = ..."), a raw pointer to the container could not reach it,
+// and SizeOf counted the handle. Its bytes were already reserved at fbc's offset (DIVERGENZE 193); a type
+// of plain data now simply USES them, and is reached through a VIEW of the container (NestedMemberHandle).
+// ⛔ What cannot live there, and why - each is state kept PER RECORD rather than in the byte image:
+//   - a STRING field: strings live in the record's own string vector, indexed by slot - a view would
+//     reach the CONTAINER's vector at the member's slot numbers, i.e. someone else's strings;
+//   - an ARRAY member: its slot holds an FArrays handle sized per record (DIVERGENZE 226, second step);
+//   - a type with a PARENT (EXTENDS, so RTTI and virtual dispatch): the dynamic type id is per record;
+//   - ⛔ a type with a CONSTRUCTOR or a DESTRUCTOR - and the first version of this said the opposite. Every
+//     constructor and destructor body opens with bcRecordSetTypeId on THIS, and THIS would be a view:
+//     refused at run time (the corpus's v5c_nesteddtor and m12_endinproc died on it) - and worse, at
+//     offset 0 THIS is the CONTAINER'S handle, so the member's type id would have overwritten the
+//     container's in silence. The declaration says it: the parser stamps ACCESSCONSTRUCTOR /
+//     ACCESSDESTRUCTOR on the Type node.
+var
+  i: Integer;
+begin
+  Result := False;
+  if (UIdx < 0) or (UIdx > High(FUDTs)) then Exit;
+  if GNestedInlineOff < 0 then
+    GNestedInlineOff := Ord(GetEnvironmentVariable('SB_NO_NESTED_INLINE') = '1');
+  if GNestedInlineOff = 1 then Exit;
+  if FUDTs[UIdx].Parent <> '' then Exit;
+  if (FUDTs[UIdx].Node <> nil) and
+     ((FUDTs[UIdx].Node.Attributes.Values['ACCESSCONSTRUCTOR'] <> '') or
+      (FUDTs[UIdx].Node.Attributes.Values['ACCESSDESTRUCTOR'] <> '')) then Exit;
+  // ...and a constructor or destructor DEFINED without a Declare inside the Type (corpus v5c_nesteddtor).
+  if (FCtorDtorTypes <> nil) and (FCtorDtorTypes.IndexOf(UpperFast(FUDTs[UIdx].Name)) >= 0) then Exit;
+  for i := 0 to High(FUDTs[UIdx].Fields) do
+  begin
+    if FUDTs[UIdx].Fields[i].Bank = srtString then Exit;
+    if FUDTs[UIdx].Fields[i].IsArray then Exit;
+    if (FUDTs[UIdx].Fields[i].NestedType <> '') and
+       not UDTInlinePOD(FindUDT(FUDTs[UIdx].Fields[i].NestedType)) then Exit;
+  end;
+  Result := True;
+end;
+
+procedure TSSAGenerator.CollectCtorDtorTypes(N: TASTNode);
+// Every "Constructor T(...)" / "Destructor T()" DEFINED in the program files T in FCtorDtorTypes. The
+// procedure's name child reads "T.CONSTRUCTOR#<sig>" or "T.DESTRUCTOR" (namespace prefix included), and
+// the type is everything before the last ".CONSTRUCTOR" / ".DESTRUCTOR".
+var
+  i, p: Integer;
+  Nm, K: string;
+begin
+  if (N = nil) or (FCtorDtorTypes = nil) then Exit;
+  if (N.NodeType = antProcedureDecl) and (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antIdentifier) then
+  begin
+    K := UpperFast(VarToStr(N.Value));
+    if (K = 'CONSTRUCTOR') or (K = 'DESTRUCTOR') then
+    begin
+      Nm := UpperFast(VarToStr(N.GetChild(0).Value));
+      p := Pos('.' + K, Nm);
+      if p > 1 then FCtorDtorTypes.Add(Copy(Nm, 1, p - 1));
+    end;
+  end;
+  for i := 0 to N.ChildCount - 1 do CollectCtorDtorTypes(N.GetChild(i));
+end;
+
+function TSSAGenerator.NestedMemberHandle(const Parent: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
+// The value every consumer of a nested member works on (DIVERGENZE 226), asked in ONE place:
+//   - a member that is its own record: the handle kept in its slot, as it always was;
+//   - a member that LIVES in the container's bytes at offset 0 (every alternative of a UNION): the
+//     container's own handle - the same record, and the member's field slots are offsets from 0 - so
+//     field access stays native in the compiled engines;
+//   - at any other offset: a VIEW, the record-field pointer of the member (ssaRefAddrField), which the
+//     record ops resolve to the container plus the member's offset.
+begin
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) or (FieldIdx < 0) or
+     (FieldIdx > High(FUDTs[UDTIdx].Fields)) then
+    Exit(EnsureIntRegister(Parent));
+  if not FUDTs[UDTIdx].Fields[FieldIdx].InlineNested then
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRecordLoadInt, Result, EnsureIntRegister(Parent), MakeSSAValue(svkNone),
+                    MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].Slot));
+    Exit;
+  end;
+  if FUDTs[UDTIdx].Fields[FieldIdx].ByteOffset = 0 then
+    Exit(EnsureIntRegister(Parent));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRefAddrField, Result, EnsureIntRegister(Parent), MakeSSAValue(svkNone),
+                  MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].Slot));
+end;
+
 procedure TSSAGenerator.ComputeUDTLiveLayout(UDTIdx: Integer);
 { A3 - the LIVE byte image of a record, and the one property that makes it worth having:
   IT IS fbc's C LAYOUT, for EVERY type.
@@ -31392,6 +31486,15 @@ begin
        (not FUDTs[UDTIdx].Fields[i].IsArray) and (FUDTs[UDTIdx].Fields[i].NestedType <> '') and
        (FUDTs[UDTIdx].Fields[i].Bank <> srtString) then
     begin
+      // ⭐⭐ ...UNLESS THE MEMBER IS PLAIN DATA, WHICH NOW LIVES IN THOSE RESERVED BYTES (DIVERGENZE 226).
+      // Its slot is its byte offset (width 0: it is a place, not a value), it takes no side slot, and so
+      // the live size is fbc's size - "Union : u As T2 : q As LongInt : End Union" measures 8, not 16.
+      if UDTInlinePOD(FindUDT(FUDTs[UDTIdx].Fields[i].NestedType)) then
+      begin
+        FUDTs[UDTIdx].Fields[i].InlineNested := True;
+        FUDTs[UDTIdx].Fields[i].Slot := Integer(FUDTs[UDTIdx].Fields[i].ByteOffset shl 4);
+        Continue;
+      end;
       if (Ofs mod 8) <> 0 then Ofs := Ofs + (8 - (Ofs mod 8));
       FUDTs[UDTIdx].Fields[i].Slot := (Ofs shl 4);   // full width: a handle is never narrowed
       Ofs := Ofs + 8;
@@ -31414,6 +31517,16 @@ var
   Total: Int64;
   Bad: Integer;
 begin
+  // DIVERGENZE 226: which types construct or destroy themselves, asked of the procedures DEFINED - a
+  // "Destructor T()" written with no Declare inside the Type leaves no mark on the Type node.
+  if FCtorDtorTypes = nil then
+  begin
+    FCtorDtorTypes := TStringList.Create;
+    FCtorDtorTypes.Sorted := True;
+    FCtorDtorTypes.Duplicates := dupIgnore;
+    FCtorDtorTypes.CaseSensitive := False;
+  end;
+  CollectCtorDtorTypes(Node);
   for i := 0 to High(FUDTs) do
     FillOneUDT(i);
   if GetEnvironmentVariable('UDT_DIAG') <> '1' then Exit;
@@ -35224,6 +35337,15 @@ begin
     begin
       NestedUDT := FindUDT(FUDTs[UDTIdx].Fields[i].NestedType);
       if NestedUDT < 0 then Continue;
+      // DIVERGENZE 226: a member that LIVES in our bytes has nothing to allocate - only its own defaults
+      // and constructor, run on the view of it.
+      if FUDTs[UDTIdx].Fields[i].InlineNested then
+      begin
+        NestedHandle := NestedMemberHandle(HandleVal, UDTIdx, i);
+        EmitRecordInit(NestedHandle, NestedUDT, WithDefaults);
+        EmitConstructorCall(NestedHandle, FUDTs[NestedUDT].Name);
+        Continue;
+      end;
       NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaRecordNew, NestedHandle,
                       MakeSSAConstInt(FUDTs[NestedUDT].LiveBytes),
@@ -35291,9 +35413,7 @@ begin
         j := FindUDT(FUDTs[UDTIdx].Fields[i].NestedType);
         if j >= 0 then
         begin
-          NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          EmitInstruction(ssaRecordLoadInt, NestedHandle, HandleVal, MakeSSAValue(svkNone),
-                          MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+          NestedHandle := NestedMemberHandle(HandleVal, UDTIdx, i);   // DIVERGENZE 226
           EmitUDTAggregateInit(NestedHandle, j, FUDTs[UDTIdx].Fields[i].DefaultExpr);
         end;
         Continue;
@@ -35634,7 +35754,9 @@ begin
   GuardSlot := -1;
   GuardBank := srtInt;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
-    if (FUDTs[UDTIdx].Fields[i].NestedType <> '') or
+    // ⛔ ...never a member that LIVES in our bytes (DIVERGENZE 226): its slot is DATA, which a program may
+    // have set to zero, not a handle that is zero only until the record is initialised.
+    if ((FUDTs[UDTIdx].Fields[i].NestedType <> '') and not FUDTs[UDTIdx].Fields[i].InlineNested) or
        (FUDTs[UDTIdx].Fields[i].IsArray and (FUDTs[UDTIdx].Fields[i].ArrayBounds <> nil)) then
     begin GuardSlot := FUDTs[UDTIdx].Fields[i].Slot; Break; end;
   // ...or, for a type whose only per-instance setup is a FIELD DEFAULT, that field's own slot. A fresh
@@ -36012,9 +36134,7 @@ begin
        (ObjectTypeName(ArgsNode.GetChild(i)) = '') then
     begin
       j := FindUDT(FUDTs[UDTIdx].Fields[FieldIdx].NestedType);
-      ArrHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaRecordLoadInt, ArrHandle, HandleVal, MakeSSAValue(svkNone),
-                      MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].Slot));
+      ArrHandle := NestedMemberHandle(HandleVal, UDTIdx, FieldIdx);   // DIVERGENZE 226
       NestedArgs := ArgsNode.GetChild(i);
       // "( (111) )" hands the nested type its own list; a bare value is that list with one element, and
       // building the one-element list here keeps ONE recursion instead of two shapes of it.
@@ -36034,6 +36154,17 @@ begin
       Continue;
     end;
     ProcessExpression(ArgsNode.GetChild(i), ArgVal);
+    // DIVERGENZE 226: a nested member that LIVES in our bytes has no handle slot to store a record
+    // into - "Type<pair>( Type<parent>(1, 2), ... )" wrote the temporary's HANDLE over t1's bytes, and
+    // t1.a read 4. The value is a record of the member's type: copy it into the member's bytes.
+    if FUDTs[UDTIdx].Fields[FieldIdx].InlineNested and
+       (ObjectTypeName(ArgsNode.GetChild(i)) <> '') then
+    begin
+      j := FindUDT(FUDTs[UDTIdx].Fields[FieldIdx].NestedType);
+      EmitRecordCopy(NestedMemberHandle(HandleVal, UDTIdx, FieldIdx), EnsureIntRegister(ArgVal), j);
+      Inc(FieldIdx);
+      Continue;
+    end;
     Bank := FUDTs[UDTIdx].Fields[FieldIdx].Bank;
     Slot := FUDTs[UDTIdx].Fields[FieldIdx].Slot;
     if FUDTs[UDTIdx].Fields[FieldIdx].BitWidth > 0 then
@@ -36406,9 +36537,7 @@ begin
       if FUDTs[UDTIdx].Fields[i].NestedType <> '' then
       begin
         Slot := FUDTs[UDTIdx].Fields[i].Slot;
-        NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-        EmitInstruction(ssaRecordLoadInt, NestedHandle, HandleVal,
-                        MakeSSAValue(svkNone), MakeSSAConstInt(Slot));   // load nested member handle
+        NestedHandle := NestedMemberHandle(HandleVal, UDTIdx, i);   // its handle, or its VIEW (226)
         EmitDestructorCall(NestedHandle, FUDTs[UDTIdx].Fields[i].NestedType);
       end;
 end;
@@ -44637,10 +44766,8 @@ begin
       // Nested record member: load both handles (int slot), deep-copy into the destination's own.
       NestedUDT := FindUDT(FUDTs[UDTIdx].Fields[i].NestedType);
       if NestedUDT < 0 then Continue;
-      DNest := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaRecordLoadInt, DNest, DestHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
-      SNest := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaRecordLoadInt, SNest, SrcHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+      DNest := NestedMemberHandle(DestHandle, UDTIdx, i);   // handles, or VIEWS (DIVERGENZE 226)
+      SNest := NestedMemberHandle(SrcHandle, UDTIdx, i);
       EmitRecordCopy(DNest, SNest, NestedUDT);
     end
     else
@@ -46545,7 +46672,7 @@ var
   MemberArrHandle, MemberArrIdx: TSSAValue;
   MemberArrBank: TSSARegisterType;
   ParentHandle, NestedHandle: TSSAValue;
-  ParentUDT, Slot: Integer;
+  ParentUDT, Slot, FieldI: Integer;
   Bank: TSSARegisterType;
   SharedTmp, ChainIdx, CancelObj: TASTNode;
 begin
@@ -47032,9 +47159,17 @@ begin
     if NestedT = '' then
       NestedT := UDTFieldPtrPointee(ParentUDT, VarToStr(ObjNode.Value));
     if NestedT = '' then Exit;   // parent.field is neither a record nor a UDT pointer
-    NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaRecordLoadInt, NestedHandle, ParentHandle,
-                    MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+    // DIVERGENZE 226: a member that LIVES in the parent's bytes is reached through the parent (offset 0)
+    // or a VIEW of it - never through a handle, which it does not have.
+    FieldI := UDTFieldIndex(ParentUDT, VarToStr(ObjNode.Value));
+    if (FieldI >= 0) and FUDTs[ParentUDT].Fields[FieldI].InlineNested then
+      NestedHandle := NestedMemberHandle(ParentHandle, ParentUDT, FieldI)
+    else
+    begin
+      NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordLoadInt, NestedHandle, ParentHandle,
+                      MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+    end;
     HandleVal := NestedHandle;
     TypeName := NestedT;
     Result := True;
@@ -47169,6 +47304,14 @@ begin
     Exit;
   end;
   if not ResolveRecordObject(Node.GetChild(0), HandleVal, TypeName) then Exit;
+  // DIVERGENZE 226: reading a WHOLE nested member that lives in our bytes yields the member itself - the
+  // container at offset 0, or a VIEW - where a member with its own record yields the handle in its slot.
+  if (UDTFieldIndex(UDTIdx, VarToStr(Node.Value)) >= 0) and
+     FUDTs[UDTIdx].Fields[UDTFieldIndex(UDTIdx, VarToStr(Node.Value))].InlineNested then
+  begin
+    Result := NestedMemberHandle(HandleVal, UDTIdx, UDTFieldIndex(UDTIdx, VarToStr(Node.Value)));
+    Exit;
+  end;
 
   DestVal := MakeSSARegister(Bank, FProgram.AllocRegister(Bank));
   case Bank of
@@ -47496,8 +47639,15 @@ begin
     end;
     if (NestSrcT <> '') and (UpperFast(NestSrcT) = UpperFast(NestedT)) then
     begin
-      NestDstH := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaRecordLoadInt, NestDstH, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+      // The destination member: its handle, or - when it LIVES in our bytes - the member itself (226).
+      if (UDTIdx >= 0) and (UDTFieldIndex(UDTIdx, VarToStr(MemberNode.Value)) >= 0) and
+         FUDTs[UDTIdx].Fields[UDTFieldIndex(UDTIdx, VarToStr(MemberNode.Value))].InlineNested then
+        NestDstH := NestedMemberHandle(HandleVal, UDTIdx, UDTFieldIndex(UDTIdx, VarToStr(MemberNode.Value)))
+      else
+      begin
+        NestDstH := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaRecordLoadInt, NestDstH, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+      end;
       EmitRecordCopy(NestDstH, EnsureIntRegister(NestSrcH), FindUDT(NestedT));
       Exit;
     end;

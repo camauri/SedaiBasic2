@@ -242,6 +242,7 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
 #define RECPTR(h_, out_) do {                                                     \
     int64_t hh_ = (h_);                                                           \
     if (!recdesc) return pc;                                                      \
+    if (hh_ < 0) return pc;                   /* a VIEW (226): the interpreter's */ \
     if (hh_ & recdesc[4]) {                                                       \
       if (!recdesc[3]) return pc;               /* locked mode: not ours */       \
       (out_) = ((char *const *)(intptr_t)recdesc[3])[hh_ & recdesc[5]];           \

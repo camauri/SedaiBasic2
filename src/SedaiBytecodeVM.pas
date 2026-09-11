@@ -891,6 +891,14 @@ type
     procedure RawClear(Ctx: TExecutionContext; DstPtr: Int64; Value: Byte; ByteCount: PtrUInt);  // CLEAR: set ByteCount bytes to Value
     function ResolveRec(Ctx: TExecutionContext; Handle: Int64): PRecordStorage; inline;
     function RecPtrTarget(Ctx: TExecutionContext; PtrAddr: Int64; out Slot: Integer): PRecordStorage; inline;  // decode @obj.field pointer
+    // ⭐ DIVERGENZE 226: a nested member that LIVES in its container's bytes is reached through a VIEW - the
+    // record-field pointer of the member (RECPTR_TAG, so negative), whose slot names its byte offset. Every
+    // record field op goes through these four, which add that offset; a plain handle takes the old road.
+    function RecViewTarget(Ctx: TExecutionContext; View: Int64; var Enc: Int64): PRecordStorage;
+    function RecLoadI(Ctx: TExecutionContext; H, Enc: Int64): Int64; inline;
+    function RecLoadF(Ctx: TExecutionContext; H, Enc: Int64): Double; inline;
+    procedure RecStoreI(Ctx: TExecutionContext; H, Enc, Val: Int64); inline;
+    procedure RecStoreF(Ctx: TExecutionContext; H, Enc: Int64; Val: Double); inline;
     // ⭐ The THREE POINTER DOMAINS, answered in one place each. A pointer VALUE is one of: a record-field
     // pointer (RECPTR_TAG, bit 63, so NEGATIVE), a raw heap address (RAWPTR_TAG, bit 62) or a packed
     // array pointer. The bcRefLoad*/bcRefStore* arms spelled all three out inline, and the bcRawLoad*/
@@ -5058,6 +5066,12 @@ function TBytecodeVM.ResolveRec(Ctx: TExecutionContext; Handle: Int64): PRecordS
 // lock-free — concurrent writes to the SAME shared record are the programmer's job, via a mutex).
 // A plain handle indexes the active context's per-thread heap (only that thread touches it).
 begin
+  // ⛔ A VIEW IS NOT A HANDLE (DIVERGENZE 226). It is negative, and a view of a SHARED record also carries
+  // bit 62 - so without this test it would index the shared table with a value that is not an index, and
+  // answer ANOTHER record in silence. The field ops go through RecLoadI & co.; anything else is refused.
+  if Handle < 0 then
+    raise ERangeError.CreateFmt('Negative record handle %d where a whole record is needed: a VIEW of a ' +
+      'nested member (DIVERGENZE 226) or an invalid handle', [Handle]);
   if (Handle and SHARED_REC_FLAG) <> 0 then
   begin
     // Lock-free by default. The lock here never protected the RECORD (its pointer is stable and field
@@ -5100,6 +5114,61 @@ begin
   Handle := (PtrAddr shr RECPTR_SLOT_BITS) and RECPTR_INDEX_MASK;
   if (PtrAddr and SHARED_REC_FLAG) <> 0 then Handle := Handle or SHARED_REC_FLAG;
   Result := ResolveRec(Ctx, Handle);
+end;
+
+function TBytecodeVM.RecViewTarget(Ctx: TExecutionContext; View: Int64; var Enc: Int64): PRecordStorage;
+// A VIEW (DIVERGENZE 226) is the record-field pointer of a nested member whose bytes are its container's:
+// the record it names is the CONTAINER, and the member's byte offset is added to the field's own. The
+// view's slot carries width 0, so the sum keeps the field's width code in the low nibble.
+var
+  S: Integer;
+begin
+  Result := RecPtrTarget(Ctx, View, S);
+  Enc := Enc + (Int64(S) and not Int64($F));
+end;
+
+function TBytecodeVM.RecLoadI(Ctx: TExecutionContext; H, Enc: Int64): Int64;
+var
+  R: PRecordStorage;
+  E: Int64;
+begin
+  if H >= 0 then Exit(RecFieldInt(ResolveRec(Ctx, H), Enc));
+  E := Enc;
+  R := RecViewTarget(Ctx, H, E);
+  Result := RecFieldInt(R, E);
+end;
+
+function TBytecodeVM.RecLoadF(Ctx: TExecutionContext; H, Enc: Int64): Double;
+var
+  R: PRecordStorage;
+  E: Int64;
+begin
+  if H >= 0 then Exit(RecFieldFloat(ResolveRec(Ctx, H), Enc));
+  E := Enc;
+  R := RecViewTarget(Ctx, H, E);
+  Result := RecFieldFloat(R, E);
+end;
+
+procedure TBytecodeVM.RecStoreI(Ctx: TExecutionContext; H, Enc, Val: Int64);
+var
+  R: PRecordStorage;
+  E: Int64;
+begin
+  if H >= 0 then begin RecSetFieldInt(ResolveRec(Ctx, H), Enc, Val); Exit; end;
+  E := Enc;
+  R := RecViewTarget(Ctx, H, E);
+  RecSetFieldInt(R, E, Val);
+end;
+
+procedure TBytecodeVM.RecStoreF(Ctx: TExecutionContext; H, Enc: Int64; Val: Double);
+var
+  R: PRecordStorage;
+  E: Int64;
+begin
+  if H >= 0 then begin RecSetFieldFloat(ResolveRec(Ctx, H), Enc, Val); Exit; end;
+  E := Enc;
+  R := RecViewTarget(Ctx, H, E);
+  RecSetFieldFloat(R, E, Val);
 end;
 
 procedure TBytecodeVM.CleanupSharedRecords;
@@ -9929,11 +9998,11 @@ begin
     bcRecordFree:
       FreeSharedRecord(Ctx.IntRegs[Instr.Src1]);  // DELETE p: release the heap record (Src1=handle)
     // M5.2c: ResolveRec routes the handle to its record (per-thread heap or the shared region).
-    bcRecordLoadInt:    Ctx.IntRegs[Instr.Dest] := RecFieldInt(ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate);
-    bcRecordLoadFloat:  Ctx.FloatRegs[Instr.Dest] := RecFieldFloat(ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate);
+    bcRecordLoadInt:    Ctx.IntRegs[Instr.Dest] := RecLoadI(Ctx, Ctx.IntRegs[Instr.Src1], Instr.Immediate);
+    bcRecordLoadFloat:  Ctx.FloatRegs[Instr.Dest] := RecLoadF(Ctx, Ctx.IntRegs[Instr.Src1], Instr.Immediate);
     bcRecordLoadString: Ctx.StringRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.StringData[Instr.Immediate];
-    bcRecordStoreInt:   RecSetFieldInt(ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate, Ctx.IntRegs[Instr.Src2]);
-    bcRecordStoreFloat: RecSetFieldFloat(ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate, Ctx.FloatRegs[Instr.Src2]);
+    bcRecordStoreInt:   RecStoreI(Ctx, Ctx.IntRegs[Instr.Src1], Instr.Immediate, Ctx.IntRegs[Instr.Src2]);
+    bcRecordStoreFloat: RecStoreF(Ctx, Ctx.IntRegs[Instr.Src1], Instr.Immediate, Ctx.FloatRegs[Instr.Src2]);
     bcRecordStoreString:ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.StringData[Instr.Immediate] := Ctx.StringRegs[Instr.Src2];
     bcRecordTypeId:     Ctx.IntRegs[Instr.Dest] := ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.TypeId;
     bcRecordSetTypeId:  ResolveRec(Ctx, Ctx.IntRegs[Instr.Src1])^.TypeId := Instr.Immediate;
@@ -16304,6 +16373,11 @@ begin
       19: // bcRefAddrField — pack a record-field pointer from a handle (Src1) and slot (Immediate)
         begin
           PtrAddr := Ctx.IntRegs[Instr.Src1];   // record handle (may carry SHARED_REC_FLAG)
+          // ...or a VIEW (DIVERGENZE 226): a member of a member. Its slot has width 0, so adding the
+          // field's slot adds the byte offsets and keeps the field's width code.
+          if PtrAddr < 0 then
+            Ctx.IntRegs[Instr.Dest] := PtrAddr + (Int64(Instr.Immediate) and RECPTR_SLOT_MASK)
+          else
           Ctx.IntRegs[Instr.Dest] := RECPTR_TAG or (PtrAddr and SHARED_REC_FLAG) or
             (((PtrAddr and SHARED_REC_MASK) and RECPTR_INDEX_MASK) shl RECPTR_SLOT_BITS) or
             (Int64(Instr.Immediate) and RECPTR_SLOT_MASK);

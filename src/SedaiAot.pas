@@ -3931,7 +3931,7 @@ var
   //
   // HandleReg = Src1, value = Dest (load) or Src2 (store), Slot = Src3 const.
   procedure AotRecAccess(apc, HandleReg, Slot, ValReg: Integer; IsFloat, IsStore: Boolean);
-  var p, pJoin, Ofs, W: Integer;
+  var p, pJoin, pv, Ofs, W: Integer;
   begin
     // A3-i: Slot carries the field's BYTE OFFSET in bits 4..31 and its width code in bits 0..3, and
     // the numeric halves of a record are one byte image - so both "bank" offsets name the same field
@@ -3945,6 +3945,12 @@ var
     W := Slot and $F;
     Ofs := Slot shr 4;
     ILoad(RAX, HandleReg);                          // rax = handle
+    // ⛔ A VIEW (DIVERGENZE 226) - a nested member inside its container's bytes, RECPTR-tagged and so
+    // NEGATIVE - is the interpreter's: leave before the value is used as an index.
+    E.EmitBytes([$48, $85, $C0]);                   // test rax, rax
+    E.EmitBytes([$79, $00]); pv := E.Len - 1;       // jns +notview
+    ExitTo(apc);
+    E.PatchByte(pv, Byte(E.Len - (pv + 1)));
     E.EmitBytes([$48, $0F, $BA, $E0, 62]);          // bt rax, 62   (SHARED_REC_FLAG = 1 shl 62)
     E.EmitBytes([$73, $00]); p := E.Len - 1;        // jnc +plain   (CF=0 -> per-context heap)
     // --- shared region ---

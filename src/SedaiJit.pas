@@ -1289,7 +1289,7 @@ var
   // (a dynamic array = a pointer) at its offset, then load/store [fieldptr + slot*8]. No handle/slot bounds
   // check, matching the interpreter (range checks off). HandleReg = Src1, ValDstReg = Dest/Src2, Slot = Imm.
   procedure RecAccess(apc, HandleReg, Slot, ValDstReg: Integer; IsFloat, IsStore: Boolean);
-  var p, Ofs, W: Integer;
+  var p, pv, Ofs, W: Integer;
   begin
     // A3-i: Slot is no longer an index into a slot array. It carries the field's BYTE OFFSET in
     // bits 4..31 and its width code in bits 0..3, and the record's numeric halves are one byte
@@ -1300,6 +1300,11 @@ var
     W := Slot and $F;
     Ofs := Slot shr 4;
     ILoad(RAX, HandleReg);                          // rax = handle
+    // ⛔ A VIEW (DIVERGENZE 226), negative: the interpreter's, like a shared record below.
+    E.EmitBytes([$48, $85, $C0]);                   // test rax, rax
+    E.EmitBytes([$79, $00]); pv := E.Len - 1;       // jns +notview
+    DeoptTo(apc);
+    E.PatchByte(pv, Byte(E.Len - (pv + 1)));
     E.EmitBytes([$48, $0F, $BA, $E0, 62]);          // bt rax, 62  (SHARED_REC_FLAG = 1 shl 62)
     E.EmitBytes([$73, $00]); p := E.Len - 1;        // jnc +over  (CF=0 -> not shared -> fast path)
     DeoptTo(apc);                                    // shared record -> interpreter (takes the lock)
