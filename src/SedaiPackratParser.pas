@@ -262,6 +262,8 @@ type
     procedure RejectReservedDeclNames(Node: TASTNode);   // MODERN: fbc's reserved words, per context (264)
     procedure RejectNonConstSharedRef(Root: TASTNode);   // MODERN: a Shared/Static reference on a constant address (260)
     procedure ShadowDeclaredBuiltins;                    // MODERN: a declared name wins over a builtin (267)
+    function MakeStaticRefDef(const DottedName, TypeName: string; InitExpr: TASTNode;
+      Tok: TLexerToken): TASTNode;                       // "Static ByRef" member definition as a Shared reference (269)
     function InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
     procedure ApplyDeclaredDefaults(const QualName: string; ParamList: TASTNode; SkipThis: Boolean);
     procedure ClearTypeMethodDefaults;
@@ -5734,7 +5736,7 @@ var
   NestedStructDepth, StructGrpCur: Integer;
   FieldTypeName, TokU, AliasType, FpParams, FpRet: string;
   AliasNode: TASTNode;   // "Type a As Integer, b As Double": the extra aliases of a comma list
-  IsStaticField, LeadingType, FpIsFP: Boolean;
+  IsStaticField, IsStaticByref, LeadingType, FpIsFP: Boolean;
   CurAccess: string;   // the Public:/Private:/Protected: section currently in force
   ImplList: string;   // MODERN: the IMPLEMENTS list, recorded on the type node
 begin
@@ -6177,6 +6179,17 @@ begin
       IsStaticField := True;
       TokU := UpperFast(VarToStr(Context.CurrentToken.Value));   // re-read: a DIM may follow STATIC
     end;
+    // ⛔ "Static ByRef As T1 R1" (DIVERGENZE 269): a static REFERENCE member. BYREF was never consumed, so
+    // it became the member's NAME - a static field called BYREF of type T1, and a typeless R1 after it.
+    // The member is one reference for the whole program, bound by its definition ("Dim ByRef As T1
+    // T2.R1 = x"), which is where the SSA declares it: here it is only marked.
+    IsStaticByref := False;
+    if IsStaticField and (TokU = 'BYREF') then
+    begin
+      Context.Advance;                              // consume BYREF
+      IsStaticByref := True;
+      TokU := UpperFast(VarToStr(Context.CurrentToken.Value));
+    end;
     // FreeBASIC allows an in-TYPE field to be introduced with a leading DIM ("Dim As Double m(Any,Any)").
     // Consume it — the field grammar below handles both "As type name(dims)" and "name(dims) As type".
     if TokU = kDIM then Context.Advance;
@@ -6259,6 +6272,7 @@ begin
         FieldNode.Attributes.Values['FPRET'] := FpRet;
       end;
       if IsStaticField then FieldNode.Attributes.Values['STATIC'] := '1';
+      if IsStaticByref then FieldNode.Attributes.Values['BYREF'] := '1';
       if BitWidth > 0 then FieldNode.Attributes.Values['BITWIDTH'] := IntToStr(BitWidth);
       // "As String * n": the declared capacity. Storage stays variable-length (advisory), but the
       // BINARY layout needs it — fbc gives such a field n+1 bytes on file (the NUL terminator).
@@ -6315,6 +6329,7 @@ begin
           FieldNode := TASTNode.CreateWithValue(antIdentifier, UpperFast(FieldTok.Value), FieldTok);
           FieldNode.AddChild(TASTNode.CreateWithValue(antIdentifier, FieldTypeName, FieldTok));
           if IsStaticField then FieldNode.Attributes.Values['STATIC'] := '1';
+          if IsStaticByref then FieldNode.Attributes.Values['BYREF'] := '1';
           if Assigned(ArrDimNode) then
           begin
             FieldNode.Attributes.Values['ARRAYFIELD'] := '1';
@@ -12169,6 +12184,37 @@ begin
   Walk(Node, False);
 end;
 
+function TPackratParser.MakeStaticRefDef(const DottedName, TypeName: string; InitExpr: TASTNode;
+  Tok: TLexerToken): TASTNode;
+// ⭐ THE DEFINITION OF A STATIC REFERENCE MEMBER (DIVERGENZE 269) IS A SHARED REFERENCE UNDER THE DOTTED
+// NAME: "Dim ByRef As T1 T2.R1 = x" becomes exactly the node "Dim Shared ByRef As T1 <T2.R1> = x" gives
+// - child 2 is "@x", built the way ParseDim builds it - so the one reference machinery binds it, a UDT
+// by sharing the handle and a scalar by holding the address. The SSA's member funnel reads T2.R1 (and
+// inst.R1) through that name. fbc: the member aliases x in both directions, and @T2.R1 = @x.
+// ⚠️ The node takes ownership of InitExpr.
+var
+  AddrNode: TASTNode;
+begin
+  Result := TASTNode.Create(antArrayDecl, Tok);
+  Result.Attributes.Values['BYREF'] := '1';
+  Result.Attributes.Values['SHARED'] := '1';
+  Result.Attributes.Values['STATICREF'] := '1';
+  Result.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperFast(DottedName), Tok));
+  Result.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperFast(TypeName), Tok));
+  if InitExpr.NodeType = antIdentifier then
+  begin
+    AddrNode := TASTNode.CreateWithValue(antProcAddress, InitExpr.ValueUpper, Tok);
+    InitExpr.Free;
+  end
+  else
+  begin
+    AddrNode := TASTNode.Create(antProcAddress, Tok);
+    AddrNode.AddChild(InitExpr);
+  end;
+  Result.AddChild(AddrNode);
+  DoNodeCreated(Result);
+end;
+
 procedure TPackratParser.ShadowDeclaredBuiltins;
 // ⛔ A DECLARED NAME THAT SILENTLY READ THE BUILTIN (DIVERGENZE 267). "Dim now As Integer : now = 7 :
 // Print now" printed the DATE where fbc prints 7: the declaration passed and the use still reached the
@@ -12450,6 +12496,13 @@ var
       // address for the whole program, so "Dim Shared ByRef As T1 rt = T2.R1" is constant - fbc's
       // dim/byref-init-from-byref.bas chains through them. A field of an INSTANCE stays refused.
       Shared.Add(N.GetChild(0).ValueUpper);
+    // ...and every STATIC field of a Type is one address for the whole program, defined or not: a
+    // definition WITHOUT an initializer ("Dim T2.S As T1") leaves no node at all, and fbc still takes
+    // "Dim Shared ByRef As T1 rs = T2.S" (measured: it prints the member).
+    if N.NodeType = antTypeDecl then
+      for i := 0 to N.ChildCount - 1 do
+        if (N.GetChild(i).NodeType = antIdentifier) and (N.GetChild(i).Attributes.Values['STATIC'] = '1') then
+          Shared.Add(N.ValueUpper + '.' + N.GetChild(i).ValueUpper);
     // The parser writes a static member's definition as an ASSIGNMENT to "T2.R1" whose owner carries
     // STATICMEMBERDEF=1 - not as a Dim - so it is recognised here by that mark.
     if (N.NodeType = antAssignment) and (N.ChildCount >= 1) and
@@ -13785,6 +13838,8 @@ var
   StaticLB, StaticK: Integer;        // DIVERGENZE 94: the member array's lower bound, and the element index
   StaticSawParen: Boolean;
   StaticDotted: string;               // DIVERGENZE 93: the dotted name as written
+  StaticRefType: string;              // DIVERGENZE 269: the type after AS, for a static REFERENCE member
+  StaticAfterAs: Boolean;
   StaticElem, StaticIdx, StaticAsg, InitList: TASTNode;
   NameIsConst: Boolean;   // "As Const <type>" on this declaration
   FixedCapVal: Int64;   // folded "* n" capacity
@@ -14044,6 +14099,22 @@ begin
             // node the lowering's funnel is handed.
             MemberAccess.GetChild(0).Attributes.Values['STATICMEMBERDEF'] := '1';
             Context.Advance;                   // field name
+            // ⭐ "Dim ByRef As T1 T2.R1 = x" defines a STATIC REFERENCE member (DIVERGENZE 269): it is
+            // written as the Shared reference it is - "Dim Shared ByRef As T1 <T2.R1> = x" - so the
+            // whole reference machinery binds it, and the member funnel reads it through that name.
+            if IsByref and Context.Check(ttOpEq) then
+            begin
+              Context.Advance;                 // '='
+              InitExpr := FExpressionParser.ParseExpression;
+              if Assigned(InitExpr) then
+              begin
+                Result.AddChild(MakeStaticRefDef(MemberAccess.GetChild(0).ValueUpper + '.' +
+                                  MemberAccess.ValueUpper, SharedTypeName, InitExpr, NameTok));
+                MemberAccess.Free;
+                DoNodeCreated(Result);
+                Exit;
+              end;
+            end;
             if Context.Check(ttOpEq) then
             begin
               Context.Advance;                 // '='
@@ -14114,6 +14185,8 @@ begin
         // keeps exactly the behaviour this branch had before.
         StaticLB := 0;
         StaticSawParen := False;
+        StaticRefType := '';
+        StaticAfterAs := False;
         while (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) and
               (not Context.Check(ttOpEq)) do
         begin
@@ -14135,6 +14208,10 @@ begin
             else
               StaticLB := -1;
           end;
+          // ...and keep the TYPE a static reference member needs (269): the words after AS.
+          if Context.Check(ttAsType) then StaticAfterAs := True
+          else if StaticAfterAs then
+            StaticRefType := Trim(StaticRefType + ' ' + UpperFast(VarToStr(Context.CurrentToken.Value)));
           Context.Advance;
         end;
         // ⛔⛔ A BRACE INITIALIZER IS NOT AN EXPRESSION, and this branch asked for one. "Dim T.arr(0 To 2)
@@ -14172,6 +14249,20 @@ begin
             MemberAccess.Free;
             Result.Free;
             Result := StaticDef;
+            DoNodeCreated(Result);
+            Exit;
+          end;
+        end;
+        // ⭐ ...and the trailing-AS spelling of a STATIC REFERENCE member's definition, "Dim ByRef
+        // T2.R1 As T1 = x" (DIVERGENZE 269) - the Shared reference it is, as in the leading-AS twin.
+        if IsByref and Context.Check(ttOpEq) then
+        begin
+          Context.Advance;                     // '='
+          InitExpr := FExpressionParser.ParseExpression;
+          if Assigned(InitExpr) then
+          begin
+            Result.AddChild(MakeStaticRefDef(StaticDotted, StaticRefType, InitExpr, NameTok));
+            MemberAccess.Free;
             DoNodeCreated(Result);
             Exit;
           end;

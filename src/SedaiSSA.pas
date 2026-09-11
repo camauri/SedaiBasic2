@@ -346,6 +346,7 @@ type
     // still declared and initialised, so anything else that resolves through it is unaffected.
     FModuleConstVals: TStringList;       // name (UPPER) -> 'I:'/'F:'/'S:' + literal text
     FStaticMembers: TStringList;         // OOP: static member variables "TYPE.FIELD" (UPPER), backed by a shared global scalar
+    FStaticRefMembers: TStringList;      // "Static ByRef" members "TYPE.FIELD=type": a Shared REFERENCE under the dotted name (269)
     // ...and the static member PROCEDURES, "TYPE.NAME" (UPPER). The parser stamps the definition
     // with STATICMETH (it is the only place that sees "Declare STATIC Sub" in the type body);
     // gathered here so a call through an OBJECT EXPRESSION can skip evaluating the object.
@@ -968,6 +969,7 @@ type
     function IsAddrParam(const Name: string): Boolean;                          // BYREF-return address-carrying param?
     function AddrParamBank(const Name: string): TSSARegisterType;               // pointee bank of an address param
     function IsRefVar(const Name: string): Boolean;                             // BYREF reference variable (auto-deref)?
+    function RefVarAddrValue(const Name: string): TSSAValue;                    // the address a reference carries (its home if Shared, 270)
     function RefVarNarrowCode(const Name: string): Integer;                     // ...its raw width code, 0 = full width (DIVERGENZE 256)
     function RefVarBank(const Name: string): TSSARegisterType;                  // pointee bank of a reference variable
     function IsRawPtr(const Name: string): Boolean;                             // raw (Allocate-backed) pointer var?
@@ -1850,6 +1852,8 @@ begin
   FModuleConstVals := TIndexedStringList.Create;
   FModuleConstVals.CaseSensitive := False;
   FStaticMembers := TIndexedStringList.Create;
+  FStaticRefMembers := TIndexedStringList.Create;
+  FStaticRefMembers.CaseSensitive := False;
   FStaticMemberProcs := TIndexedStringList.Create;
   FStaticMemberProcs.CaseSensitive := False;
   FStaticMembers.CaseSensitive := False;
@@ -2041,6 +2045,7 @@ begin
   FreeAndNil(FBareTypeNames);
   FreeAndNil(FSingleMemo);
   FStaticMembers.Free;
+  FStaticRefMembers.Free;
   FStaticMemberProcs.Free;
   FStaticMemberArrays.Free;
   FStaticMemberTypes.Free;
@@ -3502,7 +3507,7 @@ begin
       // ⛔ It has to be tested FIRST: a shared ref-to-UDT matches the two branches below it as well.
       if (Node.ChildCount = 0) and IsRefVar(VarToStr(Node.Value)) then
       begin
-        Result := EnsureIntRegister(GetOrAllocateVariable(Node.ValueUpper));
+        Result := RefVarAddrValue(Node.ValueUpper);
         Exit;
       end;
       // ⭐ "@p" WHERE p IS AN ADDRESS-CARRYING BYREF PARAMETER - the SAME fact as the branch above,
@@ -4382,7 +4387,7 @@ begin
       // reading r dereferences it (load the pointee through the address), so r reads as target.
       else if IsRefVar(VarName) then
       begin
-        Left := EnsureIntRegister(GetOrAllocateVariable(VarName));
+        Left := RefVarAddrValue(VarName);
         FuncRetType := RefVarBank(VarName);
         Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
         // ⭐ A NARROW reference reads its OWN width (DIVERGENZE 256): see RefVarNarrowCode.
@@ -10153,7 +10158,7 @@ begin
   if IsRefVar(VarName) then
   begin
     ProcessExpression(ExprNode, ExprValue);
-    VarReg := EnsureIntRegister(GetOrAllocateVariable(VarName));   // the carried address
+    VarReg := RefVarAddrValue(VarName);   // the carried address (from its home when Shared, 270)
     // ⭐ A NARROW reference writes its OWN width (DIVERGENZE 256): through ssaRawStore* the VM writes
     // only the declared bytes of raw or C memory - the wide store overwrote the neighbours.
     // ⚠️ Into a VM cell (a reference to an @-taken narrow scalar) the value is stored whole, as it was
@@ -13043,6 +13048,15 @@ begin
       ProcessExpression(ArrayDeclNode.GetChild(2), RecHandleVal);   // @target -> packed address (int)
       EmitInstruction(ssaCopyInt, GetOrAllocateVariable(UpperFast(ArrName)), EnsureIntRegister(RecHandleVal),
                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // ⛔ ...AND A SHARED ONE LIVES IN ITS HOME, not in a register of the module's code (DIVERGENZE 270).
+      // The UDT branch above publishes; this one did not, so "Dim Shared ByRef As Integer r = v" read
+      // inside a Sub found 0 and died on "Null or invalid pointer dereference" - and every hoisted
+      // "Static ByRef" local is exactly such a Shared reference.
+      if IsSharedScalar(UpperFast(ArrName)) then
+      begin
+        EnsureSharedBackingSized(UpperFast(ArrName));
+        PublishScalarToHome(UpperFast(ArrName), EnsureIntRegister(RecHandleVal));
+      end;
       Continue;
     end;
 
@@ -37794,6 +37808,21 @@ begin
         if FieldNode.ChildCount > 0 then ftype := FieldNode.GetChild(0).ValueUpper;
         bank := TypeNameToBank(ftype, fn);                 // builtin scalar bank (int/float/string)
         backing := tn + '.' + fn;
+        // ⛔ A "Static ByRef" member (DIVERGENZE 269) owns NO storage: it is one REFERENCE for the whole
+        // program, and its definition ("Dim ByRef As T1 T2.R1 = x") declares it as a Shared reference
+        // under this very dotted name - the parser writes it that way. So no backing here; only the
+        // name, so the member funnel finds it, and a UDT's type, so "T2.R1.F" resolves its field.
+        if FieldNode.Attributes.Values['BYREF'] = '1' then
+        begin
+          if FStaticRefMembers.IndexOfName(backing) < 0 then
+            FStaticRefMembers.Add(backing + '=' + UpperFast(ftype));
+          if FindUDT(ftype) >= 0 then
+          begin
+            FStaticMemberTypes.Values[backing] := UpperFast(ftype);
+            FVarRecordType.Values[backing] := UpperFast(ftype);
+          end;
+          Continue;
+        end;
         // ⛔ ...AND A STATIC MEMBER CAN BE AN ARRAY. The parser reads "(dims)" for any field, static or
         // not, so "Static a() As Integer" arrives here carrying BOTH flags - and this routine ignored
         // ARRAYFIELD outright and synthesised a ONE-ELEMENT SCALAR backing for it. Nothing raised: the
@@ -38371,6 +38400,13 @@ begin
       // its own suite are exactly that). With an initialiser it lowers to a store through the member and
       // so arrives here like any other write; the parser marks its base identifier so the two can be
       // told apart, because nothing in the shape of the store distinguishes them.
+      if ObjNode.Attributes.Values['STATICMEMBERDEF'] <> '1' then
+        CheckMemberAccess(at, FieldName);
+      Exit(key);
+    end;
+    // ...and a "Static ByRef" member, whose storage is the Shared reference of the same name (269).
+    if FStaticRefMembers.IndexOfName(key) >= 0 then
+    begin
       if ObjNode.Attributes.Values['STATICMEMBERDEF'] <> '1' then
         CheckMemberAccess(at, FieldName);
       Exit(key);
@@ -39787,6 +39823,26 @@ begin
   if BlockDeclaredHere(Name, BlkKey) then
     Exit(FRefVars.IndexOfName(BlkKey) >= 0);
   Result := FRefVars.IndexOfName(UpperFast(Name)) >= 0;
+end;
+
+function TSSAGenerator.RefVarAddrValue(const Name: string): TSSAValue;
+// ⛔ THE ADDRESS A REFERENCE CARRIES, asked in ONE place (DIVERGENZE 270). A reference's whole
+// representation is the target's address; for a local it lives in a register, but a SHARED one - a
+// module "Dim Shared ByRef", and every hoisted "Static ByRef" local - lives in its HOME, the 1-element
+// global array, because a procedure has its own registers. The read, the write and "@r" all asked the
+// register, so inside a Sub "@r" answered 0 and "Print r" died on a null dereference, while the very
+// same lines at module level were right.
+var
+  Acc: TASTNode;
+begin
+  if IsSharedScalar(UpperFast(Name)) and (FCurrentProcName <> '') then
+  begin
+    Acc := MakeSharedScalarAccess(UpperFast(Name), nil);
+    try ProcessExpression(Acc, Result); finally Acc.Free; end;
+    Result := EnsureIntRegister(Result);
+  end
+  else
+    Result := EnsureIntRegister(GetOrAllocateVariable(UpperFast(Name)));
 end;
 
 function TSSAGenerator.RefVarBank(const Name: string): TSSARegisterType;
@@ -46913,6 +46969,14 @@ begin
   end;
   // OOP static member variable (via type name or instance): read from its shared global scalar.
   SMBack := StaticMemberBackingName(Node.GetChild(0), VarToStr(Node.Value));
+  // A "Static ByRef" member (269) is read through its NAME: the variable path is the one that knows a
+  // reference and dereferences it; the backing element holds an address, not the value.
+  if (SMBack <> '') and (FStaticRefMembers.IndexOfName(SMBack) >= 0) then
+  begin
+    AccNode := TASTNode.CreateWithValue(antIdentifier, SMBack, Node.Token);
+    try ProcessExpression(AccNode, Result); finally AccNode.Free; end;
+    Exit;
+  end;
   if SMBack <> '' then
   begin
     AccNode := MakeSharedScalarAccess(SMBack, Node.Token);
@@ -47214,6 +47278,15 @@ begin
   end;
   // OOP static member variable (via type name or instance): store to its shared global scalar.
   SMBack := StaticMemberBackingName(MemberNode.GetChild(0), VarToStr(MemberNode.Value));
+  // ...and WRITTEN through its name, which writes through the reference to what it is bound to (269).
+  if (SMBack <> '') and (FStaticRefMembers.IndexOfName(SMBack) >= 0) then
+  begin
+    StoreAssign := TASTNode.Create(antAssignment, MemberNode.Token);
+    StoreAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, SMBack, MemberNode.Token));
+    StoreAssign.AddChild(ExprNode.Clone);
+    try ProcessAssignment(StoreAssign); finally StoreAssign.Free; end;
+    Exit;
+  end;
   if SMBack <> '' then
   begin
     StoreAssign := TASTNode.Create(antAssignment, MemberNode.Token);

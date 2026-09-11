@@ -444,21 +444,95 @@ begin
   end;
 end;
 
+// The name a hoisted STATIC REFERENCE is bound to - "Static ByRef As T a = v" gives V, "= T2.R1" gives
+// T2.R1, "= arr(1)" gives ARR - or '' when the hoisted node is not a reference or names nothing simple.
+function RefTargetKey(H: TASTNode): string;
+var
+  D, Init, C: TASTNode;
+begin
+  Result := '';
+  if (H = nil) or (H.ChildCount < 1) then Exit;
+  D := H.GetChild(0);
+  if (D.NodeType <> antArrayDecl) or (D.Attributes.Values['BYREF'] <> '1') or (D.ChildCount < 3) then Exit;
+  Init := D.GetChild(2);
+  if Init.NodeType <> antProcAddress then Exit;
+  if Init.ChildCount = 0 then Exit(UpperCase(VarToStr(Init.Value)));
+  C := Init.GetChild(0);
+  case C.NodeType of
+    antIdentifier: Result := UpperCase(VarToStr(C.Value));
+    antMemberAccess:
+      if (C.ChildCount >= 1) and (C.GetChild(0).NodeType = antIdentifier) then
+        Result := UpperCase(VarToStr(C.GetChild(0).Value)) + '.' + UpperCase(VarToStr(C.Value));
+    antArrayAccess:
+      if (C.ChildCount >= 1) and (C.GetChild(0).NodeType = antIdentifier) then
+        Result := UpperCase(VarToStr(C.GetChild(0).Value));
+  end;
+end;
+
+// The index of the module-level statement that DECLARES Key (a Dim of that name), or -1.
+function DeclaringIndex(AST: TASTNode; const Key: string): Integer;
+var
+  i, k: Integer;
+  N, D: TASTNode;
+begin
+  for i := 0 to AST.ChildCount - 1 do
+  begin
+    N := AST.GetChild(i);
+    if (N = nil) or (N.NodeType <> antDim) then Continue;
+    for k := 0 to N.ChildCount - 1 do
+    begin
+      D := N.GetChild(k);
+      if (D.NodeType = antArrayDecl) and (D.ChildCount >= 1) and (D.GetChild(0).NodeType = antIdentifier) and
+         (UpperCase(VarToStr(D.GetChild(0).Value)) = Key) then
+        Exit(i);
+    end;
+  end;
+  Result := -1;
+end;
+
 procedure LowerStaticLocals(AST: TASTNode);
 var
-  ProcIdx, i: Integer;
-  Hoisted: TFPList;
+  ProcIdx, i, j, TopCount: Integer;
+  Hoisted, Refs: TFPList;
+  Key: string;
 begin
   if AST = nil then Exit;
   Hoisted := TFPList.Create;
+  Refs := TFPList.Create;
   try
     ProcIdx := 0;
     WalkProcs(AST, ProcIdx, Hoisted);
     // Prepend the hoisted "DIM SHARED" declarations to the top of the program, in collection order, so
     // each static global is declared and initialised before any procedure that uses it runs.
-    for i := Hoisted.Count - 1 downto 0 do
-      AST.Children.Insert(0, TASTNode(Hoisted[i]));
+    // ⛔⛔ ...EXCEPT A STATIC REFERENCE (DIVERGENZE 270). "Static ByRef As Integer a = v" BINDS where the
+    // hoisted Dim runs, and at the top of the program v's own Dim has not run yet: the reference took
+    // the address of storage that did not exist, and the first use died on "Null or invalid pointer
+    // dereference" (a UDT: "Access violation"). For fbc the binding is a constant address and there is
+    // no order at all. ⇒ A reference is placed right AFTER the statement that declares its target - a
+    // module variable, a static member's definition ("T2.R1", DIVERGENZE 269) or another hoisted static -
+    // and only a target nothing at module level declares keeps the old place at the top.
+    TopCount := 0;
+    for i := 0 to Hoisted.Count - 1 do
+      if RefTargetKey(TASTNode(Hoisted[i])) <> '' then Refs.Add(Hoisted[i])
+      else
+      begin
+        AST.Children.Insert(TopCount, TASTNode(Hoisted[i]));
+        Inc(TopCount);
+      end;
+    for i := 0 to Refs.Count - 1 do
+    begin
+      Key := RefTargetKey(TASTNode(Refs[i]));
+      j := DeclaringIndex(AST, Key);
+      if j >= 0 then
+        AST.Children.Insert(j + 1, TASTNode(Refs[i]))
+      else
+      begin
+        AST.Children.Insert(TopCount, TASTNode(Refs[i]));
+        Inc(TopCount);
+      end;
+    end;
   finally
+    Refs.Free;
     Hoisted.Free;
   end;
 end;
