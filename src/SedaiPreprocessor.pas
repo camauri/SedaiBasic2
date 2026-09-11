@@ -274,7 +274,14 @@ begin
   end;
   if (Fbc = '') or not FileExists(Fbc) then Exit;
   Dir := ExtractFilePath(ExpandFileName(Fbc));
-  // <prefix>/bin/fbc  ->  <prefix>/include/freebasic
+  // ⛔⛔ TWO LAYOUTS, and only the Linux one was known (11 Sep 2026). A Windows FreeBASIC keeps its headers
+  // in "inc" BESIDE fbc.exe, so sb.exe found no FreeBASIC tree at all even with fbc.exe on the PATH - and
+  // with no tree, a missing #include is dropped in silence (MissingIncludeIsAnError): crt/string.bi
+  // vanished and "strlen" was "Array not declared", three steps away from the cause.
+  //   <prefix>\fbc.exe      ->  <prefix>\inc                    (the Windows standalone package)
+  //   <prefix>/bin/fbc      ->  <prefix>/include/freebasic      (Linux, and the Windows "installed" layout)
+  Cand := IncludeTrailingPathDelimiter(Dir) + 'inc';
+  if DirectoryExists(Cand) then AddIncludeSearchPath(Cand);
   Dir := IncludeTrailingPathDelimiter(ExtractFilePath(ExcludeTrailingPathDelimiter(Dir))) +
          'include' + PathDelim + 'freebasic';
   if DirectoryExists(Dir) then AddIncludeSearchPath(Dir);
