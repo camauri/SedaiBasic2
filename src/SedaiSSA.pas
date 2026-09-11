@@ -1192,13 +1192,18 @@ type
     function RankedCandidatesDiffer(const L1, L2: string; N: Integer): Boolean;// ...and whether two candidates really differ
     function IsFieldAddrExpr(Node: TASTNode): Boolean;                  // "@obj.field" over a MANAGED record (no emit)
     function RecPtrWireWidth(const Pointee: string): Integer;           // record-field pointer's low 4 bits for this pointee (-1 = leave alone)
+    function InlineArrayElemWidthCode(const ElemType: string): Integer;  // DIVERGENZE 293: an inline array member's element width code (-1 = may not live in the bytes)
     function OperandWidthCode(Node: TASTNode): Integer;                 // narrow width code (1..6) of a scalar operand, else 0 (CSIGN/CUNSG)
     function BinaryElemBytes(const VarName: string): Integer;           // byte width of a scalar for binary PUT/GET (from its width code)
     function EmitBinGetToLValue(const HandleReg: TSSAValue; Target: TASTNode): Boolean;  // Get # into a non-bare target
     function BinaryElemBytesOfNode(Node: TASTNode): Integer;   // ...and of any PUT/GET target shape
     function BinaryElemBytesOfWidthCode(W: Integer): Integer;           // width code (1..7) -> byte width
     procedure UDTFieldCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);   // one field's C size/alignment
-    function FixedArrayMemberCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64): Boolean;  // n*SizeOf(elem) for a fixed array member
+    function FixedArrayMemberCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64;
+                                    ReportOnly: Boolean = False): Boolean;  // n*SizeOf(elem) for a fixed array member
+    function ArrayMemberElemShape(UDTIdx, FieldIdx: Integer; out ElemSz, ElemAl: Int64;
+                                  ReportOnly: Boolean): Boolean;  // ...and the shape of ONE of its elements
+    function ArrayMemberElemOffset(UDTIdx, FieldIdx: Integer; IdxNode: TASTNode): Int64;  // OffsetOf(T, m(i,j)): the element's byte offset within the member
     procedure UDTFieldReportShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);  // what fbc SAYS a field measures
     // A NESTED record member is laid out INLINE, like C and like fbc (DIVERGENZE 193): its size and
     // alignment are the nested type's own, not the eight bytes of the handle our storage keeps.
@@ -2572,6 +2577,31 @@ begin
   Result := W and $F;
 end;
 
+function TSSAGenerator.InlineArrayElemWidthCode(const ElemType: string): Integer;
+// DIVERGENZE 293 - the width code an element of an INLINE array member is read and written with, or -1
+// when the element has no byte image we can lay out.
+//
+// It is RecPtrWireWidth for a scalar element, plus the one case that function has to answer -1 to and
+// this one must not: a POINTER element. RecPtrWireWidth answers "what does this POINTEE say about the
+// storage of a pointer field", and a pointee that is itself a pointer says nothing - the right answer
+// there is "leave the field's width alone". Here the question is the other one: how wide is the element
+// ITSELF, and a pointer is eight bytes, width code 0. Keeping the two apart is why this is a function
+// and not a third caller of RecPtrWireWidth.
+var
+  T: string;
+begin
+  T := UpperFast(Trim(ElemType));
+  if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then Exit(0);
+  Result := RecPtrWireWidth(T);
+end;
+
+function IfThenOp(Cond: Boolean; const WhenTrue, WhenFalse: TSSAOpCode): TSSAOpCode;
+// Pick one of two opcodes. It exists so a site that already reads well ("emit the compare") does not
+// have to be split in two just to choose between the signed and the unsigned form of it.
+begin
+  if Cond then Result := WhenTrue else Result := WhenFalse;
+end;
+
 function RawCodeOfWidth(Bytes: Integer): Integer;
 // The unsigned raw element-type code for an access of this many bytes. It exists so that a site which
 // SCALES an index by a width cannot then read or write a DIFFERENT width - the two used to be written
@@ -3348,6 +3378,7 @@ var
   CatLen: Integer;                  // (DIVERGENZE 154): its operands are read RAW
   NumCast: Boolean;               // arithmetic op: apply a numeric Cast operator to a UDT operand
   RecUDTIdx, RecSlotK, RecFieldIdx: Integer;   // OFFSETOF: UDT index + field scan
+  RecFieldNode, RecIdxNode: TASTNode;          // OFFSETOF: the field, and "m(i)"'s index list
   RecLayoutOfs: TInt64Array;     // OFFSETOF: the type's C byte layout (UDTCLayout)
   RecLayoutSize: Int64;
   FuncRetType: TSSARegisterType;  // M2: user FUNCTION return type
@@ -8928,14 +8959,26 @@ begin
            // which the parser reads as the TIME function, so "OffsetOf(MSG, time)" missed this branch
            // and died as "Array not declared: OFFSETOF". Its name is still the node's value, and
            // whether it names a field is asked of the type just below.
-           ((Node.GetChild(1).GetChild(1).NodeType = antIdentifier) or
+           ((Node.GetChild(1).GetChild(1).NodeType in [antIdentifier, antArrayAccess]) or
             (VarToStr(Node.GetChild(1).GetChild(1).Value) <> '')) then
         begin
           RecUDTIdx := FindUDT(Node.GetChild(1).GetChild(0).ValueUpper);
           ValCode := 0;   // reuse as the byte offset accumulator
           if RecUDTIdx >= 0 then
           begin
-            ArrName2 := Node.GetChild(1).GetChild(1).ValueUpper;   // field name
+            // ⭐ AN ARRAY MEMBER IS ASKED WITH AN INDEX, and that is the ONLY spelling fbc takes:
+            // "OffsetOf(G, pd)" is its "error 73: Array access, index expected", "OffsetOf(G, pd(2))"
+            // is 24. The name is then the array access's own child and the element's offset is added
+            // to the member's - row-major, last index fastest, in the element's size (DIVERGENZE 293).
+            RecFieldNode := Node.GetChild(1).GetChild(1);
+            RecIdxNode := nil;
+            if (RecFieldNode.NodeType = antArrayAccess) and (RecFieldNode.ChildCount >= 1) and
+               (RecFieldNode.GetChild(0) <> nil) then
+            begin
+              if RecFieldNode.ChildCount >= 2 then RecIdxNode := RecFieldNode.GetChild(1);
+              RecFieldNode := RecFieldNode.GetChild(0);
+            end;
+            ArrName2 := RecFieldNode.ValueUpper;   // field name
             RecFieldIdx := -1;
             for RecSlotK := 0 to High(FUDTs[RecUDTIdx].Fields) do
               if FUDTs[RecUDTIdx].Fields[RecSlotK].Name = ArrName2 then
@@ -8960,6 +9003,8 @@ begin
                 ValCode := RecLayoutOfs[RecFieldIdx]
               else
                 ValCode := RecFieldIdx * 8;         // shape we cannot image: the answer we used to give
+              if RecIdxNode <> nil then
+                ValCode := ValCode + ArrayMemberElemOffset(RecUDTIdx, RecFieldIdx, RecIdxNode);
             end;
           end;
           Result := MakeSSAConstInt(ValCode);
@@ -12418,6 +12463,7 @@ function TSSAGenerator.TryFoldConstIntExpr(Node: TASTNode; out Val: Int64): Bool
 var
   L, R: Int64;
   Op: TASTNode;
+  FoldIsLen: Boolean;
 begin
   Result := False;
   Val := 0;
@@ -12445,9 +12491,21 @@ begin
     // the bound was not constant, the array was sized at run time, and no rule keyed on constant bounds
     // ever saw it. Two spellings reach here: "SizeOf(T)" and "SizeOf(ZString * n)", the second an
     // antBinaryOp of the type name and the capacity, whose size IS that capacity.
+    // ⭐ ...AND SO IS "Len( <a type> )", which is the SAME constant under another name (DIVERGENZE
+    // 293). crt/sys/linux/socket.bi writes "__ss_padding(0 To 128-(2*Len(__uint32_t))-1) As Byte": the
+    // bound did not fold, the whole C layout of sockaddr_storage declined, and SizeOf answered 16
+    // against fbc's 128 with __ss_align at 8 instead of 4.
+    // ⛔ ONLY FOR A TYPE NAME. "Len(v)" on a VALUE is a run-time length and folding it would answer
+    // the size of whatever TypeSizeBytes makes of an unknown name - eight - for every variable in
+    // sight. IsTypeNameForLen is the same test the LEN lowering itself uses.
     antArrayAccess, antFunctionCall:
       begin
-        if (not SameText(VarToStr(Node.Value), 'SIZEOF')) then
+        FoldIsLen := False;
+        if SameText(VarToStr(Node.Value), 'LEN') or
+           ((Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) and
+            (Node.GetChild(0).ValueUpper = 'LEN')) then
+          FoldIsLen := True
+        else if (not SameText(VarToStr(Node.Value), 'SIZEOF')) then
           if (Node.ChildCount < 1) or (Node.GetChild(0).NodeType <> antIdentifier) or
              (Node.GetChild(0).ValueUpper <> 'SIZEOF') then Exit;
         Op := Node;
@@ -12456,6 +12514,8 @@ begin
           Op := Op.GetChild(Op.ChildCount - 1);
         if Op.ChildCount <> 1 then Exit;
         Op := Op.GetChild(0);
+        if FoldIsLen and
+           ((Op.NodeType <> antIdentifier) or not IsTypeNameForLen(Op.ValueUpper)) then Exit;
         if Op.NodeType = antIdentifier then
           Val := TypeSizeBytes(Op.ValueUpper)
         else if (Op.NodeType = antBinaryOp) and (Op.ChildCount = 2) and
@@ -17811,6 +17871,7 @@ var
   PrevBlock, CondBlock, BodyBlock, GEBlock: TSSABasicBlock;  // PHASE 3 TIER 3: CFG construction
   StepNode: TASTNode;
   StepIsNegative: Boolean;
+  VarIsUnsigned64: Boolean;   // the loop variable is a 64-bit UNSIGNED type: compare unsigned
   StepSignReg: Integer;  // Register to hold STEP sign check result
   UseLELabel, UseGELabel, CheckResultLabel: string;  // Labels for runtime step direction
   NeedRuntimeCheck: Boolean;  // True if STEP direction must be determined at runtime
@@ -17885,6 +17946,11 @@ begin
   GEBlock := nil;          // only assigned when the step's sign is a runtime question
   StepIsNegative := False;
   NeedRuntimeCheck := False;
+  // ⛔ AN UNSIGNED 64-BIT LOOP VARIABLE IS COMPARED UNSIGNED. Its value passes 2^63 like any other
+  // ULongInt, and a signed "i <= to" reads that as a negative number: "For i As ULongInt = 0 To 1 Step
+  // 1ull Shl 63" never stopped (fbc runs it once). Only the 64-bit unsigned types need it - a UByte,
+  // UShort or ULong is held as a positive Int64 after narrowing, so the signed compare is already right.
+  VarIsUnsigned64 := PrintKindOf(VarName) = 2;
   if Node.ChildCount > 3 then
   begin
     StepNode := Node.GetChild(3);
@@ -17895,9 +17961,20 @@ begin
 
     // Also check if the evaluated STEP value is a negative constant
     // This handles cases where STEP is a variable containing a negative value
+    //
+    // ⛔⛔ AN UNSIGNED STEP IS NEVER NEGATIVE, whatever its top bit says. "For i As UByte = 0 To 1
+    // Step 1ull Shl 63" walks UP in fbc and runs exactly once - the value is 9223372036854775808, and
+    // the only thing that makes it look negative here is that we hold it in an Int64. Read as a
+    // negative step the loop ran ZERO times (fbc's compound/for-step, four assertions).
+    // ⚠️ It was INVISIBLE until DIVERGENZE 293 typed the constant right: before that "Const s =
+    // 1ull Shl 63" was a LONGINT, so the step printed -9223372036854775808 AND "Int(1 / step)" floored
+    // to -1 - and the test's own ctr1 came out 0 too. Two errors agreeing is not a pass; it is a green
+    // that measures nothing (the suite lost this test the moment one of them was fixed).
     if not StepIsNegative then
     begin
-      if (StepValue.Kind = svkConstInt) and (StepValue.ConstInt < 0) then
+      if IsUnsigned64Expr(StepNode) then
+        StepIsNegative := False                     // and no run-time sign question either
+      else if (StepValue.Kind = svkConstInt) and (StepValue.ConstInt < 0) then
         StepIsNegative := True
       else if (StepValue.Kind = svkConstFloat) and (StepValue.ConstFloat < 0) then
         StepIsNegative := True
@@ -18189,7 +18266,8 @@ begin
 
     CmpReg := FProgram.AllocRegister(srtInt);  // comparison result is an int boolean (see note above)
     if VarReg.RegType = srtInt then
-      EmitInstruction(ssaCmpGeInt, MakeSSARegister(srtInt, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone))
+      EmitInstruction(IfThenOp(VarIsUnsigned64, ssaCmpGeUInt, ssaCmpGeInt),
+                      MakeSSARegister(srtInt, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone))
     else
       EmitInstruction(ssaCmpGeFloat, MakeSSARegister(srtInt, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone));
     EmitInstruction(ssaJumpIfZero, MakeSSALabel(EndLabel), MakeSSARegister(srtInt, CmpReg),
@@ -18227,7 +18305,8 @@ begin
     begin
       // Negative step: use >= comparison
       if VarReg.RegType = srtInt then
-        EmitInstruction(ssaCmpGeInt, MakeSSARegister(srtInt, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone))
+        EmitInstruction(IfThenOp(VarIsUnsigned64, ssaCmpGeUInt, ssaCmpGeInt),
+                        MakeSSARegister(srtInt, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone))
       else
         EmitInstruction(ssaCmpGeFloat, MakeSSARegister(srtInt, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone));
     end
@@ -18235,7 +18314,8 @@ begin
     begin
       // Positive or zero step: use <= comparison
       if VarReg.RegType = srtInt then
-        EmitInstruction(ssaCmpLeInt, MakeSSARegister(srtInt, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone))
+        EmitInstruction(IfThenOp(VarIsUnsigned64, ssaCmpLeUInt, ssaCmpLeInt),
+                        MakeSSARegister(srtInt, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone))
       else
         EmitInstruction(ssaCmpLeFloat, MakeSSARegister(srtInt, CmpReg), VarReg, EndValue, MakeSSAValue(svkNone));
     end;
@@ -27555,7 +27635,7 @@ procedure TSSAGenerator.UDTFieldReportShape(UDTIdx, FieldIdx: Integer; out Size,
 var
   F: TUDTField;
 begin
-  if FixedArrayMemberCShape(UDTIdx, FieldIdx, Size, Align) then Exit;
+  if FixedArrayMemberCShape(UDTIdx, FieldIdx, Size, Align, True) then Exit;
   F := FUDTs[UDTIdx].Fields[FieldIdx];
   // ⭐ A NESTED RECORD MEMBER IS ITS OWN TYPE, INLINE (DIVERGENZE 193). It used to answer the eight
   // bytes of the handle our storage keeps, so "Type Inner: a As Byte: b As Short: End Type" inside
@@ -27668,16 +27748,90 @@ begin
   if Align > 8 then Align := 8;
 end;
 
-function TSSAGenerator.FixedArrayMemberCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64): Boolean;
+function TSSAGenerator.ArrayMemberElemShape(UDTIdx, FieldIdx: Integer; out ElemSz, ElemAl: Int64;
+                                           ReportOnly: Boolean): Boolean;
+// The shape of ONE ELEMENT of an array member - what fbc lays out per element, and what a byte offset
+// inside the member is counted in. Its three arms are the three kinds of element this project knows,
+// and ReportOnly says which of them have an IMAGE we reproduce (see FixedArrayMemberCShape).
+//   - a record element: the element type's own report shape;
+//   - a pointer to a record: eight bytes, a handle in our storage;
+//   - anything else: the scalar type's SizeOf, POINTERS INCLUDED (DIVERGENZE 293) - a pointer element
+//     has a byte image like any other eight-byte value, and fbc lays "pdummy(0 To 5) As Any Ptr" out
+//     as 48 bytes inline. A GObjectClass whose member stayed behind a handle put every field after it
+//     at the wrong offset.
+var
+  F: TUDTField;
+begin
+  Result := False;
+  ElemSz := 0; ElemAl := 0;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  if (FieldIdx < 0) or (FieldIdx > High(FUDTs[UDTIdx].Fields)) then Exit;
+  F := FUDTs[UDTIdx].Fields[FieldIdx];
+  if not F.IsArray then Exit;
+  if F.ArrayElemType <> '' then
+  begin
+    if not ReportOnly then Exit;
+    if not NestedMemberShape(F.ArrayElemType, True, ElemSz, ElemAl) then Exit;
+  end
+  else if F.ArrayElemPtrPointee <> '' then
+  begin
+    if not ReportOnly then Exit;
+    ElemSz := 8; ElemAl := 8;
+  end
+  else
+  begin
+    if F.ArrayElemScalarType = '' then Exit;
+    ElemSz := TypeSizeBytes(F.ArrayElemScalarType);
+  end;
+  Result := ElemSz > 0;
+end;
+
+function TSSAGenerator.ArrayMemberElemOffset(UDTIdx, FieldIdx: Integer; IdxNode: TASTNode): Int64;
+// "OffsetOf(T, m(i, j))" - how far into the member that element begins. Row-major, the last index
+// fastest, exactly as fbc lays it out; an index that is not a compile-time constant, or a member
+// whose bounds or element size we cannot read, contributes nothing rather than a made-up number.
+var
+  Lbs, Ubs: TInt64Array;
+  n, k: Integer;
+  ElemSz, ElemAl, Lin, Stride, Ix: Int64;
+begin
+  Result := 0;
+  if (IdxNode = nil) or (IdxNode.ChildCount = 0) then Exit;
+  if not ArrayMemberElemShape(UDTIdx, FieldIdx, ElemSz, ElemAl, True) then Exit;
+  n := InlineArrayDims(UDTIdx, FieldIdx, Lbs, Ubs);
+  if (n <= 0) or (n <> IdxNode.ChildCount) then Exit;
+  Lin := 0; Stride := 1;
+  for k := n - 1 downto 0 do
+  begin
+    if Ubs[k] < Lbs[k] then Exit;                       // a bound we could not fold
+    if not TryFoldConstIntExpr(IdxNode.GetChild(k), Ix) then Exit;
+    Lin := Lin + (Ix - Lbs[k]) * Stride;
+    Stride := Stride * (Ubs[k] - Lbs[k] + 1);
+  end;
+  Result := Lin * ElemSz;
+end;
+
+function TSSAGenerator.FixedArrayMemberCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64;
+                                              ReportOnly: Boolean = False): Boolean;
 // The C shape of a FIXED-LENGTH array member: element count * element size, aligned like the element.
 // Answers False - and touches nothing - for a member whose image we do not reproduce: a dynamic array
-// (no concrete bounds), an array of RECORDS or of POINTERS (the elements are handles), or an element
-// type we cannot size.
+// (no concrete bounds) or an element type we cannot size.
+//
+// ⛔⛔ TWO QUESTIONS AGAIN, AND ReportOnly IS WHICH ONE (DIVERGENZE 293). "What does fbc SAY this
+// member measures" and "can we lay its elements out in our bytes" have different answers for an array
+// of RECORDS and for an array of pointers to a UDT: fbc lays both out inline, and we still keep a
+// handle per element - a record element is a record, and "m(i).f" follows it. Their SIZE is
+// reportable all the same, and refusing to report it is what made the whole type decline: SizeOf then
+// fell back to the live image's eight-bytes-a-field sum and EVERY field after the member moved
+// (threadlocaleinfostruct 144 against fbc's 352, jpeg_compress_struct 488 against 584).
+// ⇒ The record / UDT-pointer element answers ONLY in reporting mode. The image path
+// (ArrayMemberInlineCandidate) refuses them before it ever gets here, and this parameter means a
+// future caller cannot take the report's answer for an image by accident.
 var
   F: TUDTField;
   D, UbExpr, LbExpr: TASTNode;
   di: Integer;
-  Lb, Ub, Count, ElemSz: Int64;
+  Lb, Ub, Count, ElemSz, ElemAl: Int64;
 begin
   Result := False;
   Size := 8; Align := 8;
@@ -27688,13 +27842,7 @@ begin
             ' elem="', F.ArrayElemType, '" scalar="', F.ArrayElemScalarType,
             '" elemptr="', F.ArrayElemPtrPointee, '"');
   if (not F.IsArray) or (F.ArrayBounds = nil) or (F.ArrayBounds.ChildCount < 1) then Exit;
-  if F.ArrayElemType <> '' then Exit;                                       // element is a record
-  if F.ArrayElemPtrPointee <> '' then Exit;                                 // element is a pointer
-  if F.ArrayElemScalarType = '' then Exit;
-  if (Length(F.ArrayElemScalarType) >= 4) and
-     (Copy(F.ArrayElemScalarType, Length(F.ArrayElemScalarType) - 3, 4) = ' PTR') then Exit;
-  ElemSz := TypeSizeBytes(F.ArrayElemScalarType);
-  if ElemSz <= 0 then Exit;
+  if not ArrayMemberElemShape(UDTIdx, FieldIdx, ElemSz, ElemAl, ReportOnly) then Exit;
   Count := 1;
   D := F.ArrayBounds;
   for di := 0 to D.ChildCount - 1 do
@@ -27717,7 +27865,7 @@ begin
   end;
   if Count <= 0 then Exit;
   Size := Count * ElemSz;
-  Align := ElemSz;
+  if ElemAl > 0 then Align := ElemAl else Align := ElemSz;
   if Align > 8 then Align := 8;
   Result := True;
 end;
@@ -27787,7 +27935,7 @@ begin
     // declines only when the nested type ITSELF has no reproducible layout - a union, a dynamic array
     // member, a variable-length string - and then the whole parent declines with it, as before.
     with FUDTs[UDTIdx].Fields[i] do
-      if (IsArray and not ((ReportOnly and FixedArrayMemberCShape(UDTIdx, i, Sz2, Al2)) or
+      if (IsArray and not ((ReportOnly and FixedArrayMemberCShape(UDTIdx, i, Sz2, Al2, True)) or
                            FieldArrayInline(UDTIdx, i))) or   // an inline array IS its image (226)
          ((NestedType <> '') and (IsArray or not NestedMemberShape(NestedType, ReportOnly, Sz2, Al2))) or
          ((Bank = srtString) and (StrCapacity <= 0)) then Exit;
@@ -31471,7 +31619,10 @@ function TSSAGenerator.ArrayMemberInlineCandidate(UDTIdx, FieldIdx: Integer; out
 // numbers may: its elements at fbc's offsets, which is what a Union overlaps ("m(0 To 3, 0 To 3)" over
 // "_11.._44" in D3DXMATRIX) and what C reads through a struct pointer. What may not, and why:
 //   - an "Any" member: ReDim sizes it per record, and a record's byte image has one size;
-//   - an array of STRINGS, RECORDS or POINTERS: their elements are managed values or handles, not bytes;
+//   - an array of STRINGS or of RECORDS: their elements are managed values or handles, not bytes.
+//     ⭐ An array of POINTERS to a SCALAR may, since DIVERGENZE 293: the element is eight bytes like any
+//     other, and fbc lays it out inline. An array of pointers to a UDT still may not - its elements are
+//     record HANDLES and "obj.m(i)->x" follows them;
 //   - an array of BOOLEANS: a Boolean has no width code of its own on the wire;
 //   - a member the program passes WHOLE ("f(x.m())", CollectWholeArrayFields): an array parameter binds an
 //     FArrays array, and bytes inside a record are not one;
@@ -31494,7 +31645,7 @@ begin
   if FWholeArrayFields.IndexOf(FUDTs[UDTIdx].Fields[FieldIdx].Name) >= 0 then Exit;
   T := UpperFast(Trim(FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemScalarType));
   if (T = '') or (T = 'BOOLEAN') or (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') then Exit;
-  if RecPtrWireWidth(T) < 0 then Exit;
+  if InlineArrayElemWidthCode(T) < 0 then Exit;
   if not FixedArrayMemberCShape(UDTIdx, FieldIdx, Size, Align) then
   begin
     Size := 8; Align := 8; Exit;
@@ -32436,7 +32587,7 @@ begin
     FUDTs[UDTIdx].Fields[i].InlineArray := FUDTs[UDTIdx].Fields[i].IsArray and FieldArrayInline(UDTIdx, i);
     if FUDTs[UDTIdx].Fields[i].InlineArray then
       FUDTs[UDTIdx].Fields[i].Slot := (FUDTs[UDTIdx].Fields[i].ByteOffset shl 4) or
-        (RecPtrWireWidth(FUDTs[UDTIdx].Fields[i].ArrayElemScalarType) and $F);
+        (InlineArrayElemWidthCode(FUDTs[UDTIdx].Fields[i].ArrayElemScalarType) and $F);
     // The two facts the ACCESSORS read: which bit of the unit this member starts at, and whether it
     // shares a unit with the member before it (the C layouts ask PlaceBitField again rather than this
     // mark, because their own field sizes - and so their offsets - can differ from the live image's).
@@ -42369,7 +42520,7 @@ var
   T: string;
   u, j: Integer;
   LayoutOffsets: TInt64Array;
-  LayoutSize: Int64;
+  LayoutSize, LayoutAlign: Int64;
 begin
   T := UpperFast(Trim(TypeName));
   if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then Exit(8);
@@ -42405,6 +42556,15 @@ begin
       // honoured) whenever every member has a reproducible shape; a type holding a variable-length
       // string / array / nested record falls back to the historic one-slot-per-field sum.
       if UDTCLayout(u, LayoutOffsets, LayoutSize, True) then   // SizeOf reports; it does not promise an image
+        Result := LayoutSize
+      // ⭐ A UNION IS ASKED ITS OWN SHAPE (DIVERGENZE 293). UDTCLayout declines one - its members
+      // overlap, there is no sequential image - and SizeOf fell through to LiveBytes, which is the
+      // LIVE image and holds a HANDLE for every array member: X11's XClientMessageEvent_data
+      // ("b As ZString * 20 / s(0 To 9) As Short / l(0 To 4) As clong") measured 24 against fbc's 40,
+      // and XEvent 120 against 192. UDTShapeOf has answered for a union since DIVERGENZE 292 - it is
+      // what a union-typed MEMBER already contributes to its parent - so asking it here is also what
+      // stops SizeOf(U) and "U as a member" from drifting apart.
+      else if FUDTs[u].IsUnion and UDTShapeOf(u, True, LayoutSize, LayoutAlign) and (LayoutSize > 0) then
         Result := LayoutSize
       else if FUDTs[u].LiveBytes > 0 then
         // A3-i: where the C layout declines - a UNION, or a type holding an array, a nested record or
@@ -46343,9 +46503,12 @@ begin
         outputs with the leading space TRIMMED - and the sign space is exactly
         what the question is about. The guardian, which compares bytes, said so
         immediately. }
+      // ⚠️ THE SHIFTS ARE IN THIS LIST TOO, and they were added the day IsUnsigned64Expr got them:
+      // the two lists have to travel together, or a "-u Shr 1" whose VALUE is unsigned falls through
+      // to the other question and loses the sign column fbc prints (bug_unsigned_negate_print line 43).
       if (Node.ChildCount >= 2) and Assigned(Node.Token) and
          (Node.Token.TokenType in [ttOpAdd, ttOpSub, ttOpMul, ttOpIntDiv, ttOpMod,
-                                   ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR]) then
+                                   ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR, ttOpShl, ttOpShr]) then
         Result := PrintsUnsigned64Expr(Node.GetChild(0)) or
                   PrintsUnsigned64Expr(Node.GetChild(1))
       else
@@ -46375,6 +46538,13 @@ begin
         // ORIGINAL token text (Node.Value already holds the reinterpreted, negative Int64 bits).
         if Assigned(Node.Token) and (Node.Token.TokenType <> ttStringLiteral) then
         begin
+          // ⛔ THE "u" SUFFIX IS NOT ENOUGH HERE, and the first version used it: the token records only
+          // THAT a suffix was unsigned, not how WIDE it was, and "5UL" is a 32-bit ULong - which this
+          // question is deliberately not about (a ULong is held as a positive Int64 and compares right
+          // already). Taking every suffixed literal as unsigned-64 dropped the sign column from
+          // "Print 5UL * 3L" (m305) and from "(-u) \ 2" (bug_unsigned_negate_print). ⇒ The inline form
+          // "Step 1ull Shl 63" is therefore still read signed; through a CONST or a VAR - which carry
+          // their declared type - it is not. Closing it wants a WIDTH on the token, not a wider rule.
           Txt := Trim(VarToStr(Node.Token.Value));
           if (Txt <> '') and not TryStrToInt64(Txt, I64) then
           begin
@@ -46396,8 +46566,11 @@ begin
     antBinaryOp:
       if (Node.ChildCount >= 2) and Assigned(Node.Token) then
         case Node.Token.TokenType of
+          // ⚠️ THE SHIFTS ARE IN THE LIST, and measured: fbc prints "7 Shl 1u" with no sign column,
+          // so unsignedness travels through a shift from EITHER side - not the C rule, where the result
+          // takes the left operand's type alone.
           ttOpAdd, ttOpSub, ttOpMul, ttOpIntDiv, ttOpMod,
-          ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR:
+          ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR, ttOpShl, ttOpShr:
             Result := IsUnsigned64Expr(Node.GetChild(0)) or IsUnsigned64Expr(Node.GetChild(1));
         end;
     antMemberAccess:

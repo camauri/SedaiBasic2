@@ -5331,10 +5331,50 @@ function TPackratParser.ParseRecordFieldType: string;
 var
   FixedCapVal: Int64;   // folded "* n" capacity
   FixedLenExpr: TASTNode;
+  TypeOfMark: Integer;
 // Parse an in-TYPE field type after AS: a (dotted) type name, an optional "PTR" suffix (stored as an
 // int handle), and an optional fixed-length "* n" (advisory in v1). Returns '' if no type token follows.
 begin
   Result := '';
+  // ⭐ "As TypeOf( <a type> )" NAMES THAT TYPE, and a field could not say it (DIVERGENZE 293).
+  // "TYPEOF" was read as the type's NAME and "( ... )" left standing in the stream, so the field had an
+  // unknown type, the whole C layout of its record declined and every OffsetOf after it fell back to
+  // "declaration index * 8": X11's _XDisplay_ (its "error_vec As TypeOf( Function(...) As Long ) Ptr")
+  // measured 4688 against fbc's 4680, with conn_checker at 24 instead of 20 - and that one field cost
+  // the layout of the three biggest X11 headers. The PROCEDURE spelling is handled by the caller
+  // (TryParseProcPtrType, which knows both); this is the one that names an ordinary type.
+  if Context.Check(ttIdentifier) and SameText(VarToStr(Context.CurrentToken.Value), 'TYPEOF') and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen) then
+  begin
+    Context.SavePosition(TypeOfMark);
+    Context.Advance;                              // TYPEOF
+    Context.Advance;                              // '('
+    if AtDottedTypeName or
+       ((Length(Context.CurrentToken.Value) > 0) and
+        (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_'])) then
+    begin
+      Result := ParseDottedName;
+      while AtPointerSuffix do
+      begin
+        Result := Result + ' PTR';
+        Context.Advance;
+      end;
+      if Context.Check(ttDelimParClose) then
+      begin
+        Context.Advance;                          // ')'
+        while AtPointerSuffix do                  // ...and the suffixes OUTSIDE the parentheses
+        begin
+          Result := Result + ' PTR';
+          Context.Advance;
+        end;
+        Exit;
+      end;
+    end;
+    // ⚠️ Not a type name inside: leave the cursor exactly where it was and let the ordinary
+    // reader answer, which is what it did before this branch existed.
+    Context.RestorePosition(TypeOfMark);
+    Result := '';
+  end;
   if AtDottedTypeName or
      ((Length(Context.CurrentToken.Value) > 0) and
       (UpCase(Context.CurrentToken.Value[1]) in ['A'..'Z', '_'])) then
@@ -6213,7 +6253,31 @@ begin
     begin
       Context.Advance;                              // AS
       SkipTypeQualifiers;                     // FB: "As Const <type>"
-      FieldTypeName := ParseRecordFieldType;
+      // ⭐ A PROCEDURE TYPE MAY COME FIRST TOO, and the As-first form is how a header declares a
+      // member whose name is a KEYWORD: pango/pango.bi writes
+      //     begin as sub(byval renderer as PangoRenderer ptr)
+      //     as sub(byval renderer as PangoRenderer ptr) end
+      // so that "end" never opens a line. This path only ever read a NAME, so "sub" was taken for the
+      // type, its parameter list was left standing, and _PangoRendererClass came out 264 bytes against
+      // fbc's 248 with everything after those two members 16 bytes late (DIVERGENZE 293).
+      if Context.Check(ttProcedureStart) or
+         (Context.Check(ttIdentifier) and
+          SameText(VarToStr(Context.CurrentToken.Value), 'TYPEOF') and
+          Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen)) then
+      begin
+        FpTmp := TASTNode.CreateWithValue(antIdentifier, '', Context.CurrentToken);
+        if TryParseProcPtrType(FpTmp) then
+        begin
+          FpIsFP := True;
+          FpParams := FpTmp.Attributes.Values['FPPARAMS'];
+          FpRet := FpTmp.Attributes.Values['FPRET'];
+          FieldTypeName := 'INTEGER';               // the field slot holds the procedure entry PC
+          while AtPointerSuffix do Context.Advance;
+        end;
+        FpTmp.Free;
+      end;
+      if not FpIsFP then
+        FieldTypeName := ParseRecordFieldType;
       LeadingType := True;
     end;
     // A field name may be an identifier or a reserved word (e.g. LEN, TYPE, NAME): accept any
@@ -6251,7 +6315,13 @@ begin
         SkipTypeQualifiers;                     // FB: "As Const <type>"
         // FreeBASIC funcptr field "fn As Function(params) As R" / "As Sub(params)": record the signature
         // (int-banked entry PC) instead of a type name; "obj.fn(args)" is lowered as an indirect call.
-        if Context.Check(ttProcedureStart) then
+        // ⭐ ...and the SAME type may be spelled "TypeOf( Function(...) As R )", which is how X11's
+        // _XDisplay_ writes its error_vec. TryParseProcPtrType understands both spellings and consumes
+        // nothing when it recognises neither, so the gate can simply admit it (DIVERGENZE 293).
+        if Context.Check(ttProcedureStart) or
+           (Context.Check(ttIdentifier) and
+            SameText(VarToStr(Context.CurrentToken.Value), 'TYPEOF') and
+            Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen)) then
         begin
           FpTmp := TASTNode.CreateWithValue(antIdentifier, '', FieldTok);
           if TryParseProcPtrType(FpTmp) then
@@ -6260,10 +6330,13 @@ begin
             FpParams := FpTmp.Attributes.Values['FPPARAMS'];
             FpRet := FpTmp.Attributes.Values['FPRET'];
             FieldTypeName := 'INTEGER';             // the field slot holds the procedure entry PC
+            // ⛔ "TypeOf( Sub(...) ) PTR" leaves its PTR suffix standing: a pointer to a procedure
+            // type is still one slot, but an unconsumed "ptr" ends the declaration in the wrong place.
+            while AtPointerSuffix do Context.Advance;
           end;
           FpTmp.Free;
-        end
-        else
+        end;
+        if not FpIsFP then
           FieldTypeName := ParseRecordFieldType;
         if (ArrDimNode = nil) and Context.Check(ttDelimParOpen) then
         begin
@@ -15733,6 +15806,39 @@ var
                 (S = 'UINTEGER') or (S = 'SHORT') or (S = 'USHORT') or (S = 'BYTE') or (S = 'UBYTE');
     end;
 
+    function IsUnsignedName(const S: string): Boolean;
+    begin
+      Result := (S = 'ULONG') or (S = 'ULONGINT') or (S = 'UINTEGER') or (S = 'USHORT') or (S = 'UBYTE');
+    end;
+
+    function IntNameBits(const S: string): Integer;
+    begin
+      if (S = 'BYTE') or (S = 'UBYTE') then Result := 8
+      else if (S = 'SHORT') or (S = 'USHORT') then Result := 16
+      else if (S = 'LONG') or (S = 'ULONG') then Result := 32
+      else Result := 64;
+    end;
+
+    function IntResultName(const L, R: string): string;
+    // ⭐ THE USUAL ARITHMETIC CONVERSIONS, and this used to answer LONGINT for every pair
+    // (DIVERGENZE 293). An UNSIGNED operand makes the result unsigned, and an unsigned CONST prints
+    // with no sign column - which is how win/winnt.bi's "1ull Shl XSTATE_LEGACY_FLOATING_POINT" and
+    // lzma's "UINT32_C(1) Shl 23" read in fbc. The 295 work typed the LITERAL and stopped at the
+    // first operator above it.
+    var
+      B: Integer;
+    begin
+      B := IntNameBits(L);
+      if IntNameBits(R) > B then B := IntNameBits(R);
+      if B < 32 then B := 32;                    // fbc promotes a narrow pair to at least 32 bits
+      if IsUnsignedName(L) or IsUnsignedName(R) then
+      begin
+        if B <= 32 then Result := 'ULONG' else Result := 'ULONGINT';
+      end
+      else if B <= 32 then Result := 'LONG'
+      else Result := 'LONGINT';
+    end;
+
   begin
     Result := 'DOUBLE';
     if V = nil then Exit;
@@ -15799,6 +15905,11 @@ var
     end;
     if (V.NodeType = antUnaryOp) and (V.ChildCount >= 1) then
       Exit(InferConstTypeName(V.GetChild(0)));
+    // ⛔ PARENTHESES ARE TRANSPARENT TO A TYPE too, and this case was missing: "(2u * 3u) + 1u"
+    // asked the left operand and got the DOUBLE default, so the unsignedness stopped at the bracket -
+    // which is exactly the shape lzma writes ("(UINT32_C(1) shl 23)").
+    if (V.NodeType = antParentheses) and (V.ChildCount >= 1) then
+      Exit(InferConstTypeName(V.GetChild(0)));
     // ⛔ A CAST NAMES THE TYPE OF ITS RESULT, and the CONST takes it. "const HWND_BROADCAST =
     // cast(HWND, &hffff)" is an HWND in fbc - a pointer, printed unsigned - and here it fell to the
     // DOUBLE default: windows.bi's special handles came out as floats. The name is kept as spelled; the
@@ -15818,7 +15929,11 @@ var
             if (L = 'STRING') or (R = 'STRING') then Result := 'STRING'
             // ...two INTEGER operands of any width stay an integer: a ULONG literal or a CUInt() on
             // one side (295) must not turn "TSIZE - 1" back into a Double.
-            else if IsIntName(L) and IsIntName(R) then Result := 'LONGINT'
+            // ⚠️ A SHIFT IS NOT THE C RULE HERE, and it was written that way first: in C the result
+            // takes the LEFT operand's type alone, the right being a count. fbc does not - "7 Shl 1u"
+            // prints unsigned - so the same conversions apply to every operator in this list. MEASURED
+            // against the oracle, not deduced (m908q).
+            else if IsIntName(L) and IsIntName(R) then Result := IntResultName(L, R)
             else Result := 'DOUBLE';
           end;
       end;
