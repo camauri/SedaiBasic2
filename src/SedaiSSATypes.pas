@@ -162,6 +162,12 @@ const
   // raw load at all). The WASM arm even CARRIED the bug in a comment - "the backend reproduces the
   // interpreter rather than correcting it" - so the note was right and the behaviour it copied was not.
   RTC_U8 = 7; RTC_U16 = 8; RTC_U32 = 9;
+  { ⭐ An 8-byte POINTER read out of raw memory (DIVERGENZE 250). To every engine it is RTC_I64 - eight
+    bytes, no extension - and the one difference is the VM's: a pointer read out of C's OWN memory (a
+    field of a struct C handed back, "g->__tm_zone") is C's too, so it comes back tagged as a machine
+    address with its region recorded, or home as the VM pointer it names. As a plain RTC_I64 it came
+    back bare and the VM took it for one of its own. }
+  RTC_PTR64 = 10;
 
   { The width of ONE wide character in the byte IMAGE of a WSTRING - the raw-heap buffer an @-taken
     "WString * n" is backed with, what "Clear w, 0, SizeOf(w)" writes over, and what a UByte or UShort

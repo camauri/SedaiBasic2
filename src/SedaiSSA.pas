@@ -2603,7 +2603,8 @@ begin
   else if Node.NodeType = antIdentifier then
   begin
     Nm := VarToStr(Node.Value);
-    Result := (PointerUDTType(Nm) <> '') and not IsRawPtr(Nm);
+    // ...and not one laid over C's memory (a struct C handed back): that one holds an ADDRESS.
+    Result := (PointerUDTType(Nm) <> '') and not IsRawPtr(Nm) and (RawUDTPtrType(Nm) = '');
   end;
 end;
 
@@ -26128,7 +26129,12 @@ begin
       2: EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I16));
       4: EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I32));
     else
-      EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64));
+      // ⭐ ...and a POINTER field says so: read out of a struct C handed back it is C's pointer, and the
+      // VM tags it on the way out (DIVERGENZE 250). An INTEGER field of the same width must not be.
+      if (F.PtrPointee <> '') or (F.RawPtrPointee <> '') then
+        EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_PTR64))
+      else
+        EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64));
     end;
   end;
   Result := True;
@@ -30600,7 +30606,7 @@ var
   cInt, cFloat, cStr, ArrDims: Integer;
   TypeName, FieldName, NestedT, PtrPointeeT, ArrElemType, ArrElemPtrPointeeT, FuncPtrSigVal: string;
   ArrElemScalarType: string;
-  RawPtrPointeeT, PointeeScalarT, MultiPtrPointeeT, UltimateT: string;
+  RawPtrPointeeT, PointeeScalarT, MultiPtrPointeeT, UltimateT, PtrTypeT: string;
   IsArrayField: Boolean;
   SavedTypePath: string;
 begin
@@ -30664,9 +30670,18 @@ begin
         // chained pointer-field access (p->nxt->val) and p->ptrfield-> resolve correctly. A "T PTR" field
         // where T is a SCALAR (Double Ptr, Integer Ptr, ...) instead holds a raw byte-heap address, so
         // record its scalar pointee to drive raw indexing/deref of "obj.field".
-        if (Length(TypeName) > 4) and (Copy(TypeName, Length(TypeName) - 3, 4) = ' PTR') then
+        // ⛔ ...THROUGH ITS TYPEDEF, the third reader of this fact to need it (DIM and parameters were the
+        // other two, DIVERGENZE 246). "bv_val As PCHAR" is a Byte Ptr as surely as "As Byte Ptr", but the
+        // test was on the SPELLING: the field got no pointee, TryEmitRawUDTField read it as an integer,
+        // and a pointer out of a C struct came back bare - "*g->zone" died where fbc prints "GMT"
+        // (DIVERGENZE 250). Only the POINTEE is derived from the resolved name; the bank is untouched.
+        PtrTypeT := TypeName;
+        if not ((Length(PtrTypeT) > 4) and (Copy(PtrTypeT, Length(PtrTypeT) - 3, 4) = ' PTR')) and
+           (GetEnvironmentVariable('SB_NO_FIELD_ALIAS_PTR') = '') then   // A/B knob: the old spelling test
+          PtrTypeT := UpperFast(CanonicalType(TypeName));
+        if (Length(PtrTypeT) > 4) and (Copy(PtrTypeT, Length(PtrTypeT) - 3, 4) = ' PTR') then
         begin
-          PointeeScalarT := Trim(Copy(TypeName, 1, Length(TypeName) - 4));
+          PointeeScalarT := Trim(Copy(PtrTypeT, 1, Length(PtrTypeT) - 4));
           if FindUDT(PointeeScalarT) >= 0 then
             PtrPointeeT := PointeeScalarT
           else if (Pos(' PTR', PointeeScalarT) = 0) then   // single-level scalar pointer only
@@ -41436,7 +41451,13 @@ begin
       Result := (A.ChildCount > 0) and (A.GetChild(0) <> nil) and
                 (A.GetChild(0).NodeType = antArrayAccess);
     antIdentifier:
-      Result := (PointeeTypeOf(VarToStr(A.Value)) <> '') and not IsRawPtr(VarToStr(A.Value));
+      // ⛔ ...and not a UDT pointer laid over C's memory either (FRawUDTPtrs): a struct a C call handed
+      // back holds an ADDRESS, never an element pointer of the program's array. IsRawPtr does not read
+      // that registry, so "ber_flatten(ber, @bv)" - ber a BerElement Ptr from ber_alloc_t - counted ber as
+      // the program's memory and vetoed the out-parameter: "bv->bv_len" then took the record-handle path
+      // and died (DIVERGENZE 249). Two registries of one fact; this reader asked only one of them.
+      Result := (PointeeTypeOf(VarToStr(A.Value)) <> '') and not IsRawPtr(VarToStr(A.Value)) and
+                (RawUDTPtrType(VarToStr(A.Value)) = '');
     antCast, antBinaryOp:
       for j := 0 to A.ChildCount - 1 do
         if ArgIsProgramMemory(A.GetChild(j)) then Exit(True);
@@ -41650,7 +41671,12 @@ var
     Idx := FProgram.IndexOfForeignDecl(UpperFast(CalleeName));
     if (Idx < 0) or not ParseForeignDecl(FProgram.GetForeignDecl(Idx), D) then Exit;
     for k := 0 to ArgListNode.ChildCount - 1 do
-      if ArgIsProgramMemory(ArgListNode.GetChild(k)) then Exit;
+      if ArgIsProgramMemory(ArgListNode.GetChild(k)) then
+      begin
+        if GetEnvironmentVariable('RAWPTRDIAG') <> '' then
+          WriteLn(ErrOutput, 'RAWPTR outarg veto [', CalleeName, '] argument ', k + 1, ' is program memory');
+        Exit;
+      end;
     for k := 0 to ArgListNode.ChildCount - 1 do
     begin
       if k > High(D.ParamTypeNames) then Break;
@@ -41667,6 +41693,8 @@ var
         begin
           FRawUDTPtrs.Add(NU + '=' + PointerUDTType(NU));
           FRawCollectChanged := True;
+          if GetEnvironmentVariable('RAWPTRDIAG') <> '' then
+            WriteLn(ErrOutput, 'RAWPTR outarg udt [', CalleeName, '] ', NU, ' -> ', PointerUDTType(NU), ' laid over C memory');
         end;
       end
       else

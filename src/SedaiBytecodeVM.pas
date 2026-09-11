@@ -5798,7 +5798,7 @@ begin
     RTC_I8, RTC_U8:   W := 1;
     RTC_I16, RTC_U16: W := 2;
     RTC_I32, RTC_U32: W := 4;
-    RTC_I64:          W := 8;
+    RTC_I64, RTC_PTR64: W := 8;         // a pointer is eight bytes wherever it is read (DIVERGENZE 250)
   else
     W := A.ElemWidth;                 // 0 = "one element, at its own width"
   end;
@@ -5812,7 +5812,7 @@ begin
     RTC_U16: Result := PWord(@A.ByteData[ByteOfs])^;
     RTC_I32: Result := PLongInt(@A.ByteData[ByteOfs])^;
     RTC_U32: Result := PLongWord(@A.ByteData[ByteOfs])^;
-    RTC_I64: Result := PInt64(@A.ByteData[ByteOfs])^;
+    RTC_I64, RTC_PTR64: Result := PInt64(@A.ByteData[ByteOfs])^;
   else
     // No type on the read: one element, at the array's own width and sign.
     case A.ElemWidth of
@@ -5838,7 +5838,7 @@ begin
     RTC_I8, RTC_U8:   W := 1;
     RTC_I16, RTC_U16: W := 2;
     RTC_I32, RTC_U32: W := 4;
-    RTC_I64:          W := 8;
+    RTC_I64, RTC_PTR64: W := 8;         // a pointer is eight bytes wherever it is read (DIVERGENZE 250)
   else
     W := FArrays[ArrIdx].ElemWidth;
   end;
@@ -5994,6 +5994,23 @@ begin
     RTC_U8:  Result := PByte(RawAddr(RawPtr, 1))^;
     RTC_U16: Result := PWord(RawAddr(RawPtr, 2))^;
     RTC_U32: Result := PLongWord(RawAddr(RawPtr, 4))^;
+    // ⭐ A POINTER read out of raw memory (DIVERGENZE 250). From C's own memory it is C's pointer: it
+    // comes home if it names memory the VM owns, and is otherwise tagged as a machine address and made
+    // readable inside its mapping (239 a) - "*g->__tm_zone" read "GMT" in fbc and died here, because the
+    // bare address was taken for one of the VM's own pointers. From the VM's memory nothing changes: a
+    // pointer the program stored there is already in the VM's domain.
+    RTC_PTR64:
+      begin
+        Result := PInt64(RawAddr(RawPtr, 8))^;
+        if (Result <> 0) and ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) and
+           ((Result and FGNPTR_TAG) = 0) then
+        begin
+          AvU := PtrUInt(VMPointerForMachineAddr(nil, PtrUInt(Result)));
+          if AvU <> 0 then Exit(Int64(AvU));
+          ForeignNoteRegion(nil, PtrUInt(Result), 0, True, False);
+          Result := Result or FGNPTR_TAG;
+        end;
+      end;
   else
     Result := PInt64(RawAddr(RawPtr, 8))^;
   end;
