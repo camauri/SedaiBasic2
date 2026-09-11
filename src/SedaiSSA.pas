@@ -971,6 +971,7 @@ type
     function AddrParamBank(const Name: string): TSSARegisterType;               // pointee bank of an address param
     function IsRefVar(const Name: string): Boolean;                             // BYREF reference variable (auto-deref)?
     function RefVarAddrValue(const Name: string): TSSAValue;                    // the address a reference carries (its home if Shared, 270)
+    function RefVarIsWide(const Name: string): Boolean;                         // a reference to a WSTRING: read/written as wide cells
     function RefVarNarrowCode(const Name: string): Integer;                     // ...its raw width code, 0 = full width (DIVERGENZE 256)
     function RefVarBank(const Name: string): TSSARegisterType;                  // pointee bank of a reference variable
     function IsRawPtr(const Name: string): Boolean;                             // raw (Allocate-backed) pointer var?
@@ -4401,7 +4402,8 @@ begin
         else
         case FuncRetType of
           srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-          srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone),
+                                     MakeSSAConstInt(Ord(RefVarIsWide(VarName))));
         else
           EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end;
@@ -6022,7 +6024,20 @@ begin
             // LEN of a declared NUMERIC/pointer variable is the SIZE of its declared type
             // (fbc: Byte->1, Short->2, Integer->8, Single->4, Ptr->8...), NOT a string length.
             // The old fallthrough coerced the number to a string and answered 1.
-            TempInt := DeclaredScalarLenBytes(TempStr);
+            // ⛔ ...BUT A REFERENCE IS DECLARED "INTEGER" ONLY BECAUSE ITS REGISTER HOLDS AN ADDRESS
+            // (DIVERGENZE 276). Its LEN is the LEN of what it refers to: "Dim ByRef lw As WString = w :
+            // Len( lw )" answered 8 - the size of an Integer - where fbc answers 2, and a reference to a
+            // Byte answered 8 where fbc answers 1. A string referand takes the string path below; a
+            // numeric one answers its own type's size.
+            if IsRefVar(TempStr) then
+            begin
+              if RefVarBank(TempStr) = srtString then
+                TempInt := -1
+              else
+                TempInt := TypeSizeBytes(UpperFast(FRefVars.Values[UpperFast(TempStr)]));
+            end
+            else
+              TempInt := DeclaredScalarLenBytes(TempStr);
             if TempInt >= 0 then
             begin
               Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -10180,7 +10195,9 @@ begin
     end;
     case RefVarBank(VarName) of
       srtFloat:  begin ExprValue := EnsureFloatRegister(ExprValue);  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone)); end;
-      srtString: begin ExprValue := EnsureStringRegister(ExprValue); EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone)); end;
+      srtString: begin ExprValue := EnsureStringRegister(ExprValue);
+                   EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue,
+                                   MakeSSAConstInt(Ord(RefVarIsWide(VarName)))); end;
     else
       ExprValue := EnsureIntRegister(ExprValue);
       EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
@@ -37619,6 +37636,12 @@ begin
           // decide, exactly as it already does for a bare literal.
           else if ConstIsInt and (TypeNameU = '') then
             ElemBank := srtInt
+          // ⛔ A REFERENCE'S HOME HOLDS AN ADDRESS, whatever it refers to. "Dim Shared ByRef rz As ZString
+          // = z" got a STRING home, so the address was stored with IntToString and read back through
+          // StrVal and a float round - and a packed raw address does not survive that: inside a Sub "rz"
+          // died on "Raw pointer dereference out of bounds" (fbc's dim/byref.bas, group allDtypes).
+          else if Decl.Attributes.Values['BYREF'] = '1' then
+            ElemBank := srtInt
           else
             ElemBank := TypeNameToBank(TypeNameU, VNameU);
           ai := FProgram.DeclareArray(VNameU, ElemBank, [1]);   // 1-element global array, same name
@@ -39864,6 +39887,24 @@ begin
   end
   else
     Result := EnsureIntRegister(GetOrAllocateVariable(UpperFast(Name)));
+end;
+
+function TSSAGenerator.RefVarIsWide(const Name: string): Boolean;
+// Is this reference's declared type a WSTRING? Then its target is WIDE cells, and the string load/store
+// through it has to say so (the immediate ssaRefLoadString/ssaRefStoreString already read, as the BYREF-
+// return protocol passes it). Without it "Dim Shared ByRef rw As WString = w" read w as a byte string
+// and printed "1" for "13" (fbc's dim/byref.bas, group allDtypes). Same scope rule as RefVarNarrowCode.
+var
+  BlkKey: string;
+  idx: Integer;
+begin
+  Result := False;
+  if BlockDeclaredHere(Name, BlkKey) then
+    idx := FRefVars.IndexOfName(BlkKey)
+  else
+    idx := FRefVars.IndexOfName(UpperFast(Name));
+  if idx < 0 then Exit;
+  Result := UpperFast(CanonicalType(UpperFast(FRefVars.ValueFromIndex[idx]))) = 'WSTRING';
 end;
 
 function TSSAGenerator.RefVarBank(const Name: string): TSSARegisterType;
@@ -42613,6 +42654,11 @@ begin
     antIdentifier:
       begin
         Result := IsWStringVar(VarToStr(Node.Value));
+        // ⭐ ...AND A REFERENCE TO A WSTRING IS WIDE (DIVERGENZE 276). A reference is filed in FRefVars,
+        // not in FWStringVars, so "Dim ByRef lw As WString = w : Len( lw )" counted the wide value as
+        // BYTES - 8 where fbc answers 2 (fbc's dim/byref.bas).
+        if (not Result) and IsRefVar(VarToStr(Node.Value)) then
+          Result := RefVarIsWide(VarToStr(Node.Value));
         // ⭐ ...AND A CONST DECLARED FROM "wstr( <literal> )" IS WIDE (DIVERGENZE 150). Everything that
         // reads it has to count CODEPOINTS: fbc's own string/asc asserts
         // "asc( wstr(!"\u1111\u0000\u2222"), 1 ) = &h1111", and read as a byte string it answered

@@ -335,6 +335,12 @@ begin
       GrandNode := TASTNode(Grands[i]);
       NameNode := Decl.GetChild(0);
       TypeNode := Decl.GetChild(1);
+      // ⛔ THE NAME FIRST - the INFER branch below uses it. It was computed AFTER that branch, so a
+      // "Static Var" was hoisted under the PREVIOUS static's mangled name, or under an empty one when it
+      // was the first: "Sub t() : Static Var ByRef s = g" hoisted a nameless global, renamed every s to
+      // it, and died on an access violation at start-up (fbc's dim/byref.bas, group noCtorsCalled).
+      VName := UpperCase(VarToStr(NameNode.Value));
+      Mangled := 'STATIC.' + IntToStr(ProcIdx) + '.' + VName;
       // An INFER declaration hoists WHOLE: cloning keeps child[1] as the initializer and carries the
       // INFER mark with it, which is exactly what the module-level VAR needs to type itself. Rebuilding
       // it as "name AS type" (the scalar path below) would have to invent the type this shape exists
@@ -346,8 +352,6 @@ begin
         DimNode.Children.Remove(Decl);
         Continue;
       end;
-      VName := UpperCase(VarToStr(NameNode.Value));
-      Mangled := 'STATIC.' + IntToStr(ProcIdx) + '.' + VName;
       if TypeNode.NodeType = antDimensions then
       begin
         // Array static. With literal bounds (the common case, and the only one FreeBASIC lets carry an
@@ -453,8 +457,18 @@ begin
   Result := '';
   if (H = nil) or (H.ChildCount < 1) then Exit;
   D := H.GetChild(0);
-  if (D.NodeType <> antArrayDecl) or (D.Attributes.Values['BYREF'] <> '1') or (D.ChildCount < 3) then Exit;
-  Init := D.GetChild(2);
+  if (D.NodeType <> antArrayDecl) or (D.Attributes.Values['BYREF'] <> '1') then Exit;
+  // A "Static Var ByRef s = g" (INFER) carries its initializer as child 1 - it names no type.
+  if D.Attributes.Values['INFER'] = '1' then
+  begin
+    if D.ChildCount < 2 then Exit;
+    Init := D.GetChild(1);
+  end
+  else
+  begin
+    if D.ChildCount < 3 then Exit;
+    Init := D.GetChild(2);
+  end;
   if Init.NodeType <> antProcAddress then Exit;
   if Init.ChildCount = 0 then Exit(UpperCase(VarToStr(Init.Value)));
   C := Init.GetChild(0);

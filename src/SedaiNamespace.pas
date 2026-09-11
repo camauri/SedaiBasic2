@@ -71,6 +71,11 @@ type
     // "NS.BAR", so the field was never written and every read of it answered 0. fbc's dim/auto_var2
     // writes that cross-shadowed pair on purpose.
     TypeFieldNames: TStringList;
+    // ⭐ ...and the full names of the ENUMS declared inside a namespace ("NS.E1"). "NS.E1.B" names the
+    // same member as "NS.B", so the middle component is dropped - but ONLY for an enum. Asked of any
+    // other middle component it rewrote a record FIELD into a namespace VARIABLE of the same name:
+    // "v.i = 5" inside a namespace that also declares "Dim Shared i" wrote ns.i (DIVERGENZE 272).
+    EnumNames: TStringList;
     constructor Create;
     destructor Destroy; override;
     function IsMember(const Prefix, Name: string): Boolean;
@@ -88,6 +93,9 @@ begin
   GlobalTypeNames := TStringList.Create;
   TypeFieldNames := TStringList.Create;
   TypeFieldNames.CaseSensitive := False;
+  EnumNames := TStringList.Create;
+  EnumNames.Duplicates := dupIgnore;
+  EnumNames.Sorted := True;
   GlobalTypeNames.Duplicates := dupIgnore;
   GlobalTypeNames.Sorted := True;
   NamespaceNames := TStringList.Create;
@@ -107,6 +115,7 @@ end;
 destructor TNsContext.Destroy;
 begin
   TypeFieldNames.Free;
+  EnumNames.Free;
   NamespaceNames.Free;
   MemberKeys.Free;
   GlobalNames.Free;
@@ -266,7 +275,13 @@ begin
           // "NS.B" answered nothing at all where fbc answers 12. The member names are mangled with the
           // rest, so both spellings land on the same declaration.
           if Decl.NodeType = antEnum then
+          begin
             CollectEnumMemberNames(Decl, ChildPrefix, Ctx);
+            // The enum's own name rides on the node (MemberDeclName has no case for an enum). An
+            // anonymous enum has none, and nothing can name it in the middle of a chain anyway.
+            if Trim(VarToStr(Decl.Value)) <> '' then
+              Ctx.EnumNames.Add(UpperCase(ChildPrefix + '.' + Trim(VarToStr(Decl.Value))));
+          end;
         end;
       end;
       // Recurse for physically nested namespaces.
@@ -1102,19 +1117,17 @@ begin
       // enum's members are members of NS: the base has already collapsed to "NS.E1", which is not a
       // namespace, so the chain stopped there and read as a record field - 0. Drop the middle component
       // when what is left IS a namespace that has the member.
-      // ⛔⛔ ...BUT NOT A TYPE'S NAME IN THE MIDDLE. "ns.SomeUDT.i" where SomeUDT declares a STATIC member
-      // i and ns declares its own "Dim Shared i": the base collapsed to "NS.SOMEUDT", NS has an I, and the
-      // rule above dropped SOMEUDT - so every read, every write and the member's own definition went to
-      // ns.i instead ("Dim Shared SomeUDT.i = 2" overwrote it; fbc's dim/byref2.bas). The middle component
-      // is dropped only when it is NOT a type that declares the member as its own field.
-      if (Ctx.NamespaceNames.IndexOf(BaseName) < 0) and (LastDelimiter('.', BaseName) > 0) then
+      // ⛔⛔ ...BUT ONLY AN ENUM'S NAME. The rule used to fire for ANY middle component whose namespace had
+      // a member of that name, and a record is the commonest one: in a namespace that also declares
+      // "Dim Shared i", "ns.SomeUDT.i" (a static member, fbc's dim/byref2.bas) and "v.i" (a FIELD of a
+      // variable, fbc's dim/byref.bas group allDtypes) were both rewritten to ns.i - reads answered the
+      // wrong variable and writes clobbered it, in silence. DIVERGENZE 272.
+      if (Ctx.NamespaceNames.IndexOf(BaseName) < 0) and (LastDelimiter('.', BaseName) > 0) and
+         (Ctx.EnumNames.IndexOf(BaseName) >= 0) then
       begin
         Qual := Copy(BaseName, 1, LastDelimiter('.', BaseName) - 1);
         V := UpperCase(VarToStr(Node.Value));
-        if (Ctx.NamespaceNames.IndexOf(Qual) >= 0) and Ctx.IsMember(Qual, V) and
-           (Pos(',' + V + ',', Ctx.TypeFieldNames.Values[BaseName] + ',') = 0) and
-           (Pos(',' + V + ',', Ctx.TypeFieldNames.Values[
-              Copy(BaseName, LastDelimiter('.', BaseName) + 1, MaxInt)] + ',') = 0) then
+        if (Ctx.NamespaceNames.IndexOf(Qual) >= 0) and Ctx.IsMember(Qual, V) then
           BaseName := Qual;
       end;
       if Ctx.NamespaceNames.IndexOf(BaseName) >= 0 then
