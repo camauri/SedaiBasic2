@@ -1102,11 +1102,19 @@ begin
       // enum's members are members of NS: the base has already collapsed to "NS.E1", which is not a
       // namespace, so the chain stopped there and read as a record field - 0. Drop the middle component
       // when what is left IS a namespace that has the member.
+      // ⛔⛔ ...BUT NOT A TYPE'S NAME IN THE MIDDLE. "ns.SomeUDT.i" where SomeUDT declares a STATIC member
+      // i and ns declares its own "Dim Shared i": the base collapsed to "NS.SOMEUDT", NS has an I, and the
+      // rule above dropped SOMEUDT - so every read, every write and the member's own definition went to
+      // ns.i instead ("Dim Shared SomeUDT.i = 2" overwrote it; fbc's dim/byref2.bas). The middle component
+      // is dropped only when it is NOT a type that declares the member as its own field.
       if (Ctx.NamespaceNames.IndexOf(BaseName) < 0) and (LastDelimiter('.', BaseName) > 0) then
       begin
         Qual := Copy(BaseName, 1, LastDelimiter('.', BaseName) - 1);
-        if (Ctx.NamespaceNames.IndexOf(Qual) >= 0) and
-           Ctx.IsMember(Qual, UpperCase(VarToStr(Node.Value))) then
+        V := UpperCase(VarToStr(Node.Value));
+        if (Ctx.NamespaceNames.IndexOf(Qual) >= 0) and Ctx.IsMember(Qual, V) and
+           (Pos(',' + V + ',', Ctx.TypeFieldNames.Values[BaseName] + ',') = 0) and
+           (Pos(',' + V + ',', Ctx.TypeFieldNames.Values[
+              Copy(BaseName, LastDelimiter('.', BaseName) + 1, MaxInt)] + ',') = 0) then
           BaseName := Qual;
       end;
       if Ctx.NamespaceNames.IndexOf(BaseName) >= 0 then

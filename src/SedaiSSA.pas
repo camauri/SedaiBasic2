@@ -347,6 +347,7 @@ type
     FModuleConstVals: TStringList;       // name (UPPER) -> 'I:'/'F:'/'S:' + literal text
     FStaticMembers: TStringList;         // OOP: static member variables "TYPE.FIELD" (UPPER), backed by a shared global scalar
     FStaticRefMembers: TStringList;      // "Static ByRef" members "TYPE.FIELD=type": a Shared REFERENCE under the dotted name (269)
+    FWantByrefRetAddr: Boolean;          // "@(fp( ))": the next indirect ByRef call hands back the ADDRESS, not the value
     // ...and the static member PROCEDURES, "TYPE.NAME" (UPPER). The parser stamps the definition
     // with STATICMETH (it is the only place that sees "Declare STATIC Sub" in the type body);
     // gathered here so a call through an OBJECT EXPRESSION can skip evaluating the object.
@@ -36818,7 +36819,27 @@ begin
       // alone left the backing untouched, so the callee's changes vanished the moment the caller read
       // the variable again - silently, and only for SHARED arguments. That is what made a bignum's
       // limb COUNT stop updating in pidigits while the limbs themselves updated fine.
-      if IsSharedScalar(ArgExpr.ValueUpper) then
+      // ⛔ ...AND A REFERENCE DOES NOT HOLD THE VALUE EITHER: its register carries the TARGET's address.
+      // Copying the callee's final value into it overwrote the address and left the target alone -
+      // "Var ByRef ri = i : fByref( ri )" printed i unchanged (fbc's dim/byref.bas). Written THROUGH it.
+      if IsRefVar(ArgExpr.ValueUpper) then
+      begin
+        case RT of
+          srtInt:    TmpName := '__BRWTMP%';
+          srtString: TmpName := '__BRWTMP$';
+        else         TmpName := '__BRWTMP!';
+        end;
+        EmitXferLoad(RT, Slot, GetOrAllocateVariable(TmpName));
+        case RT of
+          srtFloat:  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), RefVarAddrValue(ArgExpr.ValueUpper),
+                                     GetOrAllocateVariable(TmpName), MakeSSAValue(svkNone));
+          srtString: EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), RefVarAddrValue(ArgExpr.ValueUpper),
+                                     GetOrAllocateVariable(TmpName), MakeSSAValue(svkNone));
+        else         EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), RefVarAddrValue(ArgExpr.ValueUpper),
+                                     GetOrAllocateVariable(TmpName), MakeSSAValue(svkNone));
+        end;
+      end
+      else if IsSharedScalar(ArgExpr.ValueUpper) then
       begin
         case RT of
           srtInt:    TmpName := '__BRWTMP%';
@@ -41922,7 +41943,13 @@ begin
           (Node.GetChild(0).NodeType = antIdentifier) then
   begin
     LhsU := Node.GetChild(0).ValueUpper;
-    ConsiderRaw(LhsU, Node.GetChild(2));
+    // ⛔ ...BUT A REFERENCE IS NOT A POINTER. Its initializer is written "@target", and inside a
+    // procedure the target is a raw-backed @-taken local, so the "p = @x" rule marked the REFERENCE raw:
+    // "ri + 2" was then scaled as pointer arithmetic, and "Dim ByRef ri As Integer = i : ri += 2" gave
+    // i + 16 (fbc's dim/byref.bas, 127 where fbc says 113). A reference reads and writes through the
+    // address it carries (IsRefVar, raw widths included); raw-ness is a question about POINTERS.
+    if Node.Attributes.Values['BYREF'] <> '1' then
+      ConsiderRaw(LhsU, Node.GetChild(2));
     // ⭐ ...AND A REFERENCE TO A RECORD THAT LIES IN C's MEMORY (or raw memory). "Dim ByRef As tm g =
     // *gmtime(@t)" bound g to the pointer's value as if it were a record HANDLE, and the first "g.field"
     // took the managed path with a C address and died. The bind already carries the address; what was
@@ -43025,6 +43052,30 @@ begin
   if AddrNd <> nil then
   begin
     try EmitArrayElementAddress(AddrNd, Result); finally AddrNd.Free; end;
+    Exit;
+  end;
+  // ⭐ "@(p1( ))" WHERE p1 IS "As Function( ) ByRef As T": not an array element, a CALL - and the call
+  // hands back the referand's address, which is the answer. fbc's dim/byref.bas asserts "@(p1( )) = @i".
+  // ⛔ Asked FIRST, before any rung that reads the name as an array: at module level p1 has a backing
+  // array of its own, so the "declared array" rung answered the address of p1's OWN cell (element 0,
+  // "@(p1( )) = @i" false) - and inside a procedure the ladder fell off the end with "Cannot take
+  // address of element of undeclared array: P1". SHAREDELEM is the synthetic read of that backing.
+  if (Node.GetChild(0).NodeType = antIdentifier) and (Node.Attributes.Values['SHAREDELEM'] <> '1') and
+     (FFuncPtrSigs.IndexOfName(Node.GetChild(0).ValueUpper) >= 0) and
+     (Copy(FFuncPtrSigs.Values[Node.GetChild(0).ValueUpper],
+           Length(FFuncPtrSigs.Values[Node.GetChild(0).ValueUpper]) - 5, 6) = '|BYREF') then
+  begin
+    FWantByrefRetAddr := True;
+    try
+      if Node.ChildCount >= 2 then
+        Result := EmitFuncPtrCall(Node.GetChild(0).ValueUpper, FFuncPtrSigs.Values[Node.GetChild(0).ValueUpper],
+                                  Node.GetChild(1))
+      else
+        Result := EmitFuncPtrCall(Node.GetChild(0).ValueUpper, FFuncPtrSigs.Values[Node.GetChild(0).ValueUpper], nil);
+    finally
+      FWantByrefRetAddr := False;
+    end;
+    Result := EnsureIntRegister(Result);
     Exit;
   end;
   // ⭐ "@x[1]" where x is a UDT with a BYREF index operator: the operator IS what names the place, and
@@ -44163,6 +44214,14 @@ begin
     // register over. Celling it would give the inner callee a pointer to a pointer.
     if IsAddrParam(VarToStr(ArgExpr.Value)) then
       Exit(EmitAddrParamRegister(VarToStr(ArgExpr.Value), Addr));
+    // ...and a REFERENCE hands over the address it CARRIES - the target's - not the address of its own
+    // cell: "Var ByRef ri = i : fByref( ri )" let the callee increment the reference's cell and left i
+    // alone (fbc's dim/byref.bas answers 112). The same answer "@ri" gives.
+    if IsRefVar(VarToStr(ArgExpr.Value)) then
+    begin
+      Addr := RefVarAddrValue(VarToStr(ArgExpr.Value));
+      Exit(True);
+    end;
     if EmitVarAddressIsReal(VarToStr(ArgExpr.Value)) then
     begin
       Addr := EmitVarAddress(VarToStr(ArgExpr.Value));
@@ -44565,7 +44624,14 @@ var
   ai: Integer;
 begin
   PCVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  if IsRawAddrLocal(FPName) then
+  // ⛔ A REFERENCE TO A FUNCTION POINTER ("Dim ByRef p2 As Function( ) ... = p1") carries p1's ADDRESS,
+  // not an entry PC: calling through it jumped to that address - the top of the module - and the program
+  // restarted for ever ("call:call:call:..."), fbc's dim/byref.bas. The entry PC is what p1 holds, so it
+  // is read THROUGH the reference first. Asked before the Shared branch, which would otherwise hand the
+  // reference's own home (the address) to the call as a PC.
+  if IsRefVar(FPName) then
+    EmitInstruction(ssaRefLoadInt, PCVal, RefVarAddrValue(FPName), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+  else if IsRawAddrLocal(FPName) then
     EmitInstruction(ssaRawLoadInt, PCVal, EnsureIntRegister(AddrLocalHandle(UpperFast(FPName))),
                     MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64))
   else if IsRawModuleScalar(FPName) then
@@ -44769,7 +44835,11 @@ var
   RetIsByref: Boolean;
   RT, RetRT: TSSARegisterType;
   ArgVal, PCVal, AddrVal: TSSAValue;
+  WantAddr: Boolean;
 begin
+  // Taken and CLEARED at once: an argument may itself be an indirect ByRef call, whose VALUE is wanted.
+  WantAddr := FWantByrefRetAddr;
+  FWantByrefRetAddr := False;
   PCVal := PCValIn;
   Bar := Pos('|', Sig);
   RetPart := Copy(Sig, Bar + 1, MaxInt);
@@ -44826,6 +44896,12 @@ begin
   begin
     AddrVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitXferLoad(srtInt, XFER_RESULT_SLOT, AddrVal);
+    // "@(fp( ))" asks for the referand's ADDRESS - the very value that came back - not its content.
+    if WantAddr then
+    begin
+      Result := AddrVal;
+      Exit;
+    end;
     Result := MakeSSARegister(RetRT, FProgram.AllocRegister(RetRT));
     case RetRT of
       srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
