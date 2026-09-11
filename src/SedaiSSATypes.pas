@@ -1081,6 +1081,11 @@ begin
           (T = 'INT32') or (T = 'UINT32') then Sz := 4
   else if (T = 'INTEGER') or (T = 'UINTEGER') or (T = 'LONGINT') or
           (T = 'ULONGINT') or (T = 'DOUBLE') then Sz := 8
+  // ⭐ CVA_LIST, fbc's own variadic list type, is the C ABI's va_list: on SysV x86-64 a STRUCTURE of 24
+  // bytes (gp_offset, fp_offset, two pointers), on Win64 a pointer. Here its VALUE is an integer cursor
+  // into the call's staged arguments, but its SIZE is the ABI's - every C struct that holds a va_list is
+  // laid out around it (crt.bi, curses.bi, freetype2: SizeOf(va_list) 8 where fbc says 24). DIVERGENZE 291.
+  else if T = 'CVA_LIST' then Sz := {$IFDEF WINDOWS}8{$ELSE}24{$ENDIF}
   else
     Result := False;
 end;

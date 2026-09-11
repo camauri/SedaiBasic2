@@ -3545,7 +3545,32 @@ begin
   // Ptr)" in the manual's own printf example - is two juxtaposed identifiers that die on "Expected ')'".
   // Fold it into the single "ZSTRING PTR" identifier the rest of the pipeline uses for pointer types,
   // exactly as SIZEOF(<type> PTR) already does.
-  if (FuncName = kCVAARG) and ModernMode and (not Context.Check(ttDelimParClose)) then
+  // ⭐ OFFSETOF(T, <field>) names a FIELD as its second argument, and a field may carry ANY word fbc lets it
+  // carry - "window", "class", "data", "next", "width"... (DIVERGENZE 290, measured word by word by
+  // job/tests/tools/reserved_words/field_probe.sh: 138 of them were a syntax error here, and "width",
+  // "color", "base" read as their BUILTIN and answered 0). Followed by ")" the word cannot be anything
+  // but the field's name; the SSA asks the TYPE, as it already did for "time" and "pos" (277).
+  // ⚠️ Only here: "f(x, rnd)" elsewhere must keep meaning the function RND.
+  if (FuncName = 'OFFSETOF') and (not Context.Check(ttDelimParClose)) then
+  begin
+    Indices := TASTNode.Create(antExpressionList);
+    Indices.AddChild(ParseExpression);                         // the TYPE
+    if Context.Check(ttSeparParam) then
+    begin
+      Context.Advance;                                         // ','
+      if (Length(VarToStr(Context.CurrentToken.Value)) > 0) and
+         (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_']) and
+         Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParClose) then
+      begin
+        Indices.AddChild(TASTNode.CreateWithValue(antIdentifier,
+                         UpperCase(VarToStr(Context.CurrentToken.Value)), Context.CurrentToken));
+        Context.Advance;
+      end
+      else
+        Indices.AddChild(ParseExpression);
+    end;
+  end
+  else if (FuncName = kCVAARG) and ModernMode and (not Context.Check(ttDelimParClose)) then
   begin
     Indices := TASTNode.Create(antExpressionList);
     Indices.AddChild(ParseExpression);                         // the CVA_LIST cursor

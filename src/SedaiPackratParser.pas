@@ -5978,7 +5978,9 @@ begin
     // the members came out FLAT, so they were laid out one after another instead of overlapping -
     // OffsetOf(MyType, i) answered 16 where fbc says 8, SizeOf 24 where fbc says 16, and writing one
     // member did not change the other. Each block now gets an id that every field inside carries.
-    if Context.Check(ttUnionDecl) then
+    // ...but "union as long" is a FIELD called union, as fbc reads it (DIVERGENZE 290, field_probe.sh).
+    if Context.Check(ttUnionDecl) and
+       not (Assigned(Context.PeekNext) and SameText(VarToStr(Context.PeekNext.Value), 'AS')) then
     begin
       // ⛔ A NAMED nested block declares a TYPE OF ITS OWN ("Union U ... End Union" then "m As U"),
       // and this model flattens the members into the enclosing type instead. Accepting the name
@@ -6133,7 +6135,11 @@ begin
     // String"). Like DECLARE'd methods they are defined out-of-line (SUB Type.method), so skip the whole
     // declaration line here — otherwise the field grammar below would take the keyword as a field name
     // and choke on its "()" parameter list (which ParseDimensionList reads as empty array dimensions).
-    if (TokU = kCONSTRUCTOR) or (TokU = kDESTRUCTOR) or (TokU = kOPERATOR) or (TokU = kPROPERTY) then
+    // ⛔ ...UNLESS "AS" FOLLOWS: then the word is a FIELD's name ("property as CARD32" in X11's
+    // xDeletePropertyReq, "constructor as function(...)" in GLib's GObjectClass), and skipping the line
+    // dropped the field from the layout - SizeOf 8 where fbc says 12 (DIVERGENZE 290).
+    if ((TokU = kCONSTRUCTOR) or (TokU = kDESTRUCTOR) or (TokU = kOPERATOR) or (TokU = kPROPERTY)) and
+       not (Assigned(Context.PeekNext) and SameText(VarToStr(Context.PeekNext.Value), 'AS')) then
     begin
       // Conservative on purpose: the line is skipped whole, so which operator it is cannot be told
       // apart here. Saying "this type has something that takes a THIS" costs at most the raw-storage
@@ -15718,7 +15724,15 @@ var
   // open-addressing probe, the innermost loop of the program, "p = (p + 1) And TMASK" came out as
   // AddInt, IntToFloat, FloatToInt, BitwiseAnd. fbc types that CONST as an integer, and so do we now.
   var
-    L, R: string;
+    L, R, Fn: string;
+    I64: Int64;
+
+    function IsIntName(const S: string): Boolean;
+    begin
+      Result := (S = 'LONGINT') or (S = 'LONG') or (S = 'INTEGER') or (S = 'ULONG') or (S = 'ULONGINT') or
+                (S = 'UINTEGER') or (S = 'SHORT') or (S = 'USHORT') or (S = 'BYTE') or (S = 'UBYTE');
+    end;
+
   begin
     Result := 'DOUBLE';
     if V = nil then Exit;
@@ -15729,9 +15743,39 @@ var
       else if (Pos('.', VarToStr(V.Value)) > 0) or
               (Pos('E', V.ValueUpper) > 0) then
         Result := 'DOUBLE'
+      // ⭐ A DECIMAL literal takes the first type of fbc's ladder Long -> ULong -> LongInt -> ULongInt that
+      // holds it, so "Const T3 = 4294967295" is a ULONG and prints with no sign column (DIVERGENZE 295,
+      // GL_INVALID_INDEX). The same test PRINT applies to a bare literal: the token must BE the number (a
+      // synthesized literal borrows a neighbour's token) and not a base literal (&H.. is not on the ladder).
+      else if Assigned(V.Token) and (not V.Token.BasePrefixed) and
+              TryStrToInt64(Trim(VarToStr(V.Token.Value)), I64) and
+              (I64 = StrToInt64Def(Trim(VarToStr(V.Value)), I64 + 1)) and
+              (I64 >= Int64(2147483648)) and (I64 <= Int64(4294967295)) then
+        Result := 'ULONG'
       else
         Result := 'LONGINT';
       Exit;
+    end;
+    // ⭐ A CONVERSION FUNCTION NAMES THE TYPE OF ITS RESULT, as a CAST does (below). "Const _TRUNCATE =
+    // CUInt(-1)" is an unsigned 64-bit value in fbc - 18446744073709551615 - and here it fell to the DOUBLE
+    // default and printed -1 (DIVERGENZE 295: win/crtdefs.bi, GL_TIMEOUT_IGNORED, ULONG_LONG_MAX).
+    if (V.NodeType in [antFunctionCall, antArrayAccess]) then
+    begin
+      Fn := V.ValueUpper;
+      if (Fn = '') and (V.ChildCount >= 1) and (V.GetChild(0).NodeType = antIdentifier) then
+        Fn := V.GetChild(0).ValueUpper;
+      if Fn = 'CUINT' then Exit('UINTEGER');
+      if Fn = 'CULNGINT' then Exit('ULONGINT');
+      if Fn = 'CULNG' then Exit('ULONG');
+      if Fn = 'CUSHORT' then Exit('USHORT');
+      if Fn = 'CUBYTE' then Exit('UBYTE');
+      if Fn = 'CINT' then Exit('INTEGER');
+      if Fn = 'CLNG' then Exit('LONG');
+      if Fn = 'CLNGINT' then Exit('LONGINT');
+      if Fn = 'CSHORT' then Exit('SHORT');
+      if Fn = 'CBYTE' then Exit('BYTE');
+      if Fn = 'CSNG' then Exit('SINGLE');
+      if Fn = 'CDBL' then Exit('DOUBLE');
     end;
     if ValueIsString(V) then Exit('STRING');
     // A CONST already declared above this one answers with the type IT was given.
@@ -15760,7 +15804,9 @@ var
             L := InferConstTypeName(V.GetChild(0));
             R := InferConstTypeName(V.GetChild(1));
             if (L = 'STRING') or (R = 'STRING') then Result := 'STRING'
-            else if (L = 'LONGINT') and (R = 'LONGINT') then Result := 'LONGINT'
+            // ...two INTEGER operands of any width stay an integer: a ULONG literal or a CUInt() on
+            // one side (295) must not turn "TSIZE - 1" back into a Double.
+            else if IsIntName(L) and IsIntName(R) then Result := 'LONGINT'
             else Result := 'DOUBLE';
           end;
       end;

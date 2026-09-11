@@ -156,6 +156,7 @@ type
     IsZString: Boolean;     // ZSTRING field: like a WSTRING it keeps VARIABLE-length semantics (no padding
                             // to StrCapacity, LEN is the content length) and occupies n bytes in the C
                             // layout -- not n+1: for a ZSTRING the terminator is inside the declared n
+    IsCvaList: Boolean;     // DIVERGENZE 291: a CVA_LIST field - the ABI's va_list, 24 bytes on SysV x86-64
     IsBoolean: Boolean;     // BOOLEAN field. It has no WIDTH CODE - a Boolean is not a narrowed integer,
                             // it is its own type - so the declared type had to be remembered outright:
                             // without it "Print obj.flag" answered -1 where fbc prints "true", and
@@ -8948,8 +8949,13 @@ begin
                                         '- a bit field has no address', [ArrName2, FUDTs[RecUDTIdx].Name]);
             if RecFieldIdx >= 0 then
             begin
+              // ⛔ NOT every member of a union begins at byte 0: the members of an ANONYMOUS "Type ... End
+              // Type" inside it follow each other - "union _LARGE_INTEGER : type : LowPart As DWORD :
+              // HighPart As LONG : end type : ..." has HighPart at 4, and this answered 0 for it while the
+              // BYTES were right (ComputeUDTLiveLayout stamps the offset; a write to QuadPart read back 7 and
+              // 5 as fbc does). The live layout's offset is the answer. DIVERGENZE 294.
               if FUDTs[RecUDTIdx].IsUnion then
-                ValCode := 0                        // every member of a union begins at byte 0
+                ValCode := FUDTs[RecUDTIdx].Fields[RecFieldIdx].ByteOffset
               else if UDTCLayout(RecUDTIdx, RecLayoutOfs, RecLayoutSize, True) then   // OFFSETOF reports
                 ValCode := RecLayoutOfs[RecFieldIdx]
               else
@@ -27526,6 +27532,10 @@ begin
   // holding a Boolean was the wrong size and every field after it sat at the wrong offset.
   // (fbc: SizeOf(Boolean) = 1, and a Boolean member is byte-aligned like a Byte.)
   if F.IsBoolean then begin Size := 1; Align := 1; Exit; end;
+  // ⭐ A CVA_LIST FIELD IS THE ABI's va_list: a 24-byte structure aligned to 8 on SysV x86-64, a pointer on
+  // Win64. Its VALUE here is still the 8-byte cursor our variadic model keeps (it sits at the start of
+  // the reserved bytes); the SIZE is what a C struct around it is laid out with. DIVERGENZE 291.
+  if F.IsCvaList then begin Size := {$IFDEF WINDOWS}8{$ELSE}24{$ENDIF}; Align := 8; Exit; end;
   Size := BinaryElemBytesOfWidthCode(F.WidthCode);
   Align := Size;
 end;
@@ -27583,6 +27593,30 @@ var
   Sz, Al: Int64;
 begin
   Size := 0; Align := 1;
+  // ⭐ A UNION HAS A SHAPE TOO (DIVERGENZE 292). UDTCLayout declines a union (its members overlap: there is
+  // no sequential image to report), so a union-typed MEMBER had no shape and fell to the 8-byte handle,
+  // and the container fell back to eight bytes per field: "k As Long : u As U : z As Short" measured 24
+  // with z at 16 where fbc says 12 and 8 - SQL_INTERVAL_STRUCT's intval, every LARGE_INTEGER member.
+  // The live layout has already placed each member (an anonymous struct's members one after another,
+  // everything else at 0), so the union ends where its furthest member ends, rounded to its widest
+  // alignment. ⚠️ Not LiveBytes: a member that keeps a handle has its slot in a side region AFTER the image.
+  if FUDTs[UDTIdx].IsUnion then
+  begin
+    for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    begin
+      if ReportShape then UDTFieldReportShape(UDTIdx, i, Sz, Al)
+      else UDTFieldCShape(UDTIdx, i, Sz, Al);
+      if (FUDTs[UDTIdx].FieldAlign > 0) and (Al > FUDTs[UDTIdx].FieldAlign) then
+        Al := FUDTs[UDTIdx].FieldAlign;
+      if Al > Align then Align := Al;
+      if FUDTs[UDTIdx].Fields[i].ByteOffset + Sz > Size then
+        Size := FUDTs[UDTIdx].Fields[i].ByteOffset + Sz;
+    end;
+    if Align < 1 then Align := 1;
+    if (Size mod Align) <> 0 then Size := Size + (Align - (Size mod Align));
+    Result := Size > 0;
+    Exit;
+  end;
   Result := UDTCLayout(UDTIdx, Offs, Size, ReportShape) and (Size > 0);
   if not Result then Exit;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
@@ -31169,6 +31203,7 @@ begin
       FUDTs[Idx].Fields[n].IsWString := (TypeName = 'WSTRING');  // codepoint LEN/MID on obj.field
       FUDTs[Idx].Fields[n].IsZString := (TypeName = 'ZSTRING');  // variable-length, n bytes in C
       FUDTs[Idx].Fields[n].IsBoolean := (CanonicalType(TypeName) = 'BOOLEAN');
+      FUDTs[Idx].Fields[n].IsCvaList := (CanonicalType(TypeName) = 'CVA_LIST');   // 291
       // "As String * n" capacity: the C layout uses it (see UDTCLayout) AND the field's storage is
       // padded to it, exactly as a fixed-length scalar's is (see TryFixedLenStore's header comment).
       FUDTs[Idx].Fields[n].StrCapacity := StrToIntDef(FieldNode.Attributes.Values['FIXEDLEN'], 0);
