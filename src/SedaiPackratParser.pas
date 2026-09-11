@@ -13044,6 +13044,12 @@ begin
   else if Context.Check(ttIdentifier) then
     Result := ParseFileHandleIdent
   else if Context.Check(ttDelimParOpen) then
+    Result := FoldFileHandlePostfix(FExpressionParser.ParseExpression(precCall))
+  // ⭐ ...and a DEREFERENCE, the fourth spelling: "Write #*CPtr(Integer Ptr, file), s" is how the libffi
+  // examples of fbc's manual pass a file number through a user-data pointer (DIVERGENZE 255). At operand
+  // position '*' can only be the prefix dereference; the same precedence as the parenthesised form reads
+  // "*CPtr(...)" and stops at the comma.
+  else if Context.Check(ttOpMul) then
     Result := FoldFileHandlePostfix(FExpressionParser.ParseExpression(precCall));
 end;
 

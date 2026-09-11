@@ -3191,6 +3191,17 @@ begin
   begin
     begin
       Context.Advance;                        // SUB / FUNCTION
+      // ⛔ ...AND A CALLING CONVENTION MAY STAND BEFORE THE PARAMETER LIST, as TryParseProcPtrType already
+      // knows for DIM and parameters: "CPtr(Sub CDecl(), f)" is the FFI_FN macro of ffi.bi, and the
+      // convention was taken for the start of the type's token run - the parentheses were never
+      // consumed and the comma never found (DIVERGENZE 254). One internal convention: skipped here too.
+      while Context.Check(ttIdentifier) and
+            ((SameText(VarToStr(Context.CurrentToken.Value), 'CDECL')) or
+             (SameText(VarToStr(Context.CurrentToken.Value), 'STDCALL')) or
+             (SameText(VarToStr(Context.CurrentToken.Value), 'PASCAL')) or
+             (SameText(VarToStr(Context.CurrentToken.Value), 'FASTCALL')) or
+             (SameText(VarToStr(Context.CurrentToken.Value), 'THISCALL'))) do
+        Context.Advance;
       if Context.Check(ttDelimParOpen) then
       begin
         Depth := 1;
