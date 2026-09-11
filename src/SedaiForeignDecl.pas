@@ -64,6 +64,14 @@ function ForeignCallbackSig(const ATypeName: string;
                             out ARet: TForeignKind; out AArgs: array of TForeignKind;
                             out ANArgs: Integer): Boolean;
 
+{ ⭐ A pointer parameter handed the address of a NARROW value the VM keeps in an 8-byte cell (DIVERGENZE
+  247). The call site writes it as "W<k>:<declared type>", k the width code of what the program declared
+  (1=s8 2=u8 3=s16 4=u16 5=s32 6=u32 7=single). Answers k, or 0 for every other type name. }
+function ForeignNarrowCode(const ATypeName: string): Integer;
+
+{ Bytes of one C element for a narrow width code: 1, 1, 2, 2, 4, 4, 4; 0 for anything else. }
+function ForeignNarrowBytes(ACode: Integer): Integer;
+
 { How many bytes the kind occupies, for the buffer an argument is marshalled into. }
 function ForeignKindSize(AKind: TForeignKind): Integer;
 
@@ -156,6 +164,27 @@ begin
   Result := True;
 end;
 
+function ForeignNarrowCode(const ATypeName: string): Integer;
+var
+  T: string;
+begin
+  Result := 0;
+  T := TrimLeft(ATypeName);
+  if (Length(T) >= 3) and ((T[1] = 'W') or (T[1] = 'w')) and (T[2] in ['1'..'7']) and (T[3] = ':') then
+    Result := Ord(T[2]) - Ord('0');
+end;
+
+function ForeignNarrowBytes(ACode: Integer): Integer;
+begin
+  case ACode of
+    1, 2:    Result := 1;
+    3, 4:    Result := 2;
+    5, 6, 7: Result := 4;
+  else
+    Result := 0;
+  end;
+end;
+
 function ForeignKindOf(const ATypeName: string): TForeignKind;
 var
   T: string;
@@ -169,6 +198,11 @@ begin
   // own "as function(...)": that one is deliberately discarded (see the note on the scanner), and the
   // procedure that will actually run is the one whose banks must be staged.
   if Copy(T, 1, 6) = 'FNPTR:' then Exit(fkPointer);
+  // ⭐ ...and "REC:<declared type>" is a pointer parameter handed the address of a BASIC RECORD: the call
+  // site knows it statically, the runtime cannot tell a record handle from a small integer (DIVERGENZE 245).
+  if Copy(T, 1, 4) = 'REC:' then Exit(fkPointer);
+  // ...and "W<k>:<declared type>" one handed the address of a NARROW value (DIVERGENZE 247).
+  if ForeignNarrowCode(T) > 0 then Exit(fkPointer);
   // A POINTER is a pointer whatever it points at, and the suffix can repeat ("Any Ptr Ptr").
   if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then Exit(fkPointer);
   if (T = 'ANY') then Exit(fkPointer);           // "As Any" only ever appears as a pointer here

@@ -157,7 +157,10 @@ begin
   if Pos('.dll', LowerCase(AName)) > 0 then Exit;
   {$ENDIF}
 
-  // 2. The SONAME. On Windows the same idea wears a different spelling: libffi-8.dll, libpng16-16.dll.
+  // 2. The SONAME. On Windows the same idea wears a different spelling: libffi-8.dll, libpng16-16.dll -
+  // and DirectX's own, with an underscore: `#inclib "d3dx9"` is what the FreeBASIC headers ask for,
+  // and the import library of that name (libd3dx9.dll.a) points at d3dx9_43.dll. There is no import
+  // library here to read, so the numbered name is searched like any other SONAME, newest first.
   {$IFDEF WINDOWS}
   Base := 'lib' + AName + '-';
   for v := MAX_SONAME_VERSION downto 0 do
@@ -165,6 +168,8 @@ begin
     Result := TryOpen(Base + IntToStr(v) + '.dll', Paths);
     if Result <> NilHandle then Exit;
     Result := TryOpen(AName + '-' + IntToStr(v) + '.dll', Paths);
+    if Result <> NilHandle then Exit;
+    Result := TryOpen(AName + '_' + IntToStr(v) + '.dll', Paths);
     if Result <> NilHandle then Exit;
   end;
   {$ELSE}

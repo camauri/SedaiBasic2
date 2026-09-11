@@ -833,6 +833,9 @@ type
                                 const ASig: string): Pointer;       // una procedura BASIC che C puo' chiamare
     function VMPointerForMachineAddr(ACtx: TExecutionContext; A: PtrUInt): Int64;  // ...e la strada inversa
     function ForeignPtrHome(ACtx: TObject; A: PtrUInt): Int64;   // la stessa, per la FFI
+    function ForeignRecBytes(ACtx: TObject; Value: Int64; out ALen: PtrUInt): Pointer;  // the C image of a record (DIVERGENZE 245)
+    function ForeignCellRun(ACtx: TObject; Value: Int64; out ACells: PtrUInt;
+                            out AIsFloat: Boolean): Pointer;   // the 8-byte cells of a narrow value (DIVERGENZE 247)
     procedure ForeignNoteRegion(ACtx: TObject; ABase, ALen: PtrUInt; AAdd, AWide: Boolean);
     function ForeignWideUnit(RawPtr: Int64; out PU: PWord; out AvailUnits: PtrUInt): Boolean;
     function ForeignRegionAddr(A, NeedBytes: PtrUInt; out AAvail: PtrUInt): Pointer;
@@ -6511,6 +6514,8 @@ begin
       T.MakeClosure := @ForeignMakeClosure;
       T.PtrHome := @ForeignPtrHome;
       T.NoteRegion := @ForeignNoteRegion;
+      T.RecBytes := @ForeignRecBytes;
+      T.CellRun := @ForeignCellRun;
       FForeignTable := T;
     finally
       LeaveCriticalSection(FWorkerLock);
@@ -7011,10 +7016,90 @@ begin
     if ForeignWideUnit(Tagged, PU, AvU) then Exit(Pointer(PU));
     Exit(Pointer(PtrUInt(Tagged and not FGNPTR_TAG)));
   end;
+  // ⭐ A record-FIELD pointer ("@b.y", RECPTR_TAG - the only NEGATIVE pointer value) names bytes of the
+  // record's live C image: C gets the field's own address (DIVERGENZE 245). BlockAddr refuses it, and
+  // the refusal below used to hand the tagged value over AS an address.
+  if Tagged < 0 then
+  begin
+    Result := ForeignRecBytes(ACtx, Tagged, AvU);
+    if Result <> nil then Exit;
+  end;
   try
     Result := BlockAddr(TExecutionContext(ACtx), Tagged, 1);
   except
     on ERangeError do Result := Pointer(PtrUInt(Tagged));
+  end;
+end;
+
+function TBytecodeVM.ForeignRecBytes(ACtx: TObject; Value: Int64; out ALen: PtrUInt): Pointer;
+// ⭐ THE C IMAGE OF A BASIC RECORD (DIVERGENZE 245): the machine address of TRecordStorage.Bytes - every
+// numeric field at its true offset, which is what a C struct pointer wants - and how many bytes follow.
+//   Value >= 0  a record HANDLE (the call site said so: "REC:"), the image from its first byte;
+//   Value <  0  a record-FIELD pointer (RECPTR_TAG), the image from that field's byte offset.
+// nil when the value names no record: an out-of-range handle is refused, never resolved blindly.
+// ⚠️ String fields are not in the image (they live in StringData): C sees the bytes of the layout, as
+// a C struct would, and nothing there is a string C could read.
+var
+  Ctx: TExecutionContext;
+  Handle: Int64;
+  Ofs: PtrUInt;
+  R: PRecordStorage;
+begin
+  Result := nil; ALen := 0;
+  Ctx := TExecutionContext(ACtx);
+  if Ctx = nil then Exit;
+  if Value < 0 then
+  begin
+    // The low field is (byte offset shl 4) or width code - see RECPTR_SLOT_BITS in SedaiSSATypes.
+    Ofs := PtrUInt(Value and RECPTR_SLOT_MASK) shr 4;
+    Handle := (Value shr RECPTR_SLOT_BITS) and RECPTR_INDEX_MASK;
+    if (Value and SHARED_REC_FLAG) <> 0 then Handle := Handle or SHARED_REC_FLAG;
+  end
+  else
+  begin
+    Ofs := 0;
+    Handle := Value;
+  end;
+  if (Handle and SHARED_REC_FLAG) <> 0 then
+  begin
+    if (Handle and SHARED_REC_MASK) > High(FSharedRecords) then Exit;
+  end
+  else if Handle > High(Ctx.Records) then Exit;
+  R := ResolveRec(Ctx, Handle);
+  if (R = nil) or (Ofs >= PtrUInt(Length(R^.Bytes))) then Exit;
+  ALen := PtrUInt(Length(R^.Bytes)) - Ofs;
+  Result := @R^.Bytes[Ofs];
+end;
+
+function TBytecodeVM.ForeignCellRun(ACtx: TObject; Value: Int64; out ACells: PtrUInt;
+  out AIsFloat: Boolean): Pointer;
+// ⭐ THE 8-BYTE CELLS OF A NARROW VALUE (DIVERGENZE 247): the element this VM pointer names, in an array
+// that keeps one Int64 (IntData) or one Double (FloatData) per element, and how many cells follow it to
+// the end of the storage. A scalar whose address is taken lives in exactly such a one-element array.
+// nil for everything that is ALREADY laid out as C reads it - a packed narrow array (ElemWidth > 0), the
+// raw heap, C's own memory - and for a record-field pointer: the marshaller then keeps the ordinary path.
+var
+  ArrayIdx: Integer;
+  Ofs: Int64;
+begin
+  Result := nil; ACells := 0; AIsFloat := False;
+  if (Value <= 0) or ((Value and (RAWPTR_TAG or FGNPTR_TAG)) <> 0) then Exit;
+  ArrayIdx := MapArrDyn(TExecutionContext(ACtx), (Value shr POINTER_ARRAY_SHIFT) - 1);
+  Ofs := Value and POINTER_OFFSET_MASK;
+  if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (Ofs < 0) then Exit;
+  if FArrays[ArrayIdx].ElemWidth <> 0 then Exit;            // packed: already C's layout
+  case FArrays[ArrayIdx].ElementType of
+    0: if Ofs < Length(FArrays[ArrayIdx].IntData) then
+       begin
+         ACells := PtrUInt(Length(FArrays[ArrayIdx].IntData) - Ofs);
+         Result := @FArrays[ArrayIdx].IntData[Ofs];
+       end;
+    1: if Ofs < Length(FArrays[ArrayIdx].FloatData) then
+       begin
+         ACells := PtrUInt(Length(FArrays[ArrayIdx].FloatData) - Ofs);
+         AIsFloat := True;
+         Result := @FArrays[ArrayIdx].FloatData[Ofs];
+       end;
   end;
 end;
 

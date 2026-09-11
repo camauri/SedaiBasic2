@@ -68,6 +68,23 @@ type
   TForeignRegionNote = procedure(ACtx: TObject; ABase, ALen: PtrUInt; AAdd, AWide: Boolean) of object;
   { AWide: the block is a WSTRING Windows handed back - UTF-16 units that the program counts as cells. }
 
+  { ⭐ THE ADDRESS OF A BASIC RECORD (DIVERGENZE 245). A record keeps a live C image of its numeric
+    fields, so C can be handed exactly the bytes it expects - but "@rec" is the record's HANDLE, a small
+    integer, and nothing at run time tells it from a MAKEINTRESOURCE number. The call site knows (the
+    parameter is written "REC:<type>"), and this answers the machine address of the image and how many
+    bytes follow it; nil when the value names no record. A record-FIELD pointer (RECPTR_TAG, negative)
+    is answered too, at its field's offset. }
+  TForeignRecResolver = function(ACtx: TObject; Value: Int64; out ALen: PtrUInt): Pointer of object;
+
+  { ⭐ THE 8-BYTE CELLS OF A NARROW VALUE (DIVERGENZE 247). A scalar whose address is taken, and an array
+    of SINGLE, keep one Int64 / Double per element whatever the declared width - so "sscanf("%d", @n)"
+    had C write four bytes into an eight-byte cell, and a "float*" read half a double. This answers the
+    run of cells from the pointed element to the end of its storage, and which bank they are in; nil when
+    the pointer does not name UNPACKED cells (a packed narrow array, raw memory, C's own memory, a record),
+    which are already laid out the way C reads them. }
+  TForeignCellResolver = function(ACtx: TObject; Value: Int64; out ACells: PtrUInt;
+                                  out AIsFloat: Boolean): Pointer of object;
+
   TForeignBinding = record
     Decl: TForeignDecl;
     ArgKinds: array of TForeignKind;
@@ -90,6 +107,8 @@ type
     FMakeClosure: TForeignClosureMaker; // optional: senza, un callback resta un PC che C non sa chiamare
     FPtrHome: TForeignPtrHome;          // optional: senza, un parametro d'uscita resta un indirizzo nudo
     FNoteRegion: TForeignRegionNote;    // optional: without it no C memory is ever readable
+    FRecBytes: TForeignRecResolver;     // optional: without it a record's address cannot reach C
+    FCellRun: TForeignCellResolver;     // optional: without it a narrow value's cells reach C at 8 bytes
     // ⛔⛔ ONE LOCK, AND IT COVERS PREPARATION ONLY. Two threads can reach the same foreign call for the
     // FIRST time at the same moment - a web request handler is exactly that shape - and preparation
     // opens libraries, resolves symbols and builds type descriptors, all of it writing shared state
@@ -118,6 +137,8 @@ type
     property MakeClosure: TForeignClosureMaker read FMakeClosure write FMakeClosure;
     property PtrHome: TForeignPtrHome read FPtrHome write FPtrHome;
     property NoteRegion: TForeignRegionNote read FNoteRegion write FNoteRegion;
+    property RecBytes: TForeignRecResolver read FRecBytes write FRecBytes;
+    property CellRun: TForeignCellResolver read FCellRun write FCellRun;
   end;
 
 { La mappa dai nostri tipi a quelli della ABI. ⛔ Esportata perche' chi costruisce una CHIUSURA ha
@@ -539,6 +560,23 @@ var
   RegW: array[0..63] of Integer;
   OutLoc: array[0..63] of Pointer;     // dove un parametro "T PTR PTR" tiene il suo puntatore
   NOut: Integer;
+  // ⭐ The records this call handed over (DIVERGENZE 245): the image's machine address and the VM value
+  // it came from. A returned pointer EQUAL to one comes home as that value - D3DXVec3Normalize answers
+  // its output argument, and "... = @v" must hold.
+  RecBase: array[0..63] of PtrUInt;
+  RecVM: array[0..63] of Int64;
+  NRec, r: Integer;
+  // ⭐ The NARROW values this call handed over (DIVERGENZE 247): each one travels as a copy at C's width,
+  // made from the program's 8-byte cells and written back into them after the call.
+  NTmp: array[0..63] of array of Byte;   // the copy C sees
+  NCell: array[0..63] of Pointer;        // the program's first cell (PInt64 or PDouble)
+  NCnt: array[0..63] of PtrUInt;         // how many cells were copied
+  NCode: array[0..63] of Integer;        // the width code (1..7)
+  NVM: array[0..63] of Int64;            // the VM pointer, to map a returned pointer back
+  NN, nwid: Integer;
+  nk: PtrUInt;
+  NIsF: Boolean;
+  NCode1: Integer;
   NReg: Integer;
   RetAddr: PtrUInt;
   Avail: PtrUInt;
@@ -585,7 +623,7 @@ begin
                                       [B^.Decl.Name, NArgs]);
   Prepare(B^);
 
-  SlotI := 0; SlotF := 0; NReg := 0; NOut := 0;
+  SlotI := 0; SlotF := 0; NReg := 0; NOut := 0; NRec := 0; NN := 0;
   FillChar(Buf, SizeOf(Buf), 0);
   for i := 0 to NArgs - 1 do
   begin
@@ -607,6 +645,34 @@ begin
           // ⭐ UN CALLBACK non e' un puntatore a dati: il valore nel banco intero e' il PC d'ingresso
           // di una procedura BASIC, e cio' che C vuole e' un indirizzo su cui saltare. La voce di
           // questo sito di chiamata lo dice scrivendo il parametro come "FNPTR:..." (DIVERGENZE 218).
+          // ⭐ A NARROW VALUE IN 8-BYTE CELLS (DIVERGENZE 247): the call site wrote "W<k>:" because the
+          // program declared a LONG / SHORT / SINGLE there, and C reads and writes that width. The cells
+          // are copied at C's width, C gets the copy, and the copy goes back after the call. Only when the
+          // pointer really names unpacked cells OF THE MATCHING BANK: anything else is already C's layout
+          // and keeps the ordinary path below.
+          NCode1 := 0;
+          if i <= High(B^.Decl.ParamTypeNames) then NCode1 := ForeignNarrowCode(B^.Decl.ParamTypeNames[i]);
+          if (NCode1 > 0) and Assigned(FCellRun) and (NN <= High(NTmp)) then
+          begin
+            P := FCellRun(ACtx, XferInt[SlotI], nk, NIsF);
+            if (P <> nil) and (nk > 0) and (NIsF = (NCode1 = 7)) then
+            begin
+              nwid := ForeignNarrowBytes(NCode1);
+              SetLength(NTmp[NN], nk * PtrUInt(nwid) + 8);    // a spare word: C may read one past the end
+              FillChar(NTmp[NN][0], Length(NTmp[NN]), 0);
+              case NCode1 of
+                1, 2: for r := 0 to Integer(nk) - 1 do NTmp[NN][r] := Byte(PInt64(P)[r]);
+                3, 4: for r := 0 to Integer(nk) - 1 do PWord(@NTmp[NN][0])[r] := Word(PInt64(P)[r]);
+                5, 6: for r := 0 to Integer(nk) - 1 do PLongWord(@NTmp[NN][0])[r] := LongWord(PInt64(P)[r]);
+                7:    for r := 0 to Integer(nk) - 1 do PSingle(@NTmp[NN][0])[r] := PDouble(P)[r];
+              end;
+              NCell[NN] := P; NCnt[NN] := nk; NCode[NN] := NCode1; NVM[NN] := XferInt[SlotI];
+              PPointer(Vals[i])^ := @NTmp[NN][0];
+              Inc(NN);
+              Inc(SlotI);
+              Continue;
+            end;
+          end;
           if (i <= High(B^.Decl.ParamTypeNames)) and Assigned(FMakeClosure) and
              (UpperCase(Copy(B^.Decl.ParamTypeNames[i], 1, 6)) = 'FNPTR:') then
           // ⛔⛔ NO Inc(SlotI) HERE: the one at the bottom of this arm counts every pointer, callbacks
@@ -614,10 +680,33 @@ begin
           // invisible to qsort, whose callback is the last argument, and gdi32 LineDDA handed its
           // callback an lParam of 0 (guard m907j, qsort_r).
             PPointer(Vals[i])^ := FMakeClosure(ACtx, XferInt[SlotI], B^.Decl.ParamTypeNames[i])
+          // ⭐ The address of a BASIC RECORD (DIVERGENZE 245): the call site marked it, because its value
+          // is a record HANDLE that no run-time test can tell from a number. C gets the record's C image.
+          // ⛔ A value that names no record is refused aloud: passing the handle on as an address is the
+          // access violation this entry was opened for.
+          else if Assigned(FRecBytes) and (XferInt[SlotI] <> 0) and
+                  ((XferInt[SlotI] and FGNPTR_TAG) = 0) and (i <= High(B^.Decl.ParamTypeNames)) and
+                  (UpperCase(Copy(B^.Decl.ParamTypeNames[i], 1, 4)) = 'REC:') then
+          begin
+            P := FRecBytes(ACtx, XferInt[SlotI], Avail);
+            if P = nil then
+              raise EForeignCallError.CreateFmt('%s: argument %d is the address of a record that does not exist',
+                                                [B^.Decl.Name, i + 1]);
+            PPointer(Vals[i])^ := P;
+            if NRec <= High(RecBase) then
+            begin
+              RecBase[NRec] := PtrUInt(P); RecVM[NRec] := XferInt[SlotI]; Inc(NRec);
+            end;
+          end
           else if Assigned(FResolvePtr) then
           begin
             P := FResolvePtr(ACtx, XferInt[SlotI]);
             PPointer(Vals[i])^ := P;
+            // ...and a record-FIELD pointer ("@v.y", negative) resolved to its field: remembered the same way.
+            if (P <> nil) and (XferInt[SlotI] < 0) and (NRec <= High(RecBase)) then
+            begin
+              RecBase[NRec] := PtrUInt(P); RecVM[NRec] := XferInt[SlotI]; Inc(NRec);
+            end;
             {$IFDEF WINDOWS}
             // ⭐ A WSTRING PTR argument over the program's own memory becomes a UTF-16 copy. The region
             // says how many cells there are: the copy has room for every one of them - two units for a
@@ -696,6 +785,21 @@ begin
   AbiCall(B^.Fn, B^.RetRef, Slice(B^.ArgRefs, NArgs), Slice(Vals, NArgs), @RetBuf[0]);
   if Assigned(FNoteRegion) then FgnNoteReleases(ACtx, B^.Decl.Symbol, @Vals[0], NArgs, FNoteRegion);
 
+  // ...and each narrow copy goes back into the program's cells at the program's width, SIGN-EXTENDED
+  // where the declared type is signed: -7 written by "%d" is -7 again, not 4294967289 (DIVERGENZE 247).
+  // Cells C did not touch round-trip unchanged: a narrow scalar is stored already narrowed, and a SINGLE
+  // already rounded to single precision.
+  for nwid := 0 to NN - 1 do
+    case NCode[nwid] of
+      1: for r := 0 to Integer(NCnt[nwid]) - 1 do PInt64(NCell[nwid])[r] := ShortInt(NTmp[nwid][r]);
+      2: for r := 0 to Integer(NCnt[nwid]) - 1 do PInt64(NCell[nwid])[r] := NTmp[nwid][r];
+      3: for r := 0 to Integer(NCnt[nwid]) - 1 do PInt64(NCell[nwid])[r] := SmallInt(PWord(@NTmp[nwid][0])[r]);
+      4: for r := 0 to Integer(NCnt[nwid]) - 1 do PInt64(NCell[nwid])[r] := PWord(@NTmp[nwid][0])[r];
+      5: for r := 0 to Integer(NCnt[nwid]) - 1 do PInt64(NCell[nwid])[r] := LongInt(PLongWord(@NTmp[nwid][0])[r]);
+      6: for r := 0 to Integer(NCnt[nwid]) - 1 do PInt64(NCell[nwid])[r] := PLongWord(@NTmp[nwid][0])[r];
+      7: for r := 0 to Integer(NCnt[nwid]) - 1 do PDouble(NCell[nwid])[r] := PSingle(@NTmp[nwid][0])[r];
+    end;
+
   {$IFDEF WINDOWS}
   // ...and each UTF-16 copy goes back into the program's cells: a surrogate pair becomes ONE character,
   // which is the whole difference from fbc's WSTRING on Windows (that one keeps the two units).
@@ -769,6 +873,28 @@ begin
         RetAddr := PtrUInt(ResInt);
         if ResInt <> 0 then
         begin
+          // ⭐ The address of a record this call handed over comes home as the value it left as - the
+          // handle, or the field pointer (DIVERGENZE 245). Only an EXACT match: a record handle has no
+          // offset to add, so an address inside the image keeps the machine path below.
+          for r := 0 to NRec - 1 do
+            if RetAddr = RecBase[r] then
+            begin
+              ResInt := RecVM[r];
+              Exit;
+            end;
+          // ...and a pointer INTO a narrow copy names an element of the program's own storage: the VM
+          // pointer counts ELEMENTS, so the byte delta is divided by C's width (DIVERGENZE 247).
+          for r := 0 to NN - 1 do
+          begin
+            nwid := ForeignNarrowBytes(NCode[r]);
+            if (nwid > 0) and (Length(NTmp[r]) > 0) and (RetAddr >= PtrUInt(@NTmp[r][0])) and
+               (RetAddr - PtrUInt(@NTmp[r][0]) <= NCnt[r] * PtrUInt(nwid)) and
+               (((RetAddr - PtrUInt(@NTmp[r][0])) mod PtrUInt(nwid)) = 0) then
+            begin
+              ResInt := NVM[r] + Int64((RetAddr - PtrUInt(@NTmp[r][0])) div PtrUInt(nwid));
+              Exit;
+            end;
+          end;
           {$IFDEF WINDOWS}
           // ⭐ A pointer INTO a UTF-16 copy (lstrcpyW answers its destination) names a cell of the
           // program's own WSTRING: count the characters in front of that unit, pairs as one.

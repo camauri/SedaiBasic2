@@ -684,6 +684,8 @@ type
     function ManagedPtrArithUDT(Node: TASTNode): string;          // pointee UDT of "p", "(p)", "p±n", "n+p" for a managed UDT pointer
     function ProcHasParamCount(const NameU: string; N: Integer): Boolean;
     function BasicProcCallbackSig(Node: TASTNode): string;   // "@proc" -> FNPTR:<ret>:<args>
+    function ForeignRecordArg(Node: TASTNode): Boolean;      // "@rec" / a UDT PTR -> a record handle (DIVERGENZE 245)
+    function ForeignNarrowArg(Node: TASTNode; out TypeU: string): Integer;  // "@n" of a narrow value -> width code (DIVERGENZE 247)
     function ProcPtrSigNameOfProc(const NameU: string): string;   // "SUB(BYTE)" / "FUNCTION(LONG)AS INTEGER"  // decl has exactly N parameters
     procedure PreProcessData(Node: TASTNode);  // Pre-scan AST to collect all DATA statements first
     procedure ProcessStatement(Node: TASTNode);
@@ -2558,6 +2560,139 @@ begin
   ParamList := Decl.GetChild(1);
   if (ParamList = nil) or (ParamList.NodeType <> antParameterList) then Exit;
   Result := ParamList.ChildCount = N;
+end;
+
+function TSSAGenerator.ForeignRecordArg(Node: TASTNode): Boolean;
+// ⭐ The ADDRESS OF A BASIC RECORD, handed to a pointer parameter of a C function (DIVERGENZE 245):
+// "memcpy(@b, @a, SizeOf(a))", "D3DXVec3Normalize(@v, @v)", a "T Ptr" variable or parameter.
+//
+// ⛔⛔ WHY IT HAS TO BE DECIDED HERE. In this VM "@rec" is the record's HANDLE - a small integer (1, 2,
+// ...), or for an element of an array of records the shared-region index with bit 62 set, which is
+// RAWPTR_TAG's own bit. At run time the marshaller cannot tell a handle from a number the program
+// meant as a pointer (MAKEINTRESOURCE(32512) is exactly that shape, and it must stay the number), nor a
+// shared handle from a byte-heap offset. It passed the handle AS an address: an access violation on
+// Linux and Windows alike, and the CRT deck never saw it because no probe gave C a record of its own.
+// ⇒ The call site writes the parameter as "REC:<type>" and the runtime hands C the record's live C
+// image (TRecordStorage.Bytes), which already holds every numeric field at its true offset.
+//
+// ⚠️ Only the forms whose VALUE is known to be a handle: "@<record variable>", "@<element of an array of
+// records>", and a MANAGED "T Ptr" name (a raw one carries a byte-heap or machine address and keeps its
+// own path). "@<proc>" is a callback and is answered by BasicProcCallbackSig, never here.
+var
+  Nm: string;
+  Child, Decl: TASTNode;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if Node.NodeType = antProcAddress then
+  begin
+    if Node.ChildCount = 0 then
+    begin
+      Nm := UpperFast(VarToStr(Node.Value));
+      if (Nm = '') or FProcDecls.TryGetValue(Nm, Decl) then Exit;
+      Result := VarRecordTypeName(Nm) <> '';
+    end
+    else
+    begin
+      Child := Node.GetChild(0);
+      while (Child.NodeType = antParentheses) and (Child.ChildCount >= 1) do Child := Child.GetChild(0);
+      Result := (Child.NodeType = antArrayAccess) and (ObjectTypeName(Child) <> '');
+    end;
+  end
+  else if Node.NodeType = antIdentifier then
+  begin
+    Nm := VarToStr(Node.Value);
+    Result := (PointerUDTType(Nm) <> '') and not IsRawPtr(Nm);
+  end;
+end;
+
+function TSSAGenerator.ForeignNarrowArg(Node: TASTNode; out TypeU: string): Integer;
+// ⭐ The address of a NARROW value handed to a C pointer parameter (DIVERGENZE 247): the width code of
+// what the program DECLARED there (1=s8 2=u8 3=s16 4=u16 5=s32 6=u32 7=single), or 0.
+//
+// ⛔ WHY. A scalar whose address is taken, and an array of SINGLE, keep one 8-byte cell per element
+// whatever the declared width, and nothing in the storage says what that width was. C reads and writes
+// the width IT declared: "sscanf("%d", @n)" wrote -7 into the low half of n's cell and n read 4294967289,
+// "%f" into a SINGLE wrote four bytes of a float into a double. Only the call site knows the declared
+// type of the argument, so it writes it into the entry ("W<k>:"), and the marshaller copies to C's width
+// and back.
+// ⚠️ This only ANNOUNCES a width. The runtime converts only when the pointer really names unpacked cells
+// of the matching bank (ForeignCellRun): a packed narrow array, raw memory and C's own memory already have
+// C's layout and keep their path, so a wrong guess here degrades to the old behaviour, never to a new one.
+var
+  Nm: string;
+  Child, Decl: TASTNode;
+  Idx, W: Integer;
+begin
+  Result := 0; TypeU := '';
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if Node.NodeType = antProcAddress then
+  begin
+    if Node.ChildCount = 0 then
+    begin
+      // "@n": the width the DIM filed for the name, read exactly as a STORE reads it (ApplyScalarNarrow:
+      // this procedure's own entry first, then the bare name) - the registry that already makes
+      // "n = 4000000000" wrap to a LONG. The same answer, from the same place.
+      Nm := UpperFast(VarToStr(Node.Value));
+      if (Nm = '') or FProcDecls.TryGetValue(Nm, Decl) then Exit;
+      Idx := -1;
+      if FInProcedure and (FCurrentProcName <> '') then
+        Idx := FVarWidthCode.IndexOf(FCurrentProcName + '|' + Nm);
+      if Idx < 0 then Idx := FVarWidthCode.IndexOf(Nm);
+      W := 0;
+      if Idx >= 0 then W := PtrInt(FVarWidthCode.Objects[Idx]);
+      // ⭐ ...and a scalar whose address is TAKEN is backed by a one-element array: its DIM files the
+      // width among that array's ELEMENT facts, which is where a store to it reads it too.
+      if W = 0 then
+      begin
+        Idx := FArrayElemWidth.IndexOf(ArrayFactKey(Nm));
+        if Idx >= 0 then W := PtrInt(FArrayElemWidth.Objects[Idx]);
+      end;
+      case W of
+        1: TypeU := 'BYTE';   2: TypeU := 'UBYTE';
+        3: TypeU := 'SHORT';  4: TypeU := 'USHORT';
+        5, 9: TypeU := 'LONG'; 6, 10: TypeU := 'ULONG';
+        7: TypeU := 'SINGLE';
+      end;
+    end
+    else
+    begin
+      // "@a(i)": the declared ELEMENT width, asked of the element itself - the array's NAME answers ''
+      // in DeclaredTypeNameOf, while Declared32Code reads the element facts (FArrayElemWidth) the
+      // storage was built from.
+      Child := Node.GetChild(0);
+      while (Child.NodeType = antParentheses) and (Child.ChildCount >= 1) do Child := Child.GetChild(0);
+      if (Child.NodeType = antArrayAccess) and (Child.ChildCount >= 1) and
+         (Child.GetChild(0).NodeType = antIdentifier) then
+        case Declared32Code(Child) of
+          1: TypeU := 'BYTE';   2: TypeU := 'UBYTE';
+          3: TypeU := 'SHORT';  4: TypeU := 'USHORT';
+          5, 9: TypeU := 'LONG'; 6, 10: TypeU := 'ULONG';
+          7: TypeU := 'SINGLE';
+        end;
+    end;
+  end
+  else if Node.NodeType = antIdentifier then
+  begin
+    // A MANAGED pointer variable: its value is an element pointer like "@a(i)". A raw one is bytes.
+    Nm := VarToStr(Node.Value);
+    if IsRawPtr(Nm) then Exit;
+    TypeU := ManagedPtrPointee(Nm);
+  end;
+  if GetEnvironmentVariable('FGNDIAG') = '1' then
+    WriteLn(ErrOutput, 'FGN narrow? node=', Ord(Node.NodeType), ' children=', Node.ChildCount,
+            ' value=', VarToStr(Node.Value), ' type=', TypeU);
+  if TypeU = '' then Exit;
+  TypeU := UpperFast(CanonicalType(UpperFast(TypeU)));
+  if TypeU = 'BYTE' then Result := 1
+  else if TypeU = 'UBYTE' then Result := 2
+  else if TypeU = 'SHORT' then Result := 3
+  else if TypeU = 'USHORT' then Result := 4
+  else if TypeU = 'LONG' then Result := 5
+  else if TypeU = 'ULONG' then Result := 6
+  else if TypeU = 'SINGLE' then Result := 7;
 end;
 
 function TSSAGenerator.BasicProcCallbackSig(Node: TASTNode): string;
@@ -16361,7 +16496,11 @@ begin
     P := ParamList.GetChild(i);
     if P.ValueUpper <> UpperFast(Name) then Continue;
     if P.ChildCount < 1 then Exit;
-    T := P.GetChild(0).ValueUpper;
+    // ⛔ THROUGH ITS TYPEDEF, as the prologue registers it (DIVERGENZE 246): the PRINT kind of "q[1]"
+    // asks here, and with the spelling "PL" (an alias of LONG PTR) it found no pointee - the element
+    // printed without its sign column, " 1020 30" where fbc prints " 10 20 30". Two readers of one fact.
+    if FuncPtrTypeSig(VarToStr(P.GetChild(0).Value)) <> '' then Exit;
+    T := UpperFast(CanonicalType(P.GetChild(0).ValueUpper));
     if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
       Result := Trim(Copy(T, 1, Length(T) - 4));
     Exit;
@@ -47775,7 +47914,7 @@ function TSSAGenerator.VariadicCallSiteDecl(const Decl: TForeignDecl; ArgListNod
 // is a hypothesis until a probe says so, and this one refused the most common idiom of the C library.
 var
   i, k: Integer;
-  Params, T, Line: string;
+  Params, T, Line, NarrowT: string;
 begin
   Params := '';
   for i := 0 to High(Decl.ParamTypeNames) do
@@ -47787,7 +47926,18 @@ begin
     T := '';
     if (ForeignKindOf(Decl.ParamTypeNames[i]) = fkPointer) and
        Assigned(ArgListNode) and (i < ArgListNode.ChildCount) then
+    begin
       T := BasicProcCallbackSig(ArgListNode.GetChild(i));
+      // ...and one handed the address of a BASIC RECORD says so, for the runtime cannot (DIVERGENZE 245).
+      if (T = '') and ForeignRecordArg(ArgListNode.GetChild(i)) then
+        T := 'REC:' + Decl.ParamTypeNames[i];
+      // ...and one handed the address of a NARROW value writes the width it was declared with (247).
+      if (T = '') then
+      begin
+        k := ForeignNarrowArg(ArgListNode.GetChild(i), NarrowT);
+        if k > 0 then T := 'W' + IntToStr(k) + ':' + Decl.ParamTypeNames[i];
+      end;
+    end;
     if T <> '' then Params := Params + T
     else Params := Params + Decl.ParamTypeNames[i];
   end;
@@ -47796,6 +47946,11 @@ begin
     T := BasicProcCallbackSig(ArgListNode.GetChild(i));
     if T <> '' then
       // gia' pronta: la coda variadica puo' portare un callback quanto un parametro dichiarato
+    else if ForeignRecordArg(ArgListNode.GetChild(i)) then
+      T := 'REC:ANY PTR'                   // a record's address, in the tail as anywhere (DIVERGENZE 245)
+    else if ForeignNarrowArg(ArgListNode.GetChild(i), NarrowT) > 0 then
+      // "sscanf(s, "%d", @n)": the tail is where C's out-parameters live (DIVERGENZE 247)
+      T := 'W' + IntToStr(ForeignNarrowArg(ArgListNode.GetChild(i), NarrowT)) + ':ANY PTR'
     else if VarArgIsAddress(ArgListNode.GetChild(i)) then
       T := 'ANY PTR'
     else
@@ -47846,6 +48001,7 @@ var
   StageRTs: array of TSSARegisterType;
   StageSlots: array of Integer;
   PtrReg: TSSAValue;
+  NarrowT: string;
 begin
   Result := False;
   ResultVal := MakeSSAValue(svkNone);
@@ -47886,10 +48042,13 @@ begin
   begin
     if NArgs > Length(Decl.ParamTypeNames) then NArgs := Length(Decl.ParamTypeNames);
     // ...e anche una chiamata NON variadica vuole la propria voce se le si passa una procedura BASIC:
-    // e' li' che la firma del callback viene scritta (DIVERGENZE 218).
+    // e' li' che la firma del callback viene scritta (DIVERGENZE 218). ...And so does one handed the
+    // address of a BASIC record: the entry is where "REC:" is written (DIVERGENZE 245).
     for i := 0 to NArgs - 1 do
       if (ForeignKindOf(Decl.ParamTypeNames[i]) = fkPointer) and
-         (BasicProcCallbackSig(ArgListNode.GetChild(i)) <> '') then
+         ((BasicProcCallbackSig(ArgListNode.GetChild(i)) <> '') or
+          ForeignRecordArg(ArgListNode.GetChild(i)) or
+          (ForeignNarrowArg(ArgListNode.GetChild(i), NarrowT) > 0)) then
       begin
         Idx := VariadicCallSiteDecl(Decl, ArgListNode, NArgs);
         Break;
@@ -48910,10 +49069,16 @@ begin
         // that both name a pointer param "buf" with different pointee banks don't collide (first-wins would
         // mistype the second — cf. scalar-type-collision). FUNCPTR/ADDRCARRIER/byref-return params carry a
         // scalar address and have no " PTR" suffix, so they are naturally excluded.
+        // ⛔ ...THROUGH ITS TYPEDEF, as the DIM path already does (RegisterPointerVars). "byval s As LPSTR"
+        // declares a ZSTRING PTR as surely as "byval s As ZString Ptr", but the test is on the SPELLING,
+        // so an aliased pointer parameter was never registered: "*s" read an INTEGER - "abc" printed
+        // 6513249 - and every Windows callback handed an LPSTR read a number (DIVERGENZE 246).
+        // A function-pointer alias keeps its own route (FFuncPtrSigs above) and is not data.
         if (ParamNodeJ.Attributes.Values['FUNCPTR'] <> '1') and
-           (ParamNodeJ.ChildCount >= 1) and (ParamNodeJ.GetChild(0).NodeType = antIdentifier) then
+           (ParamNodeJ.ChildCount >= 1) and (ParamNodeJ.GetChild(0).NodeType = antIdentifier) and
+           (FuncPtrTypeSig(VarToStr(ParamNodeJ.GetChild(0).Value)) = '') then
         begin
-          ParentType := ParamNodeJ.GetChild(0).ValueUpper;
+          ParentType := UpperFast(CanonicalType(ParamNodeJ.GetChild(0).ValueUpper));
           if (Length(ParentType) >= 4) and (Copy(ParentType, Length(ParentType) - 3, 4) = ' PTR') then
             FCurrentProcPtrParams.Values[ParamNodeJ.ValueUpper] :=
               Trim(Copy(ParentType, 1, Length(ParentType) - 4));
