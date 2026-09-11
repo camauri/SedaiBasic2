@@ -1076,8 +1076,11 @@ begin
   // SIZEOF(T) over a plain type, keep their existing paths.
   // ...and any WORD, not only an identifier token: a type named like a keyword ("Window") is lexed as the
   // keyword, and the gate kept it out of the branch that reads it as a name (DIVERGENZE 290).
+  // ⛔ ...but never a STRING LITERAL: its token's value is the text WITHOUT the quotes, so "hello" looks like
+  // a word, and "SizeOf( ""hello"" )" became the identifier HELLO (fbc suite: quirk/len-sizeof-udt-member).
   if (IdentName = 'SIZEOF') and Context.Check(ttDelimParOpen) and
-     Assigned(Context.PeekNext) and (Length(VarToStr(Context.PeekNext.Value)) > 0) and
+     Assigned(Context.PeekNext) and (Context.PeekNext.TokenType <> ttStringLiteral) and
+     (Length(VarToStr(Context.PeekNext.Value)) > 0) and
      (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) then
   begin
     Result := ParseSizeOfPtrType(Token);
@@ -2986,7 +2989,7 @@ begin
   // followed by ")" in MODERN is handed on as the NAME it is; the SSA asks whether it names a type or a
   // variable, exactly as it does for any SizeOf(x).
   // (Any word: "Time" is an IDENTIFIER token - the name of a function - and still names the type here.)
-  if ModernMode and
+  if ModernMode and (Context.CurrentToken.TokenType <> ttStringLiteral) and
      (Length(VarToStr(Context.CurrentToken.Value)) > 0) and
      (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_']) and
      Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParClose) then
@@ -3580,7 +3583,8 @@ begin
     Indices := TASTNode.Create(antExpressionList);
     // ...and the FIRST argument is a TYPE, which may be named like a keyword too: X11's "Screen" (SCREEN is
     // a graphics statement) - "offsetof(Screen, root)" was a syntax error. Followed by "," it is a name.
-    if (Length(VarToStr(Context.CurrentToken.Value)) > 0) and
+    if (Context.CurrentToken.TokenType <> ttStringLiteral) and
+       (Length(VarToStr(Context.CurrentToken.Value)) > 0) and
        (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_']) and
        Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttSeparParam) then
     begin
@@ -3593,7 +3597,8 @@ begin
     if Context.Check(ttSeparParam) then
     begin
       Context.Advance;                                         // ','
-      if (Length(VarToStr(Context.CurrentToken.Value)) > 0) and
+      if (Context.CurrentToken.TokenType <> ttStringLiteral) and
+         (Length(VarToStr(Context.CurrentToken.Value)) > 0) and
          (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_']) and
          Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParClose) then
       begin
