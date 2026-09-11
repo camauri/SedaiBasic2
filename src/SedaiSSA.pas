@@ -957,6 +957,7 @@ type
     function IsAddrParam(const Name: string): Boolean;                          // BYREF-return address-carrying param?
     function AddrParamBank(const Name: string): TSSARegisterType;               // pointee bank of an address param
     function IsRefVar(const Name: string): Boolean;                             // BYREF reference variable (auto-deref)?
+    function RefVarNarrowCode(const Name: string): Integer;                     // ...its raw width code, 0 = full width (DIVERGENZE 256)
     function RefVarBank(const Name: string): TSSARegisterType;                  // pointee bank of a reference variable
     function IsRawPtr(const Name: string): Boolean;                             // raw (Allocate-backed) pointer var?
     procedure CollectRawPtrVars(Node: TASTNode);                                // pre-scan: mark ptrs assigned from Allocate*
@@ -4335,6 +4336,14 @@ begin
         Left := EnsureIntRegister(GetOrAllocateVariable(VarName));
         FuncRetType := RefVarBank(VarName);
         Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
+        // ⭐ A NARROW reference reads its OWN width (DIVERGENZE 256): see RefVarNarrowCode.
+        if (RefVarNarrowCode(VarName) > 0) and (FuncRetType = srtFloat) then
+          EmitInstruction(ssaRawLoadFloat, Result, Left, MakeSSAValue(svkNone),
+                          MakeSSAConstInt(RefVarNarrowCode(VarName)))
+        else if (RefVarNarrowCode(VarName) > 0) and (FuncRetType = srtInt) then
+          EmitInstruction(ssaRawLoadInt, Result, Left, MakeSSAValue(svkNone),
+                          MakeSSAConstInt(RefVarNarrowCode(VarName)))
+        else
         case FuncRetType of
           srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -10096,6 +10105,24 @@ begin
   begin
     ProcessExpression(ExprNode, ExprValue);
     VarReg := EnsureIntRegister(GetOrAllocateVariable(VarName));   // the carried address
+    // ⭐ A NARROW reference writes its OWN width (DIVERGENZE 256): through ssaRawStore* the VM writes
+    // only the declared bytes of raw or C memory - the wide store overwrote the neighbours.
+    // ⚠️ Into a VM cell (a reference to an @-taken narrow scalar) the value is stored whole, as it was
+    // before: no wrap to the declared width there. Not a regression; noted in the ledger.
+    if (RefVarNarrowCode(VarName) > 0) and (RefVarBank(VarName) = srtFloat) then
+    begin
+      ExprValue := EnsureFloatRegister(ExprValue);
+      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue,
+                      MakeSSAConstInt(RefVarNarrowCode(VarName)));
+      Exit;
+    end;
+    if (RefVarNarrowCode(VarName) > 0) and (RefVarBank(VarName) = srtInt) then
+    begin
+      ExprValue := EnsureIntRegister(ExprValue);
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue,
+                      MakeSSAConstInt(RefVarNarrowCode(VarName)));
+      Exit;
+    end;
     case RefVarBank(VarName) of
       srtFloat:  begin ExprValue := EnsureFloatRegister(ExprValue);  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone)); end;
       srtString: begin ExprValue := EnsureStringRegister(ExprValue); EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone)); end;
@@ -34268,6 +34295,13 @@ begin
         if FRefVars.IndexOfName(VarName) < 0 then
           FRefVars.Add(VarName + '=' + TypeName);
         RegisterTypedVar(VarName, 'INTEGER');   // r holds an address -> int register
+        // ⭐ ...but it PRINTS as what it refers to (DIVERGENZE 256): a UByte reference is unsigned and
+        // takes no sign column. The register holds an address, and that is all RegisterTypedVar knew.
+        if FPreScanProcName <> '' then
+          SetPrintKindScoped(FPreScanProcName, VarName, TypeName)
+        else
+          SetNameEntryValue(FVarPrintKind, UpperFast(VarName),
+                            PrintKindOfType(UpperFast(CanonicalType(UpperFast(TypeName)))));
         Continue;
       end;
       // DIM name AS type  -> typed scalar (child[1] = antIdentifier type). M4.4b: a parameterised
@@ -39678,6 +39712,35 @@ begin
   Result := srtInt;
   idx := FRefVars.IndexOfName(UpperFast(Name));
   if idx >= 0 then Result := TypeNameToBank(FRefVars.ValueFromIndex[idx], Name);
+end;
+
+function TSSAGenerator.RefVarNarrowCode(const Name: string): Integer;
+// The raw width code of a reference variable whose declared type is NARROW (Byte..ULong, Single), or 0.
+//
+// ⛔⛔ WHY (DIVERGENZE 256). A reference's reads and writes were ssaRefLoad*/ssaRefStore*, which carry no
+// width: on raw memory a "Dim ByRef As UByte b = *p" read EIGHT bytes and a store through it overwrote
+// the seven after it - a silent corruption; on memory C owns a Long reference read the next field too.
+// A Long over a block whose upper bytes happened to be zero looked right, which is how it lived.
+// ⇒ A narrow reference is read and written through ssaRawLoad*/ssaRawStore* with this code. Those
+// already tell the three pointer domains apart (raw and C memory at the declared width, a record field
+// or an array element through PtrDomain*), so nothing new is needed in the VM or the engines.
+// ⚠️ 0 for everything eight bytes wide or not a number (Integer, Double, a pointer, a String, a UDT):
+// those keep the path they had.
+var
+  BlkKey, T: string;
+  idx: Integer;
+begin
+  Result := 0;
+  // The same scope rule as IsRefVar: an open block that declared the name owns the answer.
+  if BlockDeclaredHere(Name, BlkKey) then
+    idx := FRefVars.IndexOfName(BlkKey)
+  else
+    idx := FRefVars.IndexOfName(UpperFast(Name));
+  if idx < 0 then Exit;
+  T := UpperFast(CanonicalType(UpperFast(FRefVars.ValueFromIndex[idx])));
+  if (T = 'BYTE') or (T = 'UBYTE') or (T = 'BOOLEAN') or (T = 'SHORT') or (T = 'USHORT') or
+     (T = 'LONG') or (T = 'ULONG') or (T = 'SINGLE') then
+    Result := RawTypeCodeOfPointee(T);
 end;
 
 function TSSAGenerator.RawPtrMarkedHere(const NameU: string): Boolean;
