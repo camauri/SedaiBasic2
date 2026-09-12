@@ -471,12 +471,15 @@ raw bytes.
     answers the element at index 0 where every lower bound is zero (equal to `base_ptr`, as under fbc)
     and NULL otherwise, so a program that walks it with absolute indices fails immediately instead of
     reading the wrong array quietly.
-  - **A PER-INSTANCE UDT array member answers NULL** (ledger 305): `FBC.ArrayDescriptorPtr(x.a())`
-    where `a` is declared `Dim`/`ReDim` inside the type. Such a member's storage does not record the
-    same facts fbc's descriptor reports — its declared bounds are applied at the ACCESS rather than
-    stored — and answering some fields correctly beside others wrongly would be worse than not
-    answering. A **`Static`** member is a module array under its own dotted name and IS answered, flags
-    included. NULL is testable (`If ap Then ... Else`), which is how fbc's own tests are written.
+  - **On a ONE-dimensional UDT array member, `base_ptr` does not compare equal to `@x.a(lb)`** — it
+    does on a multi-dimensional one (ledger 305). `@x.a(2)` on a 1-D member encodes the DECLARED index
+    as its offset while the multi-dimensional path encodes the STORAGE index, and `base_ptr` is built
+    on the second convention. ⚠️ The pointer dereferences to the right element either way, so what
+    differs is two spellings of one address, not a wrong element. Every other field of a member's
+    descriptor — `size`, `element_len`, `dimensions`, `flags` and `dimTb()` — matches fbc, for
+    `(Any)`, concrete-bounds and `ReDim` members alike, before and after a `ReDim` and an `Erase`.
+  - **`SizeOf` of a type with a DYNAMIC array member is 8, not fbc's 72** (ledger 313). fbc puts its
+    array descriptor inside the record; this implementation holds a handle.
 - `Interface`, `Override` and `Final` do not exist in fbc; a MODERN source using them will not compile
   there. That is the point of an extension.
 - `Implements` exists in fbc as a reserved word with no effect. In MODERN it constrains: a type that
