@@ -1047,7 +1047,8 @@ type
     function RawElemSizeOfPointee(const PointeeType: string): Int64;             // SizeOf(scalar pointee) in bytes
     function TypeSizeBytes(const TypeName: string): Int64;                       // SizeOf(T) in bytes (FB sizes)
     procedure EmitRawAlloc(CallNode: TASTNode; out Result: TSSAValue);           // ALLOCATE/CALLOCATE/REALLOCATE → raw ptr
-    procedure EmitRawMemOp(const FuncU: string; ArgsNode: TASTNode; out Result: TSSAValue);  // FB_MEMCOPY/FB_MEMMOVE/CLEAR/FB_MEMCOPYCLEAR
+    procedure EmitRawMemOp(const FuncU: string; ArgsNode: TASTNode; out Result: TSSAValue;
+                           PtrForm: Boolean = False);  // FB_MEMCOPY/FB_MEMMOVE/CLEAR/FB_MEMCOPYCLEAR
     function TryEmitManagedRecordClear(ArgsNode: TASTNode): Boolean;  // CLEAR over a MANAGED record
     function TryEmitManagedMemCopy(ArgsNode: TASTNode; out Res: TSSAValue): Boolean;  // FB_MEMCOPY over MANAGED storage
     function IsAddrLocal(const Name: string): Boolean;                          // @-taken LOCAL (per-frame record-backed)?
@@ -2601,6 +2602,88 @@ function IfThenOp(Cond: Boolean; const WhenTrue, WhenFalse: TSSAOpCode): TSSAOpC
 // have to be split in two just to choose between the signed and the unsigned form of it.
 begin
   if Cond then Result := WhenTrue else Result := WhenFalse;
+end;
+
+function IsOurRuntimeForeignDecl(const Line: string): Boolean;
+// ⭐⭐ A DECLARATION OF THE FreeBASIC RUNTIME IS NOT A FOREIGN SYMBOL - it is a declaration of what
+// THIS ENGINE already is. `fbc-int/*.bi` declare their routines inside `extern "rtlib"`, and reading
+// those headers for real (12 Sep 2026) made every one of them a call into a `libfb` we do not ship:
+// "fbc.allocate(64)" became an FFI call to malloc, and "fbc.rnd()" was refused for passing no
+// argument to a declaration that has one (with a default we do not apply).
+// ⇒ Such a declaration is NOT REGISTERED. The call then falls through to the built-in of the same
+// name, which is what the program meant all along.
+//
+// ⛔⛔ THE KEY IS THE PAIR (NAME, ALIAS), AND IT HAS TO BE. The alias alone is not enough: `crt.bi`
+// declares `malloc` as MALLOC and `memcpy` as MEMCPY, and those ARE foreign calls - the CRT deck's 36
+// probes go through them. What tells the two apart is that fbc-int spells the same symbols under ITS
+// own names (ALLOCATE, MEMCOPY, ...). Matching on the alias alone would have taken CRT's away.
+// 🕳️ Deliberately absent, each for its reason: ARRAYDESCRIPTORPTR / ARRAYCONSTDESCRIPTORPTR and
+// RNDGETSTATE hand back fbc's INTERNAL shapes (the array descriptor, the PRNG state), which we do not
+// lay out; MATHLOCK, MATHUNLOCK and CPUDETECT are declared by the header but are not in fbc's own
+// runtime either - under fbc they fail at LINK ("Undefined symbol", "undefined reference to
+// fb_CpuDetect"), so refusing them is agreeing with the oracle. Measured, not assumed.
+var
+  p1, p2: Integer;
+  Nm, Alias_: string;
+begin
+  Result := False;
+  p1 := Pos('|', Line);
+  if p1 <= 1 then Exit;
+  Nm := UpperFast(Trim(Copy(Line, 1, p1 - 1)));
+  p2 := PosEx('|', Line, p1 + 1);
+  if p2 <= 0 then Exit;
+  Alias_ := Trim(Copy(Line, p1 + 1, p2 - p1 - 1));
+  case Nm of
+    'ALLOCATE':        Result := Alias_ = 'malloc';
+    'CALLOCATE':       Result := Alias_ = 'calloc';
+    'REALLOCATE':      Result := Alias_ = 'realloc';
+    'DEALLOCATE':      Result := Alias_ = 'free';
+    'CLEAR':           Result := Alias_ = 'memset';
+    'MEMCOPY':         Result := Alias_ = 'memcpy';
+    'MEMMOVE':         Result := Alias_ = 'memmove';
+    'COPYCLEAR':       Result := Alias_ = 'fb_MemCopyClear';
+    'ARRAYLEN':        Result := Alias_ = 'fb_ArrayLen';
+    'ARRAYSIZE':       Result := Alias_ = 'fb_ArraySize';
+    'RANDOMIZE':       Result := Alias_ = 'fb_Randomize';
+    'RND':             Result := Alias_ = 'fb_Rnd';
+  end;
+end;
+
+function RtlibBuiltinFor(const QualifiedU: string): string;
+// ⭐⭐ THE RUNTIME IS OURS EVEN WHERE fbc's HEADER DECLARES IT. `fbc-int/*.bi` declare their routines
+// inside `extern "rtlib"` - FreeBASIC's own runtime, which for a program running here is THIS ENGINE.
+// A declaration of one of them is a DECLARATION, not a foreign symbol: it must bind to the built-in we
+// already have, never become a call into a `libfb` we do not ship.
+//
+// Maps the qualified name to the BARE built-in, and '' when we do not implement it. Both the namespace
+// the header uses and the bare spelling are listed, because a program may have said "Using FBC".
+// ⚠️ fbc DECLARES more than its own runtime EXPORTS: `fbc.mathLock`, `fbc.mathUnlock` and
+// `fbc.CpuDetect` do not link even under fbc ("Undefined symbol", "undefined reference to
+// fb_CpuDetect"), so refusing them is what fbc does too - measured, not assumed.
+// 🕳️ Not here, and each with its reason: ArrayDescriptorPtr / ArrayConstDescriptorPtr (they hand back
+// fbc's INTERNAL array descriptor, a shape we do not lay out), rndGetState (same, for the PRNG state).
+begin
+  Result := '';
+  case QualifiedU of
+    'FB.ARRAYLEN',        'ARRAYLEN':        Result := 'ARRAYLEN';
+    'FB.ARRAYSIZE',       'ARRAYSIZE':       Result := 'ARRAYSIZE';
+    'FBC.ALLOCATE':       Result := 'ALLOCATE';
+    'FBC.CALLOCATE':      Result := 'CALLOCATE';
+    'FBC.REALLOCATE':     Result := 'REALLOCATE';
+    'FBC.DEALLOCATE':     Result := 'DEALLOCATE';
+    // ⛔ THE fbc-int MEMORY FAMILY TAKES POINTERS, and FB's own keywords take the target BYREF -
+    // the header says so itself, keeping the byref spellings commented out beside the live ones.
+    // Mapping them onto our byref built-ins made "fbc.clear(p, 7, 64)" clear the POINTER VARIABLE p
+    // (which is what fbc's byref Clear would do, and which this engine refuses by name). They get
+    // their own names, and EmitRawMemOp is told the addresses are already values.
+    'FBC.CLEAR':          Result := 'FBCPTR_CLEAR';
+    'FBC.MEMCOPY':        Result := 'FBCPTR_FB_MEMCOPY';
+    'FBC.MEMMOVE':        Result := 'FBCPTR_FB_MEMMOVE';
+    'FBC.COPYCLEAR':      Result := 'FBCPTR_FB_MEMCOPYCLEAR';
+    'FBC.RANDOMIZE':      Result := 'RANDOMIZE';
+    'FBC.RND':            Result := 'RND';
+    'FBC.RND32':          Result := 'RND32';
+  end;
 end;
 
 function RawCodeOfWidth(Bytes: Integer): Integer;
@@ -8475,6 +8558,36 @@ begin
         end;
 
         ArrName := VarToStr(Node.GetChild(0).Value);
+        // ⭐ A ROUTINE fbc's OWN HEADERS DECLARE IN `extern "rtlib"` IS OURS: the qualifier is dropped
+        // here, once, and every built-in branch below sees the bare name it already knows. Doing it at
+        // the name is what keeps this to one place instead of one branch per routine - and it is why
+        // "fb.ArrayLen" needed a special case before: the parser folds the dotted name into ONE
+        // identifier as soon as "Namespace FB" is real, so the qualified spelling arrives HERE.
+        // ⛔ Only when nothing of that name is declared: a program's own "fbc" namespace wins.
+        if FModernMode and (Pos('.', ArrName) > 0) and (ArrayIndexOf(ArrName) < 0) and
+           (RtlibBuiltinFor(UpperFast(ArrName)) <> '') then
+        begin
+          // ⚠️ ...EXCEPT THE TWO ARRAY ONES, which already have a branch of their own further down AND
+          // a rule that prints them UNSIGNED, keyed on the QUALIFIED spelling (fbc answers them as
+          // UInteger; the BARE arraylen/arraysize are an extension of ours and stay signed, because
+          // fbc refuses those and there is no oracle to conform to). Rewriting the node would make
+          // "fb.ArrayLen(a())" print " 10" where fbc prints "10".
+          if (UpperFast(ArrName) = 'FB.' + kARRAYLEN) or (UpperFast(ArrName) = 'FB.' + kARRAYSIZE) then
+          begin
+            ArrName := RtlibBuiltinFor(UpperFast(ArrName));   // the local only; the node keeps its name
+          end
+          else
+          begin
+            ArrName := RtlibBuiltinFor(UpperFast(ArrName));
+          // ⛔ THE NODE IS REWRITTEN, NOT ONLY THE LOCAL. Half the branches below read the name from
+          // the NODE (IsAllocCall does, and so do the UDT-temporary and image tests), so renaming only
+          // this variable moved some of them and not others: "fbc.allocate(64)" got past the foreign
+          // table and then died as "the procedure is declared and never defined", because the ALLOCATE
+          // branch was still looking at "FBC.ALLOCATE". Rewriting in place is what the type-constructor
+          // shorthand a few lines above does, and for the same reason.
+            Node.GetChild(0).Value := ArrName;
+          end;
+        end;
 
         // FreeBASIC's "Type( value )" shorthand whose type was INFERRED from the target, and the target
         // is a BUILT-IN type ("Dim x As Integer = Type( 1.5 )", "f = Type( 1.5 )"): there is no temporary
@@ -8558,6 +8671,62 @@ begin
           Exit;
         end;
 
+        // ⭐ fbc-int/math.bi's RND and RANDOMIZE, which arrive here as an ordinary CALL. Both are
+        // keywords elsewhere in this pipeline - RND is lowered from an antFunctionCall the parser
+        // builds, RANDOMIZE from an antRandomize STATEMENT - so the qualified spellings
+        // "fbc.rnd( n )" and "fbc.randomize( seed, alg )" reached neither. Renaming the identifier is
+        // not enough for a built-in the parser recognises by KEYWORD: the node shape is different.
+        // ⚠️ The ALGORITHM argument of "fbc.randomize( seed, algorithm )" is accepted and ignored -
+        // this engine has one generator, and answering a different sequence is not something a seed
+        // can make agree with fbc anyway. The SEED is honoured, which is what a program relies on.
+        if FModernMode and (ArrayIndexOf(ArrName) < 0) and (UpperFast(ArrName) = kRND) and
+           (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) then
+        begin
+          if Node.GetChild(1).ChildCount >= 1 then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ArgReg := EnsureFloatRegister(ArgValue);
+          end
+          else
+            ArgReg := EnsureFloatRegister(MakeSSAConstFloat(1.0));
+          Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+          EmitInstruction(ssaMathRnd, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+        // ⭐ ...and "fbc.rnd32() As ULong", the raw 32-bit draw. There is no bare keyword for it here,
+        // so it is composed from the one generator this engine has: Rnd * 2^32, truncated.
+        // ⚠️ It cannot MATCH fbc's bits and does not claim to - two different generators seeded the
+        // same way answer different sequences, which is true of Rnd itself.
+        if FModernMode and (ArrayIndexOf(ArrName) < 0) and (UpperFast(ArrName) = 'RND32') and
+           (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) then
+        begin
+          ArgReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+          EmitInstruction(ssaMathRnd, ArgReg, EnsureFloatRegister(MakeSSAConstFloat(1.0)),
+                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          ArgValue := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+          EmitInstruction(ssaMulFloat, ArgValue, ArgReg,
+                          EnsureFloatRegister(MakeSSAConstFloat(4294967296.0)), MakeSSAValue(svkNone));
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaFloatToInt, Result, ArgValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Exit;
+        end;
+        if FModernMode and (ArrayIndexOf(ArrName) < 0) and (UpperFast(ArrName) = 'RANDOMIZE') and
+           (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) then
+        begin
+          if Node.GetChild(1).ChildCount >= 1 then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            EmitInstruction(ssaRandomize, MakeSSAValue(svkNone), EnsureIntRegister(ArgValue),
+                            MakeSSAValue(svkNone), MakeSSAConstInt(1));
+          end
+          else
+            EmitInstruction(ssaRandomize, MakeSSAValue(svkNone),
+                            EnsureIntRegister(MakeSSAConstInt(0)),
+                            MakeSSAValue(svkNone), MakeSSAConstInt(0));
+          Result := MakeSSAValue(svkNone);
+          Exit;
+        end;
+
         // FreeBASIC raw-memory block ops on the byte heap (MODERN only): FB_MEMCOPY(dst,src,bytes),
         // FB_MEMMOVE(dst,src,bytes), CLEAR(dst,value,bytes), FB_MEMCOPYCLEAR(dst,dstlen,src,srclen).
         // dst/src are raw pointer values (from Allocate); v1 takes the pointer directly. Valid as a
@@ -8565,9 +8734,13 @@ begin
         if FModernMode and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and
            ((UpperFast(ArrName) = kFBMEMCOPY) or (UpperFast(ArrName) = kFBMEMMOVE) or
-            (UpperFast(ArrName) = kCLEAR) or (UpperFast(ArrName) = kFBMEMCOPYCLEAR)) then
+            (UpperFast(ArrName) = kCLEAR) or (UpperFast(ArrName) = kFBMEMCOPYCLEAR) or
+            (Copy(UpperFast(ArrName), 1, 7) = 'FBCPTR_')) then
         begin
-          EmitRawMemOp(UpperFast(ArrName), Node.GetChild(1), Result);
+          if Copy(UpperFast(ArrName), 1, 7) = 'FBCPTR_' then
+            EmitRawMemOp(Copy(UpperFast(ArrName), 8, MaxInt), Node.GetChild(1), Result, True)
+          else
+            EmitRawMemOp(UpperFast(ArrName), Node.GetChild(1), Result);
           Exit;
         end;
 
@@ -42844,7 +43017,8 @@ begin
   Result := True;
 end;
 
-procedure TSSAGenerator.EmitRawMemOp(const FuncU: string; ArgsNode: TASTNode; out Result: TSSAValue);
+procedure TSSAGenerator.EmitRawMemOp(const FuncU: string; ArgsNode: TASTNode; out Result: TSSAValue;
+                                     PtrForm: Boolean = False);
 // FreeBASIC raw-memory block ops on the byte heap. The byte count register is carried in Src3 (the
 // compiler maps Src3 -> Immediate). FB_MEMCOPYCLEAR is composed from a memcopy plus a clear of the
 // tail (no dedicated opcode): rest pointer = dst + srclen (a raw pointer is a tagged byte offset, so a
@@ -42950,6 +43124,23 @@ var
     AddrNode.Free;
   end;
 
+  function AddrPos(ArgNode: TASTNode): TSSAValue;
+  // An ADDRESS position of one of these operations. FB's own keywords take it BYREF - "Clear x, 0, n"
+  // means the storage of x - while fbc-int/memory.bi declares the SAME operations taking a POINTER
+  // ("fbc.clear(p, 7, 64)" means the memory p points at). PtrForm says which of the two this call is,
+  // and it is the ONLY difference between them: everything below is shared.
+  var
+    V: TSSAValue;
+  begin
+    if PtrForm then
+    begin
+      ProcessExpression(ArgNode, V);
+      AddrPos := V;
+    end
+    else
+      AddrPos := ByRefAddr(ArgNode);
+  end;
+
 begin
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   // ⛔ A CONST destination is not writable, and these operations WRITE. fbc refuses "Clear a, 0, n"
@@ -42966,8 +43157,8 @@ begin
     // ...over MANAGED storage first: a record or a fixed-length string field has no byte image, and
     // the copy is honoured as the copy of the OBJECT the reference names. See TryEmitManagedMemCopy.
     if TryEmitManagedMemCopy(ArgsNode, TmpV) then begin Result := TmpV; Exit; end;
-    TmpV := ByRefAddr(ArgsNode.GetChild(0)); DstR := EnsureIntRegister(TmpV);
-    TmpV := ByRefAddr(ArgsNode.GetChild(1)); SrcR := EnsureIntRegister(TmpV);
+    TmpV := AddrPos(ArgsNode.GetChild(0)); DstR := EnsureIntRegister(TmpV);
+    TmpV := AddrPos(ArgsNode.GetChild(1)); SrcR := EnsureIntRegister(TmpV);
     ProcessExpression(ArgsNode.GetChild(2), TmpV); BytesR := EnsureIntRegister(TmpV);
     if FuncU = kFBMEMCOPY then
       EmitInstruction(ssaRawMemCopy, Result, DstR, SrcR, BytesR)   // Result = destination pointer (FB returns dst)
@@ -42983,7 +43174,7 @@ begin
     if TryEmitManagedRecordClear(ArgsNode) then Exit;
     // Clear cdecl (ByRef dst As Any, ByVal value As Long = 0, ByVal bytes As UInteger):
     // only the destination is ByRef, the other two positions are values.
-    TmpV := ByRefAddr(ArgsNode.GetChild(0)); DstR := EnsureIntRegister(TmpV);
+    TmpV := AddrPos(ArgsNode.GetChild(0)); DstR := EnsureIntRegister(TmpV);
     ProcessExpression(ArgsNode.GetChild(1), TmpV); ValR := EnsureIntRegister(TmpV);
     ProcessExpression(ArgsNode.GetChild(2), TmpV); BytesR := EnsureIntRegister(TmpV);
     EmitInstruction(ssaRawClear, MakeSSAValue(svkNone), DstR, ValR, BytesR);
@@ -42991,9 +43182,9 @@ begin
   end
   else  // kFBMEMCOPYCLEAR: (dst, dstlen, src, srclen) - dst and src ByRef, both lengths ByVal
   begin
-    TmpV := ByRefAddr(ArgsNode.GetChild(0)); DstR := EnsureIntRegister(TmpV);
+    TmpV := AddrPos(ArgsNode.GetChild(0)); DstR := EnsureIntRegister(TmpV);
     ProcessExpression(ArgsNode.GetChild(1), TmpV); DstLenR := EnsureIntRegister(TmpV);
-    TmpV := ByRefAddr(ArgsNode.GetChild(2)); SrcR := EnsureIntRegister(TmpV);
+    TmpV := AddrPos(ArgsNode.GetChild(2)); SrcR := EnsureIntRegister(TmpV);
     ProcessExpression(ArgsNode.GetChild(3), TmpV); SrcLenR := EnsureIntRegister(TmpV);
     // copy the first srclen bytes
     EmitInstruction(ssaRawMemCopy, MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt)), DstR, SrcR, SrcLenR);
@@ -52742,7 +52933,8 @@ begin
     for PsI := 1 to Length(FgnText) do
       if FgnText[PsI] = ';' then
       begin
-        if Trim(Copy(FgnText, FgnStart, PsI - FgnStart)) <> '' then
+        if (Trim(Copy(FgnText, FgnStart, PsI - FgnStart)) <> '') and
+           not IsOurRuntimeForeignDecl(Trim(Copy(FgnText, FgnStart, PsI - FgnStart))) then
           FProgram.AddForeignDecl(Trim(Copy(FgnText, FgnStart, PsI - FgnStart)));
         FgnStart := PsI + 1;
       end;
