@@ -1058,6 +1058,8 @@ type
     function AddrLocalHandle(const Name: string): TSSAValue;                    // its per-frame record/raw-address handle (hidden var)
     function AddrLocalType(const Name: string): string;                         // declared type of an @-taken local/param
     function IsRawAddrLocal(const Name: string): Boolean;                       // @-taken NON-string scalar local/param -> raw byte slot
+    function IsCharBufName(const Name: string): Boolean;       // an @-taken ZString/WString buffer, either scope
+    function ZStringBufElemBytes(const Name: string): Int64;   // one CELL of such a buffer, in bytes
     function RawZStringBufBytes(const Name: string): Integer;                   // @-taken "ZSTRING * n" buffer -> n bytes, else 0
     procedure EmitRawAddrScalarAlloc(const Name: string);                       // allocate its per-frame 8-byte raw slot into the hidden handle
     function IsRawModuleScalar(const Name: string): Boolean;                    // MODULE-level @-taken non-string scalar (raw byte slot, address in a shared int array)
@@ -1246,6 +1248,7 @@ type
     procedure RecordSharedScalarType(const VarName, TypeName: string);       // DIM SHARED never recorded its type (print form + narrow width)
     function PrintKindOf(const VarName: string): Integer;               // scoped entry wins over the module one
     function PrintKindOfExpr(Node: TASTNode): Integer;                  // ...also for a call's return type
+    function PtrExprPointeeTypeName(Node: TASTNode): string;            // the POINTEE of a pointer EXPRESSION (name, cast, p±n)
     function IsBooleanExprNode(Node: TASTNode): Boolean;                 // declared BOOLEAN, so it reads "true"/"false"
     function BooleanTextOf(const Val: TSSAValue): TSSAValue;            // ...and this is that text
     function Narrow32Code(Node: TASTNode): Integer;  // 9 or 10: which 32-bit wrap this expression takes
@@ -29606,6 +29609,43 @@ begin
   EmitInstruction(ssaStrMid, Result, Src, StartV, LenV);
 end;
 
+function TSSAGenerator.PtrExprPointeeTypeName(Node: TASTNode): string;
+// The POINTEE type of a pointer EXPRESSION - a name, a cast, or pointer arithmetic on either, in any
+// number of parentheses. '' when the expression is not a pointer.
+//
+// ⛔⛔ IT EXISTS SO THERE IS ONE ANSWER AND NOT THREE. Two separate questions need it - "does this
+// indexed read print unsigned?" (PrintKindOfExpr) and "is this value unsigned 64-bit?"
+// (IsUnsigned64Expr) - and each had grown its own partial version: the first knew a CAST base and an
+// IDENTIFIER base, the second knew neither for an index. So "Cast(UByte Ptr, x)[i]" printed right
+// while "(Cast(UByte Ptr, x) + 9)[i]" printed a sign column fbc does not, and the same byte read two
+// ways disagreed about a column. This file records that failure shape repeatedly; one helper is the
+// answer to it.
+// 📌 Both spellings measured against fbc 1.10.1 through the zlib probe deck.
+var
+  T: string;
+begin
+  Result := '';
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if Node.NodeType = antIdentifier then Exit(PointeeTypeOf(VarToStr(Node.Value)));
+  if Node.NodeType = antCast then
+  begin
+    T := UpperFast(Trim(VarToStr(Node.Value)));
+    if (Length(T) >= 5) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
+      Exit(Trim(Copy(T, 1, Length(T) - 4)));
+    Exit('');
+  end;
+  // "p + n" / "p - n" / "n + p": the pointer side carries the pointee, and only ADD may have it on
+  // the right - the same side rule EmitRawPtrArith uses.
+  if (Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) and Assigned(Node.Token) and
+     ((Node.Token.TokenType = ttOpAdd) or (Node.Token.TokenType = ttOpSub)) then
+  begin
+    Result := PtrExprPointeeTypeName(Node.GetChild(0));
+    if (Result = '') and (Node.Token.TokenType = ttOpAdd) then
+      Result := PtrExprPointeeTypeName(Node.GetChild(1));
+  end;
+end;
+
 function TSSAGenerator.PrintKindOfExpr(Node: TASTNode): Integer;
 // The print form of a printable EXPRESSION, not just of a bare variable. A FUNCTION's return type is
 // recorded under its own name, so "Print isOverlapping(a, b)" on a "... As Boolean" function must print
@@ -29684,6 +29724,16 @@ begin
           if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
           else if AwCode = 8 then Result := 2;
         end;
+      end
+      // ⭐ ...AND THE SAME READ WITH ARITHMETIC IN FRONT OF IT: "(Cast(UByte Ptr, x) + 9)[i]" is the
+      // idiom for walking a buffer, and it reached none of the arms above - the base is a
+      // PARENTHESISED expression, not a cast and not a name. One helper answers all three spellings.
+      else if FModernMode and (Node.ChildCount >= 2) and (Node.GetChild(1).ChildCount = 1) and
+              (PtrExprPointeeTypeName(Node.GetChild(0)) <> '') then
+      begin
+        AwCode := TypeNameWidthCode(UpperFast(CanonicalType(PtrExprPointeeTypeName(Node.GetChild(0)))));
+        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
+        else if AwCode = 8 then Result := 2;
       end
       else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antMemberAccess) then
       begin
@@ -41889,8 +41939,22 @@ begin
   PtrName := RawPtrExprName(PtrSide);
   ProcessExpression(PtrSide, PtrVal); PtrVal := EnsureIntRegister(PtrVal);
   ProcessExpression(IntSide, IntVal); IntVal := EnsureIntRegister(IntVal);
+  // ⛔⛔ A CHARACTER BUFFER STEPS ONE BYTE, AND THE POINTEE LOOKUP HAS NOTHING TO SAY ABOUT IT.
+  // "@z + n" where z is a "ZString * 32" is the commonest C idiom in this whole tree - walk a buffer -
+  // and the scale came from PointeeTypeOf(z), which is EMPTY because z is not a pointer: the ladder
+  // then fell to its 8-byte default and "@z + 9" advanced SEVENTY-TWO bytes. Measured against fbc by
+  // the zlib probe deck: `crc32(c1, cast(ubyte ptr, @s) + 9, len(s) - 9)` did not equal the one-shot
+  // checksum, while the same walk through a NAMED "ubyte ptr" intermediate was right all along -
+  // which is what said the defect is the SCALE of this add and not the pointer.
+  // ⚠️ A WSTRING buffer keeps the width its own cells have (RawZStringBufBytes reports bytes, so the
+  // division is by the character count); this engine's WSTRING is one cell per character by decision.
   if PtrName <> '' then
-    sz := RawElemSizeOf(PtrName)
+  begin
+    if (PointeeTypeOf(PtrName) = '') and IsCharBufName(PtrName) then
+      sz := ZStringBufElemBytes(PtrName)
+    else
+      sz := RawElemSizeOf(PtrName);
+  end
   else
     sz := RawElemSizeOfPointee(StrDataPtrPointee(PtrSide));
   if sz > 1 then
@@ -44616,6 +44680,29 @@ begin
   Result := IsAddrLocal(Name) and (AddrLocalType(Name) <> 'STRING');
 end;
 
+function TSSAGenerator.IsCharBufName(const Name: string): Boolean;
+// Is this an @-taken CHARACTER BUFFER - a "ZString * n" / "WString * n" whose address a raw pointer
+// may walk? ⛔ It asks BOTH scopes, and that is the whole point: RawZStringBufBytes answers only for a
+// LOCAL (it gates on IsAddrLocal), so a MODULE-level buffer fell through every rule written on it. The
+// local form of "@z + 9" was right and the module form advanced 72 bytes - the same declaration, two
+// answers, which is the shape this file records over and over.
+begin
+  Result := (RawZStringBufBytes(Name) > 0) or
+            (IsRawModuleScalar(Name) and
+             ((RawModuleScalarType(Name) = 'ZSTRING') or (RawModuleScalarType(Name) = 'WSTRING')));
+end;
+
+function TSSAGenerator.ZStringBufElemBytes(const Name: string): Int64;
+// How many bytes ONE CELL of such a buffer occupies - which is what scales "@z + i". Asked separately
+// from RawZStringBufBytes, which answers the buffer's WHOLE size: the two are the same number only for
+// a one-character ZSTRING, and reusing that one would have made "@z + 1" step over the entire buffer.
+begin
+  Result := 1;
+  if (AddrLocalType(UpperFast(Name)) = 'WSTRING') or
+     (IsRawModuleScalar(Name) and (RawModuleScalarType(Name) = 'WSTRING')) then
+    Result := WIDE_CELL_BYTES;
+end;
+
 function TSSAGenerator.RawZStringBufBytes(const Name: string): Integer;
 // An @-taken "ZSTRING * n" / "WSTRING * n" is a CHARACTER BUFFER, not a scalar: n bytes (n cells of
 // WIDE_CELL_BYTES for a WSTRING) that another pointer may read as raw memory. Answers its size in
@@ -47111,6 +47198,20 @@ begin
         // UInteger/ULongInt (recorded under its name in FVarPrintKind = 2 by RegisterRecordVars). A
         // genuine array element access lands here too but its array name is never in FVarPrintKind
         // (only scalars/params/returns are), so it correctly stays signed.
+        // ⭐ "p[i]" ON A POINTER TAKES ITS UNSIGNEDNESS FROM THE POINTEE, and this arm read the
+        // BASE's name instead - which for a pointer says nothing, so the element stayed signed and
+        // PRINT gave it a sign column fbc does not. The DEREF spelling "*p" already agreed, which is
+        // what says the gap is this shape and not the model.
+        // 📌 Found by the zlib probe deck on `get_crc_table()`, whose table is `z_crc_t ptr` - an
+        // alias of culong - so "tbl[0]" printed " 8576877436153626624" where fbc prints it with no
+        // leading space. ⛔ A genuine ARRAY element must NOT be caught here: it has its own registry
+        // (FUnsigned64Arrays), and a pointer is told apart by having a POINTEE at all.
+        if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) and
+           (PtrExprPointeeTypeName(Node.GetChild(0)) <> '') then
+        begin
+          U := UpperFast(CanonicalType(UpperFast(PtrExprPointeeTypeName(Node.GetChild(0)))));
+          Exit((U = 'ULONGINT') or (U = 'UINTEGER'));
+        end;
         if Node.NodeType = antFunctionCall then
           U := Node.ValueUpper
         else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
