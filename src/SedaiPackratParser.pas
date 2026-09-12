@@ -12342,12 +12342,15 @@ type
   TDeclState = (dsExpectName, dsLeadType, dsAfterName, dsInit);
 var
   TL: TTokenList;
-  N, i, s, e, k, Depth, Body: Integer;
+  N, i, s, e, k, Depth, Body, TypeDepth: Integer;
   Glob, Module: TStringList;
   Bodies: array of TStringList;
+  BodyFields: array of TStringList;                      // the owner type's fields, for a method body (267/286)
   BodyEnd: array of Integer;
-  InBody, InType, IsShared, IsConst: Boolean;
+  InBody, InType, IsShared, IsConst, JustOpened: Boolean;
   Target: TStringList;
+  Types, Bases: TStringList;                             // type name -> its field names / its base type
+  CurFields: TStringList;
   State: TDeclState;
   U, H: string;
 
@@ -12426,11 +12429,118 @@ var
     end;
   end;
 
+  function IsNameWord(const W: string): Boolean;
+  begin
+    Result := (W <> '') and (((W[1] >= 'A') and (W[1] <= 'Z')) or (W[1] = '_'));
+  end;
+
+  procedure ScanFields(From, UpTo: Integer; Lst: TStringList);
+  // A FIELD line of a Type/Union body: "<name>[(..)] As <type>" or "As <type> <name>[, <name>]".
+  // ⭐ The two forms are told apart by where AS sits, and each comma group yields ONE name: the FIRST
+  // word of the group in the name-first form, the LAST in the lead-type form ("As ZString * 8 nm").
+  // ⚠️ This is a NAME scan, not a type checker: a line it reads wrong costs at most one word shadowed
+  // inside the type's own methods, which is where fbc shadows it anyway.
+  var
+    j, d, FirstW, LastW: Integer;
+    W, Nm: string;
+    LeadType: Boolean;
+
+    procedure Flush;
+    var
+      Idx: Integer;
+    begin
+      if LeadType then Idx := LastW else Idx := FirstW;
+      FirstW := -1;
+      LastW := -1;
+      if Idx < 0 then Exit;
+      Nm := Up(Idx);
+      if IsNameWord(Nm) and (Lst.IndexOf(Nm) < 0) then Lst.Add(Nm);
+    end;
+
+  begin
+    j := From;
+    while j < UpTo do
+    begin
+      W := Up(j);
+      // ⛔ REDIM IS ONE OF THESE, and leaving it out cost a wrong refusal in the fbc suite:
+      // "Type UDT : redim array(0 To 0) As Integer : End Type" (structs/dynamic-array-fields) has REDIM
+      // as its first word, so the scan took REDIM for the field's NAME - and then, inside a method of
+      // that type, every "redim a(...)" was retyped into an identifier and the statement stopped parsing.
+      if (W = 'DIM') or (W = 'REDIM') or (W = 'STATIC') or (W = 'SHARED') or (W = 'CONST') or
+         (W = 'VAR') or (W = 'PUBLIC') or (W = 'PRIVATE') or (W = 'PROTECTED') then Inc(j) else Break;
+    end;
+    if j >= UpTo then Exit;
+    LeadType := Up(j) = 'AS';
+    FirstW := -1;
+    LastW := -1;
+    d := 0;
+    while j < UpTo do
+    begin
+      W := Up(j);
+      if (W = '(') or (W = '[') then Inc(d)
+      else if (W = ')') or (W = ']') then Dec(d)
+      else if d = 0 then
+      begin
+        if W = ',' then Flush
+        else if W = '=' then
+        begin
+          Flush;                                         // the initializer is not a name
+          Inc(j);
+          while j < UpTo do
+          begin
+            W := Up(j);
+            if (W = '(') or (W = '[') then Inc(d)
+            else if (W = ')') or (W = ']') then Dec(d)
+            else if (d = 0) and (W = ',') then Break;
+            Inc(j);
+          end;
+          Inc(j);
+          Continue;
+        end
+        else if W <> 'AS' then
+        begin
+          if FirstW < 0 then FirstW := j;
+          LastW := j;
+        end;
+      end;
+      Inc(j);
+    end;
+    Flush;
+  end;
+
+  function FieldsVisibleIn(const TypeName: string): TStringList;
+  // The names a bare word in a method of TypeName can mean: its own fields and, through EXTENDS,
+  // every base's. Returns a fresh list (nil when the type is unknown).
+  var
+    Nm: string;
+    Idx, Guard, q: Integer;
+    Src: TStringList;
+  begin
+    Result := nil;
+    Nm := TypeName;
+    Guard := 0;
+    while (Nm <> '') and (Guard < 16) do
+    begin
+      Inc(Guard);
+      Idx := Types.IndexOf(Nm);
+      if Idx < 0 then Break;
+      Src := TStringList(Types.Objects[Idx]);
+      if Src <> nil then
+      begin
+        if Result = nil then Result := TStringList.Create;
+        for q := 0 to Src.Count - 1 do
+          if Result.IndexOf(Src[q]) < 0 then Result.Add(Src[q]);
+      end;
+      Nm := Bases.Values[Nm];
+    end;
+  end;
+
   procedure OpenBody(HeadIdx, EndIdx: Integer; IsDeclare: Boolean);
   // "Sub name [Alias ".."] [Cdecl] (params)": the name is global, the parameters belong to the body.
   var
     j: Integer;
     Params: TStringList;
+    Owner: string;
   begin
     // ⛔ A Declare aliased to fbc's RUNTIME ("Declare Function FileCopy Alias ""fb_FileCopy""", file.bi)
     // names the routine this compiler's builtin already IS - it is not a name of the program. Taking it
@@ -12446,9 +12556,24 @@ var
     j := HeadIdx + 1;
     while (j < EndIdx) and (Up(j) <> '(') do Inc(j);
     if j < EndIdx then Scan(j + 1, EndIdx, Params, 0);
+    // ⭐ A METHOD sees its own type's fields BARE (DIVERGENZE 286, the implicit THIS), and the field
+    // wins over the word even in STATEMENT position - measured on fbc: with a field called "print", a
+    // line "print <literal>" inside that method answers "error 10: Expected =". So the owner's field
+    // names shadow here exactly like a local declaration does.
+    // "Sub T.m" / "Function T.m" / "Property T.p" / "Operator T.cast" name the type before the dot;
+    // "Constructor T" / "Destructor T" name it straight away.
+    Owner := '';
+    if (Up(HeadIdx) = 'CONSTRUCTOR') or (Up(HeadIdx) = 'DESTRUCTOR') then
+      Owner := Up(HeadIdx + 1)
+    else if (HeadIdx + 2 < N) and (TL.GetTokenDirect(HeadIdx + 2) <> nil) and
+            (TL.GetTokenDirect(HeadIdx + 2).TokenType = ttOpDot) then
+      Owner := Up(HeadIdx + 1);
     SetLength(Bodies, Length(Bodies) + 1);
+    SetLength(BodyFields, Length(BodyFields) + 1);
     SetLength(BodyEnd, Length(BodyEnd) + 1);
     Bodies[High(Bodies)] := Params;
+    if Owner <> '' then BodyFields[High(BodyFields)] := FieldsVisibleIn(Owner)
+    else BodyFields[High(BodyFields)] := nil;
     BodyEnd[High(BodyEnd)] := -1;                        // set at the matching END
     InBody := True;
   end;
@@ -12467,6 +12592,10 @@ begin
   N := TL.Count;
   Glob := TStringList.Create;
   Module := TStringList.Create;
+  Types := TStringList.Create;
+  Bases := TStringList.Create;
+  CurFields := nil;
+  TypeDepth := 0;
   InBody := False;
   InType := False;
   try
@@ -12481,11 +12610,56 @@ begin
         H := Up(k);
         if InType then
         begin
-          if (H = 'END') and ((Up(k + 1) = 'TYPE') or (Up(k + 1) = 'UNION') or (Up(k + 1) = 'ENUM')) then
-            InType := False;
+          if ((H = 'TYPE') or (H = 'UNION')) and (Up(k + 2) <> 'AS') then
+            Inc(TypeDepth)                               // a nested anonymous block: its fields are ours
+          else if (H = 'END') and ((Up(k + 1) = 'TYPE') or (Up(k + 1) = 'UNION') or (Up(k + 1) = 'ENUM')) then
+          begin
+            Dec(TypeDepth);
+            if TypeDepth <= 0 then
+            begin
+              InType := False;
+              CurFields := nil;
+            end;
+          end
+          // ⛔ A METHOD line inside the type is not a field: "Destructor()" written without DECLARE
+          // would otherwise be collected under the name DESTRUCTOR, and then the token retype turned
+          // its own "End Destructor" into an identifier. ⚠️ But a field MAY be called by one of those
+          // words when it is followed by As ("constructor As Long", DIVERGENZE 290), so the test is on
+          // the word AND on what follows it, never on the word alone.
+          else if (CurFields <> nil) and
+                  (not (InSet(BODY_KINDS, ' ' + H + ' ') or (H = 'DECLARE') or (H = 'ENUM') or
+                        (H = 'END')) or (Up(k + 1) = 'AS')) then
+            ScanFields(k, e, CurFields);
         end
         else if ((H = 'TYPE') or (H = 'UNION') or (H = 'ENUM')) and (Up(k + 2) <> 'AS') then
-          InType := True                                 // fields are not names of this scan
+        begin
+          InType := True;                                // fields are not names of THIS scan...
+          TypeDepth := 1;
+          CurFields := nil;
+          // ...but they ARE names inside the type's own methods, so collect them under the type's name.
+          if (H <> 'ENUM') and IsNameWord(Up(k + 1)) then
+          begin
+            i := Types.IndexOf(Up(k + 1));
+            if i >= 0 then
+            begin
+              // ⛔ THE SAME TYPE NAME DECLARED TWICE IS TWO TYPES, not one with more fields. This file
+              // sees a whole translation unit, namespaces included, and fbc's own suite declares "Type UDT"
+              // once per TEST_GROUP - merging their fields would shadow, inside one type's methods, words
+              // the OTHER type declared. Answering "no fields" for an ambiguous name can only lose a
+              // shadow; merging can invent one.
+              TStringList(Types.Objects[i]).Clear;
+              CurFields := nil;
+              Bases.Values[Up(k + 1)] := '';
+            end
+            else
+            begin
+              i := Types.AddObject(Up(k + 1), TStringList.Create);
+              CurFields := TStringList(Types.Objects[i]);
+              if (Up(k + 2) = 'EXTENDS') and IsNameWord(Up(k + 3)) then
+                Bases.Values[Up(k + 1)] := Up(k + 3);
+            end;
+          end;
+        end
         else if (H = 'END') and InSet(BODY_KINDS,' ' + Up(k + 1) + ' ') then
         begin
           if InBody then BodyEnd[High(BodyEnd)] := e;
@@ -12533,14 +12707,27 @@ begin
       e := StmtEnd(s);
       k := SkipModifiers(s, e);
       H := Up(k);
+      JustOpened := False;
       if (not InBody) and (Body <= High(Bodies)) and InSet(BODY_KINDS,' ' + H + ' ') and
          (Up(s) <> 'DECLARE') and (Up(s) <> 'END') then
+      begin
         InBody := True;
+        JustOpened := True;                                // its own HEAD is not body text
+      end;
       for i := s to e - 1 do
       begin
         U := Up(i);
-        if not IsCandidate(U) then Continue;
+        if U = '' then Continue;
         if TL.GetTokenDirect(i).TokenType = ttIdentifier then Continue;
+        // A field of the method's own type first: that set is not the builtin CANDIDATES, it is
+        // whatever the type declares (DIVERGENZE 286).
+        if InBody and not JustOpened and (Body <= High(BodyFields)) and (BodyFields[Body] <> nil) and
+           (BodyFields[Body].IndexOf(U) >= 0) then
+        begin
+          TL.GetTokenDirect(i).TokenType := ttIdentifier;
+          Continue;
+        end;
+        if not IsCandidate(U) then Continue;
         if (Glob.IndexOf(U) >= 0) or
            (InBody and (Bodies[Body].IndexOf(U) >= 0)) or
            ((not InBody) and (Module.IndexOf(U) >= 0)) then
@@ -12556,7 +12743,11 @@ begin
   finally
     Glob.Free;
     Module.Free;
+    for i := 0 to Types.Count - 1 do Types.Objects[i].Free;
+    Types.Free;
+    Bases.Free;
     for i := 0 to High(Bodies) do Bodies[i].Free;
+    for i := 0 to High(BodyFields) do BodyFields[i].Free;
   end;
 end;
 
@@ -15897,6 +16088,12 @@ var
       // synthesized literal borrows a neighbour's token) and not a base literal (&H.. is not on the ladder).
       // ...and an explicit "u" suffix is unsigned whatever the value: "Const G_DATE_BAD_JULIAN = 0u" prints
       // "0" with no sign column in fbc (glib.bi). ULONG while it fits, ULONGINT past that.
+      // ⛔ ...and the suffix's WIDTH decides which unsigned it is, not the magnitude: MEASURED on fbc
+      // 1.10.1, "Const cu = 5u" is a UINTEGER ("cu - 10" answers 18446744073709551611) while
+      // "Const cul = 5ul" is a ULong that promotes SIGNED ("cul - 10" answers -5). Reading the ladder for
+      // a 64-bit suffix made a small "5u" a ULONG, and the whole expression signed with it.
+      else if Assigned(V.Token) and V.Token.Unsigned64Suffixed then
+        Result := 'ULONGINT'
       else if Assigned(V.Token) and V.Token.UnsignedSuffixed then
       begin
         if TryStrToInt64(Trim(VarToStr(V.Value)), I64) and (I64 >= 0) and (I64 <= Int64(4294967295)) then

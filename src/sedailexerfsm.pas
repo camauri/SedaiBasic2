@@ -115,6 +115,7 @@ type
     FPendingSingleSuffix: Boolean;
     FPendingWideLiteral: Boolean;   // the escaped literal just expanded named a codepoint above 127
     FPendingUnsignedSuffix: Boolean;   // the 'U' of an integer literal's type suffix ("12u", "5UL")
+    FPendingUnsigned64Suffix: Boolean; // ...and whether that suffix was 64 bits wide ("12u", "12ull")
 
     // Set while lexing an integer whose type suffix is '&' (Long, "3000000000&"). Long is a signed 32-bit
     // type, so the value is WRAPPED to signed 32 bits; unlike the other dropped suffixes this one changes
@@ -1318,6 +1319,7 @@ begin
   Result.SingleSuffixed := False; // ditto for the "1.5f" mark (ProcessNumber sets it from FPendingSingleSuffix)
   Result.WideLiteral := False;    // ...and for the wide-literal mark (the escaped-string scanner sets it)
   Result.UnsignedSuffixed := False;  // ...and for the "12u" mark
+  Result.Unsigned64Suffixed := False;  // ...and for its WIDTH ("12u"/"12ull" vs "5ul")
 
   Result.Line := ATokenLine;
   Result.Column := FTokenStartColumn;
@@ -1498,6 +1500,7 @@ begin
    end;
    Result.SingleSuffixed := FPendingSingleSuffix;
    Result.UnsignedSuffixed := FPendingUnsignedSuffix;
+   Result.Unsigned64Suffixed := FPendingUnsigned64Suffix;
 
    // '&' Long suffix: Long is signed 32-bit, so wrap the value to signed 32 bits and store the wrapped
    // decimal (3000000000& -> -1294967296, exactly as fbc). The wrap only applies to an INTEGER literal;
@@ -1518,6 +1521,7 @@ begin
  // paths that never scan a suffix, and a stale mark would make the NEXT literal a Single/Long.
  FPendingSingleSuffix := False;
  FPendingUnsignedSuffix := False;
+ FPendingUnsigned64Suffix := False;
  FPendingLongSuffix := False;
 end;
 
@@ -1601,7 +1605,9 @@ begin
   // ProcessNumber never runs for a base literal, so a flag left standing would both miss THIS literal
   // and mark the NEXT one ("&hFFul" printed a sign space, and the following "76543ll" lost its own).
   Result.UnsignedSuffixed := FPendingUnsignedSuffix;
+  Result.Unsigned64Suffixed := FPendingUnsigned64Suffix;
   FPendingUnsignedSuffix := False;
+  FPendingUnsigned64Suffix := False;
   // ...which is why the token has to remember that it WAS base-prefixed: with the source text gone it is
   // indistinguishable from a plain decimal literal, and FreeBASIC's type ladder treats the two differently
   // (a decimal 4294967295 is an unsigned ULong; &HFFFFFFFF is not).
@@ -2081,14 +2087,25 @@ begin
     // The suffix is dropped from the text, so the U is the only place the literal's UNSIGNEDNESS ever
     // appears - and FreeBASIC prints an unsigned with no leading sign space ("12u" is "12", not " 12").
     FPendingUnsignedSuffix := True;
+    // ⭐ ...and HOW WIDE it is, which decides the arithmetic and not only the sign column. MEASURED
+    // on fbc 1.10.1: a bare "u" is a UINTEGER (unsigned 64 here) and "ull" a ULONGINT, while "ul" is a
+    // 32-bit ULong that PROMOTES TO A SIGNED Integer - "5u - 10" answers 18446744073709551611 and
+    // "5ul - 10" answers -5. Assume 64 and clear it if a narrow size letter follows.
+    FPendingUnsigned64Suffix := True;
     AdvanceChar; C := GetCurrentChar;
     if (C = 'L') or (C = 'l') then
     begin
       AdvanceChar;
-      if (GetCurrentChar = 'L') or (GetCurrentChar = 'l') then AdvanceChar;   // ULL
+      if (GetCurrentChar = 'L') or (GetCurrentChar = 'l') then AdvanceChar    // ULL: stays 64-bit
+      else FPendingUnsigned64Suffix := False;                                 // UL: 32-bit ULong
     end
-    else if C in ['S', 's', 'B', 'b', 'I', 'i'] then
-      AdvanceChar;                                                            // US / UB / UI
+    else if C in ['S', 's', 'B', 'b'] then
+    begin
+      AdvanceChar;                                                            // US / UB: narrow
+      FPendingUnsigned64Suffix := False;
+    end
+    else if C in ['I', 'i'] then
+      AdvanceChar;                                                            // UI: UInteger, 64-bit here
   end
   else if (C = 'L') or (C = 'l') then
   begin

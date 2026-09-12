@@ -1070,6 +1070,7 @@ type
     function UDTFieldMultiPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // full pointee of a "T Ptr Ptr..." field ("T PTR"), else ''
     function UDTFieldRawPtrPointee(UDTIdx: Integer; const FieldName: string): string; // scalar pointee of a "<scalar> PTR" field, else ''
     function MemberRawPtrPointee(Node: TASTNode): string;                          // "obj.field" raw scalar pointer -> pointee type, else ''
+    function MemberArrayElemRawPtrPointee(Node: TASTNode): string;                 // "obj.m(i)" element is a raw scalar pointer -> pointee type, else ''
     function UDTFieldIsWString(UDTIdx: Integer; const FieldName: string): Boolean;  // field declared AS WSTRING?
     function DerefedType(Node: TASTNode): string;                               // FB type of *<expr> (multi-level aware)
     function DerefOperandBank(Node: TASTNode): TSSARegisterType;                // bank of *<expr> incl. pointer arithmetic (p+n)
@@ -1300,6 +1301,7 @@ type
     // True if the expression is unsigned 64-bit (UInteger/ULongInt), selecting the QWord compare/
     // div/mod forms. Propagates through +/-/*/\/Mod/bitwise, parentheses and unary.
     function IsUnsigned64Expr(Node: TASTNode): Boolean;
+    function ConstIntAsFloat(const V: TSSAValue; SrcNode: TASTNode): Double;   // fold int->float reading the bits UNSIGNED where the source is (299)
     function PrintsUnsigned64Expr(Node: TASTNode): Boolean;   // ...the PRINT form, which differs on a negation
     // OOP (M4.1): UDT type name of an object expression (no code emitted); method dispatch.
     function ObjectTypeName(ObjNode: TASTNode): string;
@@ -5208,9 +5210,9 @@ begin
       if (Node.Token.TokenType in [ttOpAdd, ttOpSub, ttOpMul, ttOpDiv]) and IsSingleExpr(Node) then
       begin
         if Left.Kind = svkConstFloat then Left := MakeSSAConstFloat(Single(Left.ConstFloat))
-        else if Left.Kind = svkConstInt then Left := MakeSSAConstFloat(Single(Double(Left.ConstInt)));
+        else if Left.Kind = svkConstInt then Left := MakeSSAConstFloat(Single(ConstIntAsFloat(Left, Node.GetChild(0))));
         if Right.Kind = svkConstFloat then Right := MakeSSAConstFloat(Single(Right.ConstFloat))
-        else if Right.Kind = svkConstInt then Right := MakeSSAConstFloat(Single(Double(Right.ConstInt)));
+        else if Right.Kind = svkConstInt then Right := MakeSSAConstFloat(Single(ConstIntAsFloat(Right, Node.GetChild(1))));
       end;
 
       // Case 1: Both operands are constants - fold completely
@@ -5253,7 +5255,8 @@ begin
             // integer operands - so 10/4 = 2.5, matching the non-const lowering above. Folding
             // to integer `div` here made the constant case disagree with the runtime.
             if Right.ConstInt <> 0 then
-              Result := MakeSSAConstFloat(Left.ConstInt / Right.ConstInt)
+              Result := MakeSSAConstFloat(ConstIntAsFloat(Left, Node.GetChild(0)) /
+                                          ConstIntAsFloat(Right, Node.GetChild(1)))
             else
               Result := MakeSSAValue(svkNone);
           ttOpIntDiv:  // \ integer division (FreeBASIC), truncates toward zero
@@ -5387,12 +5390,12 @@ begin
       if (Left.RegType = srtFloat) and (Right.Kind = svkConstInt) then
       begin
         // Constant folding: int constant will become float, skip LoadConstInt
-        Right := MakeSSAConstFloat(Double(Right.ConstInt));
+        Right := MakeSSAConstFloat(ConstIntAsFloat(Right, Node.GetChild(1)));
       end
       else if (Left.Kind = svkConstInt) and (Right.RegType = srtFloat) then
       begin
         // Constant folding: int constant will become float, skip LoadConstInt
-        Left := MakeSSAConstFloat(Double(Left.ConstInt));
+        Left := MakeSSAConstFloat(ConstIntAsFloat(Left, Node.GetChild(0)));
       end;
 
       // Load constants into registers (after type coercion check)
@@ -6459,10 +6462,15 @@ begin
           // a string-casting UDT is the third instance of it. ⚠️ PRINT, "&" and an assignment all
           // took the cast; only Str did not, so a program printed one thing and Str'd another.
           // ProcessStringExpression is exactly ProcessExpression for anything that is not such a UDT.
+          // ⛔ ...and a FIXED-LENGTH string keeps its BUFFER through Str, exactly as it does through
+          // PRINT and LEN. Measured on fbc 1.10.1: "Str(sc)" on a "String * 8" holding "map" is eight
+          // bytes - "map" and five NULs - and Len of it is 8. Lowered through the ordinary string entry
+          // point the value was CUT at the first NUL, so Str answered three bytes while PRINT of the
+          // same variable wrote eight: two readings of one storage that did not agree.
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
-            ProcessStringExpression(ArgListNode.GetChild(0), ArgValue)
+            ProcessStringExprFixedRaw(ArgListNode.GetChild(0), ArgValue)
           else if ArgListNode <> nil then
-            ProcessStringExpression(ArgListNode, ArgValue)
+            ProcessStringExprFixedRaw(ArgListNode, ArgValue)
           else begin Result := MakeSSAValue(svkNone); Exit; end;
 
           DestReg := FProgram.AllocRegister(srtString);
@@ -7314,7 +7322,16 @@ begin
           end;
 
           if ArgValue.Kind = svkConstInt then
-            Result := MakeSSAConstFloat(ArgValue.ConstInt)
+          begin
+            // ...read UNSIGNED when the argument is an unsigned-64 expression: the run-time arm below
+            // already asks that question (EmitIntToFloat), and the FOLDED one did not (DIVERGENZE 299).
+            if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
+              Result := MakeSSAConstFloat(ConstIntAsFloat(ArgValue, ArgListNode.GetChild(0)))
+            else if (ArgListNode <> nil) and (ArgListNode.NodeType <> antArgumentList) then
+              Result := MakeSSAConstFloat(ConstIntAsFloat(ArgValue, ArgListNode))
+            else
+              Result := MakeSSAConstFloat(ArgValue.ConstInt);
+          end
           else if ArgValue.Kind = svkConstFloat then
             Result := MakeSSAConstFloat(ArgValue.ConstFloat)
           else if (ArgValue.Kind = svkConstString) or
@@ -8398,10 +8415,17 @@ begin
 
         // obj.field[i] where obj.field is a raw "<scalar> PTR" field: index onto the raw byte heap.
         // Address = (field value) + i*SizeOf(pointee); load the pointee (float for SINGLE/DOUBLE, else int).
-        if (Node.GetChild(0).NodeType = antMemberAccess) and
+        // ...and "obj.m(i)[j]", where the raw pointer is an ELEMENT of an array member: the base is an
+        // expression rather than a field, which is all EmitRawFieldIndexAddress needs (DIVERGENZE 297).
+        if ((Node.GetChild(0).NodeType = antMemberAccess) or
+            ((Node.GetChild(0).NodeType = antArrayAccess) and
+             (MemberArrayElemRawPtrPointee(Node.GetChild(0)) <> ''))) and
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
         begin
-          TempStr := MemberRawPtrPointee(Node.GetChild(0));
+          if Node.GetChild(0).NodeType = antMemberAccess then
+            TempStr := MemberRawPtrPointee(Node.GetChild(0))
+          else
+            TempStr := MemberArrayElemRawPtrPointee(Node.GetChild(0));
           if TempStr <> '' then
           begin
             Left := EmitRawFieldIndexAddress(Node.GetChild(0), Node.GetChild(1), TempStr);
@@ -10972,7 +10996,7 @@ begin
     begin
       // Convert int constant to float constant at compile time and load directly
       // This eliminates LoadConstInt + IntToFloat pattern
-      ExprValue := MakeSSAConstFloat(Double(ExprValue.ConstInt));
+      ExprValue := MakeSSAConstFloat(ConstIntAsFloat(ExprValue, ExprNode));
       EmitInstruction(ssaLoadConstFloat, VarReg, ExprValue,
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end
@@ -29788,6 +29812,22 @@ begin
         if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
         else if AwCode = 8 then Result := 2;
       end
+      // ⭐ "obj.p[i]" and "obj.m(i)[j]": the base is a raw "<scalar> PTR" - a FIELD, or an ELEMENT of an
+      // array member - so what prints is the POINTEE, and its type decides the sign space. The arms above
+      // ask registries keyed on a pointer NAME, which a field has not got, so a byte read through
+      // "rec.bp[0]" kept a sign column fbc does not print while "q[0]" through a named UByte Ptr did not.
+      // ⚠ This cannot swallow "obj.m(i)" on a member array: there the base is the member itself, whose
+      // slot holds the array handle, and the raw-pointee question answers '' for it (DIVERGENZE 297).
+      else if FModernMode and (Node.ChildCount >= 2) and (Node.GetChild(1).ChildCount = 1) and
+              (RawPtrExprPointee(Node.GetChild(0)) <> '') then
+      begin
+        Txt := UpperFast(CanonicalType(UpperFast(RawPtrExprPointee(Node.GetChild(0)))));
+        AwCode := TypeNameWidthCode(Txt);
+        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
+        else if AwCode = 8 then Result := 2
+        // ...and through a ZSTRING pointer the element is a CHARACTER CODE, an unsigned byte.
+        else if Txt = 'ZSTRING' then Result := 3;
+      end
       else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antMemberAccess) then
       begin
         // obj.field(i) member-array element: the ELEMENT's narrow width says whether it prints unsigned
@@ -29963,8 +30003,13 @@ begin
       // to the decimal string), so the token's BasePrefixed mark is the only thing that still tells them
       // apart. Without it, keying off the digits alone would strip the sign space from every hex literal in
       // the range: one divergence traded for another.
-      if FModernMode and Assigned(Node.Token) and Node.Token.UnsignedSuffixed then
-        // An explicit 'U' type suffix ("12u", "5UL") makes the literal unsigned outright, whatever its
+      // ⭐ A 64-BIT unsigned suffix ("12u", "12ull") is print kind 2, not 3: kind 3 renders the SIGNED
+      // value without its sign column, so "1ull Shl 63" came out "-9223372036854775808" where fbc prints
+      // 9223372036854775808. Kind 2 is the one that renders the whole 64 bits unsigned.
+      if FModernMode and Assigned(Node.Token) and Node.Token.Unsigned64Suffixed then
+        Result := 2
+      else if FModernMode and Assigned(Node.Token) and Node.Token.UnsignedSuffixed then
+        // An explicit 'U' type suffix ("5UL") makes the literal unsigned outright, whatever its
         // magnitude - no need to consult the ladder below, which only ever recognised the one range
         // where a DECIMAL literal becomes unsigned on its own.
         Result := 3
@@ -30296,7 +30341,11 @@ begin
     else if Value.Kind = svkConstInt then
       // ⛔ Single(Double(x)), which this used to be, rounds TWICE. IEEE converts an integer to
       // binary32 with ONE rounding, and past 2^24 the two answers differ.
-      Result := MakeSSAConstFloat(Single(Value.ConstInt))
+      // ...and an UNSIGNED source converts from its unsigned value, with the same single rounding.
+      if (SrcNode <> nil) and IsUnsigned64Expr(SrcNode) then
+        Result := MakeSSAConstFloat(Single(QWord(Value.ConstInt)))
+      else
+        Result := MakeSSAConstFloat(Single(Value.ConstInt))
     else if (Value.Kind = svkRegister) and (Value.RegType = srtFloat) then
     begin
       NarrowReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
@@ -31419,6 +31468,36 @@ begin
   UDTIdx := FindUDT(UDTName);
   if UDTIdx < 0 then Exit;
   Result := UDTFieldRawPtrPointee(UDTIdx, FieldName);
+end;
+
+function TSSAGenerator.MemberArrayElemRawPtrPointee(Node: TASTNode): string;
+// "obj.m(i)" where the ARRAY MEMBER's elements are a raw "<scalar> PTR": the scalar pointee, else ''.
+// ⛔ The element's pointee has no storage of its own on the field record - ArrayElemPtrPointee holds a
+// UDT pointee only, and the RawPtrPointee the field was given is CLEARED when the field turns out to be an
+// array (the slot then holds the array handle). What survives is ArrayElemScalarType, the element's
+// DECLARED type ("ZSTRING PTR"), and the pointee is its head.
+// ⚠ Without this the deref of "obj.m(i)" fell to the scalar arm and read the ADDRESS as a number, so
+// "*mm.m(1)" printed 26984 where fbc prints the text - while "*mm.s" (a scalar field) and "*arr(1)" (an
+// ordinary array) were both right (DIVERGENZE 297).
+var
+  MemberNode: TASTNode;
+  UDTName, T: string;
+  U: Integer;
+begin
+  Result := '';
+  if (Node = nil) or (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 2) then Exit;
+  MemberNode := Node.GetChild(0);
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  if (Node.GetChild(1) = nil) or (Node.GetChild(1).ChildCount = 0) then Exit;   // "x.m()" is the whole array
+  UDTName := ObjectTypeName(MemberNode.GetChild(0));
+  if UDTName = '' then Exit;
+  U := FindUDT(UDTName);
+  if U < 0 then Exit;
+  T := UpperFast(Trim(UDTArrayElemScalarTypeOf(U, MemberNode.ValueUpper)));
+  if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
+    Result := Trim(Copy(T, 1, Length(T) - 4));
+  // A pointer to a POINTER is not a scalar pointee: leave it to the paths that know the second level.
+  if Pos(' PTR', Result) > 0 then Result := '';
 end;
 
 function TSSAGenerator.UDTFieldIsWString(UDTIdx: Integer; const FieldName: string): Boolean;
@@ -37749,11 +37828,12 @@ procedure TSSAGenerator.EmitUDTAggregateInit(const HandleVal: TSSAValue; UDTIdx:
 // constructor is initialized field-by-field — store each value into the field at the same position (in
 // declaration order). Extra values past the field count are ignored (FB would reject them; v1 is lenient).
 var
-  i, j, Slot, FieldIdx, UGrp, UFirst, USGrp: Integer;
-  ArgVal, ArrHandle, UnitVal: TSSAValue;
+  i, j, Slot, FieldIdx, UGrp, UFirst, USGrp, FixCap: Integer;
+  ArgVal, ArrHandle, UnitVal, StrVal: TSSAValue;
   SrcType: string;
   NestedArgs: TASTNode;
   Bank: TSSARegisterType;
+  FixWide: Boolean;
 begin
   if (UDTIdx < 0) or (ArgsNode = nil) then Exit;
   // "Dim As T b = (a)" where a is itself a T: fbc reads that as a value COPY, not as "store a into the
@@ -37912,7 +37992,18 @@ begin
     end;
     case Bank of
       srtFloat:  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), HandleVal, EnsureFloatRegister(ArgVal), MakeSSAConstInt(Slot));
-      srtString: EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), HandleVal, EnsureStringRegister(ArgVal), MakeSSAConstInt(Slot));
+      srtString:
+        begin
+          // ⛔ AN "As String * n" FIELD IS PADDED HERE TOO (DIVERGENZE 288). The ordinary store of a
+          // field pads it to the declared capacity and this one did not, so the SAME field filled by an
+          // aggregate initialiser held three bytes where fbc holds eight: PRINT wrote "map" where fbc
+          // writes "map" and five NULs, while Len still answered 8 from the DECLARED capacity - a
+          // storage that disagreed with everything asked ABOUT it.
+          StrVal := EnsureStringRegister(ArgVal);
+          FixCap := UDTFieldStrCapacity(UDTIdx, FUDTs[UDTIdx].Fields[FieldIdx].Name, FixWide);
+          if FixCap > 0 then StrVal := EmitFixedLenPad(StrVal, FixCap, FixWide);
+          EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), HandleVal, StrVal, MakeSSAConstInt(Slot));
+        end;
     else         EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal, EnsureIntRegister(ArgVal), MakeSSAConstInt(Slot));
     end;
     Inc(FieldIdx);
@@ -38002,10 +38093,11 @@ procedure TSSAGenerator.EmitConstructorCall(const HandleVal: TSSAValue; const Ty
 var
   Lbl, ArgSig, UdtSig: string;
   Decl, ParamList, PNode, ArrayBindArgs: TASTNode;
-  i, Slot, ArgCount, AggUDT: Integer;
+  i, Slot, ArgCount, AggUDT, FixCap: Integer;
   RT: TSSARegisterType;
   ArgVals: array of TSSAValue;
-  DefVal: TSSAValue;
+  DefVal, StrVal: TSSAValue;
+  FixWide: Boolean;
   ParamUdtDef, NDefStage: Integer;          // a BYVAL UDT default owes its private copy too (m760)
   DefSlots: array[0..63] of Integer;
   DefRTs: array[0..63] of TSSARegisterType;
@@ -38088,7 +38180,18 @@ begin
         Slot := FUDTs[AggUDT].Fields[i].Slot;
         case FUDTs[AggUDT].Fields[i].Bank of
           srtFloat:  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), HandleVal, EnsureFloatRegister(ArgVals[i]), MakeSSAConstInt(Slot));
-          srtString: EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), HandleVal, EnsureStringRegister(ArgVals[i]), MakeSSAConstInt(Slot));
+          srtString:
+            begin
+              // ⛔ ...and the "As String * n" padding, which is the rule EmitUDTAggregateInit carries
+              // and THIS copy did not (DIVERGENZE 288). An array of records reaches the field list
+              // through here - "Dim it(1 To 2) As Rec = { (""map"", 9), ... }" builds each element as a
+              // synthesized temporary - so the SAME field was padded when declared alone and unpadded
+              // inside an array. *Two copies of one rule is two places to forget it.*
+              StrVal := EnsureStringRegister(ArgVals[i]);
+              FixCap := UDTFieldStrCapacity(AggUDT, FUDTs[AggUDT].Fields[i].Name, FixWide);
+              if FixCap > 0 then StrVal := EmitFixedLenPad(StrVal, FixCap, FixWide);
+              EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), HandleVal, StrVal, MakeSSAConstInt(Slot));
+            end;
         else         EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal, EnsureIntRegister(ArgVals[i]), MakeSSAConstInt(Slot));
         end;
       end;
@@ -42217,6 +42320,9 @@ begin
     Node := Node.GetChild(0);
   if Node.NodeType = antMemberAccess then
     Result := MemberRawPtrPointee(Node)
+  // "obj.m(i)" on an array member whose ELEMENTS are a raw "<scalar> PTR" (DIVERGENZE 297).
+  else if (Node.NodeType = antArrayAccess) and (MemberArrayElemRawPtrPointee(Node) <> '') then
+    Result := MemberArrayElemRawPtrPointee(Node)
   else if (Node.NodeType = antProcAddress) and (Node.ChildCount >= 1) and
           (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
           (Node.GetChild(0).GetChild(0).NodeType = antMemberAccess) then
@@ -44974,6 +45080,12 @@ begin
           (ArrayIndexOf(VarToStr(Node.GetChild(0).Value)) < 0) and
           (Node.GetChild(1).ChildCount >= 1) then
     Result := UpperFast(DeclaredTypeNameOf(Node.GetChild(1).GetChild(0)))
+  // ⭐ ...and "*obj.m(i)" WHERE THE POINTER IS AN ELEMENT OF AN ARRAY MEMBER. The arm below asks the
+  // registry the FIELD's pointee is recorded in, and an array member's slot holds the array handle - its
+  // element's pointee lives on ArrayElemScalarType instead, so the question answered '' and the deref
+  // read the address as a number (DIVERGENZE 297).
+  else if (Node.NodeType = antArrayAccess) and (MemberArrayElemRawPtrPointee(Node) <> '') then
+    Result := MemberArrayElemRawPtrPointee(Node)
   else if (Node.NodeType = antMemberAccess) and (Node.ChildCount >= 1) then
   begin
     // ⭐ "*obj.field" WHERE THE FIELD IS THE POINTER. Every arm above asks a registry keyed on a
@@ -47211,6 +47323,18 @@ begin
   end;
 end;
 
+function TSSAGenerator.ConstIntAsFloat(const V: TSSAValue; SrcNode: TASTNode): Double;
+// The DOUBLE value of an INTEGER CONSTANT, read UNSIGNED when the expression it came from is an
+// unsigned 64-bit one.
+// ⛔ Folding it signed is the compile-time twin of the defect EmitIntToFloat exists to avoid at run
+// time: "CDbl(1ull Shl 63)" and "(1ull Shl 63) / 2" answered a NEGATIVE number where fbc answers a
+// positive one, while the SAME value held in a ULongInt variable - which never folds - was right all
+// along. That split is the usual tell that the constant path has its own conversion (DIVERGENZE 299).
+begin
+  if (SrcNode <> nil) and IsUnsigned64Expr(SrcNode) then Result := QWord(V.ConstInt)
+  else Result := V.ConstInt;
+end;
+
 function TSSAGenerator.IsUnsigned64Expr(Node: TASTNode): Boolean;
 // True when the value should be compared/divided/modded as unsigned 64-bit. Only the 64-bit unsigned
 // types matter: UByte/UShort/ULong are stored as positive Int64 after narrowing, so they already
@@ -47238,6 +47362,10 @@ begin
           // "Print 5UL * 3L" (m305) and from "(-u) \ 2" (bug_unsigned_negate_print). ⇒ The inline form
           // "Step 1ull Shl 63" is therefore still read signed; through a CONST or a VAR - which carry
           // their declared type - it is not. Closing it wants a WIDTH on the token, not a wider rule.
+          // ⭐ ...AND THE SUFFIX'S WIDTH, which is what the note above said was missing. "1ull Shl 63"
+          // and "5u - 10" are unsigned-64 in fbc; "5ul" is a 32-bit ULong and stays signed. The token
+          // records the width now, so the inline form no longer has to be read signed.
+          if Assigned(Node.Token) and Node.Token.Unsigned64Suffixed then Exit(True);
           Txt := Trim(VarToStr(Node.Token.Value));
           if (Txt <> '') and not TryStrToInt64(Txt, I64) then
           begin

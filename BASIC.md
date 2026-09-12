@@ -2159,7 +2159,7 @@ in a record, or in the numeric builtins. Keep one in a plain `Dim` until those c
 
 | Keyword | Status | Description |
 |---|---|---|
-| `STRING` | ✓ | Variable-length strings (`DIM AS STRING`); fixed-length `STRING * n` is parsed (advisory length). |
+| `STRING` | ✓ | Variable-length strings (`DIM AS STRING`); fixed-length `STRING * n` is a BUFFER of exactly n characters, as in `fbc`: every store pads or cuts to n, `LEN` answers n, and `PRINT` and `STR` write the whole buffer, NUL padding included. It becomes variable-length where the value does — assigned to a `STRING`, or concatenated. |
 | `ZSTRING` | ✓ | Null-terminated string type (`DIM AS ZSTRING [* n]`); `ZSTRING PTR` is a raw pointer to a string's bytes (see `SADD`). |
 | `WSTRING` | ✓ | Wide-character strings (UTF-8 storage, codepoint-aware LEN/MID/LEFT$/RIGHT$). Fixed-length `* n` parsed but advisory (var-length storage). |
 | var-len `STRING` initializer | ✓ | A var-len `STRING` **scalar** with STATIC storage (`SHARED`, `STATIC`, a `NAMESPACE` member, a dotted member definition, or a name a module-level `EXTERN` declared) may not be initialized, as `fbc` requires (`error 87`). A bare module-level `DIM s AS STRING = ...` is a local of the implicit main and IS allowed, as in `fbc`. ⚠️ The ARRAY form is still accepted where `fbc` refuses it — a declared permissiveness. |

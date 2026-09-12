@@ -57,6 +57,7 @@ type
                                 // so this mark is the only thing that still tells a reader the literal is
                                 // WIDE -- which is what makes Left/Mid/Len count codepoints over it.
     FUnsignedSuffixed: Boolean; // "12u" / "5ul" literal: UNSIGNED (the suffix is dropped -- see the property)
+    FUnsigned64Suffixed: Boolean; // ...and the suffix was a 64-BIT one ("12u" / "12ull"), not "5ul"
 
     // Lazy evaluation flags for performance
     FDisplayStringCached: string;
@@ -166,6 +167,13 @@ type
     // "12u"/"5UL": the U marks the literal UNSIGNED, and an unsigned prints with no leading sign space.
     // The suffix is consumed and dropped, so nothing downstream could tell "12u" from "12" without this.
     property UnsignedSuffixed: Boolean read FUnsignedSuffixed write FUnsignedSuffixed;
+    // ⛔ ...AND HOW WIDE THE SUFFIX WAS, which is a different question and the one that decides the
+    // ARITHMETIC. MEASURED on fbc 1.10.1: "1u" and "1ull" are unsigned SIXTY-FOUR ("5u - 10" answers
+    // 18446744073709551611, "1ull Shl 63" answers 9223372036854775808), while "5ul" is a 32-bit ULong
+    // that promotes to a SIGNED Integer ("5ul - 10" answers -5). Without the width, taking every
+    // suffixed literal as unsigned-64 dropped the sign column from "5UL * 3L"; taking none of them as
+    // unsigned-64 made "1ull Shl 63" negative. Both are wrong, and only the width tells them apart.
+    property Unsigned64Suffixed: Boolean read FUnsigned64Suffixed write FUnsigned64Suffixed;
 
     // INTERNAL: Lazy extraction setup (used by lexer)
     procedure SetupLazyExtraction(ExtractorCtx: Pointer; ExtractorFn: TTokenValueExtractor; RecIdx: Integer);
