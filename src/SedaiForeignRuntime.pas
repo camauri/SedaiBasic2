@@ -633,7 +633,28 @@ begin
   if B.Decl.Name = '' then
     raise EForeignCallError.Create('a foreign call names an entry this program does not carry ' +
       '(a .basc written before the foreign table existed?)');
-  B.Fn := ResolveSymbol(B);
+  // ⛔⛔ A DATA SYMBOL THAT IS NOT THERE MUST NOT STOP A PROGRAM THAT NEVER READS IT. fbc emits a
+  // reference only where the datum is USED, so its linker resolves nothing for a header that merely
+  // DECLARES one - and X11's Intrinsic family declares fifteen of them ("extern coreWidgetClass as
+  // WidgetClass"). We looked every one of them up at start-up and aborted the whole program with
+  // "the symbol was not found", so those headers could not be RUN at all while fbc runs them.
+  // ⇒ A missing DATA symbol answers NIL; the caller leaves the value 0, i.e. a NULL pointer, and a
+  // program that actually uses it fails where it uses it - which is this engine's stated equivalent of
+  // fbc's link error (the same argument the undefined-PROCEDURE path makes).
+  // ⚠️ DECLARED LIMIT: for a POINTER datum - which is what these all are - NULL blows up on the first
+  // dereference and names the address. For a SCALAR one it reads as 0 with nothing said, which is the
+  // one case this trades away; fbc refuses it at LINK. A FUNCTION still raises here as before, because
+  // a call is always a use.
+  if UpperCase(Copy(B.Decl.RetTypeName, 1, 5)) = 'DATA:' then
+  begin
+    try
+      B.Fn := ResolveSymbol(B);
+    except
+      on EForeignCallError do B.Fn := nil;
+    end;
+  end
+  else
+    B.Fn := ResolveSymbol(B);
   B.RetRef := KindToRef(B.RetKind);
   if B.RetRef = nil then
     raise EForeignCallError.CreateFmt('%s returns %s',

@@ -370,6 +370,14 @@ raw bytes.
   and `Sqr(2.0f)` differs from `Sqr(2.0)` exactly as FreeBASIC's does.
 
 
+
+- ⚠️ **An `Extern` data symbol that is not there reads as NULL instead of refusing.** FreeBASIC emits a
+  reference only where such a datum is USED, so its linker resolves nothing for a header that merely
+  DECLARES one — and X11's Intrinsic family declares fifteen of them. SedaiBasic looks a datum up when
+  the program starts; a symbol that is missing now answers NULL rather than stopping the program, so
+  those headers can be used for what they define. A POINTER datum then fails on its first dereference,
+  naming the address; a SCALAR one reads 0 with nothing said, which is the case FreeBASIC catches at
+  link time. A missing FUNCTION still fails at the call, as it always did.
 - ⚠️ **`Err` is volatile: an output operation writes its own result into it, and `PRINT USING` is the
   one place that still differs.** SedaiBasic follows FreeBASIC here — measured over twenty forms on
   6 September 2026: `PRINT` in every spelling, `WRITE`, the separators, `TAB`, `SPC`, `PRINT #`,
