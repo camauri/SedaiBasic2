@@ -62,6 +62,7 @@ var
   GPPLibPaths: TStringList = nil;
   // Where to look for an #include that is not beside its includer. See AddIncludeSearchPath.
   GPPIncludePaths: TStringList = nil;
+  GPPNoHeaderEmul: Integer = -1;    // SB_HEADER_EMULATION, the A/B knob that puts the old emulation back
   GPPFbIncludeTried: Boolean = False;
 
   // ⭐⭐ THE PREPROCESSOR'S OWN SYMBOL TABLE, and it exists because fbc's preprocessor IS the compiler
@@ -220,18 +221,34 @@ uses
   SedaiConfig;        // where things are: sedai.conf, the environment, the command line
 
 function IsEmulatedHeaderName(const FileName: string): Boolean;
-// ⛔ The list is the one RegisterEmulatedHeader actually answers to, and it is short on purpose: these
-// two are implemented HERE, and finding fbc's copies on disk must not silently replace them.
+// Which headers RegisterEmulatedHeader answers for when the FreeBASIC tree is NOT there. The list is
+// short on purpose, and since 12 Sep 2026 it no longer WINS over a copy found on disk.
+//
+// ⛔⛔⛔ THE RULE WAS REVERSED, AND THE MEASUREMENT IS WHY. It used to read: "fbgfx.bi" and every
+// "fbc-int/*" are implemented HERE, and a copy found on disk must never replace them - because reading
+// fbc's real fbc-int/array.bi killed m766 with "Array not declared: FB.ARRAYLEN". That argument named
+// a REAL defect but drew the wrong conclusion: the defect was ours (an interception that stopped
+// working the moment "Namespace FB" became a real namespace), and the emulation was hiding it while
+// answering 313 facts WRONG. Measured on the layout net, the same binary, one knob:
+//     emulated:      fbgfx.bi DIFF 16 · fbc-int/gfx.bi DIFF 211 · symbol.bi DIFF 59 · math.bi DIFF 20
+//     real headers:  fbgfx.bi MATCH 201 · fbc-int/gfx.bi DIFF 1 · symbol.bi MATCH 60 · math.bi MATCH 21
+// The whole net went from 396 differing facts to 84, and the corpus did not move.
+// ⭐ And the fear the old note carried - "its enums chain implicit increments across explicit jumps, so
+// a parse of the text is a hypothesis" - is now ANSWERED by the net rather than avoided: all 201 of
+// fbgfx.bi's constants and types agree with the oracle, read from the header itself.
+// ⚠️ What is still ours, and must stay ours, is the RUNTIME: these headers declare "extern rtlib"
+// routines that WE implement (26 in all). A declaration of one must bind to our built-in, never become
+// a foreign call - see the FB.ArrayLen interception in SedaiSSA, which now answers the FLAT spelling
+// too, and RegisterPPSymbolSelectors for the names the PREPROCESSOR needs.
+//
+// ⭐ A/B ON ONE BINARY: SB_HEADER_EMULATION=1 puts the old behaviour back.
 var
   Base: string;
 begin
+  if GPPNoHeaderEmul < 0 then
+    GPPNoHeaderEmul := Ord(GetEnvironmentVariable('SB_HEADER_EMULATION') = '1');
+  if GPPNoHeaderEmul = 0 then Exit(False);
   Base := LowerCase(ExtractFileName(FileName));
-  // ⛔ EVERY fbc-int HEADER, not just symbol.bi. These describe the COMPILER'S OWN internals - the array
-  // descriptor, the symbol table - and this engine implements what they expose natively (FB.ARRAYLEN and
-  // friends). Reading fbc's real copies instead replaces our implementation with declarations of a
-  // layout we do not have: m766 died with "Array not declared: FB.ARRAYLEN" the moment the search path
-  // made "fbc-int/array.bi" findable. ⇒ The whole directory is ours to answer, and that is a decision,
-  // not a gap: a header we IMPLEMENT must never lose to one we merely FIND.
   Result := (Base = 'fbgfx.bi') or (Pos('fbc-int', LowerCase(FileName)) > 0);
 end;
 
@@ -1274,10 +1291,56 @@ begin
             (W = 'ELSEIF') or (W = 'ELSE') or (W = 'ENDIF');
 end;
 
+function LongestDottedMacroKey(const S: string; StartI: Integer; Defs: TStringList;
+                               out EndPos: Integer): string;
+// The LONGEST dotted key present in Defs that starts at StartI - "fbc.FB_QUERY_SYMBOL.symbclass"
+// before "fbc.FB_QUERY_SYMBOL" before "fbc". EndPos is left just past it; '' when none matches.
+//
+// ⛔ TWO DOTS, NOT ONE. Both substituters tried exactly one ("id" + "." + tail), which is enough for
+// "FB_DATACLASS.FB_DATACLASS_UDT" but not for the spelling fbc's OWN fbc-int/symbol.bi writes inside
+// its isXXX macros: "fbc.FB_QUERY_SYMBOL.symbclass". That left the name unsubstituted, so
+// "__FB_QUERY_SYMBOL__" read a selector of 0 whatever the source said, and a bare mention of it
+// reached the parser as "Expected field name after .".
+// ⚠️ Nothing a program can #define carries a dot, so the only keys of this shape are the ones the
+// header support registers; an ordinary member access ("x.field.sub") matches none and is untouched.
+const
+  MAX_SEGMENTS = 3;
+var
+  j, k, n: Integer;
+  Cand: string;
+begin
+  Result := ''; EndPos := StartI;
+  j := StartI;
+  while (j <= Length(S)) and IsIdentChar(S[j]) do Inc(j);
+  if j = StartI then Exit;
+  if Defs = nil then Exit;
+  n := 1;
+  // Walk the dotted chain, remembering the longest prefix that IS a key.
+  if Defs.IndexOfName(UpperFast(Copy(S, StartI, j - StartI))) >= 0 then
+  begin
+    Result := UpperFast(Copy(S, StartI, j - StartI));
+    EndPos := j;
+  end;
+  while (n < MAX_SEGMENTS) and (j <= Length(S)) and (S[j] = '.') do
+  begin
+    k := j + 1;
+    while (k <= Length(S)) and IsIdentChar(S[k]) do Inc(k);
+    if k = j + 1 then Break;
+    Cand := UpperFast(Copy(S, StartI, k - StartI));
+    if Defs.IndexOfName(Cand) >= 0 then
+    begin
+      Result := Cand;
+      EndPos := k;
+    end;
+    j := k;
+    Inc(n);
+  end;
+end;
+
 function SubstituteMacros(const Line: string; Defs, FnDefs: TStringList; Depth: Integer): string;
 var
   i, j, k, idx, ParenDepth: Integer;
-  Word, ArgsStr, BuiltinVal: string;
+  Word, ArgsStr, BuiltinVal, DotKey: string;
   InStr: Boolean;
   InArgStr: Boolean;   // inside a "..." while scanning a macro invocation's arguments
   InCmt: Boolean;   // inside a ' comment: copy verbatim to the end of the line
@@ -1395,11 +1458,10 @@ begin
       // comes from. A member access is untouched: "x.field" is not a key.
       if (j <= Length(Line)) and (Line[j] = '.') then
       begin
-        k := j + 1;
-        while (k <= Length(Line)) and IsIdentChar(Line[k]) do Inc(k);
-        if (k > j + 1) and (Defs.IndexOfName(UpperFast(Copy(Line, i, k - i))) >= 0) then
+        DotKey := LongestDottedMacroKey(Line, i, Defs, k);
+        if (DotKey <> '') and (k > j) then          // a key that actually spans the dot
         begin
-          Result := Result + Trim(Defs.Values[UpperFast(Copy(Line, i, k - i))]);
+          Result := Result + Trim(Defs.Values[DotKey]);
           i := k;
           Continue;
         end;
@@ -2907,7 +2969,7 @@ var
   // re-tokenized (depth-guarded) rather than added as one token, so values like "-1" (-> '-' '1'),
   // "&HFF", or "1 + 2" parse correctly and nested macros expand.
   procedure Tokenize(const S: string; Depth: Integer);
-  var p, q: Integer; id, two: string; nm: string; ConstV, SzVal: Int64; ConstS: string;
+  var p, q, IdStart, DotEnd: Integer; id, two: string; nm: string; ConstV, SzVal: Int64; ConstS: string;
   begin
     p := 1;
     while p <= Length(S) do
@@ -2992,7 +3054,7 @@ var
       begin
         q := p;
         while (q <= Length(S)) and IsIdentChar(S[q]) do Inc(q);
-        id := UpperFast(Copy(S, p, q - p)); p := q;
+        id := UpperFast(Copy(S, p, q - p)); IdStart := p; p := q;
         if id = 'DEFINED' then
         begin
           // defined(NAME) or defined NAME -> 1/0
@@ -3120,10 +3182,10 @@ var
         // A DOTTED key ("FB_DATACLASS.FB_DATACLASS_UDT") is one name here too - the same rule the
         // line substituter follows, and a condition must not answer differently from the code below it.
         else if (p <= Length(S)) and (S[p] = '.') and
-                (Defs.IndexOfName(id + '.' + DottedTail(S, p)) >= 0) then
+                (LongestDottedMacroKey(S, IdStart, Defs, DotEnd) <> '') and (DotEnd > p) then
         begin
-          nm := id + '.' + DottedTail(S, p);
-          p := p + 1 + Length(DottedTail(S, p));
+          nm := LongestDottedMacroKey(S, IdStart, Defs, DotEnd);
+          p := DotEnd;
           if Depth < 32 then Tokenize(Trim(Defs.Values[nm]), Depth + 1)
           else Toks.Add('0');
         end
@@ -3470,6 +3532,75 @@ begin
   DiscoverFbIncludeDir;
   Result := (not IsEmulatedHeaderName(FileName)) and
             (GPPIncludePaths <> nil) and (GPPIncludePaths.Count > 0);
+end;
+
+procedure RegisterPPSymbolSelectors(const FileName: string; Defs: TStringList);
+// ⭐ The names `__FB_QUERY_SYMBOL__` needs IN THE PREPROCESSOR, registered even when fbc's REAL
+// fbc-int/symbol.bi has been read.
+//
+// ⛔ WHY BOTH. The real header is now read for what it truly declares - the enums, the types, the
+// isXXX macros - and that is what the COMPILER wants. But `__FB_QUERY_SYMBOL__` is a compile-time
+// intrinsic answered in the PREPROCESSOR, and the preprocessor cannot see a BASIC enum: its first
+// argument, "FB_QUERY_SYMBOL.dataclass", folded to 0, so every query asked for symbclass whatever the
+// source said and "Print __FB_QUERY_SYMBOL__( FB_QUERY_SYMBOL.dataclass, d )" answered 0 for a Double.
+// The same holds for "#if FB_DATACLASS.FB_DATACLASS_UDT = 3", which fbc accepts (measured).
+//
+// ⚠️ ONLY THE DOTTED SPELLINGS. A bare "FB_DATACLASS_INTEGER" registered as a macro would substitute
+// inside the header's OWN "Enum FB_DATACLASS" body and turn the declaration into "(0)"; the dotted
+// key cannot collide with anything the header writes. The bare names come from the real enum, where
+// they belong. ⇒ Called AFTER the file is read, for the same reason.
+
+  procedure Sel(const Name: string; Value: Integer);
+  begin
+    Defs.Values[Name]          := '(' + IntToStr(Value) + ')';
+    Defs.Values['FBC.' + Name] := '(' + IntToStr(Value) + ')';
+  end;
+
+  procedure Qual(const Name: string; Value: Integer);
+  // ⛔ The NAMESPACE-qualified BARE member, "fbc.FB_SYMBCLASS_STRUCT" - which is what the header's
+  // OWN isXXX macros write, and the only spelling they write. Registered with the "FBC." prefix and
+  // NEVER bare: a bare key would substitute inside the header's own "Enum FB_SYMBCLASS" body and turn
+  // the declaration into "(10)". The prefix cannot appear there, so it cannot collide.
+  begin
+    Defs.Values['FBC.' + Name] := '(' + IntToStr(Value) + ')';
+  end;
+
+begin
+  if (LowerCase(ExtractFileName(FileName)) <> 'symbol.bi') or
+     (Pos('fbc-int', LowerCase(FileName)) = 0) then Exit;
+  Sel('FB_QUERY_SYMBOL.SYMBCLASS',  0);
+  Sel('FB_QUERY_SYMBOL.DATATYPE',   1);
+  Sel('FB_QUERY_SYMBOL.DATACLASS',  2);
+  Sel('FB_QUERY_SYMBOL.TYPENAME',   3);
+  Sel('FB_QUERY_SYMBOL.TYPENAMEID', 4);
+  Sel('FB_QUERY_SYMBOL.MANGLEID',   5);
+  Sel('FB_QUERY_SYMBOL.EXISTS',     6);
+  Sel('FB_DATACLASS.FB_DATACLASS_INTEGER', 0);
+  Sel('FB_DATACLASS.FB_DATACLASS_FPOINT',  1);
+  Sel('FB_DATACLASS.FB_DATACLASS_FLOAT',   1);
+  Sel('FB_DATACLASS.FB_DATACLASS_STRING',  2);
+  Sel('FB_DATACLASS.FB_DATACLASS_UDT',     3);
+  Sel('FB_DATACLASS.FB_DATACLASS_PROC',    4);
+  Sel('FB_DATACLASS.FB_DATACLASS_UNKNOWN', 5);
+  Sel('FB_SYMBCLASS.FB_SYMBCLASS_VAR',       1);
+  Sel('FB_SYMBCLASS.FB_SYMBCLASS_CONST',     2);
+  Sel('FB_SYMBCLASS.FB_SYMBCLASS_PROC',      3);
+  Sel('FB_SYMBCLASS.FB_SYMBCLASS_NAMESPACE', 8);
+  Sel('FB_SYMBCLASS.FB_SYMBCLASS_ENUM',      9);
+  Sel('FB_SYMBCLASS.FB_SYMBCLASS_STRUCT',    10);
+  Qual('FB_DATACLASS_INTEGER', 0);
+  Qual('FB_DATACLASS_FPOINT',  1);
+  Qual('FB_DATACLASS_FLOAT',   1);
+  Qual('FB_DATACLASS_STRING',  2);
+  Qual('FB_DATACLASS_UDT',     3);
+  Qual('FB_DATACLASS_PROC',    4);
+  Qual('FB_DATACLASS_UNKNOWN', 5);
+  Qual('FB_SYMBCLASS_VAR',       1);
+  Qual('FB_SYMBCLASS_CONST',     2);
+  Qual('FB_SYMBCLASS_PROC',      3);
+  Qual('FB_SYMBCLASS_NAMESPACE', 8);
+  Qual('FB_SYMBCLASS_ENUM',      9);
+  Qual('FB_SYMBCLASS_STRUCT',    10);
 end;
 
 procedure RegisterEmulatedHeader(const FileName: string; Defs, FnDefs: TStringList);
@@ -4859,6 +4990,7 @@ var
               try
                 IncText.LoadFromFile(FullPath);
                 Expand(IncText.Text, ExtractFilePath(ExpandFileName(FullPath)));
+                RegisterPPSymbolSelectors(FileName, Defs);
               finally
                 IncText.Free;
               end;
@@ -5296,6 +5428,7 @@ var
                 try
                   IncText.LoadFromFile(FullPath);
                   Expand(IncText.Text, ExtractFilePath(ExpandFileName(FullPath)), FullPath);
+                  RegisterPPSymbolSelectors(FileName, Defs);
                 finally
                   IncText.Free;
                 end;

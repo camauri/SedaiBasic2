@@ -1253,6 +1253,7 @@ type
     procedure EmitIntToFloat(const Dest, Src: TSSAValue; SrcNode: TASTNode;
                              ToSingle: Boolean = False);   // Src3 bits: 1=unsigned src, 2=to binary32
     function FoldEnumMemberExpr(Node: TASTNode; const EnumName: string; out V: Int64): Boolean;
+    function TryFoldEnumMemberName(const NameU: string; out V: Int64): Boolean;  // a BARE enum member's compile-time value
     function ApplyNarrowCode(W: Integer; Value: TSSAValue; SrcNode: TASTNode = nil): TSSAValue;  // narrow by an explicit width code
     procedure ElideRedundantNarrows;                         // a narrowing that cannot change its operand
     procedure ScanMultiDimArrays(Node: TASTNode);            // names ever given >1 dimension
@@ -8910,7 +8911,16 @@ begin
 
         // FreeBASIC ARRAYLEN(arr): total element count. Not a registered keyword; intercept in MODERN
         // when ARRAYLEN itself is not a declared array. (Its argument names the array to measure.)
-        if FModernMode and (UpperFast(ArrName) = kARRAYLEN) and (ArrayIndexOf(ArrName) < 0) then
+        //
+        // ⛔⛔ AND THE NAME MAY ARRIVE FLAT, "FB.ARRAYLEN", the moment "Namespace FB" is a REAL one.
+        // The qualified spelling has a branch of its own further up, which reads an antMemberAccess of
+        // FB - but once a program (or fbc's own "fbc-int/array.bi") OPENS that namespace, the parser
+        // folds the dotted name into a single identifier and the branch never sees it: the call fell
+        // through to the array ladder and died as "Array not declared: FB.ARRAYLEN". Reproduced in
+        // three lines, with no header at all: "Namespace FB : Const Q = 5 : End Namespace" is enough.
+        // ⇒ Both forms are answered here, and only for the FB namespace - the runtime's own.
+        if FModernMode and (ArrayIndexOf(ArrName) < 0) and
+           ((UpperFast(ArrName) = kARRAYLEN) or (UpperFast(ArrName) = 'FB.' + kARRAYLEN)) then
         begin
           EmitArrayLen(Node.GetChild(1), Result);
           Exit;
@@ -8918,7 +8928,8 @@ begin
 
         // FreeBASIC ARRAYSIZE(arr): total size in bytes = element count * element size. MODERN, not a
         // declared array. (Elements occupy 8 bytes in the register banks — matches FB Integer/LongInt/Double.)
-        if FModernMode and (UpperFast(ArrName) = kARRAYSIZE) and (ArrayIndexOf(ArrName) < 0) then
+        if FModernMode and (ArrayIndexOf(ArrName) < 0) and
+           ((UpperFast(ArrName) = kARRAYSIZE) or (UpperFast(ArrName) = 'FB.' + kARRAYSIZE)) then
         begin
           EmitArraySize(Node.GetChild(1), Result);
           Exit;
@@ -12476,8 +12487,16 @@ begin
         Result := True;
       end;
     antIdentifier:
-      Result := (FModuleConstVals <> nil) and
-                TryStrToInt64(FModuleConstVals.Values[Node.ValueUpper], Val);
+      begin
+        Result := (FModuleConstVals <> nil) and
+                  TryStrToInt64(FModuleConstVals.Values[Node.ValueUpper], Val);
+        // ⭐ ...AND AN ENUM MEMBER IS A COMPILE-TIME INTEGER TOO, which this fold did not know: only
+        // a CONST was in FModuleConstVals. fbc's own fbc-int/gfx.bi writes
+        // "putter(0 To PUT_MODES-1) As FBGFX_PUTTER Ptr" with PUT_MODES an enum member - the bound did
+        // not fold, the array member kept its handle, and SizeOf(FB_GFXCTX) answered 144 against 216.
+        // SDL2's SDL_MessageBoxColorScheme is the same shape.
+        if not Result then Result := TryFoldEnumMemberName(Node.ValueUpper, Val);
+      end;
     // ⛔ PARENTHESES ARE TRANSPARENT TO A CONSTANT. Without this case "(3) - 1" is not a constant at
     // all - the fold declines on the left operand - and every caller that asks "is this bound / this
     // initialiser a compile-time integer?" answers no for a shape a program actually writes. fbc's own
@@ -39381,6 +39400,27 @@ begin
     CollectTypeConsts(Node.GetChild(i));
 end;
 
+function TSSAGenerator.TryFoldEnumMemberName(const NameU: string; out V: Int64): Boolean;
+// The compile-time value of a BARE enum member, through the two maps that already hold it: the member
+// name says which ENUM it belongs to (FEnumMemberType), and the qualified key says what it is worth
+// (FEnumQualVals). Two hashed lookups, because a scan of the qualified map would be paid per operand
+// on every header.
+var
+  i: Integer;
+  EnumName: string;
+begin
+  Result := False;
+  V := 0;
+  if (FEnumMemberType = nil) or (FEnumQualVals = nil) or (NameU = '') then Exit;
+  i := FEnumMemberType.IndexOfName(NameU);
+  if i < 0 then Exit;
+  EnumName := FEnumMemberType.ValueFromIndex[i];
+  if EnumName = '' then Exit;
+  i := FEnumQualVals.IndexOfName(EnumName + '.' + NameU);
+  if i < 0 then Exit;
+  Result := TryStrToInt64(FEnumQualVals.ValueFromIndex[i], V);
+end;
+
 function TSSAGenerator.FoldEnumMemberExpr(Node: TASTNode; const EnumName: string;
   out V: Int64): Boolean;
 // Fold one ENUM member's value expression. It is either a literal or an expression over members of
@@ -46613,7 +46653,12 @@ begin
           Exit(True)
         else
           U := '';
-        Result := (U = 'CUINT') or (U = 'CULNGINT') or (U = kCUNSG);
+        // ⛔ ...AND THE QUALIFIED PAIR MAY ARRIVE FLAT. Once "Namespace FB" is a REAL namespace -
+        // which it is as soon as the program reads fbc's own fbc-int/array.bi - the parser folds the
+        // dotted name into ONE identifier, the member-access arm above never matches, and the name
+        // lands here in U. fbc prints "1010"; without this it came back " 10 10".
+        Result := (U = 'CUINT') or (U = 'CULNGINT') or (U = kCUNSG) or
+                  (U = 'FB.' + kARRAYLEN) or (U = 'FB.' + kARRAYSIZE);
         if not Result and (U <> '') then
         begin
           // ⛔⛔ AN ARRAY ASKS ITS OWN REGISTRY, NEVER THE SCALARS' ONE. The comment above says an
