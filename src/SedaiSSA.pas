@@ -51545,6 +51545,14 @@ begin
           if ((TypeName = 'UINTEGER') or (TypeName = 'ULONGINT')) and
              (FUnsigned64Arrays.IndexOf(MangledName) < 0) then
             FUnsigned64Arrays.Add(MangledName);
+          // ⭐ ...and the element's BYTE SIZE, which is the EIGHTH face of this family and the one the
+          // width code above cannot stand in for: the width code is 0 for every 64-bit type, and
+          // ArrayElemSizeBytes needs a real number for all of them. It is what ARRAYSIZE and
+          // FB.ArraySize multiply the element count by, and without it a parameter fell back to 8:
+          // "Sub s( a() As Long )" answered FB.ArraySize 80 where fbc answers 40, while the IDENTICAL
+          // call on the caller's own array answered 40. Found by the fbc-int probe deck, which asks
+          // the PARAMETER shape - the m910 guard only ever asked a module array.
+          if TypeSizeBytes(TypeName) > 0 then NoteArrayElemBytes(MangledName, TypeSizeBytes(TypeName));
         end;
       end
       else
