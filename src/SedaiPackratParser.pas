@@ -168,6 +168,10 @@ type
     // entry at all and every definition on it would pass unasked, which is exactly the case fbc
     // refuses. The member key is MemberDecoratorKey's, the one spelling an OPERATOR's '=' survives.
     FTypeNamesSeen: TStringList;
+    // ⭐ NAME -> the type it ALIASES ("type culong as ulongint"), for the ONE question the parser has
+    // to answer about a type it did not build: is a CONST expression over it UNSIGNED? See
+    // InferConstTypeName. The SSA has CanonicalType for everything else; this is the parser's slice.
+    FTypeAliasOf: TStringList;
     // ...and the ENUM names, which are NOT type names for the aggregate-initialiser question: an
     // enum has no fields, so parentheses around its initialiser are plain grouping.
     FEnumNamesSeen: TStringList;
@@ -711,6 +715,7 @@ begin
   FTypeStaticMethods.CaseSensitive := False;
   FTypeStaticMethods.Sorted := True;
   FTypeNamesSeen := TStringList.Create;       FTypeNamesSeen.CaseSensitive := False;
+  FTypeAliasOf := TIndexedStringList.Create;  FTypeAliasOf.CaseSensitive := False;
   // ⛔ SORTED = a binary search instead of a scan. Every one of these is a pure membership SET - no
   // Objects, no index read, no walk in insertion order (checked, all nine) - and every one is asked
   // once per statement while it grows with the file, so unsorted they cost N**2 on a header.
@@ -764,6 +769,7 @@ begin
   FConstIntValues.Free;
   FTypeStaticMethods.Free;
   FTypeNamesSeen.Free;
+  FTypeAliasOf.Free;
   FEnumNamesSeen.Free;
   FTypeDeclaredMembers.Free;
   FTypesInNamespace.Free;
@@ -1408,6 +1414,7 @@ begin
   FConstIntValues.Clear;
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
   FTypeNamesSeen.Clear; FEnumNamesSeen.Clear; FTypeDeclaredMembers.Clear; FTypesInNamespace.Clear;
+  FTypeAliasOf.Clear;
   FStaticMemberProcs.Clear;
   ClearTypeMethodDefaults;   // ...and the declared default arguments
   FExternShapes.Clear;       // ...and the module-level EXTERN shapes
@@ -1506,6 +1513,7 @@ begin
   FConstIntValues.Clear;
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
   FTypeNamesSeen.Clear; FEnumNamesSeen.Clear; FTypeDeclaredMembers.Clear; FTypesInNamespace.Clear;
+  FTypeAliasOf.Clear;
   FStaticMemberProcs.Clear;
   ClearTypeMethodDefaults;   // ...and the declared default arguments
   FExternShapes.Clear;       // ...and the module-level EXTERN shapes
@@ -5838,6 +5846,7 @@ begin
                                             Context.CurrentToken);
       Context.Advance;
       AliasNode.Attributes.Values['ALIAS'] := UpperFast(AliasType);
+      if AliasNode.ValueUpper <> '' then FTypeAliasOf.Values[AliasNode.ValueUpper] := UpperFast(AliasType);
       AliasNode.Attributes.Values['ALIASLIST'] := '1';
       Result.AddChild(AliasNode);
     end;
@@ -5910,6 +5919,7 @@ begin
       end;
     end;
     Result.Attributes.Values['ALIAS'] := UpperFast(AliasType);
+    if Result.ValueUpper <> '' then FTypeAliasOf.Values[Result.ValueUpper] := UpperFast(AliasType);
     // "Type t As Integer, u As Double": several aliases on one line, each with its own type. Same
     // shape as the leading-AS list above and the same carrier (a child marked ALIASLIST).
     while Context.Check(ttSeparParam) do
@@ -5928,6 +5938,7 @@ begin
         Context.Advance;
       end;
       AliasNode.Attributes.Values['ALIAS'] := UpperFast(AliasType);
+      if AliasNode.ValueUpper <> '' then FTypeAliasOf.Values[AliasNode.ValueUpper] := UpperFast(AliasType);
       AliasNode.Attributes.Values['ALIASLIST'] := '1';
       Result.AddChild(AliasNode);
     end;
@@ -15800,19 +15811,50 @@ var
     L, R, Fn: string;
     I64: Int64;
 
-    function IsIntName(const S: string): Boolean;
+    function ResolveAlias(const S: string): string;
+    // ⭐ A TYPE ALIAS RESOLVED TO WHAT IT NAMES. The C types come in as aliases from a header -
+    // "type culong as ulongint" in crt/long.bi - so "cast(culong, 1)" reached this with the name
+    // CULONG, which is in none of the lists below: ncurses' whole attribute family
+    // ("(not (cast(culong,1) - cast(culong,1))) shl 8") came out SIGNED, printing -256 where fbc
+    // prints 18446744073709551360. The chain is followed a few links, never in a circle.
+    var
+      i, Guard: Integer;
+      T, Nx: string;
     begin
+      T := S;
+      for Guard := 1 to 8 do
+      begin
+        i := FTypeAliasOf.IndexOfName(T);
+        if i < 0 then Break;
+        Nx := UpperFast(Trim(FTypeAliasOf.ValueFromIndex[i]));
+        if (Nx = '') or (Nx = T) then Break;
+        T := Nx;
+      end;
+      Result := T;
+    end;
+
+    function IsIntName(const S0: string): Boolean;
+    var
+      S: string;
+    begin
+      S := ResolveAlias(S0);
       Result := (S = 'LONGINT') or (S = 'LONG') or (S = 'INTEGER') or (S = 'ULONG') or (S = 'ULONGINT') or
                 (S = 'UINTEGER') or (S = 'SHORT') or (S = 'USHORT') or (S = 'BYTE') or (S = 'UBYTE');
     end;
 
-    function IsUnsignedName(const S: string): Boolean;
+    function IsUnsignedName(const S0: string): Boolean;
+    var
+      S: string;
     begin
+      S := ResolveAlias(S0);
       Result := (S = 'ULONG') or (S = 'ULONGINT') or (S = 'UINTEGER') or (S = 'USHORT') or (S = 'UBYTE');
     end;
 
-    function IntNameBits(const S: string): Integer;
+    function IntNameBits(const S0: string): Integer;
+    var
+      S: string;
     begin
+      S := ResolveAlias(S0);
       if (S = 'BYTE') or (S = 'UBYTE') then Result := 8
       else if (S = 'SHORT') or (S = 'USHORT') then Result := 16
       else if (S = 'LONG') or (S = 'ULONG') then Result := 32

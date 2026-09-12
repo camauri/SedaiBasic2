@@ -46794,6 +46794,18 @@ begin
     antParentheses, antUnaryOp:
       if Node.ChildCount >= 1 then
         Result := IsUnsigned64Expr(Node.GetChild(0));
+    // ⭐ A CAST NAMES THE TYPE OF ITS RESULT here too, and the C types arrive as ALIASES from a header
+    // ("type culong as ulongint" in crt/long.bi). ncurses' whole attribute family is built out of
+    // "cast(culong, 1)" - "(not (cast(culong,1) - cast(culong,1))) shl 8" printed -256 where fbc prints
+    // 18446744073709551360, and 77 facts of curses/ncurses.bi were that one shape.
+    // ⚠️ Only the 64-bit unsigned types, which is what this question is about: a ULong is held as a
+    // positive Int64 after narrowing and already compares right.
+    antCast:
+      if Trim(VarToStr(Node.Value)) <> '' then
+      begin
+        U := UpperFast(CanonicalType(UpperFast(Trim(VarToStr(Node.Value)))));
+        Result := (U = 'ULONGINT') or (U = 'UINTEGER');
+      end;
     antBinaryOp:
       if (Node.ChildCount >= 2) and Assigned(Node.Token) then
         case Node.Token.TokenType of
