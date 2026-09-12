@@ -175,6 +175,16 @@ begin
   begin
     D := Dims.GetChild(i);
     if D = nil then Exit;
+    // ⭐⭐ "STATIC a(Any)" IS THE SAME DECLARATION AS "STATIC a()", written the other way, and it was
+    // not treated as one: ANY is neither a literal nor a range, so the whole list read as "computed
+    // bounds" and the static took the size-it-on-first-call path - where "ReDim a(Any)" evaluates the
+    // identifier ANY as an expression, reads 0, and the array comes out with ONE element.
+    // 📊 Measured against the oracle: "Static a(Any) As Integer" inside a Sub answered UBOUND 0 where
+    // fbc answers -1, while the same declaration at MODULE level and the "Static a()" spelling were
+    // both right - which is what said it was this path and not the model (DIVERGENZE 304).
+    // ⚠️ It is not "ANY is literal": an ANY dimension has NO bound to evaluate, here or anywhere, so
+    // the hoisted declaration is complete exactly as the empty list above is.
+    if (D.NodeType = antIdentifier) and SameText(Trim(VarToStr(D.Value)), 'ANY') then Continue;
     if D.NodeType = antDimRange then
     begin
       if D.Attributes.Values['ELLIPSIS'] = '1' then Continue;   // size deduced from the initializer

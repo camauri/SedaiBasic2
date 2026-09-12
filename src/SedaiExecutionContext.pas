@@ -128,6 +128,19 @@ type
     ElemWidth: Byte;              // 0 = 8 bytes in IntData; 1, 2 or 4 = packed in ByteData
     ElemSigned: Boolean;          // a narrow element sign-extends on read when its type is signed
     ByteData: array of Byte;      // populated only when ElemWidth > 0
+    { ⭐ THE TWO FACTS `FBC.ArrayDescriptorPtr` NEEDS AND NOTHING ELSE RECORDED (12 Sep 2026). The
+      descriptor is built at a DEREFERENCE, which holds the storage and not the declaration, so both
+      have to ride here - exactly the argument IsDynamic above is here for.
+        RankStated  copied from the declaration (TSSAArrayInfo.RankStated): "Dim a(Any)" stated its
+                    rank, the bare "Dim a()" did not. It decides FBARRAY_FLAGS_FIXED_DIM and how many
+                    dimTb() entries the flags declare.
+        DescDims    how many dimensions fbc's descriptor REPORTS. Not DimCount: a fresh "Dim a()"
+                    registers one runtime-sized dimension while fbc answers 0, and after
+                    "ReDim a(2 To 11) : Erase a" fbc still answers 1 - the rank SURVIVES an ERASE,
+                    which is the one thing fbc-int/array.bas checks by name. Set by DIM and REDIM,
+                    never cleared by ERASE. }
+    RankStated: Boolean;
+    DescDims: Byte;
   end;
 
 
@@ -468,8 +481,12 @@ const
     rather than an access violation three layers away. Update it ONLY together with them.
     The list, in SedaiBytecodeVM.pas: ArrayDataShared - ArrayDataStillAt - ArrayBankData -
     AliasArrayStorage - ReleaseArrayStorage - MoveArrayStorage - ClearArrayStorage - EraseArray -
-    RedimArray - RedimArrayN, plus the two loops that clear FArrays wholesale. }
-  ARRAY_STORAGE_FIELD_BYTES = 72;
+    RedimArray - RedimArrayN, plus the two loops that clear FArrays wholesale.
+    ⭐ It earned its keep again on 12 Sep 2026: RankStated and DescDims went in for
+    FBC.ArrayDescriptorPtr and it named every routine to visit, at the first run.
+    ⚠️ It fires when a VM is CONSTRUCTED, so a command that answers before that - "sb
+    --verify-opcodes" does - runs clean whatever this says. A green switch is not a green check. }
+  ARRAY_STORAGE_FIELD_BYTES = 80;
 
 procedure CheckArrayStorageLayout;
 

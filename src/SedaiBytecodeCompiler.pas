@@ -632,6 +632,7 @@ begin
     // File management commands
     ssaRawLoadZStr: Result := bcRawLoadZStr;
     ssaRawStoreZStr: Result := bcRawStoreZStr;
+    ssaArrayDescPtr: Result := bcArrayDescPtr;
     ssaCopyFile: Result := bcCopyFile;
     ssaScratch: Result := bcScratch;
     ssaRenameFile: Result := bcRenameFile;

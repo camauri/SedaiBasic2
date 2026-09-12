@@ -132,7 +132,67 @@ const
   RAWPTR_FB_PAGE_SHIFT = 40;
   RAWPTR_FB_PAGE_MASK  = Int64($FF) shl RAWPTR_FB_PAGE_SHIFT;
 
-  RAWPTR_OFS_MASK = RAWPTR_REGION_IMG - 1;  // byte offset occupies the low 60 bits
+  { ⭐ THE FOURTH REGION: AN ARRAY'S FBARRAY DESCRIPTOR (12 Sep 2026), what
+    `FBC.ArrayDescriptorPtr( a() )` in `fbc-int/array.bi` hands back - fbc's INTERNAL array descriptor,
+    which real FreeBASIC code reads field by field (`ap->base_ptr`, `ap->dimTb(d).ubound`).
+
+    ⛔⛔ AND IT IS ANSWERED, NOT STORED - which is the whole reason it is a REGION and not a block in
+    the byte heap. A program takes the pointer ONCE and reads through it AFTER a `ReDim` or an `Erase`:
+
+        dim ap as FBC.FBARRAY ptr = FBC.ArrayDescriptorPtr( a() )
+        redim a(2 To 11) : '' ...and ap->size must now say 80
+
+    A snapshot taken at the call would answer the OLD numbers in silence, and finding every site that
+    reshapes an array to refresh it is the parallel-list mistake this project has paid for before. A
+    region has no such list: the descriptor is a FUNCTION of the array's storage, computed at the
+    dereference, so it cannot be stale. The image-surface header above is answered for the same reason.
+
+    ⛔⛔ AND IT CARRIES *TWO* ARRAY IDS, which is not redundancy - they answer two different questions,
+    and using one for both was wrong in a way only a proc-local array shows:
+      the PHYSICAL slot   names the STORAGE the descriptor describes. It has to be physical because the
+                          dereference happens later, in whatever context holds the pointer, and RawAddr
+                          has no ArrMap to map a logical id through.
+      the LOGICAL id      is what goes into `base_ptr`, because that field is compared against what the
+                          PROGRAM computes for "@a(lb)" - and this VM's pointer encoding is
+                          (logicalId+1) shl 32, resolved through MapArrDyn at every dereference.
+    For a module array the two are the same number and nothing showed; a proc-local array has a PRIVATE
+    slot allocated past FStaticArrCount, so `ap->base_ptr = @l1(2)` answered FALSE where fbc answers
+    TRUE. Measured against the oracle, not reasoned about.
+
+    Bits 0..15 the byte offset (the descriptor is 240 bytes; anything past it raises), 16..37 the
+    physical slot, 38..58 the logical id. }
+  RAWPTR_REGION_ADESC       = Int64(1) shl 59;
+  RAWPTR_ADESC_OFS_MASK     = (Int64(1) shl 16) - 1;
+  RAWPTR_ADESC_PHYS_SHIFT   = 16;
+  RAWPTR_ADESC_LOG_SHIFT    = 38;
+  RAWPTR_ADESC_SLOT_MASK    = (Int64(1) shl 21) - 1;   // 2 097 152 arrays: past anything reachable
+
+  { ⭐ EVERY REGION THAT IS NOT THE BYTE HEAP, in one place. Three sites ask "is this pointer an
+    ordinary byte-heap offset?" and each carried its own hand-written list of region bits; a fourth
+    region would have had to be added to all three, and nothing would have said so. }
+  RAWPTR_REGION_ANY = RAWPTR_REGION_FB or RAWPTR_REGION_IMG or RAWPTR_REGION_ADESC;
+
+  { fbc's FBARRAY, as `fbc-int/array.bi` declares it - "declarations must follow
+    ./src/rtlib/fb_array.h". ⛔ EVERY FIELD IS EIGHT BYTES on a 64-bit target, `size`, `element_len`,
+    `dimensions` and `flags` included: they are declared `uinteger`, which is FreeBASIC's
+    pointer-width integer, not a 32-bit one. Measured against the oracle rather than assumed -
+    `SizeOf(FBC.FBARRAYDIM)` is 24 there and `SizeOf(FBC.FBARRAY)` is 240 - and the layout net keeps
+    saying so, since it asks fbc for the offset of every one of these fields. }
+  FBARRAY_OFS_INDEX_PTR   = 0;
+  FBARRAY_OFS_BASE_PTR    = 8;
+  FBARRAY_OFS_SIZE        = 16;
+  FBARRAY_OFS_ELEMENT_LEN = 24;
+  FBARRAY_OFS_DIMENSIONS  = 32;
+  FBARRAY_OFS_FLAGS       = 40;
+  FBARRAY_OFS_DIMTB       = 48;
+  FBARRAY_DIM_BYTES       = 24;      // FBARRAYDIM: elements, lbound, ubound
+  FB_MAXDIMENSIONS        = 8;
+  FBARRAY_DESC_BYTES      = FBARRAY_OFS_DIMTB + FB_MAXDIMENSIONS * FBARRAY_DIM_BYTES;   // 240
+  FBARRAY_FLAGS_DIMENSIONS = $0000000F;   // how many dimTb() entries the descriptor declares
+  FBARRAY_FLAGS_FIXED_DIM  = $00000010;   // the number of dimensions is fixed
+  FBARRAY_FLAGS_FIXED_LEN  = $00000020;   // the array points at fixed-length memory
+
+  RAWPTR_OFS_MASK = RAWPTR_REGION_ADESC - 1;  // byte offset occupies the low 59 bits
   { ⭐ A raw SLOT THAT HOLDS A POINTER (DIVERGENZE 257, option B): an @-taken ZString Ptr local lives in
     an 8-byte raw block, and the marshaller must know, at a call, that the block holds a pointer.
     RAW_PTRCELL_REQ rides on the SIZE the SSA asks RawAlloc for (no allocation is ever 2^62 bytes), so no
@@ -438,6 +498,11 @@ type
     ssaArrayCopyContents,           // deep-copy array storage between two FArrays handles: Src1=dest handle, Src2=src handle (value-semantics of an array UDT member)
     ssaArrayCopyRecords,            // value-copy an array-of-UDT member element-wise: Src1=dest handle, Src2=src handle, Immediate=packed elem UDT slot counts. Each dest element record gets an independent copy of the src element's contents.
     ssaArrayLBoundInd, ssaArrayUBoundInd,  // LBOUND/UBOUND of a UDT array member (Src1=handle reg, Src2=dim reg)
+    { FBC.ArrayDescriptorPtr( a() ) - fbc's INTERNAL array descriptor, as a pointer into the
+      descriptor REGION (see RAWPTR_REGION_ADESC): Dest = int register, Src1 = array ref.
+      🕳️ A per-instance UDT array MEMBER is not routed here (DIVERGENZE 305): its storage does not
+      describe the member the way fbc's descriptor does, so it answers NULL rather than wrong numbers. }
+    ssaArrayDescPtr,
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
     ssaPrintInt, ssaPrintIntLn,
     ssaPrintBool, ssaPrintUInt,   // B1.5 phase C: BOOLEAN true/false, unsigned-64 print
@@ -836,6 +901,16 @@ type
       call. Declared type, never guessed from the value: an integer that looks like a pointer would be
       corrupted in silence. }
     ElemIsPtr: Boolean;
+    { ⭐ DID THE DECLARATION STATE HOW MANY DIMENSIONS? "Dim a(2 To 11)" and "Dim a(Any, Any)" both do;
+      the bare "Dim a()" does not - it says "an array of unknown rank, a later ReDim will settle it".
+      ⛔ DimCount cannot answer this: both spellings register ONE runtime-sized dimension (see the
+      "Dim x()" / "Dim x(Any)" path in SedaiSSA), so they are the same record. Yet fbc's array
+      DESCRIPTOR distinguishes them in three of its fields at once - `dimensions` (1 against 0),
+      FBARRAY_FLAGS_FIXED_DIM, and how many dimTb() entries the flags declare (the rank against
+      FB_MAXDIMENSIONS) - so `FBC.ArrayDescriptorPtr` cannot be answered without it.
+      It rides to the VM on the array's flags byte, like IsDynamicShape, because the descriptor is
+      built at a DEREFERENCE, which has the storage and not the declaration. }
+    RankStated: Boolean;
   end;
 
   TSSAProgram = class
@@ -905,6 +980,7 @@ type
     procedure SetArrayLowerBoundRegisters(ArrayIdx: Integer; const LbRegs: array of Integer);
     function FindArray(const ArrName: string): Integer;
     procedure SetArrayMultiDim(ArrayIdx: Integer);   // mark: this name is multi-dimensional somewhere
+    procedure SetArrayRankStated(ArrayIdx: Integer); // mark: the declaration STATED the rank
     procedure SetArrayElemWidth(ArrayIdx, Width: Integer; Signed: Boolean);  // packed storage for a narrow type
     procedure SetArrayElemIsPtr(ArrayIdx: Integer);                          // its elements are pointers (257 B)
     procedure SetArrayPrivate(ArrayIdx: Integer);    // mark: proc-local, needs one storage PER THREAD
@@ -1944,6 +2020,13 @@ end;
 procedure TSSAProgram.SetArrayMultiDim(ArrayIdx: Integer);
 begin
   if (ArrayIdx >= 0) and (ArrayIdx <= High(FArrays)) then FArrays[ArrayIdx].MultiDimEver := True;
+end;
+
+procedure TSSAProgram.SetArrayRankStated(ArrayIdx: Integer);
+// The declaration STATED the rank - see TSSAArrayInfo.RankStated. Only ever SET: a slot declared with
+// subscripts and later ReDim'd keeps a stated rank (fbc refuses to change an array's rank at all).
+begin
+  if (ArrayIdx >= 0) and (ArrayIdx <= High(FArrays)) then FArrays[ArrayIdx].RankStated := True;
 end;
 
 procedure TSSAProgram.SetArrayLowerBoundRegisters(ArrayIdx: Integer; const LbRegs: array of Integer);

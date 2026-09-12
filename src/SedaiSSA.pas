@@ -737,6 +737,7 @@ type
     procedure CanonicaliseForeignDecls;   // resolve the declarations' types through the alias table
     function IsForeignPtrCall(Node: TASTNode): Boolean;   // a C call returning C-owned memory (DIVERGENZE 239)
     function ArgIsProgramMemory(A: TASTNode): Boolean;    // ...and the argument shape that vetoes it
+    function RawArgUDTType(ArgNode: TASTNode): string;   // argument = a UDT pointer over raw bytes?
     procedure MarkRawPointerParam(ParamNode, ArgNode: TASTNode; const CalleeU: string);   // raw-ness crosses the call here
     function RawPtrMarkedHere(const NameU: string): Boolean;       // ...is it raw in THIS scope? (DIVERGENZE 96)
     procedure PropagateRawArgs(const CalleeName: string; ArgListNode: TASTNode);  // ...for a whole call
@@ -1030,6 +1031,7 @@ type
     function IsAllocCall(Node: TASTNode; out FuncU: string): Boolean;           // Node = ALLOCATE/CALLOCATE/REALLOCATE(...)?
     function IsScreenPtrExpr(Node: TASTNode): Boolean;                          // Node = SCREENPTR / SCREENPTR()?
     function IsImageCreateExpr(Node: TASTNode): Boolean;                        // Node = IMAGECREATE(...)?
+    function IsArrayDescPtrCall(Node: TASTNode): Boolean;                       // Node = FBC.ArrayDescriptorPtr(...)?
     function RawPtrExprName(Node: TASTNode): string;                            // raw pointer var of a raw ptr expr (p, p±n), else ''
     function IsStrDataPtrExpr(Node: TASTNode): Boolean;                         // SADD(s)/STRPTR(s), and that ± an offset
     function IsStringConstName(const Name: string): Boolean;                    // a declared STRING constant?
@@ -1433,6 +1435,9 @@ type
     // FreeBASIC ARRAYLEN(arr): total element count = product over dims of (ubound-lbound+1).
     procedure EmitArrayLen(ArgsNode: TASTNode; out Result: TSSAValue);
     procedure EmitArraySize(ArgsNode: TASTNode; out Result: TSSAValue);  // ARRAYSIZE = ARRAYLEN * element bytes
+    // FBC.ArrayDescriptorPtr( a() ) - fbc's INTERNAL array descriptor, as a pointer into the
+    // descriptor region. NULL for a shape this engine cannot name (see the body).
+    procedure EmitArrayDescPtr(ArgsNode: TASTNode; out Result: TSSAValue);
     function ArrayElemSizeBytes(const ArrName: string): Int64;                   // one element of that array, in bytes
     procedure NoteArrayElemBytes(const DeclArrName: string; Bytes: Int64);
     function EmitFixedStrElemStore(const FactKey: string; Value: TSSAValue): TSSAValue;  // "ZString * n" element truncation
@@ -1594,7 +1599,8 @@ type
     function EmitByrefRetAddress(Node: TASTNode): TSSAValue;   // ...lowered to the ADDRESS it returns
     function RawUDTPtrType(const Name: string): string;   // "T PTR" holding a RAW address -> T
     function FoldIntNode(Node: TASTNode; out Val: Int64): Boolean;        // literal integer arithmetic, no side effects
-    function UDTFieldArrayShape(UDTIdx, FieldIdx: Integer; out Count, ElemBytes: Int64): Boolean;
+    function UDTFieldArrayShape(UDTIdx, FieldIdx: Integer; out Count, ElemBytes: Int64;
+                                AllowRecordElems: Boolean = False): Boolean;
     function UDTCLayoutRaw(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64): Boolean;
     function TryEmitRawUDTMemberArray(MemberNode: TASTNode; Emit: Boolean; out ArrId: Integer): Boolean;
     function EmitRawUDTFieldAddr(BaseNode, IdxNode, ChainNode: TASTNode; ElemSize, FieldOfs: Int64): TSSAValue;
@@ -2646,6 +2652,7 @@ begin
     'ARRAYSIZE':       Result := Alias_ = 'fb_ArraySize';
     'RANDOMIZE':       Result := Alias_ = 'fb_Randomize';
     'RND':             Result := Alias_ = 'fb_Rnd';
+    'ARRAYDESCRIPTORPTR', 'ARRAYCONSTDESCRIPTORPTR': Result := Alias_ = 'fb_ArrayGetDesc';
   end;
 end;
 
@@ -2683,6 +2690,11 @@ begin
     'FBC.RANDOMIZE':      Result := 'RANDOMIZE';
     'FBC.RND':            Result := 'RND';
     'FBC.RND32':          Result := 'RND32';
+    // ⭐ fbc's INTERNAL array descriptor, answered as a pointer into a REGION of its own rather than
+    // materialised anywhere (RAWPTR_REGION_ADESC). The CONST spelling is the same routine under fbc
+    // too - both alias "fb_ArrayGetDesc" - and const-ness is not a fact this engine carries here.
+    'FBC.ARRAYDESCRIPTORPTR',      'ARRAYDESCRIPTORPTR':      Result := 'ARRAYDESCRIPTORPTR';
+    'FBC.ARRAYCONSTDESCRIPTORPTR', 'ARRAYCONSTDESCRIPTORPTR': Result := 'ARRAYDESCRIPTORPTR';
   end;
 end;
 
@@ -8437,6 +8449,21 @@ begin
           end;
         end;
 
+        // ...and the same for namespace FBC, which is where the array DESCRIPTOR lives.
+        if FModernMode and (Node.GetChild(0).NodeType = antMemberAccess) and
+           (Node.GetChild(0).ChildCount = 1) and
+           (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
+           (Node.GetChild(0).GetChild(0).ValueUpper = 'FBC') and
+           (ArrayIndexOf(VarToStr(Node.GetChild(0).GetChild(0).Value)) < 0) and
+           (ObjectTypeName(Node.GetChild(0).GetChild(0)) = '') and
+           (Node.ChildCount >= 2) and
+           ((Node.GetChild(0).ValueUpper = 'ARRAYDESCRIPTORPTR') or
+            (Node.GetChild(0).ValueUpper = 'ARRAYCONSTDESCRIPTORPTR')) then
+        begin
+          EmitArrayDescPtr(Node.GetChild(1), Result);
+          Exit;
+        end;
+
         // "obj.s[i]" - the byte subscript on a STRING FIELD, which is neither a method call nor an
         // array member: it must be tested before both, or the subscript is read as an element index into
         // the field's (nonexistent) array handle and answers the HANDLE.
@@ -9096,6 +9123,20 @@ begin
            ((UpperFast(ArrName) = kARRAYLEN) or (UpperFast(ArrName) = 'FB.' + kARRAYLEN)) then
         begin
           EmitArrayLen(Node.GetChild(1), Result);
+          Exit;
+        end;
+
+        // FBC.ArrayDescriptorPtr(arr) - the same story as ARRAYLEN above, one namespace over. The
+        // qualifier has already been dropped by the rtlib rewrite further up when the name arrives
+        // flat, which it does as soon as fbc-int/array.bi has OPENED "Namespace FBC"; the two
+        // qualified spellings are listed as well, for a program that never opens it.
+        if FModernMode and (ArrayIndexOf(ArrName) < 0) and
+           ((UpperFast(ArrName) = 'ARRAYDESCRIPTORPTR') or
+            (UpperFast(ArrName) = 'FBC.ARRAYDESCRIPTORPTR') or
+            (UpperFast(ArrName) = 'ARRAYCONSTDESCRIPTORPTR') or
+            (UpperFast(ArrName) = 'FBC.ARRAYCONSTDESCRIPTORPTR')) then
+        begin
+          EmitArrayDescPtr(Node.GetChild(1), Result);
           Exit;
         end;
 
@@ -14261,6 +14302,12 @@ begin
       // unsigned 64-bit one (code 8) is already eight bytes wide.
       NoteArrayElemStorage(ArrayIdx, ElementType, ArrElemTypeName);
       NoteArrayShape(DeclArrName, True);                 // "Dim x()" / "Dim x(Any)": dynamic, by shape
+      // ⭐ ...and here the two spellings PART. Both register one runtime-sized dimension, but
+      // "Dim a(Any)" STATED that there is one of them and the bare "Dim a()" did not - which is what
+      // fbc's array descriptor reports in three fields at once (see TSSAArrayInfo.RankStated).
+      if (DimsNode.ChildCount = 1) and (DimsNode.GetChild(0).NodeType = antIdentifier) and
+         (DimsNode.GetChild(0).ValueUpper = 'ANY') then
+        FProgram.SetArrayRankStated(ArrayIdx);
       IdxReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaLoadConstInt, IdxReg, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       SetLength(DimRegs, 1);     DimRegs[0] := IdxReg.RegIndex;
@@ -14472,6 +14519,9 @@ begin
     // rule below - which then declared a fresh array on every ReDim of such a slot and cost 66 failing
     // assertions across six tests. A registry that nothing reads is not right; it is unobserved.
     NoteArrayShape(DeclArrName, (ArrayDeclNode.Attributes.Values['FROMREDIM'] = '1') or HasAnyDim);
+    // Subscripts of any kind - "(2 To 11)", "(Any, Any)", "(n)" - STATE how many dimensions there
+    // are, which the bare "Dim a()" above does not. See TSSAArrayInfo.RankStated.
+    FProgram.SetArrayRankStated(ArrayIdx);
     // ⭐ ...and the same declaration fixes the array's RANK, filed under the SLOT beside its shape
     // (B2, fbc error 36). Only for a DYNAMIC one: a FIXED array re-dimensioned at all is fbc's
     // "error 4: this array cannot be re-dimensioned", a different refusal that already exists, and
@@ -16486,6 +16536,109 @@ begin
   finally
     SynthCall.Free;
   end;
+end;
+
+procedure TSSAGenerator.EmitArrayDescPtr(ArgsNode: TASTNode; out Result: TSSAValue);
+// FBC.ArrayDescriptorPtr( a() ) / FBC.ArrayConstDescriptorPtr( a() ) - `fbc-int/array.bi` declares
+// them inside `extern "rtlib"`, so for a program running here they are OURS, not a call into a libfb
+// we do not ship (see RtlibBuiltinFor).
+//
+// ⭐ It emits a POINTER and nothing else. The 240 bytes of the FBARRAY are answered at the
+// DEREFERENCE, from the array's own storage (RAWPTR_REGION_ADESC, BuildArrayDescriptor), because a
+// program takes the pointer once and reads through it AFTER a ReDim or an ERASE - which is precisely
+// what fbc's own fbc-int/array.bas checks, and what a snapshot would answer stale.
+//
+// 🎯 AND A SHAPE THIS ENGINE CANNOT NAME ANSWERS NULL, never a wrong pointer. A descriptor names an
+// FArrays slot; a member array that lives INLINE in the record's bytes (DIVERGENZE 226) has no slot
+// of its own, so there is nothing to point at. fbc answers a real descriptor there, we answer NULL -
+// declared as DIVERGENZE 302 - and a program written the way fbc's tests are written takes its own
+// "if( ap )" false branch instead of reading numbers about the wrong array.
+var
+  NameNode, ArrNode, OwnedThis, RewrittenThis: TASTNode;
+  ArrName, TypeName: string;
+  ArrayIdx: Integer;
+begin
+  Result := MakeSSAValue(svkNone);
+  if (ArgsNode = nil) or (ArgsNode.ChildCount < 1) then Exit;
+  ArrNode := ArgsNode.GetChild(0);
+  // "a()" parses as an array ACCESS with no indices; "a" as a bare identifier. Both name the array.
+  if (ArrNode.NodeType = antArrayAccess) and (ArrNode.ChildCount >= 1) and
+     ((ArrNode.ChildCount < 2) or (ArrNode.GetChild(1).ChildCount = 0)) then
+    ArrNode := ArrNode.GetChild(0);
+
+  // A NAMED array - module, local, STATIC, or a static UDT member, which is a named slot too
+  // ("Dim T.a1(2 To 11) As Integer" declares the array "T.A1").
+  if ArrNode.NodeType = antIdentifier then
+  begin
+    ArrName := VarToStr(ArrNode.Value);
+    ArrayIdx := ArrayIndexOf(ArrName);
+    if ArrayIdx >= 0 then
+    begin
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaArrayDescPtr, Result, MakeSSAArrayRef(ArrayIdx, srtInt),
+                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Exit;
+    end;
+    // ...and the bare name inside a METHOD means "this.a", the third spelling TryMemberArrayBound
+    // documents. Same rewrite, same reason.
+    if FCurrentThisType <> '' then
+    begin
+      OwnedThis := TASTNode.Create(antArrayAccess, ArrNode.Token);
+      OwnedThis.AddChild(ArrNode.Clone);
+      try
+        if TryImplicitThisArrayNode(OwnedThis, RewrittenThis) then
+        try
+          NameNode := TASTNode.Create(antArgumentList, ArrNode.Token);
+          try
+            NameNode.AddChild(RewrittenThis.GetChild(0).Clone);
+            EmitArrayDescPtr(NameNode, Result);
+          finally
+            NameNode.Free;
+          end;
+          Exit;
+        finally
+          RewrittenThis.Free;
+        end;
+      finally
+        OwnedThis.Free;
+      end;
+    end;
+  end;
+
+  // A STATIC UDT array member is a MODULE array with a dotted name ("Static a0()" in Type T, plus the
+  // module-level "Dim T.a0() As Integer" that gives it storage), so it is the NAMED case above under
+  // its qualified name. ⛔ Asked of the TYPE and not of the object: "x.a0()" writes the instance, and
+  // the array is filed under "T.A0".
+  if (ArrNode.NodeType = antMemberAccess) and (ArrNode.ChildCount >= 1) then
+  begin
+    TypeName := ObjectTypeName(ArrNode.GetChild(0));
+    if TypeName <> '' then
+    begin
+      ArrayIdx := ArrayIndexOf(TypeName + '.' + VarToStr(ArrNode.Value));
+      if ArrayIdx >= 0 then
+      begin
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaArrayDescPtr, Result, MakeSSAArrayRef(ArrayIdx, srtInt),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        Exit;
+      end;
+    end;
+  end;
+
+  // 🕳️ A PER-INSTANCE UDT ARRAY MEMBER answers NULL, AND THE NULL IS THE POINT (DIVERGENZE 305).
+  // Its storage IS reachable - an indirect form taking the member's runtime FArrays handle was written
+  // and then WITHDRAWN - but that storage does not describe the member the way fbc's descriptor does,
+  // measured on three counts against the oracle: a member declared "a(2 To 11)" is stored with TWELVE
+  // slots at lower bound ZERO (the declared bound is applied at the ACCESS, by InlineArrayBound), so
+  // `size` answered 96 where fbc says 80; the slot does not carry the member's declared RANK, so
+  // FIXED_DIM read false where fbc says true; and `base_ptr` did not compare equal to "@x.a1(2)".
+  // ⛔ Three right fields and two wrong ones is the silent-wrong-answer class this project refuses to
+  // ship, and NULL is a value fbc's own tests TEST for ("if( ap ) ... else CU_FAIL()"), so the gap is
+  // LOUD instead of quiet. Closing it is work on the member-array STORAGE, not on the descriptor.
+
+  // Nothing this engine can describe: NULL, loudly testable, never a pointer to another array.
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
 procedure TSSAGenerator.EmitArrayLen(ArgsNode: TASTNode; out Result: TSSAValue);
@@ -26105,13 +26258,21 @@ begin
   end;
 end;
 
-function TSSAGenerator.UDTFieldArrayShape(UDTIdx, FieldIdx: Integer; out Count, ElemBytes: Int64): Boolean;
-// A FIXED-size, one-dimensional array member of a SCALAR type: its element count and element byte width.
-// Anything else (an "Any" member sized by REDIM, more than one dimension, an array of records or of
-// strings) has no byte image we can lay over raw memory.
+function TSSAGenerator.UDTFieldArrayShape(UDTIdx, FieldIdx: Integer; out Count, ElemBytes: Int64;
+                                         AllowRecordElems: Boolean): Boolean;
+// A FIXED-size, one-dimensional array member: its element count and element byte width. An "Any" member
+// sized by REDIM, more than one dimension, or an array of STRINGS has no byte image we can lay over raw
+// memory and is refused.
+//
+// ⭐ AllowRecordElems admits an array of RECORDS, at the nested type's own inline size - the remaining
+// half of DIVERGENZE 293. ⛔ Only the RAW layout may ask for it: the other caller builds a hidden array
+// of SCALARS to copy the member into, which a record element has no bank for.
+// 📌 fbc's own FBARRAY is exactly this shape ("dimTb(0 To 7) As FBARRAYDIM"), so without it
+// FBC.ArrayDescriptorPtr could hand back a correct pointer and "ap->size" would still read it as a
+// managed record HANDLE - which is how it failed, three layers from here.
 var
   F: TUDTField;
-  Lb, Ub: Int64;
+  Lb, Ub, NSz, NAl: Int64;
   D: TASTNode;
 begin
   Result := False; Count := 0; ElemBytes := 0;
@@ -26119,7 +26280,9 @@ begin
   if not F.IsArray then Exit;
   if (F.ArrayBounds = nil) or (F.ArrayBounds.ChildCount <> 1) then Exit;
   if F.ArrayElemBank = srtString then Exit;
-  if (F.ArrayElemType <> '') or (F.ArrayElemPtrPointee <> '') then Exit;
+  if F.ArrayElemPtrPointee <> '' then Exit;
+  if (F.ArrayElemType <> '') and
+     not (AllowRecordElems and NestedMemberShape(F.ArrayElemType, False, NSz, NAl) and (NSz > 0)) then Exit;
   D := F.ArrayBounds.GetChild(0);
   Lb := 0;
   if D.NodeType = antDimRange then
@@ -26131,6 +26294,12 @@ begin
   else if not FoldIntNode(D, Ub) then Exit;
   if Ub < Lb then Exit;
   Count := Ub - Lb + 1;
+  // An array of RECORDS: one element is the nested type, laid out inline as C lays it.
+  if F.ArrayElemType <> '' then
+  begin
+    ElemBytes := NSz;
+    Exit(Count > 0);
+  end;
   // ⛔ THE ELEMENT'S WIDTH, NOT THE SLOT'S. This read F.WidthCode, which is the store-narrowing width
   // of the FIELD - and the field is a handle. The two were the same number only because the field was
   // being given its element's width by mistake; ArrayElemScalarType is where the element's type lives.
@@ -26186,7 +26355,7 @@ begin
     if not IsBit then Run.Open := False;
     if FUDTs[UDTIdx].Fields[i].IsArray then
     begin
-      if not UDTFieldArrayShape(UDTIdx, i, Cnt, EB) then Exit;
+      if not UDTFieldArrayShape(UDTIdx, i, Cnt, EB, True) then Exit;
       Sz := Cnt * EB; Al := EB;
     end
     else
@@ -26605,6 +26774,11 @@ function TSSAGenerator.ResolveRawUDTBase(ObjNode: TASTNode; out TypeName: string
 // "New T[n]" and "CAllocate(n, Len(T))" hand back; both callers only knew the bare identifier, so an
 // indexed write fell through to the managed record path and faulted on a byte offset read as a handle.
 // Only the SQUARE-bracket spelling qualifies: "p(i)" on a pointer is not FreeBASIC's element access.
+var
+  OuterName: string;
+  OuterIdx, MemIdx, k: Integer;
+  OuterOfs: TInt64Array;
+  OuterSize: Int64;
 begin
   Result := False;
   TypeName := ''; UDTIdx := -1; TotalSize := 0; BaseNode := nil; IdxNode := nil; ChainNode := nil;
@@ -26624,6 +26798,53 @@ begin
     if TotalSize <= 0 then Exit;
     ChainNode := ObjNode;
     Exit(True);
+  end;
+  // ⭐⭐ "p->m(i).field" - A FIELD OF AN ELEMENT OF AN ARRAY-OF-RECORDS MEMBER, over raw memory. The
+  // remaining half of DIVERGENZE 293: the SIZE of such a type has been right since 12 Sep 2026, and
+  // reading THROUGH it still took the managed record path and died as "Invalid record handle" on a byte
+  // address. fbc's own FBARRAY is this shape ("dimTb(0 To 7) As FBARRAYDIM") and fbc-int/array.bas
+  // reads it that way in every one of its checks, so FBC.ArrayDescriptorPtr cannot work without it.
+  //
+  // ⭐ It needs NO new out-parameter, which is why it is written this way: the element's own offsets
+  // are shifted by the MEMBER's offset inside the outer type, so "Offsets[FieldIdx]" already carries
+  // both, and TotalSize becomes the element STRIDE - exactly the two numbers EmitRawUDTFieldAddr wants
+  // for "base + idx*stride + fieldOfs". The three callers are unchanged.
+  if (ObjNode.NodeType = antArrayAccess) and (ObjNode.ChildCount >= 2) and
+     (ObjNode.GetChild(0) <> nil) and (ObjNode.GetChild(0).NodeType = antMemberAccess) and
+     (ObjNode.GetChild(0).ChildCount >= 1) and
+     (ObjNode.GetChild(0).GetChild(0).NodeType = antIdentifier) then
+  begin
+    OuterName := RawUDTPtrType(ObjNode.GetChild(0).GetChild(0).ValueUpper);
+    if (OuterName <> '') and (FindUDT(OuterName) >= 0) and
+       UDTCLayoutRaw(FindUDT(OuterName), OuterOfs, OuterSize) then
+    begin
+      OuterIdx := FindUDT(OuterName);
+      MemIdx := -1;
+      for k := 0 to High(FUDTs[OuterIdx].Fields) do
+        if UpperFast(FUDTs[OuterIdx].Fields[k].Name) = ObjNode.GetChild(0).ValueUpper then
+          begin MemIdx := k; Break; end;
+      if (MemIdx >= 0) and (MemIdx <= High(OuterOfs)) and FUDTs[OuterIdx].Fields[MemIdx].IsArray and
+         (FUDTs[OuterIdx].Fields[MemIdx].ArrayElemType <> '') then
+      begin
+        TypeName := UpperFast(CanonicalType(FUDTs[OuterIdx].Fields[MemIdx].ArrayElemType));
+        UDTIdx := FindUDT(TypeName);
+        if (UDTIdx >= 0) and UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) and (TotalSize > 0) then
+        begin
+          IdxNode := ObjNode.GetChild(1);
+          if (IdxNode <> nil) and (IdxNode.NodeType in [antArgumentList, antExpressionList]) then
+          begin
+            if IdxNode.ChildCount <> 1 then Exit;     // "m(i, j)" is not one element of this member
+            IdxNode := IdxNode.GetChild(0);
+          end;
+          if IdxNode = nil then Exit;
+          // The member's own offset rides on every field offset - see the note above.
+          for k := 0 to High(Offsets) do Offsets[k] := Offsets[k] + OuterOfs[MemIdx];
+          BaseNode := ObjNode.GetChild(0).GetChild(0);
+          Exit(True);
+        end;
+      end;
+    end;
+    TypeName := ''; UDTIdx := -1; TotalSize := 0; SetLength(Offsets, 0);
   end;
   // ⭐ "(*p).field" IS "p->field", and it used to reach here as a shape this routine did not know:
   // an antDeref, possibly parenthesised, instead of the bare name. So the raw byte-offset path
@@ -39316,7 +39537,7 @@ procedure TSSAGenerator.CollectStaticMembers(Node: TASTNode);
 // machinery, so it is visible from methods/threads). v1 supports builtin scalar static members.
 var
   i, k, ai, di: Integer;
-  FieldNode, DimsN: TASTNode;
+  FieldNode, DimsN, StatDimsN: TASTNode;
   tn, fn, ftype, backing: string;
   bank: TSSARegisterType;
   StatDims, StatLbs: array of Integer;
@@ -39396,6 +39617,17 @@ begin
             end;
             ai := FProgram.DeclareArray(backing, bank, StatDims);
             if Length(StatLbs) = Length(StatDims) then FProgram.SetArrayLowerBounds(ai, StatLbs);
+            // ⭐ ...and the two facts fbc's array DESCRIPTOR reads, which this path never filed and the
+            // ordinary DIM path does. "Static a(Any)" STATES its rank and is DYNAMIC; the bare
+            // "Static a()" states nothing; concrete bounds state the rank and are FIXED-LENGTH.
+            // Without them FBC.ArrayDescriptorPtr( x.a() ) answered dims 0 / FIXED_DIM false for a
+            // member fbc reports as dims 1 / true - see TSSAArrayInfo.RankStated.
+            StatDimsN := nil;
+            for di := 0 to FieldNode.ChildCount - 1 do
+              if FieldNode.GetChild(di).NodeType = antDimensions then
+                begin StatDimsN := FieldNode.GetChild(di); Break; end;
+            if (StatDimsN <> nil) and (StatDimsN.ChildCount >= 1) then FProgram.SetArrayRankStated(ai);
+            if DimsN = nil then FProgram.SetArrayDynamicShape(ai, True);   // "()" or "(Any)": dynamic
             FStaticMemberArrays.AddObject(backing, TObject(PtrInt(ai)));
           end;
           Continue;
@@ -41587,6 +41819,36 @@ begin
   Result := (U = 'IMAGECREATE') and (ArrayIndexOf(U) < 0);
 end;
 
+function TSSAGenerator.IsArrayDescPtrCall(Node: TASTNode): Boolean;
+// FBC.ArrayDescriptorPtr(...) / FBC.ArrayConstDescriptorPtr(...). It answers a RAW pointer - into the
+// descriptor region - so a variable initialised from it must be tracked raw, exactly as one initialised
+// from ALLOCATE, SCREENPTR or IMAGECREATE is.
+// ⛔⛔ AND WITHOUT THIS THE WHOLE FEATURE READS AS BROKEN IN A WAY THAT LOOKS UNRELATED. The declared
+// type is "FBC.FBARRAY Ptr", a UDT pointer, so an unmarked variable takes the MANAGED RECORD path:
+// "ap->size" then indexes the shared-record table with bit 62 of the address and dies as "Invalid
+// record handle 5188146787910680576 (not a shared record)". The descriptor itself was right.
+// ⚠️ The name may arrive QUALIFIED or FLAT, for the reason the interception in ProcessExpression gives:
+// once fbc-int/array.bi has OPENED "Namespace FBC" the parser folds the dotted name into one identifier.
+var
+  U: string;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if (Node.NodeType <> antArrayAccess) and (Node.NodeType <> antFunctionCall) then Exit;
+  if Node.ChildCount < 1 then Exit;
+  if Node.GetChild(0).NodeType = antIdentifier then U := Node.GetChild(0).ValueUpper
+  else if (Node.GetChild(0).NodeType = antMemberAccess) and (Node.GetChild(0).ChildCount = 1) and
+          (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
+          (Node.GetChild(0).GetChild(0).ValueUpper = 'FBC') then
+    U := 'FBC.' + Node.GetChild(0).ValueUpper
+  else
+    Exit;
+  Result := ((U = 'ARRAYDESCRIPTORPTR') or (U = 'FBC.ARRAYDESCRIPTORPTR') or
+             (U = 'ARRAYCONSTDESCRIPTORPTR') or (U = 'FBC.ARRAYCONSTDESCRIPTORPTR')) and
+            (ArrayIndexOf(U) < 0);
+end;
+
 function TSSAGenerator.IsScreenPtrExpr(Node: TASTNode): Boolean;
 // SCREENPTR, bare or parenthesised. It yields a raw pointer -- into the framebuffer region rather than
 // the byte heap, but raw all the same -- so a variable initialised from it must be tracked raw, or
@@ -43403,15 +43665,26 @@ var
       // unmarked, "img->width" took the managed-record path and faulted on the first field.
       // ⭐ ...AND A STRUCTURE C HANDS BACK ("tm Ptr" from gmtime, any struct a Windows API returns by
       // pointer): C-layout bytes C owns, not a record this compiler allocated. DIVERGENZE 239.
+      // ⭐ ...AND fbc's OWN ARRAY DESCRIPTOR, which is a UDT pointer ("FBC.FBARRAY Ptr") over an
+      // ADDRESS in the descriptor region - not a record this compiler owns. See IsArrayDescPtrCall.
       if (RawPtrExprName(Rhs) <> '') or IsStrDataPtrExpr(Rhs) or IsRawPtrCellExpr(Rhs) or
          IsRawPtrFieldExpr(Rhs) or IsImageCreateExpr(Rhs) or IsForeignPtrCall(Rhs) or
+         IsArrayDescPtrCall(Rhs) or
          ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] <> '1') and
           TypeDeclaresAllocOperator(PointerUDTType(TargetU), 'OPERATORNEW') and
           (not TypeHasMemberProc(PointerUDTType(TargetU)))) or
          ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] = '1') and
           (not UDTBlockIsManaged(PointerUDTType(TargetU)))) then
         if FRawUDTPtrs.IndexOfName(TargetU) < 0 then
+        begin
           FRawUDTPtrs.Add(TargetU + '=' + PointerUDTType(TargetU));
+          // ⛔ RAWPTRDIAG had a HOLE here: this is the busiest raw marking in the unit - every UDT
+          // pointer laid over bytes - and it was the one that printed nothing, so "no RAWPTR line"
+          // could not be read as "not marked". It cost a wrong diagnosis on 12 Sep 2026.
+          if GetEnvironmentVariable('RAWPTRDIAG') <> '' then
+            WriteLn(ErrOutput, 'RAWPTR udt   [', FRawScanProc, '] ', TargetU, ' -> ',
+                    PointerUDTType(TargetU), ' laid over bytes');
+        end;
       Exit;
     end;
     if (Rhs.NodeType = antNew) and
@@ -43425,6 +43698,8 @@ var
       MarkRaw(TargetU)   // p = ScreenPtr: raw, in the framebuffer region
     else if IsImageCreateExpr(Rhs) then
       MarkRaw(TargetU)   // p = ImageCreate(...): raw, in the image-surface region
+    else if IsArrayDescPtrCall(Rhs) then
+      MarkRaw(TargetU)   // p = FBC.ArrayDescriptorPtr(a()): raw, in the descriptor region
     else if Rhs.NodeType = antCast then
     begin
       TU := Rhs.ValueUpper;
@@ -49651,6 +49926,20 @@ begin
                   MakeSSAValue(svkNone), MakeSSAConstInt(1));
 end;
 
+function TSSAGenerator.RawArgUDTType(ArgNode: TASTNode): string;
+// Is this ARGUMENT a UDT pointer that holds a RAW ADDRESS, and of what type? A name already marked in
+// FRawUDTPtrs, or a call that produces one. It exists so MarkRawPointerParam asks the SAME question the
+// declaration path asks, instead of a second opinion about what "raw" means.
+begin
+  Result := '';
+  if ArgNode = nil then Exit;
+  while (ArgNode.ChildCount >= 1) and (ArgNode.NodeType in [antParentheses, antCast]) do
+    ArgNode := ArgNode.GetChild(0);
+  if ArgNode.NodeType = antIdentifier then Exit(RawUDTPtrType(ArgNode.ValueUpper));
+  if IsArrayDescPtrCall(ArgNode) or IsForeignPtrCall(ArgNode) or IsImageCreateExpr(ArgNode) then
+    Exit('*');     // raw, and the PARAMETER's declared pointee is the type to file
+end;
+
 procedure TSSAGenerator.MarkRawPointerParam(ParamNode, ArgNode: TASTNode; const CalleeU: string);
 // A pointer PARAMETER is raw when the ARGUMENT passed to it is raw.
 //
@@ -49676,8 +49965,29 @@ begin
   PT := ParamNode.GetChild(0).ValueUpper;
   if (Length(PT) < 5) or (Copy(PT, Length(PT) - 3, 4) <> ' PTR') then Exit;
   Pointee := Trim(Copy(PT, 1, Length(PT) - 4));
-  // "T Ptr" with T a UDT stays a MANAGED record handle, and "T Ptr Ptr" is
-  // already raw by construction (IsRawPtr) - neither belongs here.
+  // ⭐⭐ A "T PTR" PARAMETER WHOSE ARGUMENT IS A UDT POINTER OVER RAW BYTES. "T Ptr" with T a UDT is
+  // USUALLY a managed record handle, which is why the test below excludes it - but not when the caller's
+  // pointer is one of the raw ones (a CPtr over Allocate, a struct C returned, an IMAGE, and now
+  // FBC.ArrayDescriptorPtr). That rawness stopped at the call: "show(p)" then read p->a through the
+  // managed record path and died as "Invalid record handle 4611686018427387920", while the identical
+  // read in the CALLER worked. PRE-EXISTING and measured against fbc, which prints the field
+  // (DIVERGENZE 303).
+  // ⚠️ FRawUDTPtrs is not scoped by procedure, unlike FRawPtrScoped - that is how every other writer
+  // of it works, so a same-named pointer elsewhere inherits the type. Declared, not discovered.
+  if (Pointee <> '') and (FindUDT(Pointee) >= 0) and (Pos(' PTR', Pointee) = 0) then
+  begin
+    PN := ParamNode.ValueUpper;
+    if (PN <> '') and (RawArgUDTType(ArgNode) <> '') and (FRawUDTPtrs.IndexOfName(PN) < 0) then
+    begin
+      FRawUDTPtrs.Add(PN + '=' + UpperFast(CanonicalType(Pointee)));
+      FRawCollectChanged := True;
+      if GetEnvironmentVariable('RAWPTRDIAG') <> '' then
+        WriteLn(ErrOutput, 'RAWPTR param udt [', CalleeU, '] ', PN, ' -> ', Pointee,
+                '   <- from a raw UDT argument');
+    end;
+    Exit;
+  end;
+  // "T Ptr Ptr" is already raw by construction (IsRawPtr) - it does not belong here.
   if (Pointee = '') or (FindUDT(Pointee) >= 0) or (Pos(' PTR', Pointee) > 0) then Exit;
   // ⭐ ...OR A RAW EXPRESSION WITH NO NAME TO GIVE. RawPtrExprName answers a NAME, so it can only speak
   // for an argument that IS a variable (or arithmetic on one); "show( @wstr("abc") )" hands over a raw

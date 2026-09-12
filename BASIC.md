@@ -459,6 +459,24 @@ raw bytes.
   bare ones stay as an extension, so a MODERN source using them does not compile there. The qualified
   pair is typed `UInteger` as fbc declares it (no sign column when printed); the bare pair, having no
   oracle to conform to, keeps the ordinary signed rendering.
+- ⚠️ **`FBC.ArrayDescriptorPtr` answers fbc's array descriptor, with two limits that are named.**
+  Everything a program normally reads through it agrees with fbc byte for byte — `base_ptr`, `size`,
+  `element_len`, `dimensions`, `flags` and `dimTb()` — and the descriptor is recomputed from the
+  array's storage at every read, so it is never stale after a `ReDim` or an `Erase`. The two
+  exceptions:
+  - **`index_ptr` answers NULL when a lower bound is not zero** (ledger 301). It is documented
+    `@array(0, 0, ...)`, which for `a(2 To 11)` names an address BEFORE the array's storage. In this
+    implementation a pointer is an array identity plus an element offset, so there is no value for an
+    address that precedes the array — subtracting from the offset would name a DIFFERENT array. It
+    answers the element at index 0 where every lower bound is zero (equal to `base_ptr`, as under fbc)
+    and NULL otherwise, so a program that walks it with absolute indices fails immediately instead of
+    reading the wrong array quietly.
+  - **A PER-INSTANCE UDT array member answers NULL** (ledger 305): `FBC.ArrayDescriptorPtr(x.a())`
+    where `a` is declared `Dim`/`ReDim` inside the type. Such a member's storage does not record the
+    same facts fbc's descriptor reports — its declared bounds are applied at the ACCESS rather than
+    stored — and answering some fields correctly beside others wrongly would be worse than not
+    answering. A **`Static`** member is a module array under its own dotted name and IS answered, flags
+    included. NULL is testable (`If ap Then ... Else`), which is how fbc's own tests are written.
 - `Interface`, `Override` and `Final` do not exist in fbc; a MODERN source using them will not compile
   there. That is the point of an extension.
 - `Implements` exists in fbc as a reserved word with no effect. In MODERN it constrains: a type that
@@ -2873,7 +2891,7 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 
 | Keyword | Status | Description |
 |---|---|---|
-| `Array[Const]DescriptorPtr` | ✗ | **Out of scope, declared.** `FBC.ArrayDescriptorPtr(arr())` hands back a pointer to an `FBC.FBARRAY` whose fields (`base_ptr`, `size`, `element_len`, `dimensions`, `flags`, `dimTb()`) are read directly. Its own header says *declarations must follow ./src/rtlib/fb_array.h* and binds the entry points to C symbols by alias (`extern "rtlib" ... alias "fb_ArrayGetDesc"`): it is the in-memory image of FreeBASIC's runtime library, not a feature of the language. This implementation has no such runtime — an array is a storage record in a table with one physical slot per execution context — so the descriptor is not exposed. `FB.ArrayLen` and `FB.ArraySize`, which are values rather than a memory layout, are supported (above). |
+| `Array[Const]DescriptorPtr` | ✓ | `FBC.ArrayDescriptorPtr(arr())` hands back a pointer to an `FBC.FBARRAY` and its fields are read directly: `base_ptr`, `size` (BYTES), `element_len`, `dimensions`, `flags` (`FIXED_DIM` / `FIXED_LEN` and how many `dimTb()` entries are declared) and `dimTb(d).elements/.lbound/.ubound`. ⭐ The descriptor is **computed from the array's own storage at every read**, not snapshotted at the call, because a program takes the pointer once and reads through it after a `ReDim` or an `Erase` — which is what fbc's own tests do. `base_ptr` is the same pointer value `@arr(lb)` produces, so the two compare equal. Verified against fbc 1.10.1 on fixed / `(Any)` / bare `()` arrays, module-level and proc-local, 1-D and 2-D, before and after `ReDim` and `Erase`, and for `UByte`/`Short`/`Double` element widths. **Two declared limits**: `index_ptr` answers NULL when a lower bound is not zero (it names an address before the array's storage, which this pointer domain cannot represent), and a **per-instance** UDT array member answers NULL — a STATIC one is answered. See *Declared divergences*. The `Const` spelling is the same routine, as it is under fbc. |
 
 ### Bit Manipulation
 

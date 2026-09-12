@@ -577,6 +577,13 @@ const
   // managed strings). The cell is four bytes, as fbc's wchar_t is on Linux - see WIDE_CELL_BYTES.
   bcRawLoadZStr        = bcGroupArray + 50;  // Dest(str) = C string at RawAddr(IntRegs[Src1]) up to NUL
   bcRawStoreZStr       = bcGroupArray + 51;  // bytes of StringRegs[Src2] + NUL -> RawAddr(IntRegs[Src1])
+  // FBC.ArrayDescriptorPtr( a() ): Dest(int) = a pointer into the DESCRIPTOR region for the array's
+  // physical slot (see RAWPTR_REGION_ADESC). Src1 = logical array id (immediate). The descriptor is
+  // ANSWERED at the dereference, so this op only names the array - it materialises nothing.
+  // 🕳️ A per-instance UDT array MEMBER has no form here (DIVERGENZE 305): an indirect one taking the
+  // member's runtime FArrays handle was written and withdrawn - that storage does not describe the
+  // member the way fbc's descriptor does, and NULL is better than three right fields and two wrong.
+  bcArrayDescPtr       = bcGroupArray + 52;
 
   // === GROUP 4: I/O OPERATIONS (0x04xx) ===
   // Print values
@@ -2316,6 +2323,7 @@ begin
         35: Result := 'ArrayUnbind';
         50: Result := 'RawLoadZStr';
         51: Result := 'RawStoreZStr';
+        52: Result := 'ArrayDescPtr';
         27: Result := 'ArrayRedimPush';
         28: Result := 'ArrayRedimN';
         29: Result := 'ArrayIdxPush';

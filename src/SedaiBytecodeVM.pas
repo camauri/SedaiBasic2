@@ -228,6 +228,14 @@ type
     // The FB.IMAGE header handed back for an offset below 32 in the image-pointer region. Per VM, not
     // per surface: it is filled from the surface at every read, so it is never stale.
     FImgHeaderBuf: array[0..RAWPTR_IMG_HDR_SIZE - 1] of Byte;
+    { ⭐ And the same idea for fbc's ARRAY DESCRIPTOR: the 240 bytes `FBC.ArrayDescriptorPtr` hands
+      back, filled from the array's storage at EVERY read, so a `ReDim` or an `Erase` between the call
+      and the read cannot leave it stale. See RAWPTR_REGION_ADESC and BuildArrayDescriptor.
+      ⚠️ Per VM, exactly like the image header above, which means two THREADS reading two different
+      descriptors at the same instant share it. Declared, not hidden: a program that hands the same
+      descriptor pointer to two workers is outside what this answers, and fbc's own descriptor - real
+      memory one thread can ReDim under another - is no safer. }
+    FArrDescBuf: array[0..FBARRAY_DESC_BYTES - 1] of Byte;
     FGfxScreenDepth: Integer;   // what SCREENRES actually gave, after fbc's rounding
     FSharedRecordCount: Integer;
     FSharedRecFreeList: array of Integer;  // DELETE: indices of freed shared records, reused by NEW
@@ -860,7 +868,8 @@ type
                                ExactBytes: Integer): AnsiString;
     procedure PtrDomainStoreZStr(Ctx: TExecutionContext; PtrAddr: Int64; const Value: AnsiString;
                                  Wide: Boolean);
-    function RawAddr(RawPtr: Int64; NeedBytes: PtrUInt): Pointer;
+    function RawAddr(RawPtr: Int64; NeedBytes: PtrUInt; ForWrite: Boolean = False): Pointer;
+    procedure BuildArrayDescriptor(Slot, LogicalId: Integer);
     // FreeBASIC raw byte heap (Allocate family). All return/take RAWPTR_TAG-tagged byte offsets.
     function RawAlloc(ByteCount: PtrUInt): Int64;
     function StrSAdd(const S: string): Int64;   // SADD(s) -> raw pointer to a NUL-terminated byte copy
@@ -886,7 +895,7 @@ type
     procedure RawStrCellSet(RawPtr: Int64; const S: string);                   // ...and writing one
     procedure RawStoreInt(RawPtr: Int64; TypeCode: Integer; Value: Int64);
     procedure RawStoreFloat(RawPtr: Int64; TypeCode: Integer; Value: Double);
-    function BlockAddr(Ctx: TExecutionContext; Ptr: Int64; NeedBytes: PtrUInt): Pointer;  // CLEAR/FB_MEMCOPY: the raw heap, the framebuffer, OR an array's element storage
+    function BlockAddr(Ctx: TExecutionContext; Ptr: Int64; NeedBytes: PtrUInt; ForWrite: Boolean = False): Pointer;  // CLEAR/FB_MEMCOPY: the raw heap, the framebuffer, OR an array's element storage
     procedure RawMemCopy(Ctx: TExecutionContext; DstPtr, SrcPtr: Int64; ByteCount: PtrUInt);  // FB_MEMCOPY/FB_MEMMOVE: copy ByteCount bytes
     procedure RawClear(Ctx: TExecutionContext; DstPtr: Int64; Value: Byte; ByteCount: PtrUInt);  // CLEAR: set ByteCount bytes to Value
     function ResolveRec(Ctx: TExecutionContext; Handle: Int64): PRecordStorage; inline;
@@ -5893,7 +5902,102 @@ begin
     Result := Integer(V);
 end;
 
-function TBytecodeVM.RawAddr(RawPtr: Int64; NeedBytes: PtrUInt): Pointer;
+procedure TBytecodeVM.BuildArrayDescriptor(Slot, LogicalId: Integer);
+// Fill FArrDescBuf with what fbc's FBARRAY would say about the array in physical slot Slot. Called at
+// EVERY dereference of a descriptor pointer, which is what makes the answer current: the program takes
+// the pointer once and reads it after a ReDim or an ERASE (fbc-int/array.bas does exactly that).
+//
+// ⭐ Each field measured against fbc, not deduced (job/tests/bas/m912_*.bas is the guard):
+//   base_ptr     the element at the array's LOWEST bounds, in this VM's pointer domain - the same
+//                value "@a(2)" produces, which is what the oracle's test compares it against, so it is
+//                built from the LOGICAL id and not from Slot (see RAWPTR_REGION_ADESC: for a proc-local
+//                array the two differ, and using Slot made the comparison answer FALSE). NULL when
+//                there is no storage, as fbc's is.
+//   size         the BYTES of the contents, not the element count.
+//   dimensions   TArrayStorage.DescDims - see why it is not DimCount there.
+//   flags        how many dimTb() entries are declared (the rank if the declaration stated one,
+//                FB_MAXDIMENSIONS if it did not), plus FIXED_DIM and FIXED_LEN.
+//
+// 🎯 index_ptr is "@array(0,0,...)", which for a non-zero lower bound names an address BEFORE the
+// array's storage. This VM's pointer domain has no such value - a pointer is (arrayId+1) shl 32 or the
+// element offset, so subtracting from the offset borrows from the ARRAY ID and would name a different
+// array - so it answers the element at index 0 only where every lower bound IS zero, and NULL
+// otherwise. NULL rather than base_ptr deliberately: a program that walks index_ptr with an absolute
+// index then fails LOUDLY instead of reading the wrong element (DIVERGENZE 301).
+var
+  ElemBytes, Rank, d, FlagV, Elems: Int64;
+  AllZeroLb: Boolean;
+  P: PByte;
+begin
+  FillChar(FArrDescBuf, SizeOf(FArrDescBuf), 0);
+  if (Slot < 0) or (Slot > High(FArrays)) then Exit;
+  P := @FArrDescBuf[0];
+  ElemBytes := 8;
+  if FArrays[Slot].ElemWidth > 0 then ElemBytes := FArrays[Slot].ElemWidth;
+  Rank := FArrays[Slot].DescDims;
+  if Rank > FB_MAXDIMENSIONS then Rank := FB_MAXDIMENSIONS;
+
+  // ⛔ THE ELEMENT COUNT IS THE PRODUCT OF THE DIMENSIONS, NOT TotalSize - and the two are not always
+  // the same number. A UDT array MEMBER declared "a(2 To 11)" is stored with twelve slots (its index is
+  // applied against the lower bound at access), so TotalSize answered 12 and `size` came out 96 where
+  // fbc says 80. The DIMENSIONS are what fbc's descriptor describes, and dimTb() is built from them a
+  // few lines below, so taking `size` from anywhere else could only disagree with our own answer.
+  Elems := 0;
+  if Rank > 0 then
+  begin
+    Elems := 1;
+    for d := 0 to Rank - 1 do
+      if d <= High(FArrays[Slot].Dimensions) then Elems := Elems * FArrays[Slot].Dimensions[d]
+      else Elems := 0;
+    if Elems < 0 then Elems := 0;
+  end;
+
+  PInt64(P + FBARRAY_OFS_ELEMENT_LEN)^ := ElemBytes;
+  PInt64(P + FBARRAY_OFS_DIMENSIONS)^  := FArrays[Slot].DescDims;
+  PInt64(P + FBARRAY_OFS_SIZE)^        := Elems * ElemBytes;
+
+  // How many dimTb() entries the descriptor declares, then the two shape bits.
+  if FArrays[Slot].RankStated then FlagV := FArrays[Slot].DimCount else FlagV := FB_MAXDIMENSIONS;
+  if FlagV > FBARRAY_FLAGS_DIMENSIONS then FlagV := FBARRAY_FLAGS_DIMENSIONS;
+  if FArrays[Slot].RankStated then FlagV := FlagV or FBARRAY_FLAGS_FIXED_DIM;
+  if not FArrays[Slot].IsDynamic then FlagV := FlagV or FBARRAY_FLAGS_FIXED_LEN;
+  PInt64(P + FBARRAY_OFS_FLAGS)^ := FlagV;
+
+  AllZeroLb := True;
+  for d := 0 to Rank - 1 do
+    if (d <= High(FArrays[Slot].LowerBounds)) and (FArrays[Slot].LowerBounds[d] <> 0) then
+      AllZeroLb := False;
+  if Elems > 0 then
+  begin
+    PInt64(P + FBARRAY_OFS_BASE_PTR)^ := (Int64(LogicalId) + 1) shl POINTER_ARRAY_SHIFT;
+    if AllZeroLb then
+      PInt64(P + FBARRAY_OFS_INDEX_PTR)^ := PInt64(P + FBARRAY_OFS_BASE_PTR)^;
+  end;
+
+  for d := 0 to Rank - 1 do
+  begin
+    if d > High(FArrays[Slot].Dimensions) then Break;
+    PInt64(P + FBARRAY_OFS_DIMTB + d * FBARRAY_DIM_BYTES)^     := FArrays[Slot].Dimensions[d];
+    if d <= High(FArrays[Slot].LowerBounds) then
+    begin
+      PInt64(P + FBARRAY_OFS_DIMTB + d * FBARRAY_DIM_BYTES + 8)^  := FArrays[Slot].LowerBounds[d];
+      PInt64(P + FBARRAY_OFS_DIMTB + d * FBARRAY_DIM_BYTES + 16)^ :=
+        Int64(FArrays[Slot].LowerBounds[d]) + FArrays[Slot].Dimensions[d] - 1;
+    end
+    else
+      PInt64(P + FBARRAY_OFS_DIMTB + d * FBARRAY_DIM_BYTES + 16)^ := Int64(FArrays[Slot].Dimensions[d]) - 1;
+  end;
+  // An EMPTY dimension answers ubound 0, not -1: fbc zeroes the whole dimTb() entry of a dimension
+  // with no elements (measured - "static a1(any)" fresh reads el=0 lb=0 ub=0).
+  for d := 0 to Rank - 1 do
+    if PInt64(P + FBARRAY_OFS_DIMTB + d * FBARRAY_DIM_BYTES)^ = 0 then
+    begin
+      PInt64(P + FBARRAY_OFS_DIMTB + d * FBARRAY_DIM_BYTES + 8)^  := 0;
+      PInt64(P + FBARRAY_OFS_DIMTB + d * FBARRAY_DIM_BYTES + 16)^ := 0;
+    end;
+end;
+
+function TBytecodeVM.RawAddr(RawPtr: Int64; NeedBytes: PtrUInt; ForWrite: Boolean): Pointer;
 // Resolve a tagged raw pointer to a real address inside whichever REGION it names, after checking that
 // NeedBytes bytes starting there actually fit. Every raw load, store and block operation goes through
 // here, so a raw pointer can never address memory the VM does not own.
@@ -5916,6 +6020,30 @@ begin
   if (RawPtr and RAWPTR_TAG) = 0 then
     raise ERangeError.Create('Null or invalid raw pointer dereference');
   ofs := PtrUInt(RawPtr and RAWPTR_OFS_MASK);
+
+  // ⭐ THE ARRAY-DESCRIPTOR REGION (RAWPTR_REGION_ADESC): the 240 bytes of fbc's FBARRAY, ANSWERED
+  // from the array's storage at every read instead of stored anywhere. Asked FIRST, and with the other
+  // two region bits required CLEAR: bit 59 is also the top bit of the image region's handle field, and
+  // a test that did not exclude them would read an image pointer with a handle past 2^19 as a
+  // descriptor. Ordering would have hidden that; the condition says it.
+  if ((RawPtr and RAWPTR_REGION_ADESC) <> 0) and
+     ((RawPtr and (RAWPTR_REGION_IMG or RAWPTR_REGION_FB)) = 0) then
+  begin
+    // ⛔ A WRITE IS REFUSED BY NAME. The descriptor is computed, so a store into it would vanish at
+    // the next read - the silent-wrong-answer class this project refuses to ship. fbc's descriptor is
+    // real memory and writable; writing it there corrupts the array, so nothing is lost by saying so.
+    if ForWrite then
+      raise ERangeError.Create('the array descriptor FBC.ArrayDescriptorPtr answers is computed from ' +
+                               'the array''s own storage and cannot be written through');
+    ofs := PtrUInt(RawPtr and RAWPTR_ADESC_OFS_MASK);
+    if (ofs + NeedBytes) > PtrUInt(FBARRAY_DESC_BYTES) then
+      raise ERangeError.CreateFmt('array-descriptor dereference out of bounds: offset %d + %d > %d bytes',
+                                  [Int64(ofs), Int64(NeedBytes), Int64(FBARRAY_DESC_BYTES)]);
+    BuildArrayDescriptor(Integer((RawPtr shr RAWPTR_ADESC_PHYS_SHIFT) and RAWPTR_ADESC_SLOT_MASK),
+                         Integer((RawPtr shr RAWPTR_ADESC_LOG_SHIFT) and RAWPTR_ADESC_SLOT_MASK));
+    Result := Pointer(@FArrDescBuf[ofs]);
+    Exit;
+  end;
 
   // ⭐ THE IMAGE-SURFACE REGION. The handle rides above the offset (see RAWPTR_REGION_IMG), because
   // unlike the framebuffer there is more than one surface. The first 32 bytes are the FB.IMAGE header,
@@ -6435,7 +6563,7 @@ var
 begin
   if not Wide then
   begin
-    P := PByte(RawAddr(RawPtr, PtrUInt(Length(S)) + 1));
+    P := PByte(RawAddr(RawPtr, PtrUInt(Length(S)) + 1, True));
     if Length(S) > 0 then Move(S[1], P^, Length(S));
     P[Length(S)] := 0;
   end
@@ -6460,7 +6588,7 @@ begin
         P := PByte(PU16);
       end
       else
-        P := PByte(RawAddr(RawPtr, (n + 1) * 2));
+        P := PByte(RawAddr(RawPtr, (n + 1) * 2, True));
       n := 0;
       for i := 0 to Length(U) - 1 do
         if (U[i] > $FFFF) and (U[i] <= $10FFFF) then
@@ -6478,7 +6606,7 @@ begin
       Exit;
     end;
     {$ENDIF}
-    P := PByte(RawAddr(RawPtr, (PtrUInt(Length(U)) + 1) * WIDE_CELL_BYTES));
+    P := PByte(RawAddr(RawPtr, (PtrUInt(Length(U)) + 1) * WIDE_CELL_BYTES, True));
     for i := 0 to Length(U) - 1 do PLongWord(P)[i] := U[i];
     PLongWord(P)[Length(U)] := 0;
   end;
@@ -6509,7 +6637,7 @@ var
   Idx: Int64;
   P: PInt64;
 begin
-  P := PInt64(RawAddr(RawPtr, 8));
+  P := PInt64(RawAddr(RawPtr, 8, True));
   Idx := P^;
   if (Idx <= 0) or (Idx > High(FRawStrCells)) then
   begin
@@ -6541,22 +6669,22 @@ begin
     Exit;
   end;
   case TypeCode of
-    RTC_I8:  PShortInt(RawAddr(RawPtr, 1))^ := ShortInt(Value);
-    RTC_I16: PSmallInt(RawAddr(RawPtr, 2))^ := SmallInt(Value);
-    RTC_I32: PLongInt(RawAddr(RawPtr, 4))^ := LongInt(Value);
+    RTC_I8:  PShortInt(RawAddr(RawPtr, 1, True))^ := ShortInt(Value);
+    RTC_I16: PSmallInt(RawAddr(RawPtr, 2, True))^ := SmallInt(Value);
+    RTC_I32: PLongInt(RawAddr(RawPtr, 4, True))^ := LongInt(Value);
     // Unsigned views: same WIDTH, so the bytes written are the same - they exist for the LOAD.
-    RTC_U8:  PByte(RawAddr(RawPtr, 1))^ := Byte(Value);
-    RTC_U16: PWord(RawAddr(RawPtr, 2))^ := Word(Value);
-    RTC_U32: PLongWord(RawAddr(RawPtr, 4))^ := LongWord(Value);
+    RTC_U8:  PByte(RawAddr(RawPtr, 1, True))^ := Byte(Value);
+    RTC_U16: PWord(RawAddr(RawPtr, 2, True))^ := Word(Value);
+    RTC_U32: PLongWord(RawAddr(RawPtr, 4, True))^ := LongWord(Value);
   else
-    PInt64(RawAddr(RawPtr, 8))^ := Value;
+    PInt64(RawAddr(RawPtr, 8, True))^ := Value;
   end;
 end;
 
 procedure TBytecodeVM.RawStoreFloat(RawPtr: Int64; TypeCode: Integer; Value: Double);
 begin
-  if TypeCode = RTC_SINGLE then PSingle(RawAddr(RawPtr, 4))^ := Value
-  else PDouble(RawAddr(RawPtr, 8))^ := Value;
+  if TypeCode = RTC_SINGLE then PSingle(RawAddr(RawPtr, 4, True))^ := Value
+  else PDouble(RawAddr(RawPtr, 8, True))^ := Value;
 end;
 
 // The destination of a BLOCK operation (CLEAR, FB_MEMCOPY, FB_MEMMOVE), which is not always the byte
@@ -6575,15 +6703,15 @@ end;
 //
 // The bounds check is the same contract RawAddr keeps: NeedBytes must fit from the offset to the end of
 // the storage, so a block operation can never reach memory the VM does not own.
-function TBytecodeVM.BlockAddr(Ctx: TExecutionContext; Ptr: Int64; NeedBytes: PtrUInt): Pointer;
+function TBytecodeVM.BlockAddr(Ctx: TExecutionContext; Ptr: Int64; NeedBytes: PtrUInt; ForWrite: Boolean): Pointer;
 var
   ArrayIdx, RecSlot: Integer;
   PtrOffset, Avail: Int64;
   Rec: PRecordStorage;
 begin
   // A raw-heap / framebuffer pointer: RawAddr owns the answer.
-  if (Ptr and RAWPTR_TAG) <> 0 then Exit(RawAddr(Ptr, NeedBytes));
-  if (Ptr > 0) and ((Ptr and FGNPTR_TAG) <> 0) then Exit(RawAddr(Ptr, NeedBytes));   // DIVERGENZE 239
+  if (Ptr and RAWPTR_TAG) <> 0 then Exit(RawAddr(Ptr, NeedBytes, ForWrite));
+  if (Ptr > 0) and ((Ptr and FGNPTR_TAG) <> 0) then Exit(RawAddr(Ptr, NeedBytes, ForWrite));   // DIVERGENZE 239
   // ⭐ A RECORD-FIELD POINTER NAMES BYTES OF THE RECORD'S IMAGE (A3, DIVERGENZE 226). Every numeric field
   // and every member that lives inline - a nested record, a fixed array - sits at its fbc offset there, so a
   // block operation from one is a block of those bytes, bounded by the record like every region here. It
@@ -6641,14 +6769,14 @@ end;
 procedure TBytecodeVM.RawMemCopy(Ctx: TExecutionContext; DstPtr, SrcPtr: Int64; ByteCount: PtrUInt);
 begin
   if ByteCount = 0 then Exit;
-  Move(BlockAddr(Ctx, SrcPtr, ByteCount)^, BlockAddr(Ctx, DstPtr, ByteCount)^, ByteCount);
+  Move(BlockAddr(Ctx, SrcPtr, ByteCount)^, BlockAddr(Ctx, DstPtr, ByteCount, True)^, ByteCount);
 end;
 
 // CLEAR: set ByteCount bytes at DstPtr to Value, in whichever region DstPtr names.
 procedure TBytecodeVM.RawClear(Ctx: TExecutionContext; DstPtr: Int64; Value: Byte; ByteCount: PtrUInt);
 begin
   if ByteCount = 0 then Exit;
-  FillChar(BlockAddr(Ctx, DstPtr, ByteCount)^, ByteCount, Value);
+  FillChar(BlockAddr(Ctx, DstPtr, ByteCount, True)^, ByteCount, Value);
 end;
 
 procedure TBytecodeVM.RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);
@@ -7193,7 +7321,7 @@ begin
   if (Tagged and FGNPTR_TAG) <> 0 then Exit;       // gia' un indirizzo macchina: non e' una regione nostra
   if (Tagged and RAWPTR_TAG) <> 0 then
   begin
-    if ((Tagged and RAWPTR_REGION_IMG) <> 0) or ((Tagged and RAWPTR_REGION_FB) <> 0) then Exit;
+    if (Tagged and RAWPTR_REGION_ANY) <> 0 then Exit;   // only the byte heap has a byte index
     ofs := PtrUInt(Tagged and RAWPTR_OFS_MASK);
     if (ofs < 8) or (ofs >= PtrUInt(FRawHeapCap)) then Exit;
     AAvail := PtrUInt(FRawHeapCap) - ofs;
@@ -7307,7 +7435,7 @@ begin
   if (Value <= 0) or ((Value and FGNPTR_TAG) <> 0) then Exit;
   if (Value and RAWPTR_TAG) <> 0 then
   begin
-    if (Value and (RAWPTR_REGION_IMG or RAWPTR_REGION_FB)) <> 0 then Exit;
+    if (Value and RAWPTR_REGION_ANY) <> 0 then Exit;    // only a byte-heap block carries a header
     ofs := PtrUInt(Value and RAWPTR_OFS_MASK);
     if (ofs < 8) or (ofs + 8 > FRawHeapCap) then Exit;
     if PtrUInt((@FRawHeap[ofs - 8])^) <> (PtrUInt(RAW_HDR_PTRFLAG) or 8) then Exit;
@@ -15613,6 +15741,7 @@ var
 begin
   if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then Exit;
   FArrays[ArrayIdx].IsDynamic := True;   // a REDIM'd array is DYNAMIC: ERASE frees it (see EraseArray)
+  FArrays[ArrayIdx].DescDims := 1;       // ...and it now HAS one dimension, which an ERASE will not undo
   Lb := 0;
   if Length(FArrays[ArrayIdx].LowerBounds) > 0 then Lb := FArrays[ArrayIdx].LowerBounds[0];
   // An explicit "REDIM a(lb TO ub)" sets the lower bound too (FreeBASIC); a bare "REDIM a(ub)" keeps the
@@ -15674,7 +15803,10 @@ var
   d, NewSize, k, Lb: Integer;
 begin
   if (ArrayIdx >= 0) and (ArrayIdx < Length(FArrays)) then
+  begin
     FArrays[ArrayIdx].IsDynamic := True;   // as RedimArray: a REDIM'd array is DYNAMIC
+    if Length(Uppers) > 0 then FArrays[ArrayIdx].DescDims := Byte(Length(Uppers));
+  end;
   if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) or (Length(Uppers) = 0) then Exit;
   NewSize := 1;
   SetLength(FArrays[ArrayIdx].Dimensions, Length(Uppers));
@@ -15808,6 +15940,10 @@ begin
   Dst.ByteData    := Src.ByteData;
   Dst.ElemWidth   := Src.ElemWidth;
   Dst.ElemSigned  := Src.ElemSigned;
+  // ...and the two descriptor facts, for the same reason: an ERASE through an array PARAMETER asks
+  // the storage, and so does FBC.ArrayDescriptorPtr( param() ).
+  Dst.RankStated  := Src.RankStated;
+  Dst.DescDims    := Src.DescDims;
 end;
 
 procedure ReleaseArrayStorage(var A: TArrayStorage);
@@ -15916,6 +16052,8 @@ begin
   SetLength(A.ByteData, 0);
   A.ElemWidth := 0;
   A.ElemSigned := False;
+  A.RankStated := False;   // an EMPTY array states nothing: FBC.ArrayDescriptorPtr reads these two
+  A.DescDims := 0;
 end;
 
 procedure TBytecodeVM.ExecuteArrayDim(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -15967,6 +16105,12 @@ begin
         // Fixed or dynamic, stamped on the STORAGE: ERASE through an array PARAMETER asks the storage,
         // because the answer is the CALLER's (see EraseArray and the Immediate-2 case).
         FArrays[ArrayIdx].IsDynamic := ArrInfo.IsDynamicShape;
+        // ⭐ ...and the two facts fbc's array DESCRIPTOR needs (see TArrayStorage.DescDims). A bare
+        // "Dim a()" reports ZERO dimensions until a ReDim gives it some, which is why this is not
+        // DimCount: both spellings register one runtime-sized dimension.
+        FArrays[ArrayIdx].RankStated := ArrInfo.RankStated;
+        if ArrInfo.RankStated then FArrays[ArrayIdx].DescDims := Byte(ArrInfo.DimCount)
+        else FArrays[ArrayIdx].DescDims := 0;
         SetLength(FArrays[ArrayIdx].Dimensions, ArrInfo.DimCount);
         SetLength(FArrays[ArrayIdx].LowerBounds, ArrInfo.DimCount);
         for i := 0 to ArrInfo.DimCount - 1 do
@@ -16058,13 +16202,15 @@ function ArrayOpMayReshape(SubOp: Word): Boolean; inline;
 //   C strings             50, 51  bcRaw{Load,Store}ZStr
 //   pure queries           9, 10  LBOUND / UBOUND        45, 46  the same on a UDT member
 //   index arithmetic      29, 30  ArrayIdxPush / Resolve  43  ...on a UDT member
+//   descriptor pointer        52  FBC.ArrayDescriptorPtr - it only PACKS a slot number into a
+//                                 pointer; the 240 bytes are built later, at the dereference
 // ⚠️ A pointer store CAN write into an array's element data - that is why the lock is still taken
 // for these arms. Writing an element does not change where the element IS, which is all the
 // descriptor records.
 begin
   case SubOp of
     9, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    29, 30, 31, 32, 33, 43, 45, 46, 50, 51: Result := False;
+    29, 30, 31, 32, 33, 43, 45, 46, 50, 51, 52: Result := False;
   else
     Result := True;
   end;
@@ -16565,6 +16711,29 @@ begin
                              Instr.Immediate = 1)
         else
           RawStoreZStrVal(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1);
+      52: // bcArrayDescPtr - FBC.ArrayDescriptorPtr( a() ): Dest(int) = a pointer into the DESCRIPTOR
+          // region for this array (see RAWPTR_REGION_ADESC). Src1 = the LOGICAL array id.
+          // ⛔ The PHYSICAL slot goes into the pointer: the dereference happens later, in whatever
+          // context holds the pointer, and RawAddr has no ArrMap to map a logical id through. A private
+          // slot is allocated past FStaticArrCount, so MapArrDyn leaves it alone - while base_ptr is
+          // built from the LOGICAL id, which is the value "@a(lb)" produces and what it is compared to.
+        begin
+          ArrayIdx := Ctx.ArrMap[Instr.Src1];
+          // ⛔ A slot with no storage answers NULL and does NOT grow the table: a parameter placeholder
+          // never DIM'd is exactly the case fbc answers NULL for, and growing here would make this op a
+          // RESHAPE - costing the descriptor table and the lock on what is a pure query (see
+          // ArrayOpMayReshape).
+          LinearIdx := Instr.Src1;
+          if (ArrayIdx <= 0) or (ArrayIdx > High(FArrays)) or
+             (Int64(ArrayIdx) > RAWPTR_ADESC_SLOT_MASK) or (Int64(LinearIdx) > RAWPTR_ADESC_SLOT_MASK) or
+             (LinearIdx < 0) then
+            Ctx.IntRegs[Instr.Dest] := 0
+          else
+            // Both ids ride in the pointer - see RAWPTR_REGION_ADESC for why one is not enough.
+            Ctx.IntRegs[Instr.Dest] := RAWPTR_TAG or RAWPTR_REGION_ADESC or
+                                       (Int64(ArrayIdx) shl RAWPTR_ADESC_PHYS_SHIFT) or
+                                       (Int64(LinearIdx) shl RAWPTR_ADESC_LOG_SHIFT);
+        end;
       34: // bcArrayBind - array BYREF param (PHASE 1): save FArrays[Src1] and snapshot the arg FArrays[Immediate],
         begin  // but DEFER the alias to bcArrayBindApply. Two-phase so a batch of binds that swaps arrays
                // (recursive "proc(a(),b())" -> "proc(b(),a())", where param and arg slots coincide) reads every
@@ -20224,7 +20393,7 @@ begin
             Data := IntToStr(BinCount);
             FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
             while Length(Data) < BinCount do Data := Data + #0;   // short read at EOF: zero-fill
-            Move(Data[1], BlockAddr(Ctx, BinI, PtrUInt(BinCount))^, BinCount);
+            Move(Data[1], BlockAddr(Ctx, BinI, PtrUInt(BinCount), True)^, BinCount);
           end;
         end;
       end;

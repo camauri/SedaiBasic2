@@ -337,6 +337,10 @@ begin
       // ...and bit 6: the elements are POINTERS (DIVERGENZE 257 B). Same byte, same reasoning: an older
       // file reads back False, which is what it meant.
       if ArrInfo.ElemIsPtr then RegType := RegType or 64;
+      // ...and bit 7, the LAST free one: the declaration STATED the rank (TSSAArrayInfo.RankStated).
+      // FBC.ArrayDescriptorPtr cannot be answered without it, and a v4 file reads back False, which
+      // is what it meant - a program compiled before this existed had no descriptor to answer.
+      if ArrInfo.RankStated then RegType := RegType or 128;
       Stream.WriteBuffer(RegType, SizeOf(RegType));
     except
       on E: Exception do
@@ -512,6 +516,7 @@ begin
         ArrInfo.IsPrivate := (RegType and 1) <> 0;
         ArrInfo.MultiDimEver := (RegType and 2) <> 0;
         ArrInfo.IsDynamicShape := (RegType and 4) <> 0;
+        ArrInfo.RankStated := (RegType and 128) <> 0;   // bit 7 - written in the same change
         // ⛔ ...AND THE WIDTH, READ IN THE SAME CHANGE THAT WROTE IT. A bit added to the writer is
         // added to the reader, never one alone - DIVERGENZE 172 is the entry that cost this rule, and
         // basc_sweep is the net that sees it. A v4 file has zeroes here and reads back width 0, which
