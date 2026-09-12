@@ -14773,6 +14773,7 @@ var
   Slot, DimCount, di: Integer;
   ElemBank: TSSARegisterType;
   ObjHandle, ArrHandle, DimReg, UbVal: TSSAValue;
+  DynMember: Boolean;
 begin
   Result := False;
   if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
@@ -14791,17 +14792,52 @@ begin
   if DimCount < 1 then DimCount := 1;
   ArrHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaRecordLoadInt, ArrHandle, ObjHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+  // ⛔⛔ A DYNAMIC MEMBER IS *FREED*, NOT RESET, and this routine treated every member as FIXED - the
+  // note at the top said so in as many words ("re-dimension the member array to the bound it already
+  // has"), which is right for a fixed member and wrong for the other kind. FreeBASIC erases the two
+  // differently and the difference is observable without any descriptor: after
+  // "Erase x.a" on a "Dim a(Any)" member, fbc answers LBound 0 / UBound -1 and we answered 2 / 11 -
+  // the storage was still there, values and all (DIVERGENZE 310).
+  // ⭐ The discriminator was already recorded and not being read: TUDTField.ArrayBounds is what
+  // ConcreteArrayBounds answered at declaration time, and it is NIL exactly when the member has no
+  // concrete bounds - "(Any)" or the ReDim spelling. Nothing new to file.
+  // ⇒ Freeing it is a REDIM to lb 0 / ub -1: size ub-lb+1 = 0, which is the state fbc reports. The
+  // lower bound has to be pushed too, or RedimArrayN keeps the one the member already had and LBound
+  // would answer 2 for an array with no elements.
+  // ⛔ ...AND THE "ReDim" SPELLING IS DYNAMIC TOO, concrete bounds or not. "ReDim a(2 To 11)" inside a
+  // Type is sized at construction like the Dim form - fbc reports 2..11 before any explicit ReDim -
+  // and yet fbc FREES it on ERASE. So the discriminator is not "has it concrete bounds?" alone; the
+  // SPELLING says it, and the parser had already recorded it (TUDTField.DeclaredRedim). Reading only
+  // ArrayBounds left exactly this one kind resetting where fbc frees.
+  with FUDTs[FindUDT(TypeName)].Fields[UDTFieldIndex(FindUDT(TypeName), VarToStr(MemberNode.Value))] do
+    DynMember := (ArrayBounds = nil) or DeclaredRedim;
   for di := 0 to DimCount - 1 do
   begin
+    if DynMember then
+    begin
+      UbVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, UbVal, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), UbVal, MakeSSAValue(svkNone), MakeSSAConstInt(1));
+      UbVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, UbVal, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), UbVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Continue;
+    end;
     DimReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaLoadConstInt, DimReg, MakeSSAConstInt(di), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     UbVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaArrayUBoundInd, UbVal, ArrHandle, DimReg, MakeSSAValue(svkNone));
     EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), UbVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
-  // Immediate packs (slot<<8) | (elemType<<4) | preserve, the same encoding REDIM uses.
+  // Immediate packs (slot<<8) | (elemType<<4) | fixed<<1 | preserve, the same encoding REDIM uses.
+  // ⛔ BIT 1 MATTERS HERE TOO: erasing a FIXED member re-dimensions it to the bounds it already has,
+  // and that path stamps the storage DYNAMIC - so an ERASE turned a fixed member into a dynamic one
+  // and FBARRAY_FLAGS_FIXED_LEN went out. fbc keeps it set: an erase does not change what an array IS.
+  // Two sites emit this instruction and the flag belongs to BOTH; passing it at one only is the
+  // half-cure shape this file records.
   EmitInstruction(ssaMemberArrayRedim, MakeSSAValue(svkNone), ObjHandle, MakeSSAValue(svkNone),
-                  MakeSSAConstInt((Int64(Slot) shl 8) or (Int64(Ord(ElemBank)) shl 4) or 0));
+                  MakeSSAConstInt((Int64(Slot) shl 8) or (Int64(Ord(ElemBank)) shl 4) or
+                                  IfThen(DynMember, 0, 2)));
   Result := True;
 end;
 
@@ -16559,7 +16595,9 @@ procedure TSSAGenerator.EmitArrayDescPtr(ArgsNode: TASTNode; out Result: TSSAVal
 var
   NameNode, ArrNode, OwnedThis, RewrittenThis: TASTNode;
   ArrName, TypeName: string;
-  ArrayIdx: Integer;
+  ArrayIdx, Slot, DimCount: Integer;
+  ElemBank: TSSARegisterType;
+  ObjHandle, HandleReg: TSSAValue;
 begin
   Result := MakeSSAValue(svkNone);
   if (ArgsNode = nil) or (ArgsNode.ChildCount < 1) then Exit;
@@ -16628,16 +16666,31 @@ begin
     end;
   end;
 
-  // 🕳️ A PER-INSTANCE UDT ARRAY MEMBER answers NULL, AND THE NULL IS THE POINT (DIVERGENZE 305).
-  // Its storage IS reachable - an indirect form taking the member's runtime FArrays handle was written
-  // and then WITHDRAWN - but that storage does not describe the member the way fbc's descriptor does,
-  // measured on three counts against the oracle: a member declared "a(2 To 11)" is stored with TWELVE
-  // slots at lower bound ZERO (the declared bound is applied at the ACCESS, by InlineArrayBound), so
-  // `size` answered 96 where fbc says 80; the slot does not carry the member's declared RANK, so
-  // FIXED_DIM read false where fbc says true; and `base_ptr` did not compare equal to "@x.a1(2)".
-  // ⛔ Three right fields and two wrong ones is the silent-wrong-answer class this project refuses to
-  // ship, and NULL is a value fbc's own tests TEST for ("if( ap ) ... else CU_FAIL()"), so the gap is
-  // LOUD instead of quiet. Closing it is work on the member-array STORAGE, not on the descriptor.
+  // ⭐⭐ A PER-INSTANCE UDT ARRAY MEMBER, through its runtime FArrays handle (DIVERGENZE 305).
+  // ⛔ This branch was written, WITHDRAWN, and restored - and the withdrawal is the interesting part.
+  // The member's storage did not describe the member the way fbc's descriptor does, on three counts:
+  // a member declared "a(2 To 11)" was stored at lower bound ZERO (311), so `size` answered 96 where
+  // fbc says 80; the rank query answered -1 (309); and ERASE did not free a dynamic member (310). With
+  // all of those closed - plus the double lower-bound subtraction they had been hiding (312) - the
+  // storage now says exactly what LBOUND/UBOUND say, which is what the descriptor has to report.
+  // ⇒ Answering three right fields beside two wrong ones is what was refused; this is not that.
+  // ⚠️ An INLINE member (DIVERGENZE 226) has no FArrays entry at all - its elements live in the
+  // record's bytes - so it has no slot to describe and still answers NULL.
+  if (ArrNode.NodeType = antMemberAccess) and (ArrNode.ChildCount >= 1) then
+  begin
+    TypeName := ObjectTypeName(ArrNode.GetChild(0));
+    if (TypeName <> '') and
+       UDTArrayField(FindUDT(TypeName), VarToStr(ArrNode.Value), Slot, ElemBank, DimCount) and
+       (not MemberArrayInline(FindUDT(TypeName), VarToStr(ArrNode.Value))) and
+       ResolveRecordObject(ArrNode.GetChild(0), ObjHandle, TypeName) then
+    begin
+      HandleReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRecordLoadInt, HandleReg, ObjHandle, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaArrayDescPtrInd, Result, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Exit;
+    end;
+  end;
 
   // Nothing this engine can describe: NULL, loudly testable, never a pointer to another array.
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -36931,6 +36984,7 @@ var
   i, di, j, NestedUDT, ElemUDT: Integer;
   NestedHandle, DefVal: TSSAValue;
   DimsN, UbExpr: TASTNode;
+  MemRank: Integer;
 begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   // "As String * n" fields start as n NULs: the buffer exists at full capacity from construction, so a
@@ -36970,25 +37024,71 @@ begin
       EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal,
                       NestedHandle, MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
     end;
-  // Fixed-size array members ("Dim data(100) As Integer"): allocate and size the member's FArrays entry
-  // at construction (an "Any" member has no concrete bound and is left for an explicit REDIM). Mirrors the
-  // "Redim this.member(...)" lowering: push each upper bound, then a member REDIM (preserve = 0, fresh).
+  // Array members: allocate and size the member's FArrays entry at construction. Mirrors the
+  // "Redim this.member(...)" lowering: push each bound, then a member REDIM (preserve = 0, fresh).
+  // ⭐⭐ ...AND AN "Any" MEMBER GETS AN *EMPTY* ENTRY RATHER THAN NONE (DIVERGENZE 305). It used to be
+  // "left for an explicit REDIM", which left its field slot holding the 0 sentinel - and fbc's array
+  // DESCRIPTOR exists for such a member from construction: it reports size 0 with its rank, not a null
+  // pointer. With no entry there is nothing to describe, so FBC.ArrayDescriptorPtr( x.a() ) answered
+  // NULL where fbc answers a descriptor.
+  // ⚠️ Every OTHER answer is unchanged, and that is what makes it safe: an empty entry is lb 0 /
+  // ub -1, which is exactly what the handle-is-zero fallbacks in the bound arms were answering.
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
-    if (FUDTs[UDTIdx].Fields[i].IsArray) and (FUDTs[UDTIdx].Fields[i].ArrayBounds <> nil) and
+    if (FUDTs[UDTIdx].Fields[i].IsArray) and
        not FUDTs[UDTIdx].Fields[i].InlineArray then            // inline: already there, zeroed (226)
     begin
       DimsN := FUDTs[UDTIdx].Fields[i].ArrayBounds;
+      if DimsN = nil then
+      begin
+        // No concrete bounds: an EMPTY entry of the declared rank - lb 0, ub -1 per dimension.
+        MemRank := FUDTs[UDTIdx].Fields[i].ArrayDimCount;
+        if MemRank < 1 then MemRank := 1;
+        for di := 0 to MemRank - 1 do
+        begin
+          DefVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, DefVal, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), DefVal, MakeSSAValue(svkNone), MakeSSAConstInt(1));
+          DefVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, DefVal, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), DefVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
+        EmitInstruction(ssaMemberArrayRedim, MakeSSAValue(svkNone), HandleVal, MakeSSAValue(svkNone),
+                        MakeSSAConstInt((Int64(FUDTs[UDTIdx].Fields[i].Slot) shl 8) or
+                                        (Int64(Ord(FUDTs[UDTIdx].Fields[i].ArrayElemBank)) shl 4)));
+        Continue;
+      end;
       for di := 0 to DimsN.ChildCount - 1 do
       begin
-        if DimsN.GetChild(di).NodeType = antDimRange then UbExpr := DimsN.GetChild(di).GetChild(1)
-        else UbExpr := DimsN.GetChild(di);
+        // ⛔ THE LOWER BOUND OF A RANGE WAS NEVER PUSHED, so a member declared "ReDim a(2 To 11)" was
+        // sized 0..11 and LBound answered 0 where fbc answers 2 - the declaration said "lb TO ub" and
+        // only the ub reached the storage (DIVERGENZE 311). The fixed "Dim a(2 To 11)" spelling looked
+        // right only because it is an INLINE member (226), skipped by this loop, whose bounds come
+        // from the declaration at the ACCESS instead.
+        // ⚠️ Pushed BEFORE its upper bound: RedimArrayN pairs the two lists by index, so one entry per
+        // dimension in dimension order is what makes them line up.
+        if DimsN.GetChild(di).NodeType = antDimRange then
+        begin
+          ProcessExpression(DimsN.GetChild(di).GetChild(0), DefVal);
+          EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), EnsureIntRegister(DefVal),
+                          MakeSSAValue(svkNone), MakeSSAConstInt(1));
+          UbExpr := DimsN.GetChild(di).GetChild(1);
+        end
+        else
+          UbExpr := DimsN.GetChild(di);
         ProcessExpression(UbExpr, DefVal);
         EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), EnsureIntRegister(DefVal),
                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end;
+      // ⭐ BIT 1 = "this member is FIXED-LENGTH". Sizing a member at construction goes through the same
+      // REDIM path an explicit "ReDim x.a(...)" uses, and that path stamps the storage DYNAMIC - which
+      // is right for a ReDim and wrong for "Dim a(2 To 11)": fbc reports FBARRAY_FLAGS_FIXED_LEN set
+      // for the second, and this was the one field of the member's descriptor still disagreeing.
+      // ⚠️ The "ReDim" SPELLING keeps the dynamic stamp, concrete bounds or not - the same rule ERASE
+      // reads (DeclaredRedim, DIVERGENZE 310).
       EmitInstruction(ssaMemberArrayRedim, MakeSSAValue(svkNone), HandleVal, MakeSSAValue(svkNone),
                       MakeSSAConstInt((Int64(FUDTs[UDTIdx].Fields[i].Slot) shl 8) or
-                                      (Int64(Ord(FUDTs[UDTIdx].Fields[i].ArrayElemBank)) shl 4)));
+                                      (Int64(Ord(FUDTs[UDTIdx].Fields[i].ArrayElemBank)) shl 4) or
+                                      IfThen(FUDTs[UDTIdx].Fields[i].DeclaredRedim, 0, 2)));
       // Array-of-UDT member ("verts(100) As Vertex"): each element is a record handle. Now that the
       // handle array is sized, eagerly allocate one record instance per element (mirrors the plain
       // array-of-UDT path via ssaRecordNewArray, but the FArrays id is the runtime handle in the field

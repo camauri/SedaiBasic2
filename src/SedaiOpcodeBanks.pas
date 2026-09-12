@@ -294,6 +294,7 @@ begin
     bcArrayStoreIndInt, bcArrayStoreIndFloat, bcArrayStoreIndString,
     bcArrayIdxResolveInd, bcMemberArrayRedim,
     bcArrayLBoundInd, bcArrayUBoundInd,   // Src1 = FArrays handle (int)
+    bcArrayDescPtrInd,                    // Src1 = FArrays handle of a UDT array member (int)
     bcArrayCopyContents, bcArrayCopyRecords,  // Src1 = dest FArrays handle (int)
     // Date/time: DATESERIAL/TIMESERIAL Src1 = year/hour (int); MONTHNAME/WEEKDAYNAME Src1 = index (int)
     bcDateSerial, bcTimeSerial, bcDateName,
@@ -609,7 +610,7 @@ begin
     // === GROUP 3: Array operations ===
     bcArrayLoadInt,  // Typed array load (int) - Dest is WRITTEN
     bcArrayLBound, bcArrayUBound,  // B1.4: LBOUND/UBOUND - Dest = int bound
-    bcArrayDescPtr,  // FBC.ArrayDescriptorPtr - Dest = a pointer into the descriptor region (int)
+    bcArrayDescPtr, bcArrayDescPtrInd,  // FBC.ArrayDescriptorPtr - Dest = a pointer into the descriptor region (int)
     bcRefLoadInt,    // FreeBASIC pointer deref (int) - Dest = value loaded
     bcRefAddrField,  // @obj.field - Dest = packed record-field pointer (int)
     bcRawAlloc, bcRawRealloc,  // raw heap: Dest = raw pointer (int)

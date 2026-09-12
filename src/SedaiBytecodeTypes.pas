@@ -580,10 +580,15 @@ const
   // FBC.ArrayDescriptorPtr( a() ): Dest(int) = a pointer into the DESCRIPTOR region for the array's
   // physical slot (see RAWPTR_REGION_ADESC). Src1 = logical array id (immediate). The descriptor is
   // ANSWERED at the dereference, so this op only names the array - it materialises nothing.
-  // 🕳️ A per-instance UDT array MEMBER has no form here (DIVERGENZE 305): an indirect one taking the
-  // member's runtime FArrays handle was written and withdrawn - that storage does not describe the
-  // member the way fbc's descriptor does, and NULL is better than three right fields and two wrong.
   bcArrayDescPtr       = bcGroupArray + 52;
+  // ...and the same for a UDT ARRAY MEMBER, whose FArrays handle is only known at run time (one per
+  // instance), so it arrives in a REGISTER instead of an immediate. Src1 = int reg holding the handle;
+  // a handle of 0 (an unallocated member) answers NULL. Shares the VM arm with the form above, so the
+  // two cannot describe the same array differently.
+  // ⛔ It was written, WITHDRAWN on 12 Sep 2026 and restored the same day: the member's storage did not
+  // carry what fbc's descriptor reports until DIVERGENZE 309-312 were closed, and three right fields
+  // beside two wrong ones is not shippable. Now the storage says the same thing LBOUND/UBOUND say.
+  bcArrayDescPtrInd    = bcGroupArray + 53;
 
   // === GROUP 4: I/O OPERATIONS (0x04xx) ===
   // Print values
@@ -2324,6 +2329,7 @@ begin
         50: Result := 'RawLoadZStr';
         51: Result := 'RawStoreZStr';
         52: Result := 'ArrayDescPtr';
+        53: Result := 'ArrayDescPtrInd';
         27: Result := 'ArrayRedimPush';
         28: Result := 'ArrayRedimN';
         29: Result := 'ArrayIdxPush';

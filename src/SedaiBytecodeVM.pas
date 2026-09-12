@@ -720,6 +720,7 @@ type
     procedure BuildPrivateArrayPlan;                       // census the private ids, reserve every block
     procedure BindArrayMap(Ctx: TExecutionContext);         // hand Ctx a free block and build its ArrMap
     procedure ReleaseArrayMap(Ctx: TExecutionContext);      // give the block back (and clear its storage)
+    function MemberElemNeedsLbSub(Slot: Integer): Boolean;   // a 1-D member index still needs its lower bound off
     function MapArrDyn(Ctx: TExecutionContext; Id: Int64): Integer;  // id carried in a register/pointer
     procedure CheckPrivDesc(Ctx: TExecutionContext; Desc: Pointer);  // ARRPRIV_DIAG: descriptor vs storage
     function ActiveCtx: TExecutionContext; inline;   // this thread's context (GActiveCtx, or the main one)
@@ -1221,6 +1222,18 @@ var
   // thread veri e ha messo un lock globale sul cammino di chiamata, che su binary-trees costava 5,6x.
   GArrDescFast: Boolean = True;
   GArrPrivDiag: Boolean = False;   // ARRPRIV_DIAG=1: trace the private-array mapping
+  { ⛔⛔ ARRDESCLOCK_DIAG=1 - DOES A THREAD THAT IS NOT THE OWNER TAKE THE UNLOCKED SHORTCUT?
+    AcquireArrDescCtx skips FArrDescLock when FHasWorkers is False, and the comment beside that line
+    ASSERTS the invariant that makes it safe: "set BEFORE any worker can run, never cleared while one
+    lives". That is a claim in a comment, not a measurement - and the thread that dies inside
+    RebuildJitArrDesc IS a worker. This counts the branch, per thread kind, and PRINTS THE FIRST
+    non-owner occurrence IMMEDIATELY.
+    ⚠️ Immediately, and not at exit: a census that prints when the program ends never prints for a
+    thread that faults, which is exactly the case under investigation. }
+  GArrDescLockDiag: Boolean = False;
+  GArrDescFastOwner: Int64 = 0;      // unlocked shortcut taken by the owner thread
+  GArrDescFastOther: Int64 = 0;      // ...and by a thread that is NOT the owner  <- the question
+  GArrDescFastSaid: Boolean = False; // the first non-owner occurrence has been reported
   // ⭐⭐ ARRDESC_DIAG=1: THE CENSUS OF THE DESCRIPTOR BOOKKEEPING, and it exists for the same reason
   // HOTC_DIAG does - reading the source says which sites COULD force a full rebuild, and only a
   // counter says which ones DO. 📊 On retrogra's console the two procedures below are 49.2% of the
@@ -1783,6 +1796,7 @@ begin
   // other on ONE binary instead of two builds (see ab-needs-a-built-baseline).
   FSharedRecLockFree := SysUtils.GetEnvironmentVariable('SHAREDREC_LOCK') <> '1';
   GArrPrivDiag := SysUtils.GetEnvironmentVariable('ARRPRIV_DIAG') = '1';
+  GArrDescLockDiag := SysUtils.GetEnvironmentVariable('ARRDESCLOCK_DIAG') = '1';
   GArrDescDiag := SysUtils.GetEnvironmentVariable('ARRDESC_DIAG') = '1';
   GSpinDiag := StrToIntDef(SysUtils.GetEnvironmentVariable('SPINDIAG'), 0);
   GNoProgDirFallback := SysUtils.GetEnvironmentVariable('SB_NO_PROGDIR_FALLBACK') = '1';
@@ -4543,11 +4557,40 @@ procedure TBytecodeVM.ArrPrivRestoreSlow(Ctx: TExecutionContext; Base: Integer);
 // 4460 ms, +50%, and `perf` named it in one run - fpc_initialize 9.4%, fpc_finalize 8.2%,
 // RECORDRTTI 4.6%, dynarray_clear 4.2%, together 26.5% of a benchmark that has no private array at
 // all. Two guesses at the cause (the frame record growing, the extra store) were both wrong.
+//
+// ⛔⛔⛔ AND IT IS THE FIFTH WRITER OF FArrays, which LockArrays did not know about. That comment lists
+// "the four callers (ExecuteArrayDim, RedimArray, RedimArrayN, EraseArray)" - and this routine
+// REPLACES A WHOLE MANAGED STORAGE RECORD in the shared table, which releases the old record's
+// dynamic vectors. A worker rebuilding the descriptor table reads `FArrays[a].LowerBounds[0]` right
+// after testing its LENGTH (RebuildJitArrDesc): between the two, this assignment can free exactly
+// that vector, and the read faults.
+// 📊 Named, not guessed: `fannkuch-redux-modern-mt --no-opt` under 12-way load died ~2 runs in 36
+// with *"thread 15 died: EAccessViolation (mutexes it held stay locked)"* and answered 202 or 170
+// instead of 228. `./build.sh sb --symbols` + addr2line gave RebuildJitArrDesc:13885 <-
+// AcquireArrDescCtxLocked <- AcquireArrDescCtx <- RunFast <- RunWorker - the same stack LockArrays
+// already records for retrogra, from a writer it did not cover.
+// ⭐ And the FIRST hypothesis was refuted BY A COUNTER, not by reading: ARRDESCLOCK_DIAG=1 asked
+// whether a non-owner thread ever takes AcquireArrDescCtx's unlocked shortcut (the comment there
+// ASSERTS it cannot). Answer: 0 times in 36 runs. The invariant holds; the hole was here.
+// ⚠️ Every worker restores only ITS OWN private slots, so two writers never meet - which is why this
+// looked safe. The reader is what makes it unsafe: RebuildJitArrDesc walks EVERY slot, including the
+// private block another thread owns.
+// ⛔ The lock is LockArrays, not a second one: one definition of "the array table is being reshaped",
+// and it costs a single-threaded program nothing (it answers False with no workers, which is the case
+// the +50% measurement above is about).
 var
   i: Integer;
+  Locked: Boolean;
 begin
   if GArrPrivDiag then
     WriteLn(ErrOutput, Format('[arrpriv] RIPRISTINA da %d a %d', [Ctx.ArrPrivSaveTop, Base]));
+// ⛔⛔ A PLAIN PAIR, NOT try/finally, AND THAT IS MEASURED. This routine is split out precisely
+// because FPC's managed-record prologue cost +50% on binary-trees (the note above); a try/finally
+// adds an exception frame to the same hot path, and it showed at once - arraybind_probe went
+// 1.85 -> 2.24 s, +21%, on a SINGLE-THREADED program where the lock is never even taken. The body is
+// plain assignments over a bounded loop and cannot raise, which is the same argument LockArrays'
+// four other callers rest on ("so the region stays a plain pair").
+  Locked := LockArrays;
   for i := Ctx.ArrPrivSaveTop - 1 downto Base do
   begin
     FArrays[Ctx.ArrPrivSave[i].SlotId] := Ctx.ArrPrivSave[i].Saved;
@@ -4555,6 +4598,7 @@ begin
   end;
   Ctx.ArrPrivSaveTop := Base;
   MarkArraysDirtyAll(1);  // arbitrary slots got their storage back
+  UnlockArrays(Locked);
 end;
 
 procedure TBytecodeVM.FramePop(Ctx: TExecutionContext);
@@ -13676,9 +13720,14 @@ function TBytecodeVM.LockArrays: Boolean;
 // 📊 retrogra's demo and BASIC: a refresh thread runs while a message box DIMs a local array, and the
 // worker died inside RebuildJitArrDesc roughly two runs in three (resolved with --symbols:
 // RebuildJitArrDesc <- AcquireArrDescCtxLocked <- AcquireArrDescCtx <- RunFast).
-// ⚠️ Free of re-entrancy by construction: the four callers (ExecuteArrayDim, RedimArray, RedimArrayN,
-// EraseArray) reach nothing that takes this lock - checked, not assumed - so the region stays a plain
-// pair. And with no worker there is nobody to race with, so the single-threaded path pays nothing.
+// ⚠️ Free of re-entrancy by construction: the FIVE callers (ExecuteArrayDim, RedimArray, RedimArrayN,
+// EraseArray, ArrPrivRestoreSlow) reach nothing that takes this lock - checked, not assumed - so the
+// region stays a plain pair. And with no worker there is nobody to race with, so the single-threaded
+// path pays nothing.
+// ⛔⛔ ArrPrivRestoreSlow was added on 12 Sep 2026 and it was the HOLE: it replaces a whole managed
+// storage record in FArrays from FramePop - outside ExecuteArrayOp entirely - so this list had four
+// entries while the table had five writers. *A list of who reshapes the table is only as good as the
+// question "have I found them all?", and the answer has to be checked against who WRITES FArrays.*
 //
 // ⛔⛔⛔ AND IT ANSWERS WHETHER IT TOOK THE LOCK, instead of letting the release ASK AGAIN.
 // The pair used to read FHasWorkers twice - once here, once in UnlockArrays - which is one condition
@@ -13747,6 +13796,27 @@ function TBytecodeVM.ActiveCtx: TExecutionContext; inline;
 begin
   Result := GActiveCtx;
   if Result = nil then Result := FCtx;
+end;
+
+function TBytecodeVM.MemberElemNeedsLbSub(Slot: Integer): Boolean;
+// Does the index this element opcode was handed still need the array's lower bound taken off it?
+//
+// ⛔⛔ ONLY FOR A ONE-DIMENSIONAL MEMBER, and asking it any other way is a DOUBLE SUBTRACTION. A
+// multi-dimensional access reaches these opcodes through bcArrayIdxResolveInd, which has ALREADY
+// subtracted the lower bound of EVERY dimension while folding the indices into one linear number;
+// taking dimension 0's off again shifts the whole array down by that much, and the ORIGIN falls off
+// the front.
+// 📌 Measured: on a "ReDim m(1 To 3, 2 To 4)" member, m(1,2) - the first element - read 0 while every
+// other element read back what was written. It was SELF-CONSISTENT, because the write was shifted by
+// exactly as much as the read, so only the element that fell off the start showed (DIVERGENZE 312).
+// ⚠️ It was unreachable while a member array's lower bounds were all ZERO, which they were until the
+// declaration's "lb TO ub" started reaching the storage (311). A latent double subtraction is exactly
+// what an identity operation hides.
+// ⭐ The rank is the discriminator and it is exact, not a heuristic: a 1-D member access emits the
+// element opcode with the DECLARED index, a multi-dim one cannot reach it without the resolve.
+begin
+  Result := (Slot >= 1) and (Slot <= High(FArrays)) and
+            (Length(FArrays[Slot].LowerBounds) > 0) and (FArrays[Slot].DimCount <= 1);
 end;
 
 function TBytecodeVM.MapArrDyn(Ctx: TExecutionContext; Id: Int64): Integer;
@@ -14051,7 +14121,28 @@ begin
   // to race: the same condition RebuildJitArrDesc already uses to decide whether the old buffer must
   // be retired rather than resized. ⚠️ It is set BEFORE any worker can run, never cleared while one
   // lives, so a program that spawns threads takes the lock from that moment on - including this one.
-  if not FHasWorkers then Exit(AcquireArrDescCtxLocked(ECtx));
+  if not FHasWorkers then
+  begin
+    // ⛔ THE CLAIM ABOVE IS BEING MEASURED, NOT TRUSTED: see GArrDescLockDiag.
+    if GArrDescLockDiag then
+    begin
+      if GetCurrentThreadID = FRenderOwnerThreadId then
+        InterLockedIncrement64(GArrDescFastOwner)
+      else
+      begin
+        InterLockedIncrement64(GArrDescFastOther);
+        if not GArrDescFastSaid then
+        begin
+          GArrDescFastSaid := True;
+          WriteLn(ErrOutput, '[arrdesclock] ⛔ a NON-OWNER thread took the UNLOCKED shortcut ',
+                  '(FHasWorkers=False in thread ', Int64(GetCurrentThreadID),
+                  ', owner ', Int64(FRenderOwnerThreadId), ')');
+          Flush(ErrOutput);
+        end;
+      end;
+    end;
+    Exit(AcquireArrDescCtxLocked(ECtx));
+  end;
   EnterCriticalSection(FArrDescLock);
   try
     Result := AcquireArrDescCtxLocked(ECtx);
@@ -16202,7 +16293,7 @@ function ArrayOpMayReshape(SubOp: Word): Boolean; inline;
 //   C strings             50, 51  bcRaw{Load,Store}ZStr
 //   pure queries           9, 10  LBOUND / UBOUND        45, 46  the same on a UDT member
 //   index arithmetic      29, 30  ArrayIdxPush / Resolve  43  ...on a UDT member
-//   descriptor pointer        52  FBC.ArrayDescriptorPtr - it only PACKS a slot number into a
+//   descriptor pointer    52, 53  FBC.ArrayDescriptorPtr - it only PACKS a slot number into a
 //                                 pointer; the 240 bytes are built later, at the dereference
 // ⚠️ A pointer store CAN write into an array's element data - that is why the lock is still taken
 // for these arms. Writing an element does not change where the element IS, which is all the
@@ -16210,7 +16301,7 @@ function ArrayOpMayReshape(SubOp: Word): Boolean; inline;
 begin
   case SubOp of
     9, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    29, 30, 31, 32, 33, 43, 45, 46, 50, 51, 52: Result := False;
+    29, 30, 31, 32, 33, 43, 45, 46, 50, 51, 52, 53: Result := False;
   else
     Result := True;
   end;
@@ -16711,19 +16802,25 @@ begin
                              Instr.Immediate = 1)
         else
           RawStoreZStrVal(Ctx.IntRegs[Instr.Src1], Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1);
-      52: // bcArrayDescPtr - FBC.ArrayDescriptorPtr( a() ): Dest(int) = a pointer into the DESCRIPTOR
-          // region for this array (see RAWPTR_REGION_ADESC). Src1 = the LOGICAL array id.
+      52, 53: // bcArrayDescPtr / bcArrayDescPtrInd - FBC.ArrayDescriptorPtr( a() ): Dest(int) = a
+          // pointer into the DESCRIPTOR region for this array (see RAWPTR_REGION_ADESC). Src1 is the
+          // LOGICAL array id (52) or an int register holding a UDT member's runtime handle (53).
           // ⛔ The PHYSICAL slot goes into the pointer: the dereference happens later, in whatever
           // context holds the pointer, and RawAddr has no ArrMap to map a logical id through. A private
           // slot is allocated past FStaticArrCount, so MapArrDyn leaves it alone - while base_ptr is
           // built from the LOGICAL id, which is the value "@a(lb)" produces and what it is compared to.
+          // ⭐ ONE ARM FOR BOTH FORMS, deliberately: the two cannot then describe the same array
+          // differently, which is the failure the bcArrayLBound/...Ind pair is shaped against.
+          // ⚠️ For a MEMBER the two ids are ONE number - its handle IS the physical slot, and
+          // "@x.a(lb)" is encoded from that same handle.
         begin
-          ArrayIdx := Ctx.ArrMap[Instr.Src1];
+          if SubOp = 53 then ArrayIdx := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1])
+          else ArrayIdx := Ctx.ArrMap[Instr.Src1];
           // ⛔ A slot with no storage answers NULL and does NOT grow the table: a parameter placeholder
-          // never DIM'd is exactly the case fbc answers NULL for, and growing here would make this op a
-          // RESHAPE - costing the descriptor table and the lock on what is a pure query (see
-          // ArrayOpMayReshape).
-          LinearIdx := Instr.Src1;
+          // never DIM'd, and an unallocated member (handle 0), are exactly the cases fbc answers NULL
+          // for, and growing here would make this op a RESHAPE - costing the descriptor table and the
+          // lock on what is a pure query (see ArrayOpMayReshape).
+          if SubOp = 53 then LinearIdx := ArrayIdx else LinearIdx := Instr.Src1;
           if (ArrayIdx <= 0) or (ArrayIdx > High(FArrays)) or
              (Int64(ArrayIdx) > RAWPTR_ADESC_SLOT_MASK) or (Int64(LinearIdx) > RAWPTR_ADESC_SLOT_MASK) or
              (LinearIdx < 0) then
@@ -16898,7 +16995,7 @@ begin
           // one read and one subtract instead of two extra instructions per access - and it is the
           // identity for every array whose lower bound is 0, which is all of them today.
           PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
-          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          if MemberElemNeedsLbSub(PtrAddr) then
             LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
           if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
             Ctx.IntRegs[Instr.Dest] := ArrGetInt(FArrays[PtrAddr], LinearIdx)
@@ -16908,7 +17005,7 @@ begin
       38: // bcArrayLoadIndFloat
         begin
           PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
-          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          if MemberElemNeedsLbSub(PtrAddr) then
             LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
           if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
             Ctx.FloatRegs[Instr.Dest] := FArrays[PtrAddr].FloatData[LinearIdx]
@@ -16918,7 +17015,7 @@ begin
       39: // bcArrayLoadIndString
         begin
           PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
-          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          if MemberElemNeedsLbSub(PtrAddr) then
             LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
           if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
             Ctx.StringRegs[Instr.Dest] := FArrays[PtrAddr].StringData[LinearIdx]
@@ -16928,7 +17025,7 @@ begin
       40: // bcArrayStoreIndInt (Dest = value register, READ)
         begin
           PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
-          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          if MemberElemNeedsLbSub(PtrAddr) then
             LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
           if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
             ArrSetIntAt(PtrAddr, LinearIdx, Ctx.IntRegs[Instr.Dest]);
@@ -16936,7 +17033,7 @@ begin
       41: // bcArrayStoreIndFloat (Dest = value register, READ)
         begin
           PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
-          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          if MemberElemNeedsLbSub(PtrAddr) then
             LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
           if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
             FArrays[PtrAddr].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
@@ -16944,7 +17041,7 @@ begin
       42: // bcArrayStoreIndString (Dest = value register, READ)
         begin
           PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
-          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (Length(FArrays[PtrAddr].LowerBounds) > 0) then
+          if MemberElemNeedsLbSub(PtrAddr) then
             LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
           if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
             FArrays[PtrAddr].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
@@ -16986,9 +17083,20 @@ begin
               FArrays[PtrAddr].TotalSize := 0;
               SetLength(FArrays[PtrAddr].Dimensions, 0);
               SetLength(FArrays[PtrAddr].LowerBounds, 0);
+              // ⭐ A MEMBER ALWAYS STATES ITS RANK: it is declared "(Any)", "(Any, Any)" or with
+              // bounds - there is no bare "()" spelling for a per-instance member. That is what
+              // FBC.ArrayDescriptorPtr reports as FBARRAY_FLAGS_FIXED_DIM and as how many dimTb()
+              // entries the descriptor declares (see TArrayStorage.RankStated).
+              FArrays[PtrAddr].RankStated := True;
               RecSetFieldInt(Rec, RecSlot, PtrAddr);
             end;
             RedimArrayN(PtrAddr, FRedimPendingUBs, (Instr.Immediate and 1) <> 0, FRedimPendingLBs);
+            // ⭐ BIT 1: the member is FIXED-LENGTH, so undo the DYNAMIC stamp RedimArrayN leaves. A
+            // member sized at CONSTRUCTION from "Dim a(2 To 11)" is not a ReDim target, and fbc reports
+            // FBARRAY_FLAGS_FIXED_LEN for it - the descriptor's last disagreeing field (DIVERGENZE 305).
+            // ⚠️ Asked of the DECLARATION, not of the path: an explicit "ReDim x.a(...)" and the
+            // "ReDim" member spelling both keep the dynamic stamp, which is what ERASE reads.
+            if (Instr.Immediate and 2) <> 0 then FArrays[PtrAddr].IsDynamic := False;
             if GArrPrivDiag then
               WriteLn(ErrOutput, Format('[arrpriv] MEMBRO rec=%p slot=%d -> phys %d size=%d',
                       [Pointer(Rec), RecSlot, PtrAddr, FArrays[PtrAddr].TotalSize]));
@@ -17000,19 +17108,36 @@ begin
           SetLength(FRedimPendingLBs, 0);
         end;
       45: // bcArrayLBoundInd - LBOUND of a UDT array member (Src1=handle reg, Src2=dim reg)
+          // ⛔ DIM 0 (index -1) IS THE RANK QUERY, NOT A DIMENSION, and this arm did not know it -
+          // while the arm for a plain array (sub 9) has known it all along. "LBound(x.a, 0)" is
+          // ALWAYS 1 in FreeBASIC, whatever the array; here it fell to the out-of-range else and
+          // answered 0. One rule, two arms, and only one of them had it (DIVERGENZE 309).
         begin
           PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
-          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and
-             (LinearIdx >= 0) and (LinearIdx <= High(FArrays[PtrAddr].LowerBounds)) then
+          if LinearIdx < 0 then
+            Ctx.IntRegs[Instr.Dest] := 1
+          else if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and
+             (LinearIdx <= High(FArrays[PtrAddr].LowerBounds)) then
             Ctx.IntRegs[Instr.Dest] := FArrays[PtrAddr].LowerBounds[LinearIdx]
           else
             Ctx.IntRegs[Instr.Dest] := 0;
         end;
       46: // bcArrayUBoundInd - UBOUND of a UDT array member (upper = lower + size - 1; -1 if unallocated)
+          // ⛔ ...and the same query on this side answers HOW MANY DIMENSIONS ARE ALLOCATED: 0 for a
+          // member never ReDim'd (and for one that has been ERASEd), its rank afterwards. It fell to
+          // the same else and answered -1 - the value that means "empty array" for a real dimension,
+          // so the two questions were being given one answer. Sub 10 is where the rule already lives.
         begin
           PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]); LinearIdx := Ctx.IntRegs[Instr.Src2];
-          if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and
-             (LinearIdx >= 0) and (LinearIdx <= High(FArrays[PtrAddr].Dimensions)) then
+          if LinearIdx < 0 then
+          begin
+            if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and (FArrays[PtrAddr].TotalSize > 0) then
+              Ctx.IntRegs[Instr.Dest] := FArrays[PtrAddr].DimCount
+            else
+              Ctx.IntRegs[Instr.Dest] := 0;
+          end
+          else if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and
+             (LinearIdx <= High(FArrays[PtrAddr].Dimensions)) then
             Ctx.IntRegs[Instr.Dest] := FArrays[PtrAddr].LowerBounds[LinearIdx]
                                        + FArrays[PtrAddr].Dimensions[LinearIdx] - 1
           else

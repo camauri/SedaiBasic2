@@ -42,7 +42,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 582 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcGfxScreenList; +1 bcCloseFunc; +1 bcGfxPaletteUsing; +1 bcStrAscW; +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt; +1 bcStrMidAssignArr; +1 bcGfxCircleExF; +1 bcRecordReallocBlock; +1 bcRecordBlockLen; +2 the wide "Any set" searches; +2 bcForeignCall/F; +1 bcArrayDescPtr
+  OPCODE_LIST_COUNT = 583 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcGfxScreenList; +1 bcCloseFunc; +1 bcGfxPaletteUsing; +1 bcStrAscW; +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt; +1 bcStrMidAssignArr; +1 bcGfxCircleExF; +1 bcRecordReallocBlock; +1 bcRecordBlockLen; +2 the wide "Any set" searches; +2 bcForeignCall/F; +2 bcArrayDescPtr/Ind
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -98,7 +98,7 @@ const
     bcArrayIdxResolve, bcRawMemCopy, bcRawMemMove, bcRawClear, bcArrayBind, bcArrayUnbind,
     bcArrayBindApply, bcArrayLoadIndInt, bcArrayLoadIndFloat, bcArrayLoadIndString, bcArrayStoreIndInt, bcArrayStoreIndFloat,
     bcArrayStoreIndString, bcArrayIdxResolveInd, bcMemberArrayRedim, bcArrayLBoundInd, bcArrayUBoundInd, bcArrayCopyContents,
-    bcArrayCopyRecords, bcArrayBindInd, bcRawLoadZStr, bcRawStoreZStr, bcArrayDescPtr, bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn,
+    bcArrayCopyRecords, bcArrayBindInd, bcRawLoadZStr, bcRawStoreZStr, bcArrayDescPtr, bcArrayDescPtrInd, bcPrint, bcPrintLn, bcPrintString, bcPrintStringLn,
     bcPrintInt, bcPrintIntLn, bcPrintComma, bcPrintSemicolon, bcPrintTab, bcPrintSpc,
     bcPrintNewLine, bcPrintEnd, bcInput, bcInputInt, bcInputFloat, bcInputString,
     bcPrintBool, bcPrintUInt, bcWInputChars, bcInputChars, bcConScreen, bcConLocate,
@@ -196,7 +196,7 @@ const
   DENSE_CORE_SIZE     = 173;  // group 0   (bcForeignCall/F = subs 171/172)
   DENSE_STRING_SIZE   = 55;   // group 1   (bcStrInstrRevAnyW = sub 54)
   DENSE_MATH_SIZE     = 43;   // group 2   (CEIL/ROUND/MIN/MAX/COPYSIGN + the two bit-casts)
-  DENSE_ARRAY_SIZE    = 53;   // group 3   (bcArrayDescPtr = sub 52)
+  DENSE_ARRAY_SIZE    = 54;   // group 3   (bcArrayDescPtr/Ind = subs 52/53)
   DENSE_IO_SIZE       = 23;   // group 4
   DENSE_SPECIAL_SIZE  = 18;   // group 5   (bcCpuCount = sub 17)
   DENSE_FILEIO_SIZE   = 38;   // group 6  (+ bcCloseFunc)

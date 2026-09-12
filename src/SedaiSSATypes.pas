@@ -500,9 +500,9 @@ type
     ssaArrayLBoundInd, ssaArrayUBoundInd,  // LBOUND/UBOUND of a UDT array member (Src1=handle reg, Src2=dim reg)
     { FBC.ArrayDescriptorPtr( a() ) - fbc's INTERNAL array descriptor, as a pointer into the
       descriptor REGION (see RAWPTR_REGION_ADESC): Dest = int register, Src1 = array ref.
-      🕳️ A per-instance UDT array MEMBER is not routed here (DIVERGENZE 305): its storage does not
-      describe the member the way fbc's descriptor does, so it answers NULL rather than wrong numbers. }
-    ssaArrayDescPtr,
+      ...Ind: the array is a UDT MEMBER, so Src1 is an int register holding its runtime FArrays
+      handle - the same split bcArrayLBound / bcArrayLBoundInd already makes. }
+    ssaArrayDescPtr, ssaArrayDescPtrInd,
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
     ssaPrintInt, ssaPrintIntLn,
     ssaPrintBool, ssaPrintUInt,   // B1.5 phase C: BOOLEAN true/false, unsigned-64 print
