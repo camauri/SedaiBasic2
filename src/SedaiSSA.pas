@@ -1609,6 +1609,7 @@ type
     function ForeignStructRetSpec(UDTIdx: Integer; out Why: string): string;   // a struct returned BY VALUE (329)
     function ForeignRetUDTName(const NameU: string): string;   // ...and the UDT such a call answers (329)
     function ForeignRetPtrUDTName(const NameU: string): string;   // ...and the UDT a foreign call POINTS AT
+    function SideEffectFreeObject(Node: TASTNode): Boolean;   // may this object be evaluated TWICE?
     function RawAddrFieldPointee(Node: TASTNode): string;   // a raw pointer FIELD through parens and casts
     function AddRawUDTPtr(const ScopeU, NameU, TypeU: string): Boolean;   // ...file it, flat AND scoped (333)
     function FoldIntNode(Node: TASTNode; out Val: Int64): Boolean;        // literal integer arithmetic, no side effects
@@ -51269,6 +51270,14 @@ begin
     // firma della procedura, cosi' il runtime puo' costruire la chiusura che C chiamera'
     // (DIVERGENZE 218). Ogni altro parametro resta com'e' dichiarato.
     T := '';
+    // ⛔⛔ ...AND A PARAMETER DECLARED AS A FUNCTION-POINTER TYPEDEF DOES NOT CLASSIFY AS A POINTER.
+    // "GCallback", "GWeakNotify", "GDestroyNotify" - a C header names the callback's type, it does not
+    // spell "Any Ptr" - and ForeignKindOf sees only the NAME, so it answered fkUnknown and this rung
+    // was skipped. No closure was built, and C jumped to a BYTECODE PC: "g_signal_connect_data" then
+    // "g_signal_emit_by_name" died with an access violation, while the same handler registered through
+    // a routine whose parameter IS spelled as a pointer worked. ⇒ An "@procedure" argument is a
+    // callback whatever the declaration calls the parameter; only a kind we KNOW is not a pointer
+    // (an integer, a float) keeps its own meaning.
     if (ForeignKindOf(Decl.ParamTypeNames[i]) = fkPointer) and
        Assigned(ArgListNode) and (i < ArgListNode.ChildCount) then
     begin
@@ -51326,6 +51335,22 @@ begin
   Result := FProgram.ForeignDeclCount - 1;
 end;
 
+function TSSAGenerator.SideEffectFreeObject(Node: TASTNode): Boolean;
+// May this object expression be evaluated TWICE? Names, parentheses, dereferences, casts and member
+// accesses built out of those - and nothing else. ⛔ A CALL is the one that matters: ForeignElemObject
+// emits the object once for the tag test and once on the managed branch, so a call in the chain would
+// run twice, and half of the C library's "get" routines are not idempotent.
+begin
+  Result := False;
+  while (Node <> nil) and (Node.NodeType in [antParentheses, antDeref, antCast]) and
+        (Node.ChildCount >= 1) do
+    Node := Node.GetChild(0);
+  if Node = nil then Exit;
+  if Node.NodeType = antIdentifier then Exit(True);
+  if (Node.NodeType = antMemberAccess) and (Node.ChildCount >= 1) then
+    Exit(SideEffectFreeObject(Node.GetChild(0)));
+end;
+
 function TSSAGenerator.ForeignElemObject(Node: TASTNode; out Obj: TASTNode; out TypeName: string): Boolean;
 // The OBJECT of "obj->field" when obj may hold a C address that only its value can reveal (DIVERGENZE 259):
 //   (a) "a(i)"      an element of an array of UDT POINTERS - the program stored "@rec" or a C address;
@@ -51364,8 +51389,18 @@ begin
     end
     else if not (Idx.NodeType in [antLiteral, antIdentifier]) then Exit;
   end
+  // ⭐⭐ ...AND THE OBJECT OF THAT MEMBER NEED NOT BE A BARE NAME. It may be a CAST, which is how every
+  // GObject macro is written - "G_OBJECT_TYPE(o)" expands to
+  // "cptr(GTypeClass ptr, cptr(GTypeInstance ptr, (o))->g_class)->g_type" - and it may be ANOTHER member
+  // access, which is a linked list walked backwards ("tail->prev->prev->data"). Both died with "Invalid
+  // record handle" while the identical read stepped through a local worked, because this test asked for
+  // an identifier and nothing else. ObjectTypeName already resolves a cast and a chain, so the only
+  // thing that had to be added is permission to ask it.
+  // ⛔ SIDE-EFFECT-FREE ONLY, and that condition is not new: the note at the head of this routine says
+  // the object is evaluated TWICE - once for the tag test and once on the managed branch - so a CALL in
+  // the chain would run twice. Names, casts, parentheses, derefs and member accesses, nothing else.
   else if (Obj.NodeType = antMemberAccess) and (Obj.ChildCount >= 1) and (Obj.GetChild(0) <> nil) and
-          (Obj.GetChild(0).NodeType = antIdentifier) then
+          SideEffectFreeObject(Obj.GetChild(0)) then
   begin
     BaseT := ObjectTypeName(Obj.GetChild(0));
     BIdx := FindUDT(BaseT);
@@ -51376,6 +51411,16 @@ begin
         if not FUDTs[BIdx].Fields[i].IsArray then TypeName := FUDTs[BIdx].Fields[i].PtrPointee;
         Break;
       end;
+  end
+  // ...and a CAST standing on its own is the same fact with no field in front of it:
+  // "cptr(GTypeClass ptr, x)->g_type", the second half of the same macro.
+  else if (Obj.NodeType = antCast) and (Obj.ChildCount >= 1) and SideEffectFreeObject(Obj) then
+  begin
+    BaseT := Obj.ValueUpper;
+    if (Length(BaseT) > 4) and (Copy(BaseT, Length(BaseT) - 3, 4) = ' PTR') then
+      TypeName := UpperFast(CanonicalType(Trim(Copy(BaseT, 1, Length(BaseT) - 4))))
+    else
+      Exit;
   end
   // (c) "p" - a UDT-POINTER VARIABLE the C address was copied into ("Dim t As ffi_type Ptr = cif.rtype").
   // ⚠️ Not one the raw path already owns (a pointer C handed back is registered there), and not a record.
@@ -51718,6 +51763,15 @@ begin
     // e' li' che la firma del callback viene scritta (DIVERGENZE 218). ...And so does one handed the
     // address of a BASIC record: the entry is where "REC:" is written (DIVERGENZE 245).
     for i := 0 to NArgs - 1 do
+      // ⛔⛔ ...AND A PARAMETER WHOSE DECLARED TYPE IS A FUNCTION-POINTER TYPEDEF. A C header NAMES the
+      // callback's type - "GCallback", "GSignalCMarshaller", "GDestroyNotify" - and ForeignKindOf sees
+      // only the name, so it answered fkUnknown: the argument was never resolved to a MACHINE address
+      // and travelled as the VM's own tagged value. GLib stored it and called it, and the segfault was
+      // inside libgobject, not here. The site entry is where that parameter is written as the pointer
+      // it is.
+      // ⚠️ ...through its own ALIASES: "GSignalCMarshaller" is "GClosureMarshal", and only the
+      // resolved name is in the registry. Asking the spelling answered no for the very types a header
+      // hands the program.
       if (ForeignKindOf(Decl.ParamTypeNames[i]) = fkPointer) and
          ((BasicProcCallbackSig(ArgListNode.GetChild(i)) <> '') or
           ForeignRecordArg(ArgListNode.GetChild(i)) or
