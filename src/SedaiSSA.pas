@@ -1013,6 +1013,8 @@ type
     function RefVarBank(const Name: string): TSSARegisterType;                  // pointee bank of a reference variable
     function IsRawPtr(const Name: string): Boolean;                             // raw (Allocate-backed) pointer var?
     procedure CollectRawPtrVars(Node: TASTNode);                                // pre-scan: mark ptrs assigned from Allocate*
+    procedure MarkCallbackParamsRaw(Node: TASTNode);                            // ...and a callback's pointer params: C fills them (325/328)
+    procedure MarkOneCallbackDecl(const ProcU: string; ParamList: TASTNode);
     procedure CollectRawPtrRetFuncs(Node: TASTNode);                            // pre-scan: FUNCTIONs returning a raw "<scalar> PTR"
     function IsRawReturnExpr(Node: TASTNode): Boolean;                          // a FUNCTION-return expr that yields a raw byte-heap pointer?
     procedure CollectWStringVars(Node: TASTNode; const Owner: string = '');    // pre-scan: mark DIM ... AS WSTRING vars
@@ -2972,28 +2974,6 @@ begin
     // canonical names, and an unknown one would drop the whole signature - the closure never built.
     if T <> '' then T := UpperFast(CanonicalType(T));
     if (T = '') or (ForeignKindOf(T) = fkUnknown) then Exit;
-    // ⛔⛔ A CALLBACK'S "<UDT> PTR" PARAMETER HOLDS A MACHINE ADDRESS, and nothing else could say so.
-    // MarkRawPointerParam carries rawness from the ARGUMENT at a BASIC call site (DIVERGENZE 303); a
-    // callback has NO BASIC call site - C fills its parameters - so the mark never happened and the body
-    // read the structure as a MANAGED RECORD HANDLE. pcre2's callout hands back a
-    // "pcre2_callout_block_8 ptr" and the probe died with "Invalid record handle 2305983740423680304".
-    // ⭐ This routine is the one place that knows a BASIC procedure is being handed to C, and it already
-    // walks the parameter list to build the signature - so the question is asked where the answer is
-    // known. Same registry and same guard as the call-site path.
-    if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
-    begin
-      CbPointee := Trim(Copy(T, 1, Length(T) - 4));
-      CbParamName := prm.ValueUpper;
-      if (CbPointee <> '') and (Pos(' PTR', CbPointee) = 0) and (FindUDT(CbPointee) >= 0) and
-         (CbParamName <> '') and (FRawUDTPtrs.IndexOfName(CbParamName) < 0) then
-      begin
-        FRawUDTPtrs.Add(CbParamName + '=' + UpperFast(CanonicalType(CbPointee)));
-        FRawCollectChanged := True;
-        if GetEnvironmentVariable('RAWPTRDIAG') <> '' then
-          WriteLn(ErrOutput, 'RAWPTR callback param [', Nm, '] ', CbParamName, ' -> ', CbPointee,
-                  '   <- C fills this one');
-      end;
-    end;
     // ⛔⛔ IL SEPARATORE E' "~", NON LA VIRGOLA. La virgola separa gia' i PARAMETRI nella riga della
     // tabella esterna, quindi una firma scritta con le virgole veniva spezzata da ParseForeignDecl:
     // "FNPTR:LONG:ANY PTR,ANY PTR" diventava DUE parametri, il callback ne riceveva uno solo, e il
@@ -43870,6 +43850,113 @@ begin
   end;
 end;
 
+procedure TSSAGenerator.MarkCallbackParamsRaw(Node: TASTNode);
+// ⛔⛔ A CALLBACK'S POINTER PARAMETERS ARE FILLED BY C, and nothing else could say so. What makes a
+// pointer raw is where its VALUE came from, and MarkRawPointerParam carries that from the ARGUMENT at a
+// BASIC call site (DIVERGENZE 303) - but a callback has NO BASIC call site: C fills its parameters. Two
+// consequences, both measured on real libraries:
+//   - a "<UDT> PTR" parameter was read as a MANAGED RECORD HANDLE - pcre2's callout hands back a
+//     "pcre2_callout_block_8 ptr" and the body died with "Invalid record handle ..." (DIVERGENZE 325);
+//   - a PLAIN pointer parameter kept the wrong SCALE - "Dim As Integer Ptr c = ud" then "c[1]" stepped
+//     ONE byte instead of eight, so expat's three counters landed in the same eight bytes (0x080403,
+//     three values one byte apart) and nothing raised (DIVERGENZE 328).
+// ⭐ IT RUNS IN THE PRE-PASS, INSIDE THE FIXPOINT, and that is the whole difference between working and
+// not: the first version marked the parameter while LOWERING the foreign call, which is after
+// CollectRawPtrVars has finished - so the parameter was raw and the LOCAL copied from it ("c = ud") was
+// not, which is the half the program actually indexes.
+// ⚠ Only where the callee is a FOREIGN declaration. A BASIC procedure whose address is merely stored in
+// a procedure-pointer variable is called from BASIC, where the call site carries the rawness properly and
+// where an argument may legitimately be one of the VM's own managed addresses.
+var
+  i, k, Idx: Integer;
+  NameU, PT, Pointee, PN: string;
+  Args, A, Decl, ParamList, prm: TASTNode;
+begin
+  if (Node = nil) or not Assigned(FProgram) then Exit;
+  if Node.NodeType in [antFunctionCall, antArrayAccess] then
+  begin
+    NameU := '';
+    if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+      NameU := Node.GetChild(0).ValueUpper
+    else
+      NameU := Node.ValueUpper;
+    if NameU <> '' then
+    begin
+      Idx := FProgram.IndexOfForeignDecl(NameU);
+      if Idx >= 0 then
+        for i := 0 to Node.ChildCount - 1 do
+        begin
+          Args := Node.GetChild(i);
+          if (Args = nil) or not (Args.NodeType in [antArgumentList, antExpressionList]) then Continue;
+          for k := 0 to Args.ChildCount - 1 do
+          begin
+            A := Args.GetChild(k);
+            // ⚠ ...THROUGH A CAST TOO, which is how a typed handler is usually written:
+            // "XML_SetElementHandler(p, Cast(XML_StartElementHandler, @on_start), 0)". Unwrapping only
+            // parentheses left that spelling unmarked, and the same probe written the two ways then
+            // answered two different things.
+            while (A <> nil) and (A.NodeType in [antParentheses, antCast]) and (A.ChildCount >= 1) do
+              A := A.GetChild(0);
+            if (A = nil) or (A.NodeType <> antProcAddress) or (A.ChildCount <> 0) then Continue;
+            if not FProcDecls.TryGetValue(UpperFast(VarToStr(A.Value)), Decl) then Continue;
+            if (Decl = nil) or (Decl.ChildCount < 2) then Continue;
+            ParamList := Decl.GetChild(1);
+            if (ParamList = nil) or (ParamList.NodeType <> antParameterList) then Continue;
+            MarkOneCallbackDecl(UpperFast(VarToStr(A.Value)), ParamList);
+          end;
+        end;
+    end;
+  end;
+  for i := 0 to Node.ChildCount - 1 do MarkCallbackParamsRaw(Node.GetChild(i));
+end;
+
+procedure TSSAGenerator.MarkOneCallbackDecl(const ProcU: string; ParamList: TASTNode);
+// The two registries a pointer parameter lands in, exactly as the call-site path writes them: the UDT
+// one when the pointee is a declared type, the flat + scoped pair otherwise. See MarkCallbackParamsRaw.
+var
+  i: Integer;
+  PT, Pointee, PN: string;
+  prm: TASTNode;
+begin
+  for i := 0 to ParamList.ChildCount - 1 do
+  begin
+    prm := ParamList.GetChild(i);
+    if (prm = nil) or (prm.ChildCount < 1) or (prm.GetChild(0).NodeType <> antIdentifier) then Continue;
+    PT := UpperFast(CanonicalType(prm.GetChild(0).ValueUpper));
+    if (Length(PT) < 5) or (Copy(PT, Length(PT) - 3, 4) <> ' PTR') then Continue;
+    PN := prm.ValueUpper;
+    if PN = '' then Continue;
+    Pointee := Trim(Copy(PT, 1, Length(PT) - 4));
+    if (Pointee <> '') and (Pos(' PTR', Pointee) = 0) and (FindUDT(Pointee) >= 0) then
+    begin
+      if FRawUDTPtrs.IndexOfName(PN) < 0 then
+      begin
+        FRawUDTPtrs.Add(PN + '=' + UpperFast(CanonicalType(Pointee)));
+        FRawCollectChanged := True;
+        if GetEnvironmentVariable('RAWPTRDIAG') <> '' then
+          WriteLn(ErrOutput, 'RAWPTR callback param [', ProcU, '] ', PN, ' -> ', Pointee,
+                  '   <- C fills this one');
+      end;
+    end
+    else
+    begin
+      if FRawPtrVars.IndexOf(PN) < 0 then
+      begin
+        FRawPtrVars.Add(PN);
+        FRawCollectChanged := True;
+      end;
+      if FRawPtrScoped.IndexOf(ProcU + '|' + PN) < 0 then
+      begin
+        FRawPtrScoped.Add(ProcU + '|' + PN);
+        FRawCollectChanged := True;
+        if GetEnvironmentVariable('RAWPTRDIAG') <> '' then
+          WriteLn(ErrOutput, 'RAWPTR callback param [', ProcU, '] ', PN,
+                  '   <- C fills this one (plain pointer)');
+      end;
+    end;
+  end;
+end;
+
 procedure TSSAGenerator.CollectRawPtrVars(Node: TASTNode);
 // Pre-scan (run to a fixpoint by the caller): a pointer variable is RAW if it is assigned from
 // ALLOCATE/CALLOCATE/REALLOCATE, from a pointer CAST/CPTR of a raw value, or copied from another raw
@@ -53893,6 +53980,7 @@ begin
   try
     repeat
       FRawCollectChanged := False;
+      PreMarkStart; MarkCallbackParamsRaw(AST); PreMarkEnd('MarkCallbackParamsRaw');
       PreMarkStart; CollectRawPtrVars(AST); PreMarkEnd('CollectRawPtrVars');
       PreMarkStart; CollectRawPtrRetFuncs(AST); PreMarkEnd('CollectRawPtrRetFuncs');
     until not FRawCollectChanged;
