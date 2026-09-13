@@ -16041,6 +16041,15 @@ var
       Result := (S = 'ULONG') or (S = 'ULONGINT') or (S = 'UINTEGER') or (S = 'USHORT') or (S = 'UBYTE');
     end;
 
+    function Is64UnsignedName(const S0: string): Boolean;
+    // The only unsigned types that survive an operator: ULONGINT and UINTEGER (64-bit here).
+    var
+      S: string;
+    begin
+      S := ResolveAlias(S0);
+      Result := (S = 'ULONGINT') or (S = 'UINTEGER');
+    end;
+
     function IntNameBits(const S0: string): Integer;
     var
       S: string;
@@ -16055,20 +16064,24 @@ var
     function IntResultName(const L, R: string): string;
     // ⭐ THE USUAL ARITHMETIC CONVERSIONS, and this used to answer LONGINT for every pair
     // (DIVERGENZE 293). An UNSIGNED operand makes the result unsigned, and an unsigned CONST prints
-    // with no sign column - which is how win/winnt.bi's "1ull Shl XSTATE_LEGACY_FLOATING_POINT" and
-    // lzma's "UINT32_C(1) Shl 23" read in fbc. The 295 work typed the LITERAL and stopped at the
-    // first operator above it.
-    var
-      B: Integer;
+    // with no sign column - which is how win/winnt.bi's "1ull Shl XSTATE_LEGACY_FLOATING_POINT" reads
+    // in fbc. The 295 work typed the LITERAL and stopped at the first operator above it.
+    //
+    // ⛔⛔ ...BUT ONLY A 64-BIT UNSIGNED SURVIVES AN OPERATOR, and the version before this one said
+    // the opposite for the narrow ones - including on the very example its own comment cited.
+    // MEASURED on fbc 1.10.1, one form per line:
+    //   Const A = UINT32_C(1) Shl 23        → " 8388608"    a SIGN SPACE: signed
+    //   Const D = cast(ULong,1) Shl 23      → " 8388608"    signed
+    //   Const M = not cast(ULong,0)         → "-1"          signed (SDL2's SDL_MUTEX_MAXWAIT)
+    //   Const G = cast(UShort,3) * 2        → " 6"          signed
+    //   Const B = cast(ULong,4294967295)+1  → " 4294967296"  signed AND 64 bits wide
+    //   Const H = cast(ULong,7)             → "7"           a BARE value keeps its narrow unsigned
+    //   Const C = 1ull Shl 5                → "32"          a 64-bit unsigned stays unsigned
+    // ⇒ Every narrow operand - signed or unsigned - promotes to a 64-bit SIGNED integer; only
+    // ULONGINT/UINTEGER keeps unsignedness through an operator. The LONG/ULONG results this used to
+    // answer named widths fbc never produces here.
     begin
-      B := IntNameBits(L);
-      if IntNameBits(R) > B then B := IntNameBits(R);
-      if B < 32 then B := 32;                    // fbc promotes a narrow pair to at least 32 bits
-      if IsUnsignedName(L) or IsUnsignedName(R) then
-      begin
-        if B <= 32 then Result := 'ULONG' else Result := 'ULONGINT';
-      end
-      else if B <= 32 then Result := 'LONG'
+      if Is64UnsignedName(L) or Is64UnsignedName(R) then Result := 'ULONGINT'
       else Result := 'LONGINT';
     end;
 
@@ -16079,8 +16092,20 @@ var
     begin
       if VarIsStr(V.Value) then
         Result := 'STRING'
-      else if (Pos('.', VarToStr(V.Value)) > 0) or
-              (Pos('E', V.ValueUpper) > 0) then
+      // ⛔ AN "f" SUFFIX MAKES THE LITERAL A SINGLE, and that is a VALUE as well as a print form:
+      // "Const G = 9.80665f" is 9.80665 in fbc (SINGLE's 7 digits) and, assigned to a DOUBLE, it is
+      // 9.806650161743164 - the binary32 value - where we answered 9.806649999999999, i.e. the literal
+      // had never been rounded at all. It is SDL2's SDL_STANDARD_GRAVITY, in eight of its headers.
+      else if Assigned(V.Token) and V.Token.SingleSuffixed then
+        Result := 'SINGLE'
+      // ⛔ THE TEST IS ON THE SPELLING, NOT ON THE NUMBER, and asking the number alone let "0.0"
+      // through as an integer: the node carries the PARSED value, which renders as "0". Harmless while
+      // every float answered DOUBLE; the moment a SINGLE operand could win the pair, "9.80665f + 0.0"
+      // came out Single where fbc widens it to Double. The token keeps the source spelling.
+      else if (Pos('.', VarToStr(V.Value)) > 0) or (Pos('E', V.ValueUpper) > 0) or
+              (Assigned(V.Token) and (V.Token.TokenType = ttNumber) and
+               ((Pos('.', VarToStr(V.Token.Value)) > 0) or
+                (Pos('E', UpperFast(VarToStr(V.Token.Value))) > 0))) then
         Result := 'DOUBLE'
       // ⭐ A DECIMAL literal takes the first type of fbc's ladder Long -> ULong -> LongInt -> ULongInt that
       // holds it, so "Const T3 = 4294967295" is a ULONG and prints with no sign column (DIVERGENZE 295,
@@ -16143,7 +16168,17 @@ var
       Exit;
     end;
     if (V.NodeType = antUnaryOp) and (V.ChildCount >= 1) then
-      Exit(InferConstTypeName(V.GetChild(0)));
+    begin
+      L := InferConstTypeName(V.GetChild(0));
+      // ⛔ A UNARY OPERATOR PROMOTES EXACTLY LIKE A BINARY ONE, and this arm used to pass the
+      // operand's type straight through: "Const M = not cast(ULong, 0)" is **-1** in fbc, not
+      // 4294967295 - it is SDL2's SDL_MUTEX_MAXWAIT, and it read wrong in EIGHT of its headers.
+      // Only an INT operand promotes; a Double or a String passes through as before.
+      if IsIntName(L) and (V.Token <> nil) and
+         (V.Token.TokenType in [ttOpSub, ttOpAdd, ttBitwiseNOT]) then
+        Exit(IntResultName(L, L));
+      Exit(L);
+    end;
     // ⛔ PARENTHESES ARE TRANSPARENT TO A TYPE too, and this case was missing: "(2u * 3u) + 1u"
     // asked the left operand and got the DOUBLE default, so the unsignedness stopped at the bracket -
     // which is exactly the shape lzma writes ("(UINT32_C(1) shl 23)").
@@ -16159,6 +16194,22 @@ var
     begin
       // ⛔ "/" is FreeBASIC's FLOATING division whatever its operands are: "Const HALF = 1 / 2" is
       // 0.5, not 0. Only the operators whose result is an integer when both sides are keep LONGINT.
+      // ⭐ ...AND THE FLOAT HALF OF THE SAME QUESTION, which this case did not have: a SINGLE operand
+      // keeps the expression SINGLE unless a DOUBLE is in it - the rule IsSingleExpr already carries for
+      // the VALUE, said here for the CONST's declared TYPE. MEASURED on fbc 1.10.1:
+      //   Const C = 9.80665f * 2      → "19.6133"   a Single's 7 digits
+      //   Const B = 9.80665f + 0.0f   → "9.80665"
+      //   Const A = 9.80665f + 0.0    → "9.806650161743164"   a Double takes over
+      //   Const D = 9.80665f / 2.0f   → "4.903325"  "/" only when BOTH sides are Single
+      // ⚠ "^" is deliberately NOT here: through VARIABLES fbc types it Double (measured), and the
+      // Single answer it gives for two literals is its constant FOLDER, not the operator.
+      if (V.Token.TokenType = ttOpDiv) and (V.ChildCount >= 2) then
+      begin
+        L := InferConstTypeName(V.GetChild(0));
+        R := InferConstTypeName(V.GetChild(1));
+        if (L = 'SINGLE') and (R = 'SINGLE') then Exit('SINGLE');
+        Exit('DOUBLE');
+      end;
       case V.Token.TokenType of
         ttOpAdd, ttOpSub, ttOpMul, ttOpIntDiv, ttOpMod,
         ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR, ttOpShl, ttOpShr:
@@ -16166,6 +16217,8 @@ var
             L := InferConstTypeName(V.GetChild(0));
             R := InferConstTypeName(V.GetChild(1));
             if (L = 'STRING') or (R = 'STRING') then Result := 'STRING'
+            else if ((L = 'SINGLE') or (R = 'SINGLE')) and (L <> 'DOUBLE') and (R <> 'DOUBLE') then
+              Result := 'SINGLE'
             // ...two INTEGER operands of any width stay an integer: a ULONG literal or a CUInt() on
             // one side (295) must not turn "TSIZE - 1" back into a Double.
             // ⚠️ A SHIFT IS NOT THE C RULE HERE, and it was written that way first: in C the result

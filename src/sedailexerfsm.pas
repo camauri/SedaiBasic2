@@ -121,6 +121,7 @@ type
     // type, so the value is WRAPPED to signed 32 bits; unlike the other dropped suffixes this one changes
     // the value, not just the type. ProcessNumber / LexAmpBaseLiteral apply the wrap and clear the flag.
     FPendingLongSuffix: Boolean;
+    FPendingLong32Unsigned: Boolean;  // ...and that 32-bit narrowing is the UNSIGNED one ("UL")
 
     function GetTokenAt(Index: Integer): TLexerToken;
     function HandleTokenOverflow: TLexerToken;
@@ -1514,7 +1515,12 @@ begin
      for i := 1 to Length(TokenText) do
        if not ((TokenText[i] >= '0') and (TokenText[i] <= '9')) then begin IsIntText := False; Break; end;
      if IsIntText and TryStrToInt64(TokenText, LongVal) then
-       Result.SetExtractedValue(IntToStr(Int64(LongInt(LongVal and $FFFFFFFF))));
+     begin
+       if FPendingLong32Unsigned then
+         Result.SetExtractedValue(IntToStr(Int64(LongVal and $FFFFFFFF)))
+       else
+         Result.SetExtractedValue(IntToStr(Int64(LongInt(LongVal and $FFFFFFFF))));
+     end;
    end;
  end;
  // Always cleared, on BOTH branches and whichever call site got here: ProcessNumber is reached from FSM
@@ -1523,6 +1529,7 @@ begin
  FPendingUnsignedSuffix := False;
  FPendingUnsigned64Suffix := False;
  FPendingLongSuffix := False;
+ FPendingLong32Unsigned := False;
 end;
 
 function TLexerFSM.LexAmpBaseLiteral: TLexerToken;
@@ -1596,8 +1603,10 @@ begin
   // path in ProcessNumber. ProcessNumber never runs for a base literal, so apply and clear the flag here.
   if FPendingLongSuffix then
   begin
-    Val := Int64(LongInt(Val and $FFFFFFFF));
+    if FPendingLong32Unsigned then Val := Int64(Val and $FFFFFFFF)
+    else Val := Int64(LongInt(Val and $FFFFFFFF));
     FPendingLongSuffix := False;
+    FPendingLong32Unsigned := False;
   end;
   Result := CreateToken(ttNumber);
   Result.SetExtractedValue(IntToStr(Val));   // logical value is decimal, not the "&H.." source text
@@ -2097,7 +2106,17 @@ begin
     begin
       AdvanceChar;
       if (GetCurrentChar = 'L') or (GetCurrentChar = 'l') then AdvanceChar    // ULL: stays 64-bit
-      else FPendingUnsigned64Suffix := False;                                 // UL: 32-bit ULong
+      else
+      begin
+        FPendingUnsigned64Suffix := False;                                    // UL: 32-bit ULong
+        // ⛔ ...AND A SIZE SUFFIX NARROWS THE VALUE, which is the half this scanner did not do: the
+        // suffix was consumed and DROPPED, so "&hffffffffffffffffUL" kept all 64 bits where fbc answers
+        // 4294967295 (and says so: "warning 8: Literal number too big, truncated"). It is the shape
+        // glibconfig.bi's G_GINT64_CONSTANT takes on 64-bit Unix - "val##L" - so G_MAXINT64, G_MININT64,
+        // G_MAXUINT64 and G_TIME_SPAN_DAY all read wrong, 32 facts of glib.bi.
+        FPendingLongSuffix := True;
+        FPendingLong32Unsigned := True;
+      end;
     end
     else if C in ['S', 's', 'B', 'b'] then
     begin
@@ -2110,7 +2129,15 @@ begin
   else if (C = 'L') or (C = 'l') then
   begin
     AdvanceChar;
-    if (GetCurrentChar = 'L') or (GetCurrentChar = 'l') then AdvanceChar;     // LL
+    if (GetCurrentChar = 'L') or (GetCurrentChar = 'l') then AdvanceChar      // LL: 64-bit, no narrowing
+    else
+    begin
+      // A bare "L" is a 32-bit signed Long, and the value narrows to it - the same wrap the "&" suffix
+      // a few lines down has always applied ("3000000000&" -> -1294967296). MEASURED on fbc 1.10.1:
+      // "&h7fffffffffffffffL" answers -1, "5000000000L" answers 705032704.
+      FPendingLongSuffix := True;
+      FPendingLong32Unsigned := False;
+    end;
   end
   else if C = '%' then
     AdvanceChar   // "64%" (Integer). Unambiguous after a number: BASIC's modulo is MOD, never '%'.

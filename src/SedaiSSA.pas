@@ -3360,8 +3360,16 @@ begin
     begin
       // Same rule as the full body's antLiteral branch: bank keyed off the Variant type, not the
       // value, so 1.0 stays a float (1.0/3.0 must not fold as 1 div 3).
+      // ⛔ ...INCLUDING THE BINARY32 ROUNDING OF AN "f"-SUFFIXED LITERAL, and writing it only in the
+      // full body below moved nothing at all: this fast path is the one a literal actually takes.
+      // The token flag is tested first so an ordinary float literal costs one extra field read.
       if VarIsFloat(Node.Value) then
-        Result := MakeSSAConstFloat(Double(Node.Value))
+      begin
+        if Assigned(Node.Token) and Node.Token.SingleSuffixed and IsSingleExpr(Node) then
+          Result := MakeSSAConstFloat(Single(Double(Node.Value)))
+        else
+          Result := MakeSSAConstFloat(Double(Node.Value));
+      end
       else
         Result := MakeSSAConstInt(Int64(Node.Value));
       Exit;
@@ -4408,7 +4416,19 @@ begin
         // value: a float literal like 1.0 is an integer-valued Double and must stay a float, else
         // 1.0/3.0 would fold as integer 1 div 3 = 0. Integer literals (incl. >2^31) stay integers.
         if VarIsFloat(Node.Value) then
-          Result := MakeSSAConstFloat(Double(Node.Value))
+          // ⛔ AN "f"-SUFFIXED LITERAL IS A BINARY32 VALUE, not only a print form. Its value was kept
+          // in full double precision and only RENDERED with a Single's 7 digits when the whole
+          // expression happened to be Single - so "9.80665f" answered 9.80665 on its own and
+          // 9.806649999999999 the moment it met a Double, where fbc answers 9.806650161743164 (the
+          // binary32 value widened). Same literal, two values, and only the second is observable.
+          // ⭐ It is SDL2's SDL_STANDARD_GRAVITY, in eight of its headers.
+          // ⚠ Rounded HERE, where the value becomes a constant, and not in the node: LiteralOwnsToken
+          // compares the node's number with the token's, and a rounded node would stop owning its own
+          // token - which is what tells a real literal from a synthesized one borrowing a neighbour's.
+          if Assigned(Node.Token) and Node.Token.SingleSuffixed and IsSingleExpr(Node) then
+            Result := MakeSSAConstFloat(Single(Double(Node.Value)))
+          else
+            Result := MakeSSAConstFloat(Double(Node.Value))
         else
           Result := MakeSSAConstInt(Int64(Node.Value));
       end
@@ -8904,7 +8924,16 @@ begin
           // array was sized at RUN TIME where fbc sizes it statically, and every rule keyed on constant
           // bounds stepped over it, the "Array too big" cap included ("LIMIT \ 32" folded; the same
           // expression with SizeOf did not).
-          if FConstStrBytes.IndexOfName(ArrName2) >= 0 then
+          // ⛔ A DECLARED TYPE ALIAS WINS OVER A CONSTANT OF THE SAME NAME, and fbc says so in as many
+          // words: "warning 37: Ambigious sizeof(), referring to type alias LZMA_RESERVED_ENUM, instead
+          // of constant LZMA_RESERVED_ENUM". The C idiom "typedef enum { X } X;" comes into FreeBASIC as
+          // "Type X As Long" followed by an anonymous Enum whose first member is also X - lzma.bi,
+          // expat.bi and mpg123.bi all have one - and here the CONSTANT won: an enum member is backed by
+          // a one-element array, so the array rung below answered its element width, 8, where fbc
+          // answers the alias's 4.
+          if (FTypeAliases.IndexOfName(ArrName2) >= 0) and (FindUDT(ArrName2) < 0) then
+            Result := MakeSSAConstInt(TypeSizeBytes(ArrName2))
+          else if FConstStrBytes.IndexOfName(ArrName2) >= 0 then
             // A STRING CONST is a ZSTRING of its length + 1, not a string descriptor (FConstStrBytes).
             Result := MakeSSAConstInt(StrToInt64Def(FConstStrBytes.Values[ArrName2], 8))
           // ⛔ SIZEOF OF AN ARRAY IS THE SIZE OF ONE ELEMENT, which is FreeBASIC's rule and not C's:
