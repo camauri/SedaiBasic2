@@ -1608,6 +1608,8 @@ type
     function RawUDTPtrType(const Name: string): string;   // "T PTR" holding a RAW address -> T
     function ForeignStructRetSpec(UDTIdx: Integer; out Why: string): string;   // a struct returned BY VALUE (329)
     function ForeignRetUDTName(const NameU: string): string;   // ...and the UDT such a call answers (329)
+    function ForeignRetPtrUDTName(const NameU: string): string;   // ...and the UDT a foreign call POINTS AT
+    function RawAddrFieldPointee(Node: TASTNode): string;   // a raw pointer FIELD through parens and casts
     function AddRawUDTPtr(const ScopeU, NameU, TypeU: string): Boolean;   // ...file it, flat AND scoped (333)
     function FoldIntNode(Node: TASTNode; out Val: Int64): Boolean;        // literal integer arithmetic, no side effects
     function UDTFieldArrayShape(UDTIdx, FieldIdx: Integer; out Count, ElemBytes: Int64;
@@ -11485,7 +11487,14 @@ begin
   // half is the one that matters: a lost write is worse than a wrong read.
   if (VarNode.ChildCount >= 2) and
      (VarNode.GetChild(0) <> nil) and
-     ((VarNode.GetChild(0).NodeType = antParentheses) or IsRawElemArrayAccess(VarNode.GetChild(0))) and
+     // ⭐ ...and a CAST as the base: "Cast(Long Ptr, arr->data)[2] = 777", and the same thing spelled
+     // with a header's own macro ("g_array_index(a, long, i) = v", which is how GLib documents WRITING
+     // an element). The READ half has had this shape since DIVERGENZE 54 (EmitCastPointerIndexRead);
+     // the write half did not, so the store was LOST IN SILENCE while the read beside it was right -
+     // and a lost write is worse than a wrong read, which is the argument this whole branch was
+     // written on.
+     ((VarNode.GetChild(0).NodeType = antParentheses) or
+      (VarNode.GetChild(0).NodeType = antCast) or IsRawElemArrayAccess(VarNode.GetChild(0))) and
      (VarNode.GetChild(1).NodeType in [antExpressionList, antArgumentList]) and
      (VarNode.GetChild(1).ChildCount = 1) and
      (DerefedType(VarNode.GetChild(0)) <> '') then
@@ -26393,6 +26402,29 @@ begin
   Result := UpperFast(CanonicalType(D.RetTypeName));
 end;
 
+function TSSAGenerator.ForeignRetPtrUDTName(const NameU: string): string;
+// The UDT a FOREIGN function returns a POINTER to ("g_slist_last" answers a "GSList Ptr"), or ''. What
+// comes back is a struct C OWNS, so its fields sit at C-layout offsets - which is what lets
+// "g_slist_last(l)->data" be read without a variable in between.
+var
+  Idx: Integer;
+  D: TForeignDecl;
+  T: string;
+begin
+  Result := '';
+  if not Assigned(FProgram) then Exit;
+  Idx := FProgram.IndexOfForeignDecl(UpperFast(NameU));
+  if Idx < 0 then Exit;
+  if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), D) then Exit;
+  T := UpperFast(CanonicalType(D.RetTypeName));
+  if (Length(T) <= 4) or (Copy(T, Length(T) - 3, 4) <> ' PTR') then Exit;
+  T := UpperFast(CanonicalType(Trim(Copy(T, 1, Length(T) - 4))));
+  if Pos(' PTR', T) > 0 then Exit;            // "T Ptr Ptr" is not this rung
+  if FindUDT(T) < 0 then Exit;
+  if UDTBlockIsManaged(T) then Exit;          // records this compiler owns, not C's bytes
+  Result := T;
+end;
+
 function TSSAGenerator.ForeignStructRetSpec(UDTIdx: Integer; out Why: string): string;
 // ⭐ THE C LAYOUT OF A STRUCT A C FUNCTION RETURNS BY VALUE (DIVERGENZE 329), spelled for the
 // marshaller: "SRET:<size>:<align>:<kind>@<offset>/...". The CALL SITE is the only place that knows
@@ -27127,6 +27159,27 @@ begin
       else IdxNode := IdxNode.GetChild(0);
     end;
     if IdxNode = nil then CastNode := nil;
+  end;
+  // ⭐⭐ "f(...)->field" WHERE f IS A C FUNCTION RETURNING A "<UDT> PTR". What it answers is a struct C
+  // OWNS, so the fields sit at C-layout offsets - and this resolver reads a NAME out of the object, so
+  // with no variable in between it matched nothing: "g_slist_last(l)->data" died on "Null or invalid
+  // pointer dereference" while the identical read through a local was right. Half of GLib is written
+  // this way, and so is every C library that returns a node of its own.
+  if (ObjNode.NodeType in [antArrayAccess, antFunctionCall]) and (ObjNode.ChildCount >= 1) and
+     (ObjNode.GetChild(0) <> nil) and (ObjNode.GetChild(0).NodeType = antIdentifier) and
+     (ArrayIndexOf(ObjNode.GetChild(0).ValueUpper) < 0) then
+  begin
+    TypeName := ForeignRetPtrUDTName(ObjNode.GetChild(0).ValueUpper);
+    if TypeName <> '' then
+    begin
+      UDTIdx := FindUDT(TypeName);
+      if (UDTIdx >= 0) and UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) and (TotalSize > 0) then
+      begin
+        BaseNode := ObjNode;      // the call itself evaluates to the address
+        Exit(True);
+      end;
+    end;
+    TypeName := ''; UDTIdx := -1; TotalSize := 0; SetLength(Offsets, 0);
   end;
   if CastNode <> nil then
   begin
@@ -32054,6 +32107,16 @@ begin
         if (Length(PtrTypeT) > 4) and (Copy(PtrTypeT, Length(PtrTypeT) - 3, 4) = ' PTR') then
         begin
           PointeeScalarT := Trim(Copy(PtrTypeT, 1, Length(PtrTypeT) - 4));
+          // ⛔⛔ ...AND THE POINTEE IS RESOLVED TOO. The line above only canonicalises when the field's
+          // type has no " PTR" written on it, so "str As gchar Ptr" kept the pointee "GCHAR" - and
+          // GLib's own "type gchar as zstring" was never consulted. "*s->str" on a GString then took
+          // the numeric arm and printed 8516086157310705214 where fbc prints the text. It is the same
+          // rule DIVERGENZE 250 states for the other spelling ("a field's pointee comes from the
+          // RESOLVED name, not from how it was spelled"), missing on the half where the pointer is
+          // explicit - which is the half a C header always uses.
+          if (GetEnvironmentVariable('SB_NO_FIELD_ALIAS_PTR') = '') and
+             (FindUDT(PointeeScalarT) < 0) and (Pos(' PTR', PointeeScalarT) = 0) then
+            PointeeScalarT := UpperFast(CanonicalType(PointeeScalarT));
           if FindUDT(PointeeScalarT) >= 0 then
             PtrPointeeT := PointeeScalarT
           else if (Pos(' PTR', PointeeScalarT) = 0) then   // single-level scalar pointer only
@@ -32065,7 +32128,17 @@ begin
             UltimateT := PointeeScalarT;
             while (Length(UltimateT) > 4) and (Copy(UltimateT, Length(UltimateT) - 3, 4) = ' PTR') do
               UltimateT := Trim(Copy(UltimateT, 1, Length(UltimateT) - 4));
-            if FindUDT(UltimateT) >= 0 then MultiPtrPointeeT := PointeeScalarT;
+            if FindUDT(UltimateT) >= 0 then MultiPtrPointeeT := PointeeScalarT
+            // ⛔⛔ ...AND WHEN THE ULTIMATE TYPE IS A SCALAR, NOTHING WAS RECORDED AT ALL. A field
+            // declared "<scalar> Ptr Ptr" - "pdata As gpointer Ptr" on a GPtrArray, "argv As ZString
+            // Ptr Ptr", every "char **" in a C header - went into none of the three slots, so the
+            // field was not a pointer as far as every reader was concerned: "Cast(Any Ptr Ptr,
+            // a->pdata)[0]" took the managed path and died on "Null or invalid pointer dereference".
+            // ⭐ It belongs in RawPtrPointee with its FULL pointee spelling ("ANY PTR"), because the
+            // width ladder already has a rung for a pointee that is itself a pointer (RTC_PTR64): the
+            // element is eight bytes, which is exactly right.
+            else
+              RawPtrPointeeT := PointeeScalarT;
           end;
         end;
       end
@@ -44220,10 +44293,19 @@ var
     UDTIdx := FindUDT(ObjT);
     if UDTIdx < 0 then Exit;
     FieldT := UpperFast(UDTFieldPtrPointee(UDTIdx, Rhs.ValueUpper));
-    if FieldT = '' then Exit;                            // not a "<UDT> Ptr" field
-    // ...unless that pointee's blocks are MANAGED: then the field holds a record HANDLE, and marking
-    // the target raw would send "q->field" onto the byte heap - the mirror of the accident above.
-    Result := not UDTBlockIsManaged(FieldT);
+    if FieldT <> '' then
+      // ...unless that pointee's blocks are MANAGED: then the field holds a record HANDLE, and marking
+      // the target raw would send "q->field" onto the byte heap - the mirror of the accident above.
+      Exit(not UDTBlockIsManaged(FieldT));
+    // ⭐⭐ ...AND A FIELD DECLARED "<SCALAR> PTR" IS JUST AS RAW, which this rule did not say. It only
+    // ever asked about a "<UDT> Ptr" field - and in a C header the common case is the OTHER one:
+    // "data as gchar ptr" (GArray), "char *", "void *", "guint8 *". A "Dim As Long Ptr d =
+    // cast(Long Ptr, arr->data)" was then not raw at all, so "d[1]" stepped ONE BYTE instead of four
+    // and answered 117440512 where fbc answers 7 - the bytes of the next element read at an offset of
+    // one. Nothing raised: every index reads memory that IS there.
+    // ⚠️ "Any Ptr" is covered by the same answer: the field filling records its pointee as "ANY", which
+    // is what half of a C API hands back.
+    Result := UDTFieldRawPtrPointee(UDTIdx, Rhs.ValueUpper) <> '';
   end;
 
   procedure ConsiderRaw(const TargetU: string; Rhs: TASTNode);
@@ -44301,6 +44383,11 @@ var
       if (Length(TU) >= 4) and (Copy(TU, Length(TU) - 3, 4) = ' PTR') and (Rhs.ChildCount >= 1) then
         if IsAllocCall(Rhs.GetChild(0), FU) or IsScreenPtrExpr(Rhs.GetChild(0)) or
            IsForeignPtrCall(Rhs.GetChild(0)) or
+           // ...and through a CAST, which is how a typed view of a C buffer is always written:
+           // "Cast(Long Ptr, arr->data)" and "Cast(Long Ptr, q[i])". Without these two the list of
+           // raw sources this branch accepts was shorter than the list the un-cast chain accepts, and
+           // the cast is the spelling a C API forces.
+           IsRawPtrFieldExpr(Rhs.GetChild(0)) or IsRawPtrCellExpr(Rhs.GetChild(0)) or
            ((Rhs.GetChild(0).NodeType = antIdentifier) and IsRawPtr(VarToStr(Rhs.GetChild(0).Value))) or
            ((Rhs.GetChild(0).NodeType = antProcAddress) and (Rhs.GetChild(0).ChildCount = 0) and
             (FAddrTakenScalars.IndexOfName(Rhs.GetChild(0).ValueUpper) >= 0)) then
@@ -44320,6 +44407,13 @@ var
       MarkRaw(TargetU)   // p = q, p = q + n, p = q - n, p = (q): q raw
     else if IsRawPtrCellExpr(Rhs) then
       MarkRaw(TargetU)   // p = q[i] where q is a raw pointer-to-pointer: the cell holds a raw pointer
+    // ⭐⭐ p = a->b WHERE b IS A POINTER FIELD OF A STRUCT C OWNS. The UDT-pointee branch above has had
+    // this rule since DIVERGENZE 250; the SCALAR-pointee target never did, and that is the common case:
+    // "Dim As Long Ptr d = arr->data" over a GArray. Unmarked, d was not a raw pointer at all, so
+    // "d[1]" stepped ONE BYTE instead of four and read the next element at an offset of one - 117440512
+    // where fbc says 7. ⛔ Nothing raised, and nothing could: every index reads memory that IS there.
+    else if IsRawPtrFieldExpr(Rhs) then
+      MarkRaw(TargetU)
     else if ((Rhs.NodeType = antArrayAccess) or (Rhs.NodeType = antFunctionCall)) and
             (Rhs.ChildCount >= 1) and (Rhs.GetChild(0).NodeType = antIdentifier) and
             (ArrayIndexOf(VarToStr(Rhs.GetChild(0).Value)) < 0) and
@@ -46500,6 +46594,36 @@ begin
   EmitInstruction(ssaAddInt, Result, PtrReg, IdxVal, MakeSSAValue(svkNone));
 end;
 
+function TSSAGenerator.RawAddrFieldPointee(Node: TASTNode): string;
+// The scalar pointee of a "<scalar> PTR" FIELD OF A STRUCT C OWNS that an expression evaluates to,
+// through any number of parentheses and CASTS, or ''. ⛔ The unwrapping is the point: a C header's own
+// macro is written with two of them - GLib's "g_array_index" is
+// "cptr(t ptr, cptr(any ptr, (a)->data))[(i)]" - so a test that looks at the outermost node answers ''
+// for the very spelling the library documents.
+//
+// ⛔⛔ AND THE OBJECT HAS TO BE A RAW UDT POINTER, not any record with a pointer field. That
+// restriction is the whole correctness of this predicate, and it was learnt by breaking guard m908:
+// a "<scalar> Ptr" field may hold EITHER family - a machine address when the struct is C's, a PACKED
+// VM address when the program wrote "t.p = @buf" into a record of its own - and DIVERGENZE 129 says so
+// in as many words beside EmitRawFieldIndexAddress. Asking only "is the field a pointer" made
+// "(t.p)[1]" on a managed record scale by SizeOf and load raw, and the character code 98 was then read
+// as a record handle. A field of a struct C owns cannot hold a packed address: C put it there.
+var
+  ObjNode: TASTNode;
+begin
+  Result := '';
+  while (Node <> nil) and (Node.NodeType in [antParentheses, antCast]) and (Node.ChildCount >= 1) do
+    Node := Node.GetChild(0);
+  if (Node = nil) or (Node.NodeType <> antMemberAccess) or (Node.ChildCount < 1) then Exit;
+  ObjNode := Node.GetChild(0);
+  while (ObjNode <> nil) and (ObjNode.NodeType in [antParentheses, antDeref]) and
+        (ObjNode.ChildCount >= 1) do
+    ObjNode := ObjNode.GetChild(0);
+  if (ObjNode = nil) or (ObjNode.NodeType <> antIdentifier) then Exit;
+  if RawUDTPtrType(VarToStr(ObjNode.Value)) = '' then Exit;   // not a struct C owns
+  Result := MemberRawPtrPointee(Node);
+end;
+
 function TSSAGenerator.EmitCastPointerIndexRead(CastNode, IndicesNode: TASTNode): TSSAValue;
 // "Cast(T Ptr, expr)[i]" read in place: the pointee comes from the cast's own type, and the address
 // family from its OPERAND - a cast reinterprets the type, never the kind of address. The work itself
@@ -46547,8 +46671,15 @@ begin
   begin
     // ...and an ELEMENT of an array whose elements hold raw addresses is a raw base too. Its rawness
     // is a fact about the ARRAY, not about a variable, so neither of the two tests beside it can see it.
+    // ⭐⭐ ...AND A POINTER FIELD OF A STRUCT C OWNS is a raw base too, which none of the three beside it
+    // can see: its rawness is a fact about the FIELD's declared type, and there is no variable to ask.
+    // It is the base a C library's own headers use - GLib defines
+    // "#define g_array_index(a,t,i) cptr(t ptr, cptr(any ptr, (a)->data))[(i)]", so the documented way
+    // to read a GArray element goes through here. Without this rung the index advanced ONE ELEMENT of a
+    // managed pointer and the load read EIGHT bytes: 30064771114 - two 4-byte elements read as one -
+    // where fbc answers 42.
     IsRaw := (RawPtrExprName(RawSrcNode) <> '') or IsStrDataPtrExpr(RawSrcNode) or
-             IsRawElemArrayAccess(RawSrcNode);
+             IsRawElemArrayAccess(RawSrcNode) or (RawAddrFieldPointee(RawSrcNode) <> '');
     if IsRaw then
     begin
       Sz := RawElemSizeOfPointee(Pointee);
