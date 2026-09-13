@@ -7325,6 +7325,37 @@ begin
       end;
     end;
   end;
+  // ⭐⭐ ...AND ONE PAST THE END, in a SECOND pass. A pointer to the end of a buffer is a legitimate C
+  // pointer, and it is exactly what a streaming API leaves behind: "strm.next_out = @buf(0)", then
+  // lzma_code FILLS the window and next_out stops at @buf(n). Every test above is strict ("< length"),
+  // so that address had no name and came back tagged - "next_out = @buf(0) + got" answered FALSE on
+  // every full window (lzma deck, z02).
+  // ⚠️ A second pass, not a "<=" above: the end of one array can be the very first byte of the next
+  // block the allocator handed out, and an address INSIDE an array must win over the end of another.
+  for i := 0 to High(FArrays) do
+  begin
+    W := FArrays[i].ElemWidth;
+    if (W > 0) and (Length(FArrays[i].ByteData) > 0) then
+    begin
+      Base := PtrUInt(@FArrays[i].ByteData[0]);
+      if (A > Base) and (A - Base = PtrUInt(Length(FArrays[i].ByteData))) and
+         (((A - Base) mod PtrUInt(W)) = 0) then
+        Exit((Int64(i + 1) shl POINTER_ARRAY_SHIFT) or Int64((A - Base) div PtrUInt(W)));
+      System.Continue;
+    end;
+    if Length(FArrays[i].IntData) > 0 then
+    begin
+      Base := PtrUInt(@FArrays[i].IntData[0]);
+      if (A > Base) and (A - Base = PtrUInt(Length(FArrays[i].IntData)) * SizeOf(Int64)) then
+        Exit((Int64(i + 1) shl POINTER_ARRAY_SHIFT) or Int64(Length(FArrays[i].IntData)));
+    end;
+    if Length(FArrays[i].FloatData) > 0 then
+    begin
+      Base := PtrUInt(@FArrays[i].FloatData[0]);
+      if (A > Base) and (A - Base = PtrUInt(Length(FArrays[i].FloatData)) * SizeOf(Double)) then
+        Exit((Int64(i + 1) shl POINTER_ARRAY_SHIFT) or Int64(Length(FArrays[i].FloatData)));
+    end;
+  end;
 end;
 
 function TBytecodeVM.ForeignMakeClosure(ACtx: TObject; AEntryPC: Int64;

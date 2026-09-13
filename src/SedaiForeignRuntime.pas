@@ -769,6 +769,8 @@ var
   RPAddr: array[0..127] of PInt64;       // REC: a pointer FIELD of a record handed to C (259 b)
   RPOrig, RPTr: array[0..127] of Int64;  // ...its program value, and what C was given
   NRP, RPk, RPo: Integer;
+  HomeV: Int64;                          // ...the VM pointer a changed field names, when it is ours
+  NBase: PtrUInt;                        // the address C was actually given for a narrow copy
   RPS: string;
   DTgt: array[0..63] of array of PInt64; // W8: the program cell that copy stands for (nil = one level)
   NN, nwid: Integer;
@@ -934,8 +936,19 @@ begin
                         NBuf[NN] := W8B;
                       end;
               end;
+              // ⭐ ...and a narrow copy PERSISTS too, for the same reason code 8 does: C KEEPS pointers.
+              // "pango_cairo_context_set_shape_renderer(ctx, @draw, @payload, 0)" stores @payload and reads
+              // it when the layout is drawn, long after this call returned - and the per-call copy was gone
+              // by then, so the callback read whatever had reused that memory (1 where fbc reads 7). The
+              // buffer is the program cell's own, keyed by its VM pointer, never moved, and refreshed here
+              // at every call; NTmp stays the scratch the write-back below reads.
+              if (NCode1 <> 8) and (NBuf[NN] = nil) then
+              begin
+                NBuf[NN] := W8Buffer(XferInt[SlotI], Length(NTmp[NN]), 100 + NCode1);
+                Move(NTmp[NN][0], NBuf[NN]^, Length(NTmp[NN]));
+              end;
               NCell[NN] := P; NCnt[NN] := nk; NCode[NN] := NCode1; NVM[NN] := XferInt[SlotI];
-              if (NCode1 = 8) and (NBuf[NN] <> nil) then PPointer(Vals[i])^ := NBuf[NN]
+              if NBuf[NN] <> nil then PPointer(Vals[i])^ := NBuf[NN]
               else PPointer(Vals[i])^ := @NTmp[NN][0];
               Inc(NN);
               Inc(SlotI);
@@ -1124,13 +1137,26 @@ begin
   // ...and the POINTER FIELDS of every record handed to C come back (DIVERGENZE 259 b): one C left alone
   // gets the program's own value again (its tag, its domain); one C CHANGED holds a machine address, and
   // becomes one the program can see as such - "cif.rtype = @ffi_type_uint64" answered 0 in silence.
+  // ⭐⭐ ...unless the address C left there names the PROGRAM'S OWN memory, and then it comes home as the
+  // VM pointer it is - the question a RETURNED address has been asked since DIVERGENZE 332, asked here of
+  // a FIELD. Every streaming API is this shape: "strm.next_out = @buf(0)", then lzma_code / inflate
+  // ADVANCES next_out inside the program's struct. Tagged as a C address, it no longer compared equal to
+  // "@buf(got)", "next_out - @buf(0)" answered a number from another domain, and a read through it left
+  // the mapped block (lzma deck, z02).
   for RPk := 0 to NRP - 1 do
     if RPAddr[RPk]^ = RPTr[RPk] then
       RPAddr[RPk]^ := RPOrig[RPk]
     else if RPAddr[RPk]^ <> 0 then
     begin
-      if Assigned(FNoteRegion) then FNoteRegion(ACtx, PtrUInt(RPAddr[RPk]^), 0, True, False);
-      RPAddr[RPk]^ := RPAddr[RPk]^ or FGNPTR_TAG;
+      HomeV := 0;
+      if Assigned(FPtrHome) then HomeV := FPtrHome(ACtx, PtrUInt(RPAddr[RPk]^));
+      if HomeV <> 0 then
+        RPAddr[RPk]^ := HomeV
+      else
+      begin
+        if Assigned(FNoteRegion) then FNoteRegion(ACtx, PtrUInt(RPAddr[RPk]^), 0, True, False);
+        RPAddr[RPk]^ := RPAddr[RPk]^ or FGNPTR_TAG;
+      end;
     end;
   if Assigned(FNoteRegion) then FgnNoteReleases(ACtx, B^.Decl.Symbol, @Vals[0], NArgs, FNoteRegion);
 
@@ -1153,6 +1179,10 @@ begin
   // where the declared type is signed: -7 written by "%d" is -7 again, not 4294967289 (DIVERGENZE 247).
   // Cells C did not touch round-trip unchanged: a narrow scalar is stored already narrowed, and a SINGLE
   // already rounded to single precision.
+  // (C wrote into the PERSISTENT copy - see where it is handed over - so that is what comes back.)
+  for nwid := 0 to NN - 1 do
+    if (NCode[nwid] <> 8) and (NBuf[nwid] <> nil) then
+      Move(NBuf[nwid]^, NTmp[nwid][0], Length(NTmp[nwid]));
   for nwid := 0 to NN - 1 do
     case NCode[nwid] of
       1: for r := 0 to Integer(NCnt[nwid]) - 1 do PInt64(NCell[nwid])[r] := ShortInt(NTmp[nwid][r]);
@@ -1289,14 +1319,19 @@ begin
             end;
           // ...and a pointer INTO a narrow copy names an element of the program's own storage: the VM
           // pointer counts ELEMENTS, so the byte delta is divided by C's width (DIVERGENZE 247).
+          // ⛔ ...measured against the address C was actually GIVEN. Since DIVERGENZE 354 that is the
+          // persistent copy (NBuf), not the scratch NTmp - and "memcpy(@d(0), ...) = @d(0)" answered FALSE
+          // until this said so (guard m907p, caught by the corpus the same evening).
           for r := 0 to NN - 1 do
           begin
             nwid := ForeignNarrowBytes(NCode[r]);
-            if (nwid > 0) and (Length(NTmp[r]) > 0) and (RetAddr >= PtrUInt(@NTmp[r][0])) and
-               (RetAddr - PtrUInt(@NTmp[r][0]) <= NCnt[r] * PtrUInt(nwid)) and
-               (((RetAddr - PtrUInt(@NTmp[r][0])) mod PtrUInt(nwid)) = 0) then
+            if Length(NTmp[r]) = 0 then System.Continue;
+            if NBuf[r] <> nil then NBase := PtrUInt(NBuf[r]) else NBase := PtrUInt(@NTmp[r][0]);
+            if (nwid > 0) and (RetAddr >= NBase) and
+               (RetAddr - NBase <= NCnt[r] * PtrUInt(nwid)) and
+               (((RetAddr - NBase) mod PtrUInt(nwid)) = 0) then
             begin
-              ResInt := NVM[r] + Int64((RetAddr - PtrUInt(@NTmp[r][0])) div PtrUInt(nwid));
+              ResInt := NVM[r] + Int64((RetAddr - NBase) div PtrUInt(nwid));
               Exit;
             end;
           end;

@@ -8263,6 +8263,22 @@ begin
           Exit;
         end;
 
+        // ⭐ "f(...)[i]" - THE POINTER A C FUNCTION RETURNS, INDEXED IN PLACE. The same missing-NAME story
+        // as the cast above: "gdk_pixbuf_get_pixels(pb)[k]" matched no branch and answered 0, while the
+        // same read through "Dim px As guchar Ptr = gdk_pixbuf_get_pixels(pb)" was right, and so was
+        // "*gdk_pixbuf_get_pixels(pb)". The pointee comes from DerefedType, which answers for a call since
+        // the "*f( )" fix; only a SCALAR pointee - "f( )[i].field" belongs to the raw record resolver.
+        if (Node.GetChild(0) <> nil) and (Node.GetChild(0).NodeType = antArrayAccess) and
+           (Node.GetChild(1).NodeType in [antExpressionList, antArgumentList]) and
+           (Node.GetChild(1).ChildCount = 1) and IsForeignPtrCall(Node.GetChild(0)) and
+           (DerefedType(Node.GetChild(0)) <> '') and
+           (FindUDT(UpperFast(CanonicalType(DerefedType(Node.GetChild(0))))) < 0) then
+        begin
+          Result := EmitPointerValueIndexRead(Node.GetChild(0), UpperFast(DerefedType(Node.GetChild(0))),
+                                              Node.GetChild(0), Node.GetChild(1));
+          Exit;
+        end;
+
         // ⛔ "( expr )[i]" - A PARENTHESISED BASE. Every branch here keys off the NAME of a declared
         // pointer, and a parenthesised expression has none, so "(*pp)[0]" with "pp As Integer Ptr Ptr"
         // fell through to a shape that answered the PACKED ADDRESS of pp itself (8589934592) where fbc
@@ -11494,8 +11510,11 @@ begin
      // the write half did not, so the store was LOST IN SILENCE while the read beside it was right -
      // and a lost write is worse than a wrong read, which is the argument this whole branch was
      // written on.
+     // ⭐ ...and the pointer a C FUNCTION returns, indexed in place: "gdk_pixbuf_get_pixels(pb)[2] = 99"
+     // was lost the same way (gdk-pixbuf deck).
      ((VarNode.GetChild(0).NodeType = antParentheses) or
-      (VarNode.GetChild(0).NodeType = antCast) or IsRawElemArrayAccess(VarNode.GetChild(0))) and
+      (VarNode.GetChild(0).NodeType = antCast) or IsRawElemArrayAccess(VarNode.GetChild(0)) or
+      IsForeignPtrCall(VarNode.GetChild(0))) and
      (VarNode.GetChild(1).NodeType in [antExpressionList, antArgumentList]) and
      (VarNode.GetChild(1).ChildCount = 1) and
      (DerefedType(VarNode.GetChild(0)) <> '') then
@@ -15958,6 +15977,7 @@ var
   L, R: TSSARegisterType;
   IfA: TASTNode;
   BT, BF: TSSARegisterType;
+  ConstV: Int64;
 begin
   Result := srtFloat;
   if Node = nil then Exit;
@@ -15993,7 +16013,24 @@ begin
       else
         Result := srtInt;
     antIdentifier:
-      Result := GetVariableType(VarToStr(Node.Value));
+      begin
+        Result := GetVariableType(VarToStr(Node.Value));
+        // ⛔ ...AND AN ENUM MEMBER IS AN INT, not the classic float default a bare undeclared name gets.
+        // Nobody saw it while the value went to PRINT or into a declared parameter; a VARIADIC C tail
+        // cannot tolerate it: "pango_tab_array_new_with_positions(3, TRUE, PANGO_TAB_LEFT, 10,
+        // PANGO_TAB_LEFT, 55, ...)" sent every tail PANGO_TAB_LEFT in a FLOAT register, and C read the
+        // integer ones - the tab stops came back shifted and half garbage.
+        // ⚠️ Asked of FEnumMembers, and the other two lookups are not enough on their own: a member of an
+        // ANONYMOUS enum - which is how every fbc header binding writes them ("type PangoTabAlign as long"
+        // then a nameless "enum") - is filed only there, backed as a one-element INT array. Measured: a
+        // first version asking ModuleConstInt ("inmap=0", CONSTFOLDDIAG) and a second asking the NAMED
+        // enum registry were both inert on this call.
+        if (Result = srtFloat) and (FVarExplicitType <> nil) and
+           (FVarExplicitType.IndexOf(Node.ValueUpper) < 0) and
+           ((FEnumMembers.IndexOf(Node.ValueUpper) >= 0) or
+            TryFoldEnumMemberName(Node.ValueUpper, ConstV) or ModuleConstInt(Node.ValueUpper, ConstV)) then
+          Result := srtInt;
+      end;
     // ⛔ AN ADDRESS IS AN INT, whatever it points at. "@d" over a Double answered the FLOAT bank - the
     // bank of the pointee - so the call "f(@d)" signed "F" while every declaration of a pointer parameter
     // signs "I": the exact overload match could never be tried and the first pointer overload won.
@@ -27061,7 +27098,7 @@ var
   OuterIdx, MemIdx, k: Integer;
   OuterOfs: TInt64Array;
   OuterSize: Int64;
-  CastNode: TASTNode;
+  CastNode, Obj2: TASTNode;
 begin
   Result := False;
   TypeName := ''; UDTIdx := -1; TotalSize := 0; BaseNode := nil; IdxNode := nil; ChainNode := nil;
@@ -27138,6 +27175,62 @@ begin
         (ObjNode.NodeType in [antParentheses, antDeref]) do
     ObjNode := ObjNode.GetChild(0);
   if ObjNode = nil then Exit;
+  // ⭐⭐ "p->r.field" - A FIELD OF A RECORD MEMBER HELD BY VALUE, over raw memory. The object of ".field"
+  // is itself a member access, and every rung of this resolver wants a name, a cast or a call there, so
+  // it declined and the managed record path took the byte address for a table index: "Invalid
+  // record-field pointer". C structs nest by value everywhere - pango's PangoAttrShape carries two
+  // PangoRectangle, GObject's every instance starts with its parent's struct.
+  // ⭐ Recursive, and it needs no new out-parameter, for the same reason "p->m(i).field" above does not:
+  // the member's own offset rides on the nested type's field offsets, and the base, index and chain of
+  // the OUTER object are inherited untouched - so "p->a.b.c" and "p[i].r.y" fall out of the same rung.
+  // ⚠️ With an index, TotalSize stays the OUTER stride: "p[i]" steps over whole outer records.
+  if (ObjNode.NodeType = antMemberAccess) and (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0) <> nil) then
+  begin
+    if ResolveRawUDTBase(ObjNode.GetChild(0), OuterName, OuterIdx, OuterOfs, OuterSize,
+                         BaseNode, IdxNode, ChainNode) then
+    begin
+      MemIdx := -1;
+      for k := 0 to High(FUDTs[OuterIdx].Fields) do
+        if UpperFast(FUDTs[OuterIdx].Fields[k].Name) = ObjNode.ValueUpper then
+          begin MemIdx := k; Break; end;
+      if (MemIdx >= 0) and (MemIdx <= High(OuterOfs)) and (not FUDTs[OuterIdx].Fields[MemIdx].IsArray) and
+         (FUDTs[OuterIdx].Fields[MemIdx].NestedType <> '') then
+      begin
+        TypeName := UpperFast(CanonicalType(FUDTs[OuterIdx].Fields[MemIdx].NestedType));
+        UDTIdx := FindUDT(TypeName);
+        if (UDTIdx >= 0) and UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) and (TotalSize > 0) then
+        begin
+          for k := 0 to High(Offsets) do Offsets[k] := Offsets[k] + OuterOfs[MemIdx];
+          if IdxNode <> nil then TotalSize := OuterSize;
+          Exit(True);
+        end;
+      end;
+      // ⭐⭐ "p->q->field" - A POINTER FIELD of raw memory is itself a RAW base. C's struct holds C's
+      // pointer: TryEmitRawUDTField already loads such a field as one (RTC_PTR64, DIVERGENZE 250), and a
+      // local that copies it is marked raw - which is why "k = a->klass : k->type" worked while
+      // "a->klass->type" did not. The run-time tag test of DIVERGENZE 259 cannot stand in for this rung:
+      // the loaded address carries no tag, so inside a SUB or a callback its test chose the managed record
+      // path. Here the base of the access is the member access itself, evaluated once.
+      if (MemIdx >= 0) and (MemIdx <= High(OuterOfs)) and (not FUDTs[OuterIdx].Fields[MemIdx].IsArray) and
+         (FUDTs[OuterIdx].Fields[MemIdx].NestedType = '') and (FUDTs[OuterIdx].Fields[MemIdx].PtrPointee <> '') and
+         SideEffectFreeObject(ObjNode) then
+      begin
+        TypeName := UpperFast(CanonicalType(FUDTs[OuterIdx].Fields[MemIdx].PtrPointee));
+        UDTIdx := FindUDT(TypeName);
+        if (UDTIdx >= 0) and (not UDTBlockIsManaged(TypeName)) and
+           UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) and (TotalSize > 0) then
+        begin
+          BaseNode := ObjNode;
+          IdxNode := nil;
+          ChainNode := nil;
+          Exit(True);
+        end;
+      end;
+    end;
+    TypeName := ''; UDTIdx := -1; TotalSize := 0; SetLength(Offsets, 0);
+    BaseNode := nil; IdxNode := nil; ChainNode := nil;
+    Exit;
+  end;
   // ⭐⭐ "Cast(T Ptr, p)->field" - THE CAST APPLIED IN PLACE, with no variable to carry the mark.
   // It is how every C callback is written ("((mystruct*)data)->field"), and it is the one spelling this
   // resolver could not see: it reads a NAME out of the object and looks it up in FRawUDTPtrs, so the
@@ -27185,8 +27278,16 @@ begin
   if CastNode <> nil then
   begin
     CastT := CastNode.ValueUpper;
+    // ⛔ RawPtrExprName knows the SCALAR raw pointers only, so a cast over a "<UDT> PTR" C handed back -
+    // "Cast(PangoAttrShape Ptr, sh)" with sh a PangoAttribute Ptr, the downcast every C API with an
+    // attribute or event header is written in - answered '' and the access went to the record table.
+    // The UDT registry is the other half of the same question: a pointer laid over bytes is raw.
+    Obj2 := CastNode;
+    while (Obj2 <> nil) and (Obj2.NodeType in [antCast, antParentheses]) and (Obj2.ChildCount >= 1) do
+      Obj2 := Obj2.GetChild(0);
     if (Length(CastT) > 4) and (Copy(CastT, Length(CastT) - 3, 4) = ' PTR') and
-       (RawPtrExprName(CastNode) <> '') then
+       ((RawPtrExprName(CastNode) <> '') or
+        ((Obj2 <> nil) and (Obj2.NodeType = antIdentifier) and (RawUDTPtrType(VarToStr(Obj2.Value)) <> ''))) then
     begin
       TypeName := UpperFast(CanonicalType(Trim(Copy(CastT, 1, Length(CastT) - 4))));
       UDTIdx := FindUDT(TypeName);
@@ -30073,6 +30174,17 @@ begin
               (PtrExprPointeeTypeName(Node.GetChild(0)) <> '') then
       begin
         AwCode := TypeNameWidthCode(UpperFast(CanonicalType(PtrExprPointeeTypeName(Node.GetChild(0)))));
+        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
+        else if AwCode = 8 then Result := 2;
+      end
+      // ⭐ ...AND THE POINTER A C FUNCTION RETURNS, indexed in place: "gdk_pixbuf_get_pixels(pb)[k]" is a
+      // guchar, and printed " 224" where fbc prints "224" - the value was right, the column was not. The
+      // element type is the call's DerefedType, the same answer the read itself uses.
+      else if FModernMode and (Node.ChildCount >= 2) and (Node.GetChild(1).ChildCount = 1) and
+              (Node.GetChild(0).NodeType = antArrayAccess) and IsForeignPtrCall(Node.GetChild(0)) and
+              (DerefedType(Node.GetChild(0)) <> '') then
+      begin
+        AwCode := TypeNameWidthCode(UpperFast(CanonicalType(DerefedType(Node.GetChild(0)))));
         if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
         else if AwCode = 8 then Result := 2;
       end
@@ -44040,7 +44152,7 @@ function TSSAGenerator.IsForeignPtrCall(Node: TASTNode): Boolean;
 // arithmetic would walk eight times too far along an Integer array. A STRING argument does not count:
 // its bytes travel from the raw heap, so a pointer into them comes home raw anyway.
 var
-  NameU: string;
+  NameU, RetPointee: string;
   D: TForeignDecl;
   Idx, i, k, First: Integer;
   Args: TASTNode;
@@ -44061,6 +44173,23 @@ begin
   Idx := FProgram.IndexOfForeignDecl(NameU);
   if (Idx < 0) or not ParseForeignDecl(FProgram.GetForeignDecl(Idx), D) then Exit;
   if ForeignKindOf(D.RetTypeName) <> fkPointer then Exit;
+  // ⭐ ...AND A POINTER TO A STRUCT is C's own object whatever the arguments are. The veto below exists
+  // for a result that can land INSIDE the program's element-indexed storage - "bsearch" and "strchr"
+  // answer a scalar or Any pointer into it. A "GdkPixbuf Ptr" cannot: it is an object C allocated. And
+  // the veto CASCADED: "pb = gdk_pixbuf_new_from_data(@mine(0), ...)" was vetoed by its @mine(0), so pb
+  // was not raw, so pb counted as program memory for "gdk_pixbuf_flip(pb, ...)", and the result of that
+  // for "gdk_pixbuf_get_pixels(fl)" - whose bytes then read 0 (gdk-pixbuf deck, x04).
+  RetPointee := UpperFast(CanonicalType(Trim(D.RetTypeName)));
+  if (Length(RetPointee) > 4) and (Copy(RetPointee, Length(RetPointee) - 3, 4) = ' PTR') then
+    RetPointee := UpperFast(CanonicalType(Trim(Copy(RetPointee, 1, Length(RetPointee) - 4))));
+  if (RetPointee <> '') and (Pos(' PTR', RetPointee) = 0) and
+     not ((RetPointee = 'ANY') or (RetPointee = 'BYTE') or (RetPointee = 'UBYTE') or
+          (RetPointee = 'SHORT') or (RetPointee = 'USHORT') or (RetPointee = 'LONG') or
+          (RetPointee = 'ULONG') or (RetPointee = 'INTEGER') or (RetPointee = 'UINTEGER') or
+          (RetPointee = 'LONGINT') or (RetPointee = 'ULONGINT') or (RetPointee = 'SINGLE') or
+          (RetPointee = 'DOUBLE') or (RetPointee = 'ZSTRING') or (RetPointee = 'WSTRING') or
+          (RetPointee = 'STRING') or (RetPointee = 'BOOLEAN') or (RetPointee = 'CONST ANY')) then
+    Exit(True);
   for i := First to Node.ChildCount - 1 do
   begin
     Args := Node.GetChild(i);
@@ -44312,6 +44441,7 @@ var
   procedure ConsiderRaw(const TargetU: string; Rhs: TASTNode);
   var
     FU, TU: string;
+    RhsU: TASTNode;
   begin
     if Rhs = nil then Exit;
     // Option B: a pointer to a UDT allocated with Allocate/Callocate holds a MANAGED record handle, not a
@@ -44346,7 +44476,16 @@ var
       // pointer): C-layout bytes C owns, not a record this compiler allocated. DIVERGENZE 239.
       // ⭐ ...AND fbc's OWN ARRAY DESCRIPTOR, which is a UDT pointer ("FBC.FBARRAY Ptr") over an
       // ADDRESS in the descriptor region - not a record this compiler owns. See IsArrayDescPtrCall.
+      // ⭐ ...AND ANOTHER UDT POINTER THAT IS ALREADY LAID OVER BYTES, copied or DOWNCAST: "Dim As
+      // PangoAttrColor Ptr ac = Cast(PangoAttrColor Ptr, a)" inside a callback whose "a" C fills. It is how
+      // every C API with a common header struct is read, and RawPtrExprName only knows SCALAR raw
+      // pointers - so "ac" stayed a record handle and "ac->color.red" died on "Invalid record-field
+      // pointer" while the same access written through "a" worked.
+      RhsU := Rhs;
+      while (RhsU <> nil) and (RhsU.NodeType in [antCast, antParentheses]) and (RhsU.ChildCount >= 1) do
+        RhsU := RhsU.GetChild(0);
       if (RawPtrExprName(Rhs) <> '') or IsStrDataPtrExpr(Rhs) or IsRawPtrCellExpr(Rhs) or
+         ((RhsU <> nil) and (RhsU.NodeType = antIdentifier) and (RawUDTPtrType(VarToStr(RhsU.Value)) <> '')) or
          IsRawPtrFieldExpr(Rhs) or IsImageCreateExpr(Rhs) or IsForeignPtrCall(Rhs) or
          IsArrayDescPtrCall(Rhs) or
          ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] <> '1') and
@@ -46687,8 +46826,13 @@ begin
     // to read a GArray element goes through here. Without this rung the index advanced ONE ELEMENT of a
     // managed pointer and the load read EIGHT bytes: 30064771114 - two 4-byte elements read as one -
     // where fbc answers 42.
+    // ⭐ ...AND THE RESULT OF A C CALL returning a pointer into memory C owns (DIVERGENZE 239): the same
+    // fact a variable that receives it is marked raw by, asked of the call itself when no variable is in
+    // between - "Cast(ULong Ptr, gdk_pixbuf_get_pixels(pb))[0]" read EIGHT bytes stepping one element,
+    // and "gdk_pixbuf_get_pixels(pb)[k]" answered 0 (gdk-pixbuf deck).
     IsRaw := (RawPtrExprName(RawSrcNode) <> '') or IsStrDataPtrExpr(RawSrcNode) or
-             IsRawElemArrayAccess(RawSrcNode) or (RawAddrFieldPointee(RawSrcNode) <> '');
+             IsRawElemArrayAccess(RawSrcNode) or (RawAddrFieldPointee(RawSrcNode) <> '') or
+             IsForeignPtrCall(RawSrcNode);
     if IsRaw then
     begin
       Sz := RawElemSizeOfPointee(Pointee);

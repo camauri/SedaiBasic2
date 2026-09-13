@@ -13805,7 +13805,24 @@ begin
   // "as const GUID" e "as const IID", che sono lo stesso tipo per un alias - facendo scattare il
   // conflitto di forma su una differenza che non esiste. Il tipo per il controllo e' gia' stato
   // registrato sopra; la forma resta fuori, esattamente come prima.
-  if HadConstQual then Exit;
+  // ⭐⭐ ...BUT A C LIBRARY'S DATA IS STILL ITS DATA. The Exit above took the DIVERGENZE 253 registration
+  // with it, so "extern gdk_pixbuf_major_version as const guint" - the form gdk-pixbuf, GLib and every
+  // header that exports a version number use - became an ordinary zero-initialised global: 0 where fbc
+  // reads 2, in silence (gdk-pixbuf deck, x05). The SHAPE stays out, for the reason just given; the data
+  // is registered ONCE per name, so objsafe's two spellings of one symbol cannot bind it twice.
+  if HadConstQual then
+  begin
+    if Understood and (not HasInit) and (not HasParens) and (TypeName <> '') and (FExternCDepth > 0) and
+       (Flags = '') and (FExternShapes.IndexOfName(Nm + '#CONSTDATA') < 0) and
+       not ModuleDeclaresNameElsewhere(Nm, True) then
+    begin
+      FExternShapes.Add(Nm + '#CONSTDATA=1');
+      Why := TypeName;
+      for k := 1 to PtrDepth do Why := Why + ' PTR';
+      AddCLibraryData(Why);
+    end;
+    Exit;
+  end;
   if not Understood then Exit;
   // ⚠️ A pointer-typed Extern: before PtrDepth it left this routine as "unread", so only the C-library
   // case is new - every other check and the shape stay exactly as they were for it (skipped).

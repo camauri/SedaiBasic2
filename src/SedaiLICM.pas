@@ -96,6 +96,7 @@ type
     FLoopDefCount: TKeyCountMap;  // (RegType,RegIndex,Version) → number of defs inside the loop
     FLoopModArrays: TKeySet;      // array ids stored to inside the loop
     FLoopReshapesArrays: Boolean; // the loop can change some array's SHAPE (bounds), see BuildLoopMaps
+    FLoopWritesByAddress: Boolean; // the loop writes memory through an ADDRESS (a pointer, or C), see BuildLoopMaps
 
     { Precompute the user-variable bitmap from FProgram.VarRegMap }
     procedure BuildUserVarIndex;
@@ -853,8 +854,9 @@ function TLoopInvariantCodeMotion.IsArrayModifiedInLoop(ArrayIndex: Integer; Loo
 begin
   { Check if any ssaArrayStore in the loop modifies the same array.
     ArrayIndex is stored in Src1 for both ssaArrayLoad and ssaArrayStore.
-    The store set is precomputed per loop by BuildLoopMaps. }
-  Result := FLoopModArrays.ContainsKey(Int64(ArrayIndex));
+    The store set is precomputed per loop by BuildLoopMaps.
+    A loop that writes through an ADDRESS may have written any array - see FLoopWritesByAddress. }
+  Result := FLoopWritesByAddress or FLoopModArrays.ContainsKey(Int64(ArrayIndex));
 end;
 
 procedure TLoopInvariantCodeMotion.BuildUserVarIndex;
@@ -1157,6 +1159,7 @@ begin
   FLoopUseInside.Clear;
   FLoopModArrays.Clear;
   FLoopReshapesArrays := False;
+  FLoopWritesByAddress := False;
   if LicmDiagOn then Inc(GLicmMapCalls);
   for i := 0 to Loop.Blocks.Count - 1 do
   begin
@@ -1223,6 +1226,20 @@ begin
         ssaArrayBind, ssaArrayUnbind, ssaArrayBindApply, ssaArrayBindInd,
         ssaCall, ssaCallSub, ssaCallSubIndirect, ssaThreadCreate:
           FLoopReshapesArrays := True;
+      end;
+      // ⛔⛔ A WRITE THROUGH AN ADDRESS names no array, and can land in ANY of them. A scalar whose
+      // address is taken is backed by a one-element array, so "p = @x : For ... : *p = i : Print x"
+      // stores with RefStoreInt and reads with ArrayLoadInt ARR[x] - and the store set above, which
+      // only knows stores that NAME their array, said "x is not written in this loop". The read was
+      // hoisted and printed "0 0 0" where fbc and --no-opt print "10 20 30". A C call handed "@x" is
+      // the same write by other means ("sscanf(src(i), "%d", @z)" in a loop, pango_tab_array_get_tab
+      // filling two out-parameters) - and C may even have KEPT an address from an earlier call.
+      // One flag for every array, not a per-id set: the address is a run-time value.
+      case Instr.OpCode of
+        ssaRefStoreInt, ssaRefStoreFloat, ssaRefStoreString, ssaPoke,
+        ssaRawStoreInt, ssaRawStoreFloat, ssaRawStoreZStr,
+        ssaForeignCall, ssaForeignCallF:
+          FLoopWritesByAddress := True;
       end;
     end;
   end;
