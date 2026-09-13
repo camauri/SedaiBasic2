@@ -2944,7 +2944,7 @@ function TSSAGenerator.BasicProcCallbackSig(Node: TASTNode): string;
 var
   Decl, ParamList, NameNode, prm: TASTNode;
   i: Integer;
-  Nm, Params, Ret, T: string;
+  Nm, Params, Ret, T, CbPointee, CbParamName: string;
 begin
   Result := '';
   if Node = nil then Exit;
@@ -2972,6 +2972,28 @@ begin
     // canonical names, and an unknown one would drop the whole signature - the closure never built.
     if T <> '' then T := UpperFast(CanonicalType(T));
     if (T = '') or (ForeignKindOf(T) = fkUnknown) then Exit;
+    // ⛔⛔ A CALLBACK'S "<UDT> PTR" PARAMETER HOLDS A MACHINE ADDRESS, and nothing else could say so.
+    // MarkRawPointerParam carries rawness from the ARGUMENT at a BASIC call site (DIVERGENZE 303); a
+    // callback has NO BASIC call site - C fills its parameters - so the mark never happened and the body
+    // read the structure as a MANAGED RECORD HANDLE. pcre2's callout hands back a
+    // "pcre2_callout_block_8 ptr" and the probe died with "Invalid record handle 2305983740423680304".
+    // ⭐ This routine is the one place that knows a BASIC procedure is being handed to C, and it already
+    // walks the parameter list to build the signature - so the question is asked where the answer is
+    // known. Same registry and same guard as the call-site path.
+    if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
+    begin
+      CbPointee := Trim(Copy(T, 1, Length(T) - 4));
+      CbParamName := prm.ValueUpper;
+      if (CbPointee <> '') and (Pos(' PTR', CbPointee) = 0) and (FindUDT(CbPointee) >= 0) and
+         (CbParamName <> '') and (FRawUDTPtrs.IndexOfName(CbParamName) < 0) then
+      begin
+        FRawUDTPtrs.Add(CbParamName + '=' + UpperFast(CanonicalType(CbPointee)));
+        FRawCollectChanged := True;
+        if GetEnvironmentVariable('RAWPTRDIAG') <> '' then
+          WriteLn(ErrOutput, 'RAWPTR callback param [', Nm, '] ', CbParamName, ' -> ', CbPointee,
+                  '   <- C fills this one');
+      end;
+    end;
     // ⛔⛔ IL SEPARATORE E' "~", NON LA VIRGOLA. La virgola separa gia' i PARAMETRI nella riga della
     // tabella esterna, quindi una firma scritta con le virgole veniva spezzata da ParseForeignDecl:
     // "FNPTR:LONG:ANY PTR,ANY PTR" diventava DUE parametri, il callback ne riceveva uno solo, e il
@@ -42464,6 +42486,17 @@ begin
   else if T = 'LONG' then Result := RTC_I32
   else if T = 'SINGLE' then Result := RTC_SINGLE
   else if T = 'DOUBLE' then Result := RTC_DOUBLE
+  // ⛔ A POINTEE THAT IS ITSELF A POINTER IS RTC_PTR64, and this ladder had no rung for it - the note
+  // on DIVERGENZE 250 left it out on purpose, because this function also SIZES pointer arithmetic and
+  // it has fifty callers. It is safe: RawElemSizeOfPointee gives RTC_PTR64 the same eight bytes as
+  // RTC_I64, so no arithmetic moves; what changes is only the LOAD, which is the whole point - a
+  // pointer read out of C's memory comes home if it names memory the VM owns and is tagged as a machine
+  // address otherwise (the RTC_PTR64 arm of RawLoadTyped). A raw block the VM owns is untouched,
+  // because that arm only fires when the CONTAINER carries the foreign tag.
+  // ⭐ Found by the pcre2 deck: "pcre2_substring_list_get" writes a "PCRE2_UCHAR ptr ptr ptr" - a
+  // char** - and reading "lst[i]" died with "Null or invalid pointer dereference", because the cell's
+  // C address was taken for one of the VM's own pointers.
+  else if Pos(' PTR', T) > 0 then Result := RTC_PTR64
   else Result := RTC_I64;   // INTEGER/LONGINT/UINTEGER/ULONGINT (our INTEGER is 64-bit)
 end;
 

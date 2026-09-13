@@ -11593,6 +11593,28 @@ begin
           ArrSetIntAt(Ctx.ArrMap[Instr.Dest], Ctx.IntRegs[Instr.Src2], 0);
       end;
 
+    // ⛔⛔ THE FUSED COMPARE-AND-BRANCH FAMILY - sub-opcodes 61-70 - AND THE REASON THEY ARE HERE.
+    // They are not fused PAIRS: they are ordinary opcodes that live in the SUPER bank for room, and the
+    // hot-loop template has implemented them all along. This routine - the SINGLE-STEP dispatcher, which
+    // every path that is not the hot loop goes through - did not, so the program died with "Unknown
+    // superinstruction sub-opcode 68" the moment one of them was reached from such a path.
+    // ⭐ FOUND BY A LIBRARY DECK, not by a guard: a BASIC procedure handed to C as a CALLBACK re-enters
+    // the VM here, so pcre2 calling back into a BASIC allocator ran a fused unsigned branch through this
+    // copy. With SUPERINSTR=0 the same probe matched fbc exactly - which is what said the FFI was right
+    // and the second dispatch table was wrong.
+    // ⚠ The PC convention here is the single-step one: a TAKEN branch sets PC to Immediate - 1,
+    // because the caller increments. The hot loop sets it to Immediate and does not.
+    61: if Ctx.StringRegs[Instr.Src1] =  Ctx.StringRegs[Instr.Src2] then Ctx.PC := Instr.Immediate - 1;  // bcBranchEqString
+    62: if Ctx.StringRegs[Instr.Src1] <> Ctx.StringRegs[Instr.Src2] then Ctx.PC := Instr.Immediate - 1;  // bcBranchNeString
+    63: if Ctx.StringRegs[Instr.Src1] <  Ctx.StringRegs[Instr.Src2] then Ctx.PC := Instr.Immediate - 1;  // bcBranchLtString
+    64: if Ctx.StringRegs[Instr.Src1] >  Ctx.StringRegs[Instr.Src2] then Ctx.PC := Instr.Immediate - 1;  // bcBranchGtString
+    65: if Ctx.StringRegs[Instr.Src1] <= Ctx.StringRegs[Instr.Src2] then Ctx.PC := Instr.Immediate - 1;  // bcBranchLeString
+    66: if Ctx.StringRegs[Instr.Src1] >= Ctx.StringRegs[Instr.Src2] then Ctx.PC := Instr.Immediate - 1;  // bcBranchGeString
+    67: if QWord(Ctx.IntRegs[Instr.Src1]) <  QWord(Ctx.IntRegs[Instr.Src2]) then Ctx.PC := Instr.Immediate - 1;  // bcBranchLtUInt
+    68: if QWord(Ctx.IntRegs[Instr.Src1]) <= QWord(Ctx.IntRegs[Instr.Src2]) then Ctx.PC := Instr.Immediate - 1;  // bcBranchLeUInt
+    69: if QWord(Ctx.IntRegs[Instr.Src1]) >  QWord(Ctx.IntRegs[Instr.Src2]) then Ctx.PC := Instr.Immediate - 1;  // bcBranchGtUInt
+    70: if QWord(Ctx.IntRegs[Instr.Src1]) >= QWord(Ctx.IntRegs[Instr.Src2]) then Ctx.PC := Instr.Immediate - 1;  // bcBranchGeUInt
+
   else
     raise Exception.CreateFmt('Unknown superinstruction sub-opcode %d (full: %d) at PC=%d',
       [SubOp, Instr.OpCode, Ctx.PC]);
