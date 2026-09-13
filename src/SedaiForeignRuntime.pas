@@ -1207,6 +1207,21 @@ begin
               ResInt := RegVM[i] + Int64((RetAddr - RegBase[i]) div PtrUInt(RegW[i]));
               Exit;
             end;
+          // ⛔⛔ ...E LA MAPPA GLOBALE, prima di arrendersi. I giri qui sopra conoscono solo le regioni
+          // passate a QUESTA chiamata, e una libreria restituisce spessissimo un puntatore che le
+          // abbiamo dato PRIMA: "png_set_write_fn(p, st, ...)" consegna il blocco una volta e
+          // "png_get_io_ptr(p)" lo ripete a ogni callback, dove la lista di questa chiamata non lo
+          // contiene. Senza questo passo tornava un indirizzo MACCHINA marcato e il campo letto
+          // attraverso di lui moriva ("Raw pointer dereference out of bounds").
+          // ⭐ E' lo stesso gancio che i PARAMETRI D'USCITA usano trenta righe piu' sotto (voce 219) e
+          // che il caricamento di un puntatore dalla memoria di C usa nel VM: una sola risposta alla
+          // domanda "questo indirizzo e' casa nostra?". DIVERGENZE 332.
+          if Assigned(FPtrHome) then
+          begin
+            ResInt := FPtrHome(ACtx, RetAddr);
+            if ResInt <> 0 then Exit;
+            ResInt := Int64(RetAddr);
+          end;
           // Non e' memoria nostra (malloc, una stringa statica dentro la libreria): resta un indirizzo
           // MACCHINA, marcato perche' la chiamata dopo lo riconosca. Un NULL resta 0: "If p = 0" e' il
           // modo in cui ogni binding lo prova. Vedi FGNPTR_TAG.
