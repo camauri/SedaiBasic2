@@ -45737,7 +45737,15 @@ begin
   end;
   ArrName := VarToStr(Node.GetChild(0).Value);
   ArrayIdx := ArrayIndexOf(ArrName);
-  if ArrayIdx < 0 then
+  // ⛔⛔ ...AND A SCALAR'S BACKING IS NOT A PROGRAM ARRAY. An @-taken pointer - a SHARED one at module
+  // level, or a local whose address is taken - is made ARRAY-BACKED (one element, holding the pointer
+  // itself), so ArrayIndexOf answers YES for it and this whole block of POINTER rules was skipped:
+  // "@p[k]" then came out as the address of the BACKING's element instead of "p + k", and handing that
+  // to a C function was an access violation. ⭐ With a LOCAL pointer the very same line worked, which is
+  // what said the defect was the SHAPE of the storage and not the expression.
+  // ⚠️ It is the same guard three other readers already carry, word for word (ObjectTypeName twice and
+  // ResolveRecordObject); this was the fourth place that needed it and did not have it. DIVERGENZE 347.
+  if (ArrayIdx < 0) or IsSharedScalar(ArrName) or IsAddrLocal(ArrName) then
   begin
     // ⛔ THE STRING MUST BE TRIED FIRST, and the order here is the defect this cost: a
     // `ZString * n` marked address-taken also answers YES to ManagedPtrPointee, so it fell into
