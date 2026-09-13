@@ -623,6 +623,40 @@ begin
   end;
 end;
 
+function SretOrBuf(ASret, ALocal: Pointer): Pointer; inline;
+// The destination for the return value: a struct by value goes straight into the program's record, and
+// everything else into the local 16-byte buffer this routine reads its result out of.
+begin
+  if ASret <> nil then Result := ASret else Result := ALocal;
+end;
+
+function StructRetRef(const ATypeName: string): TAbiType;
+// ⭐ THE ABI'S OWN TYPE FOR A STRUCT RETURNED BY VALUE (DIVERGENZE 329), built from the layout the call
+// site wrote. ⛔ The offsets are BELIEVED, not re-derived: the compiler already laid the record out and
+// a second opinion here would be a second answer about the same bytes.
+var
+  Sz, Al, i, j: Integer;
+  Fl: TForeignStructFields;
+  Refs: TAbiTypeArray;
+  Ofs: array of Integer;
+begin
+  Result := nil;
+  if not ForeignStructSpec(ATypeName, Sz, Al, Fl) then Exit;
+  SetLength(Refs, Length(Fl));
+  SetLength(Ofs, Length(Fl));
+  for i := 0 to High(Fl) do
+  begin
+    Refs[i] := KindToRef(Fl[i].Kind);
+    if Refs[i] = nil then
+    begin
+      for j := 0 to High(Refs) do Refs[j].Free;
+      Exit(nil);
+    end;
+    Ofs[i] := Fl[i].Offset;
+  end;
+  Result := TAbiType.CreateStructAt(Refs, Ofs, Sz, Al);
+end;
+
 procedure TForeignTable.Prepare(var B: TForeignBinding);
 var
   i: Integer;
@@ -668,7 +702,8 @@ begin
   end
   else
     B.Fn := ResolveSymbol(B);
-  B.RetRef := KindToRef(B.RetKind);
+  if B.RetKind = fkStruct then B.RetRef := StructRetRef(B.Decl.RetTypeName)
+  else B.RetRef := KindToRef(B.RetKind);
   if B.RetRef = nil then
     raise EForeignCallError.CreateFmt('%s returns %s',
       [B.Decl.Name, ForeignKindRefusalReason(B.RetKind, B.Decl.RetTypeName)]);
@@ -745,6 +780,13 @@ var
   Avail: PtrUInt;
   ElemW: Integer;
   P: Pointer;
+  // ⭐ A STRUCT RETURNED BY VALUE (DIVERGENZE 329): the destination is the RECORD'S OWN IMAGE, not a
+  // local buffer. That way the MEMORY class - a struct past sixteen bytes, which the callee fills
+  // through a hidden pointer - writes straight into the program's record, with no size limit here and
+  // nothing copied twice.
+  SretHandle: Int64;
+  SretBuf: Pointer;
+  SretAvail: PtrUInt;
   {$IFDEF WINDOWS}
   // ⭐ THE PORTABLE WSTRING AT THE WINDOWS BOUNDARY (DIVERGENZE 234, 237). Inside the VM a WSTRING is one
   // 4-byte cell per character on every system; a Windows "...W" function wants UTF-16. Each such argument
@@ -803,6 +845,21 @@ begin
   end;
 
   SlotI := 0; SlotF := 0; NReg := 0; NOut := 0; NRec := 0; NN := 0; NRP := 0; NRun := 0;
+  SretHandle := 0; SretBuf := nil;
+  if B^.RetKind = fkStruct then
+  begin
+    if not Assigned(FRecBytes) then
+      raise EForeignCallError.CreateFmt('%s returns a struct by value and this build cannot reach a record''s image',
+                                        [B^.Decl.Name]);
+    if High(XferInt) < XFER_RESULT_HANDLE_SLOT then
+      raise EForeignCallError.CreateFmt('%s returns a struct by value and no destination was staged',
+                                        [B^.Decl.Name]);
+    SretHandle := XferInt[XFER_RESULT_HANDLE_SLOT];
+    SretBuf := FRecBytes(ACtx, SretHandle, SretAvail);
+    if (SretBuf = nil) or (SretAvail < PtrUInt(B^.RetRef.Size)) then
+      raise EForeignCallError.CreateFmt('%s returns %d bytes and the destination record holds %d',
+                                        [B^.Decl.Name, B^.RetRef.Size, SretAvail]);
+  end;
   FillChar(Buf, SizeOf(Buf), 0);
   for i := 0 to NArgs - 1 do
   begin
@@ -1060,10 +1117,10 @@ begin
     if (NArgs < 1) or (PPointer(Vals[NArgs - 1])^ = nil) then
       raise EForeignCallError.Create('calling a procedure pointer that holds no address (0)');
     AbiCall(PPointer(Vals[NArgs - 1])^, B^.RetRef, Slice(B^.ArgRefs, NArgs - 1), Slice(Vals, NArgs - 1),
-            @RetBuf[0]);
+            SretOrBuf(SretBuf, @RetBuf[0]));
   end
   else
-  AbiCall(B^.Fn, B^.RetRef, Slice(B^.ArgRefs, NArgs), Slice(Vals, NArgs), @RetBuf[0]);
+  AbiCall(B^.Fn, B^.RetRef, Slice(B^.ArgRefs, NArgs), Slice(Vals, NArgs), SretOrBuf(SretBuf, @RetBuf[0]));
   // ...and the POINTER FIELDS of every record handed to C come back (DIVERGENZE 259 b): one C left alone
   // gets the program's own value again (its tag, its domain); one C CHANGED holds a machine address, and
   // becomes one the program can see as such - "cif.rtype = @ffi_type_uint64" answered 0 in silence.
@@ -1197,6 +1254,9 @@ begin
   // next, which is the worst kind of difference to chase.
   case B^.RetKind of
     fkVoid:   ;
+    // ⭐ A struct by value is already IN the program's record - the callee wrote it there. The value of
+    // the expression is the record's handle, exactly as it is for a BASIC function returning a UDT.
+    fkStruct: ResInt := SretHandle;
     fkFloat:  ResFloat := PSingle(@RetBuf[0])^;
     fkDouble: ResFloat := PDouble(@RetBuf[0])^;
     fkS8:     ResInt := PShortInt(@RetBuf[0])^;

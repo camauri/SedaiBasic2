@@ -732,7 +732,7 @@ type
     // so it can be asked wherever a name has failed to resolve.
     function VarArgIsAddress(Node: TASTNode): Boolean;   // il valore e' un INDIRIZZO?
     function VariadicCallSiteDecl(const Decl: TForeignDecl; ArgListNode: TASTNode;
-                                  NArgs: Integer): Integer;   // la coda variadica di UN sito
+                                  NArgs: Integer; const RetOverride: string = ''): Integer;   // la coda variadica di UN sito
     function TryForeignCall(const NameU: string; ArgListNode: TASTNode;
                             out ResultVal: TSSAValue): Boolean;
     procedure CanonicaliseForeignDecls;   // resolve the declarations' types through the alias table
@@ -1606,6 +1606,8 @@ type
     function ByrefRetCallName(Node: TASTNode): string;   // call to a BYREF-returning FUNCTION? -> its resolved label
     function EmitByrefRetAddress(Node: TASTNode): TSSAValue;   // ...lowered to the ADDRESS it returns
     function RawUDTPtrType(const Name: string): string;   // "T PTR" holding a RAW address -> T
+    function ForeignStructRetSpec(UDTIdx: Integer; out Why: string): string;   // a struct returned BY VALUE (329)
+    function ForeignRetUDTName(const NameU: string): string;   // ...and the UDT such a call answers (329)
     function AddRawUDTPtr(const ScopeU, NameU, TypeU: string): Boolean;   // ...file it, flat AND scoped (333)
     function FoldIntNode(Node: TASTNode; out Val: Int64): Boolean;        // literal integer arithmetic, no side effects
     function UDTFieldArrayShape(UDTIdx, FieldIdx: Integer; out Count, ElemBytes: Int64;
@@ -1778,9 +1780,10 @@ const
   // Transfer-register slot reserved for a FUNCTION's return value (per bank). Kept well
   // above any parameter slot count so it never collides with an argument slot.
   XFER_RESULT_SLOT = 255;
-  // Int transfer slot carrying the caller-allocated result-instance handle for a FUNCTION that
-  // returns a UDT by value (V3 return-by-value): the callee copies its return value into it.
-  XFER_RESULT_HANDLE_SLOT = 254;
+  // ⭐ XFER_RESULT_HANDLE_SLOT - the int slot carrying the caller-allocated result-instance handle for
+  // a call that returns a UDT by value - now lives in SedaiSSATypes: the FOREIGN marshaller reads the
+  // same slot for a C struct returned by value (DIVERGENZE 329), and two copies of a slot number is
+  // two things to keep in step.
   // M6 (SHARED): module-global scalars are backed by dedicated transfer slots (which survive the
   // bcCallSub frame save/restore). Assigned from this base upward, per bank — kept well below the
   // result slots (254/255) and above any realistic argument-slot count (parameters use slots 0..N).
@@ -26368,6 +26371,98 @@ begin
   Result := UpperFast(FRawUDTScoped.Values['|' + NameU]);   // a SHARED the procedure only reads
 end;
 
+function TSSAGenerator.ForeignRetUDTName(const NameU: string): string;
+// The UDT a FOREIGN function returns BY VALUE, or '' - for "f(...).field", where the object is the call
+// itself. ⛔ Only when this path can actually classify the type: answering the name for a struct the
+// call would refuse would make the member access lower an expression that then raises, which is a worse
+// diagnostic than the one the call gives.
+var
+  Idx, UDTIdx: Integer;
+  D: TForeignDecl;
+  Why: string;
+begin
+  Result := '';
+  if not Assigned(FProgram) then Exit;
+  Idx := FProgram.IndexOfForeignDecl(UpperFast(NameU));
+  if Idx < 0 then Exit;
+  if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), D) then Exit;
+  if ForeignKindOf(D.RetTypeName) <> fkUnknown then Exit;   // a scalar or a pointer: not this rung
+  UDTIdx := FindUDT(UpperFast(CanonicalType(D.RetTypeName)));
+  if UDTIdx < 0 then Exit;
+  if ForeignStructRetSpec(UDTIdx, Why) = '' then Exit;
+  Result := UpperFast(CanonicalType(D.RetTypeName));
+end;
+
+function TSSAGenerator.ForeignStructRetSpec(UDTIdx: Integer; out Why: string): string;
+// ⭐ THE C LAYOUT OF A STRUCT A C FUNCTION RETURNS BY VALUE (DIVERGENZE 329), spelled for the
+// marshaller: "SRET:<size>:<align>:<kind>@<offset>/...". The CALL SITE is the only place that knows
+// it - the runtime has no way back to a UDT declaration - which is why it travels in the declaration
+// line, exactly as "REC:" and "W<k>:" do for arguments.
+//
+// ⛔ PRIMITIVE FIELDS ONLY, and a refusal that NAMES what stopped it. The SysV eightbyte
+// classification needs to know, for every byte of the struct, whether it is INTEGER or SSE; a nested
+// aggregate, an array member, a string or a bit field would have to be flattened first, and guessing
+// there does not raise - it puts the value in the wrong register file and the caller reads a number
+// nobody returned. That is the one failure this whole path exists to avoid.
+var
+  i, n, Al, Sz: Integer;
+  Offsets: TInt64Array;
+  TotalSize: Int64;
+  K: TForeignKind;
+  F: ^TUDTField;
+begin
+  Result := ''; Why := '';
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then begin Why := 'it is not a declared type'; Exit; end;
+  if FUDTs[UDTIdx].IsUnion then begin Why := 'it is a UNION'; Exit; end;
+  if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then
+  begin Why := 'it has no C byte layout'; Exit; end;
+  if TotalSize <= 0 then begin Why := 'it has no C byte layout'; Exit; end;
+  n := Length(FUDTs[UDTIdx].Fields);
+  if n = 0 then begin Why := 'it declares no field'; Exit; end;
+  Al := 1;
+  for i := 0 to n - 1 do
+  begin
+    F := @FUDTs[UDTIdx].Fields[i];
+    if F^.IsArray or F^.InlineArray then
+      begin Why := 'field "' + F^.Name + '" is an array'; Exit; end;
+    if (F^.NestedType <> '') or F^.InlineNested then
+      begin Why := 'field "' + F^.Name + '" is itself a record'; Exit; end;
+    if F^.BitWidth > 0 then
+      begin Why := 'field "' + F^.Name + '" is a bit field'; Exit; end;
+    if F^.IsCvaList then
+      begin Why := 'field "' + F^.Name + '" is a CVA_LIST'; Exit; end;
+    if (F^.UnionGroup <> 0) or (F^.StructGroup <> 0) then
+      begin Why := 'field "' + F^.Name + '" is inside a nested UNION or TYPE block'; Exit; end;
+    if (F^.Bank = srtString) or F^.IsWString or F^.IsZString or (F^.StrCapacity > 0) then
+      begin Why := 'field "' + F^.Name + '" is a string'; Exit; end;
+    // A POINTER field - declared "T Ptr", a raw scalar pointer, or a function pointer - is eight
+    // INTEGER bytes, which is all the classification needs of it.
+    if (F^.PtrPointee <> '') or (F^.RawPtrPointee <> '') or (F^.MultiPtrPointee <> '') or
+       (F^.FuncPtrSig <> '') then
+      K := fkPointer
+    else if F^.IsBoolean then K := fkU8
+    else if F^.Bank = srtFloat then
+    begin
+      if F^.WidthCode = 7 then K := fkFloat else K := fkDouble;
+    end
+    else
+      case F^.WidthCode of
+        1: K := fkS8;  2: K := fkU8;
+        3: K := fkS16; 4: K := fkU16;
+        5: K := fkS32; 6: K := fkU32;
+      else
+        K := fkS64;    // every 64-bit name: for the ABI they are one INTEGER eightbyte
+      end;
+    if i > High(Offsets) then begin Why := 'its layout has fewer fields than it declares'; Exit; end;
+    Sz := ForeignKindSize(K);
+    if Sz > Al then Al := Sz;
+    if Result <> '' then Result := Result + '/';
+    Result := Result + IntToStr(Ord(K)) + '@' + IntToStr(Offsets[i]);
+  end;
+  if Al > 8 then Al := 8;
+  Result := 'SRET:' + IntToStr(TotalSize) + ':' + IntToStr(Al) + ':' + Result;
+end;
+
 function TSSAGenerator.AddRawUDTPtr(const ScopeU, NameU, TypeU: string): Boolean;
 // File "this T PTR is laid over bytes" in BOTH registries - the flat one the fixpoint walks and the
 // scoped one every reader asks. True when the scoped entry is new, which is what a caller's diagnostic
@@ -47983,6 +48078,12 @@ begin
         // type is the POINTEE. Only the UDT-value return was known here.
         if Result = '' then Result := ProcReturnPtrUDT(ArrName);
       end;
+      // ⭐ ...and the same for a C function that RETURNS A STRUCT BY VALUE (DIVERGENZE 329):
+      // "div(17, 5).quot" is the idiom every C programmer writes, and a foreign name is not in
+      // FProcedureNames - so the rung above could never answer for one, and the field read 0 while
+      // the identical access through a variable was right.
+      if (Result = '') and (ArrayIndexOf(ArrName) < 0) then
+        Result := ForeignRetUDTName(ArrName);
     end
     // "p[i][j].field": the cell p[i] holds a MANAGED block, so p[i][j] is a record of the cell's
     // pointee type. ⛔ ProcessMemberAccess asks this BEFORE it asks ResolveRecordObject and gives up
@@ -49363,10 +49464,14 @@ begin
     // ⛔ ...and a FREE FUNCTION returning a UDT, which the METHOD case above has handled all along and
     // this one had not: "pick().n = 5" over "Function pick() ByRef As T" wrote nowhere and said nothing.
     // Same two shapes as there - a UDT return, or a "T Ptr" whose value IS the handle.
-    if (ArrayIndexOf(ArrName) < 0) and (FProcedureNames.IndexOf(ArrName) >= 0) then
+    if (ArrayIndexOf(ArrName) < 0) and
+       ((FProcedureNames.IndexOf(ArrName) >= 0) or (ForeignRetUDTName(ArrName) <> '')) then
     begin
       MemberArrElemType := VarRecordTypeName(ArrName);
       if MemberArrElemType = '' then MemberArrElemType := ProcReturnPtrUDT(ArrName);
+      // ⭐ ...and a C function that RETURNS A STRUCT BY VALUE (DIVERGENZE 329): a foreign name is not in
+      // FProcedureNames, so "pt_make(2,3).x" matched no branch at all and the field read 0 - silently.
+      if MemberArrElemType = '' then MemberArrElemType := ForeignRetUDTName(ArrName);
       if MemberArrElemType <> '' then
       begin
         ProcessExpression(ObjNode, HandleVal);   // lowers the call; the result is the handle
@@ -49449,13 +49554,16 @@ begin
       // "f(args).field" / "f(args).method()": a user FUNCTION returning a UDT. Lowering the call yields
       // the returned record's handle, which is the object of the access. Without this the node matched no
       // branch and the field read silently produced garbage.
-      if (ArrayIndexOf(ArrName) < 0) and (FProcedureNames.IndexOf(ArrName) >= 0) then
+      if (ArrayIndexOf(ArrName) < 0) and
+         ((FProcedureNames.IndexOf(ArrName) >= 0) or (ForeignRetUDTName(ArrName) <> '')) then
       begin
         ParentType := VarRecordTypeName(ArrName);
         // "f(args)->field" where f returns "T PTR": the returned int IS the record handle, exactly as for
         // a pointer variable. Only the UDT-VALUE return was known here, so the pointer-returning form fell
         // through and the access silently yielded the handle instead of the field.
         if ParentType = '' then ParentType := ProcReturnPtrUDT(ArrName);
+        // ...and a C function returning a struct by value (DIVERGENZE 329), the same rung as above.
+        if ParentType = '' then ParentType := ForeignRetUDTName(ArrName);
         if ParentType <> '' then
         begin
           ProcessExpression(ObjNode, HandleVal);
@@ -50998,7 +51106,7 @@ begin
 end;
 
 function TSSAGenerator.VariadicCallSiteDecl(const Decl: TForeignDecl; ArgListNode: TASTNode;
-  NArgs: Integer): Integer;
+  NArgs: Integer; const RetOverride: string = ''): Integer;
 // The foreign-table entry for ONE call site: the declared parameters (with any CALLBACK spelled out,
 // DIVERGENZE 218), then the variadic tail read off the ARGUMENTS. Returns its index.
 //
@@ -51020,7 +51128,7 @@ function TSSAGenerator.VariadicCallSiteDecl(const Decl: TForeignDecl; ArgListNod
 // is a hypothesis until a probe says so, and this one refused the most common idiom of the C library.
 var
   i, k: Integer;
-  Params, T, Line, NarrowT: string;
+  Params, T, Line, NarrowT, RetT: string;
 begin
   Params := '';
   for i := 0 to High(Decl.ParamTypeNames) do
@@ -51072,8 +51180,13 @@ begin
   // ⚠️ The NAME carries the argument count so two call sites of the same function with different tails
   // get different entries - and it can never collide with a real declaration, because no BASIC name
   // holds a '#'. Nothing ever looks this name up: the loader resolves the SYMBOL.
+  // ⭐ RetOverride is the C LAYOUT of a struct returned by value (DIVERGENZE 329): the declaration says
+  // only the UDT's NAME, which means nothing to the marshaller, and this entry is where the call site
+  // spells it out - exactly as it spells out a callback's signature and a record argument's offsets.
+  RetT := Decl.RetTypeName;
+  if RetOverride <> '' then RetT := RetOverride;
   Line := Decl.Name + '#' + IntToStr(NArgs) + '|' + Decl.Symbol + '|' + Decl.LibName + '|' +
-          Decl.RetTypeName + '|' + Params;
+          RetT + '|' + Params;
   if GetEnvironmentVariable('FGNDIAG') = '1' then
     WriteLn(ErrOutput, 'FGN[sito variadico] ', Line);
   for k := 0 to FProgram.ForeignDeclCount - 1 do
@@ -51401,6 +51514,11 @@ var
   StageSlots: array of Integer;
   PtrReg: TSSAValue;
   NarrowT: string;
+  // ⭐ A STRUCT RETURNED BY VALUE (DIVERGENZE 329): the UDT the declaration names, the layout the call
+  // site writes for the marshaller, and the record the caller allocates to receive it.
+  SRetType, SRetSpec, SRetWhy: string;
+  SRetUDT: Integer;
+  SRetHandle: TSSAValue;
 begin
   Result := False;
   ResultVal := MakeSSAValue(svkNone);
@@ -51408,7 +51526,29 @@ begin
   if Idx < 0 then Exit;
   if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), Decl) then Exit;
 
+  // ⭐⭐ A C FUNCTION THAT RETURNS A STRUCT BY VALUE (DIVERGENZE 329). The ABI layer has always been
+  // able to do this - it classifies the eightbytes and the FFI net exercises them - and what was
+  // missing was exactly this: the language surface routing it. The declaration names a UDT, so the
+  // kind comes out fkUnknown and the call was refused by name.
+  // ⛔ And a UDT this path cannot CLASSIFY is still refused, with the field that stopped it named:
+  // guessing an eightbyte class puts the value in the wrong register file and answers a number nobody
+  // returned.
+  SRetType := ''; SRetSpec := ''; SRetUDT := -1;
   RetKind := ForeignKindOf(Decl.RetTypeName);
+  if RetKind = fkUnknown then
+  begin
+    SRetType := UpperFast(CanonicalType(Decl.RetTypeName));
+    SRetUDT := FindUDT(SRetType);
+    if SRetUDT >= 0 then
+    begin
+      SRetSpec := ForeignStructRetSpec(SRetUDT, SRetWhy);
+      if SRetSpec = '' then
+        raise Exception.CreateFmt('Foreign function %s returns "%s" by value, which this path cannot ' +
+                                  'classify for the calling convention: %s',
+                                  [Decl.Name, Decl.RetTypeName, SRetWhy]);
+      RetKind := fkStruct;
+    end;
+  end;
   if RetKind = fkUnknown then
     raise Exception.CreateFmt('Foreign function %s returns "%s", which has no C type here',
                               [Decl.Name, Decl.RetTypeName]);
@@ -51436,10 +51576,13 @@ begin
     WriteLn(ErrOutput, 'FGN sito ', Decl.Name, ': variadic=', Decl.Variadic,
             ' NArgs=', NArgs, ' dichiarati=', Length(Decl.ParamTypeNames));
   if Decl.Variadic and (NArgs > Length(Decl.ParamTypeNames)) then
-    Idx := VariadicCallSiteDecl(Decl, ArgListNode, NArgs)
+    Idx := VariadicCallSiteDecl(Decl, ArgListNode, NArgs, SRetSpec)
   else
   begin
     if NArgs > Length(Decl.ParamTypeNames) then NArgs := Length(Decl.ParamTypeNames);
+    // ...and a STRUCT RETURNED BY VALUE wants its own entry too, for the same reason a callback and a
+    // record argument do: the entry is where the layout is written (DIVERGENZE 329).
+    if SRetSpec <> '' then Idx := VariadicCallSiteDecl(Decl, ArgListNode, NArgs, SRetSpec);
     // ...e anche una chiamata NON variadica vuole la propria voce se le si passa una procedura BASIC:
     // e' li' che la firma del callback viene scritta (DIVERGENZE 218). ...And so does one handed the
     // address of a BASIC record: the entry is where "REC:" is written (DIVERGENZE 245).
@@ -51454,9 +51597,23 @@ begin
       end;
   end;
   if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), Decl) then Exit;
+  RetKind := ForeignKindOf(Decl.RetTypeName);   // the chosen entry is the authority from here on
 
   if not Assigned(FCurrentBlock) then
     FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel('fgncall'));
+
+  // ⭐ THE RESULT INSTANCE IS ALLOCATED BEFORE THE ARGUMENTS ARE STAGED, and the ORDER is the same one
+  // a BASIC function returning a UDT by value uses: an argument may itself contain a call that reuses
+  // the reserved slots, so our handle goes in LAST.
+  SRetHandle := MakeSSAValue(svkNone);
+  if (RetKind = fkStruct) and (SRetUDT >= 0) then
+  begin
+    SRetHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRecordNew, SRetHandle,
+                    MakeSSAConstInt(FUDTs[SRetUDT].LiveBytes), MakeSSAConstInt(0),
+                    MakeSSAConstInt(FUDTs[SRetUDT].NStr or (Int64(SRetUDT) shl 32)));
+    EmitRecordInit(SRetHandle, SRetUDT);
+  end;
 
   SetLength(StageVals, NArgs);
   SetLength(StageRTs, NArgs);
@@ -51517,6 +51674,9 @@ begin
   // Phase 2: stage.
   for i := 0 to NArgs - 1 do
     EmitXferStore(StageRTs[i], StageSlots[i], StageVals[i]);
+  // ...and the destination of a struct returned by value, in the slot a BASIC UDT return already uses.
+  if RetKind = fkStruct then
+    EmitXferStore(srtInt, XFER_RESULT_HANDLE_SLOT, SRetHandle);
 
   // The result register is allocated even for a SUB: the opcode always names a Dest, and one unread
   // register is cheaper than a second pair of opcodes for the void case.
@@ -51533,6 +51693,10 @@ begin
     ResultVal := MakeSSARegister(srtInt, ResReg);
     EmitInstruction(ssaForeignCall, ResultVal, MakeSSAConstInt(NArgs),
                     MakeSSAValue(svkNone), MakeSSAConstInt(Idx));
+    // The callee wrote the struct into the record's own image; the value of the expression is that
+    // record's handle, and the end of the statement destroys the temporary, as for a BASIC UDT return.
+    if (RetKind = fkStruct) and (SRetType <> '') then
+      RegisterResultTemp(ResultVal, SRetType);
   end;
   Result := True;
 end;

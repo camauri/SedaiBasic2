@@ -67,6 +67,13 @@ type
   public
     constructor CreatePrimitive(AKind: TAbiKind);
     constructor CreateStruct(const AFields: array of TAbiType);
+    { ⭐ ...and the same struct with the offsets GIVEN rather than derived. CreateStruct re-derives the
+      C layout from each field's own alignment, which is right for a struct this unit describes itself;
+      a struct that comes from a BASIC declaration already HAS a layout, computed by the compiler, and
+      re-deriving it would be a SECOND opinion about the same bytes - the failure mode this project has
+      met again and again. The caller passes what it laid out and this believes it. }
+    constructor CreateStructAt(const AFields: array of TAbiType; const AOffsets: array of Integer;
+                               ASize, AAlign: Integer);
     property Kind: TAbiKind read FKind;
     property Size: Integer read FSize;
     property Align: Integer read FAlign;
@@ -169,6 +176,28 @@ begin
   // the struct step by a whole number of alignments.
   if (Ofs mod FAlign) <> 0 then Inc(Ofs, FAlign - (Ofs mod FAlign));
   FSize := Ofs;
+end;
+
+constructor TAbiType.CreateStructAt(const AFields: array of TAbiType;
+  const AOffsets: array of Integer; ASize, AAlign: Integer);
+var
+  i: Integer;
+begin
+  inherited Create;
+  FKind := akStruct;
+  if Length(AOffsets) <> Length(AFields) then
+    raise EAbiError.CreateFmt('a struct was given %d fields and %d offsets',
+                              [Length(AFields), Length(AOffsets)]);
+  SetLength(FFields, Length(AFields));
+  SetLength(FOffsets, Length(AFields));
+  for i := 0 to High(AFields) do
+  begin
+    FFields[i] := AFields[i];
+    FOffsets[i] := AOffsets[i];
+  end;
+  FSize := ASize;
+  FAlign := AAlign;
+  if FAlign < 1 then FAlign := 1;
 end;
 
 function TAbiType.FieldCount: Integer;

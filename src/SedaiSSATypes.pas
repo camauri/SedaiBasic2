@@ -35,6 +35,12 @@ uses
   Contnrs;   // TFPStringHashTable: the by-name lookups a sorted TStringList cannot answer fast
 
 const
+  // ⭐ Int transfer slot carrying the caller-allocated result-instance handle for a call that returns a
+  // UDT BY VALUE. It lives HERE, and not beside the other transfer-slot numbers in SedaiSSA, because a
+  // FOREIGN call that returns a struct by value uses the same slot (DIVERGENZE 329) and the marshaller
+  // must read the number the SSA wrote - one fact, one definition.
+  XFER_RESULT_HANDLE_SLOT = 254;
+
   { Register allocation limits }
   MIN_REGISTER_SLOTS = 256;      // Initial allocation size (backward compatible)
   MAX_REGISTER_SLOTS = 65536;    // Maximum registers per type (2^16), PHYSICAL: a bytecode

@@ -32,7 +32,18 @@ type
   TForeignKind = (fkUnknown, fkVoid, fkS8, fkU8, fkS16, fkU16, fkS32, fkU32,
                   fkS64, fkU64, fkFloat, fkDouble, fkPointer,
                   { recognised so it can be refused BY NAME - see ForeignKindOf }
-                  fkLongDouble);
+                  fkLongDouble,
+                  { ⭐ A STRUCT RETURNED BY VALUE (DIVERGENZE 329). Only ever a RETURN type, and only
+                    ever written by the CALL SITE, which is the one place that knows the record's C
+                    layout - see ForeignStructSpec for the spelling. }
+                  fkStruct);
+
+  { One field of a struct returned by value: what it is, and where it sits in the C image. }
+  TForeignStructField = record
+    Kind: TForeignKind;
+    Offset: Integer;
+  end;
+  TForeignStructFields = array of TForeignStructField;
 
   TForeignDecl = record
     Name: string;                    // the BASIC name, upper case
@@ -71,6 +82,15 @@ function ForeignNarrowCode(const ATypeName: string): Integer;
 
 { Bytes of one C element for a narrow width code: 1, 1, 2, 2, 4, 4, 4; 0 for anything else. }
 function ForeignNarrowBytes(ACode: Integer): Integer;
+
+{ ⭐ A STRUCT RETURNED BY VALUE (DIVERGENZE 329), spelled "SRET:<size>:<align>:<k>@<ofs>/<k>@<ofs>/..."
+  where <k> is Ord(TForeignKind) of a PRIMITIVE field and <ofs> its byte offset in the C image. The
+  CALL SITE writes it, because the layout is the compiler's and the runtime has no way back to it; the
+  runtime turns it into the ABI's own struct type and hands the callee a buffer of exactly <size>.
+  ⛔ Only primitive fields: a nested aggregate or an array member makes the whole thing unclassifiable
+  here, so the SSA refuses the call BY NAME instead of guessing an eightbyte class. }
+function ForeignStructSpec(const ATypeName: string; out ASize, AAlign: Integer;
+                           out AFields: TForeignStructFields): Boolean;
 
 { How many bytes the kind occupies, for the buffer an argument is marshalled into. }
 function ForeignKindSize(AKind: TForeignKind): Integer;
@@ -230,10 +250,47 @@ begin
   // double. Neither our trampolines nor this classification touch x87, so it is refused; being refused
   // BY NAME is what tells the next reader that the answer is "not yet", not "we did not think of it".
   if (T = 'LONGDOUBLE') then Exit(fkLongDouble);
+  // ⭐ ...and a struct RETURNED BY VALUE, written by the call site with its C layout (DIVERGENZE 329).
+  if Copy(T, 1, 5) = 'SRET:' then Exit(fkStruct);
   // ZSTRING / WSTRING with no PTR is a fixed buffer in a UDT, never a scalar parameter; a STRING
   // parameter of a foreign function is the address of its bytes.
   if (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') then Exit(fkPointer);
   Result := fkUnknown;
+end;
+
+function ForeignStructSpec(const ATypeName: string; out ASize, AAlign: Integer;
+  out AFields: TForeignStructFields): Boolean;
+var
+  T, Piece: string;
+  p, q, n: Integer;
+begin
+  Result := False; ASize := 0; AAlign := 0; SetLength(AFields, 0);
+  T := UpperCase(Trim(ATypeName));
+  if Copy(T, 1, 5) <> 'SRET:' then Exit;
+  Delete(T, 1, 5);
+  p := Pos(':', T); if p <= 0 then Exit;
+  ASize := StrToIntDef(Copy(T, 1, p - 1), -1);
+  Delete(T, 1, p);
+  p := Pos(':', T); if p <= 0 then Exit;
+  AAlign := StrToIntDef(Copy(T, 1, p - 1), -1);
+  Delete(T, 1, p);
+  if (ASize <= 0) or (AAlign <= 0) then Exit;
+  T := T + '/';
+  n := 0;
+  while T <> '' do
+  begin
+    p := Pos('/', T);
+    Piece := Copy(T, 1, p - 1);
+    Delete(T, 1, p);
+    if Piece = '' then Continue;
+    q := Pos('@', Piece); if q <= 0 then Exit;
+    SetLength(AFields, n + 1);
+    AFields[n].Kind := TForeignKind(StrToIntDef(Copy(Piece, 1, q - 1), Ord(fkUnknown)));
+    AFields[n].Offset := StrToIntDef(Copy(Piece, q + 1, MaxInt), -1);
+    if (AFields[n].Kind = fkUnknown) or (AFields[n].Offset < 0) then Exit;
+    Inc(n);
+  end;
+  Result := n > 0;
 end;
 
 function ForeignKindSize(AKind: TForeignKind): Integer;
