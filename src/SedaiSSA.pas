@@ -46925,9 +46925,14 @@ begin
     //   nz = (base AND RAWPTR_TAG) <> 0   -> -1 raw / 0 packed (this VM's boolean)
     //   scale = 1 - nz * (Sz - 1)         -> Sz raw / 1 packed
     // DIVERGENZE 129.
+    // ⛔ ...AND A C ADDRESS IS BYTES TOO. A field of a struct C owns holds a pointer C wrote, and that
+    // one carries FGNPTR_TAG, not RAWPTR_TAG - so "pa->pdata[1]" on a GPtrArray, and GLib's own
+    // "g_ptr_array_index", stepped ONE byte instead of eight and read a pointer's bytes shifted by one,
+    // while the same index through a local pointer was right (atk deck, a03). A packed VM address has
+    // neither bit, so testing both leaves its element step exactly where it was.
     SzVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaBitwiseAnd, SzVal, BaseVal,
-                    EnsureIntRegister(MakeSSAConstInt(RAWPTR_TAG)), MakeSSAValue(svkNone));
+                    EnsureIntRegister(MakeSSAConstInt(RAWPTR_TAG or FGNPTR_TAG)), MakeSSAValue(svkNone));
     ScaledIdx := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaCmpNeInt, ScaledIdx, SzVal,
                     EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
@@ -48760,6 +48765,12 @@ begin
   while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
   if ExprIsPointerValue(Node) then Exit(True);
   if (Node.NodeType = antCast) and EndsPtr(VarToStr(Node.Value)) then Exit(True);
+  // ⭐ ...and an ELEMENT of a pointer-to-pointer, "p[i]" with p a "gpointer Ptr": the element is itself a
+  // pointer, and it has no declared type of its own to ask. GLib's GPOINTER_TO_INT is exactly
+  // "Cast(Integer, pa->pdata[i])", and it kept the foreign-address tag - 2^61 + 200 where fbc says 200
+  // (atk deck; the rule is DIVERGENZE 235's, this is one more spelling of its operand).
+  if (Node.NodeType = antArrayAccess) and (Node.Attributes.Values['BRACKET'] = '1') and
+     (Node.ChildCount >= 1) and EndsPtr(DerefedType(Node.GetChild(0))) then Exit(True);
   Result := EndsPtr(DeclaredTypeNameOf(Node)) or EndsPtr(CalleeRetTypeName(Node));
 end;
 
