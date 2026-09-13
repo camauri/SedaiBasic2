@@ -76,6 +76,14 @@ type
     is answered too, at its field's offset. }
   TForeignRecResolver = function(ACtx: TObject; Value: Int64; out ALen: PtrUInt): Pointer of object;
 
+  { ⭐⭐ ...AND AN ARRAY OF THEM (DIVERGENZE 336). Every record owns its OWN image, so "@arr(0)" named
+    eight contiguous bytes and nothing after them: C, handed a pointer and a COUNT, walked straight off
+    the end - png_set_PLTE, qsort over structs, writev, every routine that takes an array of structs.
+    This answers how many records follow the one named, at consecutive indices, and how wide each image
+    is; the marshaller gathers that run into ONE buffer for the call and puts back what C changed. }
+  TForeignRecRun = function(ACtx: TObject; Value: Int64; out ACount: Integer;
+                            out AStride: PtrUInt): Boolean of object;
+
   { ⭐ THE 8-BYTE CELLS OF A NARROW VALUE (DIVERGENZE 247). A scalar whose address is taken, and an array
     of SINGLE, keep one Int64 / Double per element whatever the declared width - so "sscanf("%d", @n)"
     had C write four bytes into an eight-byte cell, and a "float*" read half a double. This answers the
@@ -112,6 +120,7 @@ type
     FPtrHome: TForeignPtrHome;          // optional: senza, un parametro d'uscita resta un indirizzo nudo
     FNoteRegion: TForeignRegionNote;    // optional: without it no C memory is ever readable
     FRecBytes: TForeignRecResolver;     // optional: without it a record's address cannot reach C
+    FRecRun: TForeignRecRun;            // optional: without it C sees ONE element of an array of records
     FCellRun: TForeignCellResolver;     // optional: without it a narrow value's cells reach C at 8 bytes
     FDeepCell: TForeignDeepCell;        // optional: without it a pointer to a pointer reaches C one level deep
     // ⛔⛔ ONE LOCK, AND IT COVERS PREPARATION ONLY. Two threads can reach the same foreign call for the
@@ -127,6 +136,7 @@ type
     // key is its VM pointer), allocated once, NEVER moved, refreshed at every call that hands it to C.
     // A longer run gets a new buffer and the old one is kept (C may still hold it) until the table dies.
     FW8Key: array of Int64;
+    FW8Kind: array of Integer;   // which KIND of copy the key names: 0 = array of pointers, 1 = a run of records
     FW8Buf: array of PByte;
     FW8Cap: array of PtrUInt;
     FW8Count: Integer;
@@ -135,7 +145,7 @@ type
     function ResolveSymbol(var B: TForeignBinding): Pointer;
     procedure Prepare(var B: TForeignBinding);
     procedure PrepareLocked(var B: TForeignBinding);   // the body of Prepare, with FPrepLock held
-    function W8Buffer(Key: Int64; Need: PtrUInt): PByte;   // the persistent copy for one program array
+    function W8Buffer(Key: Int64; Need: PtrUInt; Kind: Integer = 0): PByte;   // the persistent copy for one program array
     function DyLibBuiltin(const Sym: string; const Vals: array of Pointer; NArgs: Integer;
       ACtx: TObject): Int64;                               // DyLibLoad / DyLibSymbol / DyLibFree (strato 3)
   public
@@ -156,6 +166,7 @@ type
     property PtrHome: TForeignPtrHome read FPtrHome write FPtrHome;
     property NoteRegion: TForeignRegionNote read FNoteRegion write FNoteRegion;
     property RecBytes: TForeignRecResolver read FRecBytes write FRecBytes;
+    property RecRun: TForeignRecRun read FRecRun write FRecRun;
     property CellRun: TForeignCellResolver read FCellRun write FCellRun;
     property DeepCell: TForeignDeepCell read FDeepCell write FDeepCell;
   end;
@@ -442,7 +453,7 @@ begin
   end;
 end;
 
-function TForeignTable.W8Buffer(Key: Int64; Need: PtrUInt): PByte;
+function TForeignTable.W8Buffer(Key: Int64; Need: PtrUInt; Kind: Integer = 0): PByte;
 // The persistent translated copy for the program array whose VM pointer is Key - see FW8Key. Zeroed when
 // new; never moved. ⛔ Under FPrepLock: two threads handing C their first array at once must not both
 // grow the table.
@@ -452,7 +463,7 @@ begin
   EnterCriticalSection(FPrepLock);
   try
     for k := 0 to FW8Count - 1 do
-      if FW8Key[k] = Key then
+      if (FW8Key[k] = Key) and (FW8Kind[k] = Kind) then
       begin
         if FW8Cap[k] >= Need then Exit(FW8Buf[k]);
         SetLength(FW8Old, Length(FW8Old) + 1);
@@ -464,10 +475,12 @@ begin
     if FW8Count >= Length(FW8Key) then
     begin
       SetLength(FW8Key, FW8Count * 2 + 8);
+      SetLength(FW8Kind, FW8Count * 2 + 8);
       SetLength(FW8Buf, FW8Count * 2 + 8);
       SetLength(FW8Cap, FW8Count * 2 + 8);
     end;
     FW8Key[FW8Count] := Key;
+    FW8Kind[FW8Count] := Kind;
     FW8Buf[FW8Count] := AllocMem(Need);
     FW8Cap[FW8Count] := Need;
     Result := FW8Buf[FW8Count];
@@ -697,6 +710,17 @@ var
   RecBase: array[0..63] of PtrUInt;
   RecVM: array[0..63] of Int64;
   NRec, r: Integer;
+  // ⭐ ...and an ARRAY of them (DIVERGENZE 336): the gathered image C walks, the handle it starts at,
+  // how many records it holds and how wide each is. After the call, what C CHANGED goes back.
+  RunBuf: array[0..15] of PByte;
+  RunVM: array[0..15] of Int64;
+  RunCnt: array[0..15] of Integer;
+  RunStride: array[0..15] of PtrUInt;
+  NRun, RunN, rk: Integer;
+  RunW: PtrUInt;
+  RunP: PByte;
+  EP: Pointer;
+  EAvail: PtrUInt;
   // ⭐ The NARROW values this call handed over (DIVERGENZE 247): each one travels as a copy at C's width,
   // made from the program's 8-byte cells and written back into them after the call.
   NTmp: array[0..63] of array of Byte;   // the copy C sees
@@ -778,7 +802,7 @@ begin
     Exit;
   end;
 
-  SlotI := 0; SlotF := 0; NReg := 0; NOut := 0; NRec := 0; NN := 0; NRP := 0;
+  SlotI := 0; SlotF := 0; NReg := 0; NOut := 0; NRec := 0; NN := 0; NRP := 0; NRun := 0;
   FillChar(Buf, SizeOf(Buf), 0);
   for i := 0 to NArgs - 1 do
   begin
@@ -880,6 +904,33 @@ begin
             if P = nil then
               raise EForeignCallError.CreateFmt('%s: argument %d is the address of a record that does not exist',
                                                 [B^.Decl.Name, i + 1]);
+            // ⭐⭐ AN ARRAY OF RECORDS TRAVELS AS ONE CONTIGUOUS IMAGE (DIVERGENZE 336). Each record owns
+            // its own bytes, so what C was handed named a single element; a routine given a pointer AND A
+            // COUNT read past it into whatever followed. The run is gathered into one persistent buffer -
+            // the same shape as the translated copy of an array of pointers (257 b), and for the same
+            // reason: a copy that died with the call would leave C a dangling pointer.
+            if Assigned(FRecRun) and (NRun <= High(RunBuf)) and
+               FRecRun(ACtx, XferInt[SlotI], RunN, RunW) and (RunN > 1) then
+            begin
+              RunP := W8Buffer(XferInt[SlotI], PtrUInt(RunN) * RunW, 1);
+              if RunP <> nil then
+              begin
+                for rk := 0 to RunN - 1 do
+                begin
+                  EP := FRecBytes(ACtx, XferInt[SlotI] + rk, EAvail);
+                  if (EP = nil) or (EAvail < RunW) then begin RunP := nil; Break; end;
+                  Move(EP^, (RunP + PtrUInt(rk) * RunW)^, RunW);
+                end;
+              end;
+              if RunP <> nil then
+              begin
+                P := RunP;
+                Avail := PtrUInt(RunN) * RunW;
+                RunBuf[NRun] := RunP; RunVM[NRun] := XferInt[SlotI];
+                RunCnt[NRun] := RunN; RunStride[NRun] := RunW;
+                Inc(NRun);
+              end;
+            end;
             PPointer(Vals[i])^ := P;
             // ⭐ ...and its POINTER FIELDS (DIVERGENZE 259 b), listed by the call site as "REC:<T>@o1/o2".
             // In the image they hold the PROGRAM's values - a tagged C address, a VM pointer - and C reads
@@ -1025,6 +1076,21 @@ begin
       RPAddr[RPk]^ := RPAddr[RPk]^ or FGNPTR_TAG;
     end;
   if Assigned(FNoteRegion) then FgnNoteReleases(ACtx, B^.Decl.Symbol, @Vals[0], NArgs, FNoteRegion);
+
+  // ⭐ ...AND WHAT C WROTE INTO THE GATHERED IMAGE OF AN ARRAY OF RECORDS GOES HOME (DIVERGENZE 336).
+  // qsort REORDERS the memory it is given; png_read_image FILLS it. Each element goes back into its own
+  // record's bytes.
+  // ⛔ Only the elements that CHANGED are written back, and that is not an optimisation: the run is the
+  // contiguity ALLOCATION recorded, so it can reach past the elements this argument means, and a record
+  // another thread is writing must not be overwritten with the copy this call took of it.
+  for rk := 0 to NRun - 1 do
+    for r := 0 to RunCnt[rk] - 1 do
+    begin
+      EP := FRecBytes(ACtx, RunVM[rk] + r, EAvail);
+      if (EP = nil) or (EAvail < RunStride[rk]) then Break;
+      RunP := RunBuf[rk] + PtrUInt(r) * RunStride[rk];
+      if not CompareMem(EP, RunP, RunStride[rk]) then Move(RunP^, EP^, RunStride[rk]);
+    end;
 
   // ...and each narrow copy goes back into the program's cells at the program's width, SIGN-EXTENDED
   // where the declared type is signed: -7 written by "%d" is -7 again, not 4294967289 (DIVERGENZE 247).

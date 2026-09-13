@@ -851,6 +851,7 @@ type
     function VMPointerForMachineAddr(ACtx: TExecutionContext; A: PtrUInt): Int64;  // ...e la strada inversa
     function ForeignPtrHome(ACtx: TObject; A: PtrUInt): Int64;   // la stessa, per la FFI
     function ForeignRecBytes(ACtx: TObject; Value: Int64; out ALen: PtrUInt): Pointer;  // the C image of a record (DIVERGENZE 245)
+    function ForeignRecRun(ACtx: TObject; Value: Int64; out ACount: Integer; out AStride: PtrUInt): Boolean;  // ...and how many follow it contiguously (336)
     function ForeignDeepCell(ACtx: TObject; Value: Int64): PInt64;   // the pointed cell, if it holds a pointer (257 B)
     function ForeignCellRun(ACtx: TObject; Value: Int64; out ACells: PtrUInt;
                             out AIsFloat: Boolean): Pointer;   // the 8-byte cells of a narrow value (DIVERGENZE 247)
@@ -929,6 +930,7 @@ type
     procedure RecCacheFlush(C: PRecCache);    // give a batch of free indices back to the region
     procedure RecCacheRefill(C: PRecCache);   // restock a dry cache from the region
     procedure RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);  // M3.1: fill UDT array
+    procedure StampRecordRuns(ArrayId: Integer);  // which of its elements lie at CONSECUTIVE region indices (336)
     procedure DeepCopyArrayRecords(Ctx: TExecutionContext; DestArr, SrcArr: Int64; PackedCounts: Int64);  // value-copy array-of-UDT member
     procedure CheckFloatValid(Ctx: TExecutionContext; RegIndex: Integer; const OpName: string);
     function FormatUsing(const FormatStr: string; Value: Double;
@@ -4999,6 +5001,7 @@ begin
   // move at all. It is safe here because the handle has not been handed back yet, so no other thread
   // can resolve it.
   R^.TypeId := TypeId;
+  R^.RunLen := 1;   // alone until something stamps a run over it (a recycled slot must not keep the old)
   // On a recycled record these are almost always no-ops - the shape matches the record that was
   // retired - and FPC does return immediately when the length already matches. ⛔ BUT "returns
   // immediately" IS STILL A CALL. Profiled 21 Aug 2026 on a New/Delete loop, release build with
@@ -6842,6 +6845,46 @@ begin
   for k := 0 to FArrays[ArrayId].TotalSize - 1 do
     if ArrGetInt(FArrays[ArrayId], k) = 0 then
       ArrSetIntAt(ArrayId, k, AllocSharedRecord(ByteSize, StrC, TypeId));
+  StampRecordRuns(ArrayId);
+end;
+
+procedure TBytecodeVM.StampRecordRuns(ArrayId: Integer);
+// ⭐ WHICH ELEMENTS OF THIS ARRAY OF UDT LIE AT CONSECUTIVE REGION INDICES, written on each record as
+// "how many follow me, myself counted" (TRecordStorage.RunLen). It is what lets a foreign call hand C a
+// CONTIGUOUS image of "@arr(k)" onwards instead of one element (DIVERGENZE 336).
+// ⛔ MEASURED, never assumed: AllocSharedRecord pops indices from a per-thread batch cache, so the
+// handles of one DIM are consecutive WITHIN a batch and start over at a refill. A long array is
+// therefore several runs, and stamping TotalSize on the first would promise C elements that are not
+// contiguous - the one mistake this whole mechanism must not make.
+var
+  k, n, Idx: Integer;
+  H: Int64;
+  R: PRecordStorage;
+  Sz: Integer;
+begin
+  if (ArrayId < 0) or (ArrayId > High(FArrays)) then Exit;
+  k := 0;
+  while k < FArrays[ArrayId].TotalSize do
+  begin
+    H := ArrGetInt(FArrays[ArrayId], k);
+    if (H and SHARED_REC_FLAG) = 0 then begin Inc(k); Continue; end;
+    Idx := Integer(H and SHARED_REC_MASK);
+    if (Idx < 0) or (Idx >= FSharedRecordCount) or (FSharedRecords[Idx] = nil) then begin Inc(k); Continue; end;
+    Sz := Length(FSharedRecords[Idx]^.Bytes);
+    // how far the run reaches: consecutive INDEX, same image size, and still this array's elements
+    n := 1;
+    while (k + n < FArrays[ArrayId].TotalSize) and
+          (ArrGetInt(FArrays[ArrayId], k + n) = H + n) and
+          (Idx + n < FSharedRecordCount) and (FSharedRecords[Idx + n] <> nil) and
+          (Length(FSharedRecords[Idx + n]^.Bytes) = Sz) do
+      Inc(n);
+    for Idx := 0 to n - 1 do
+    begin
+      R := FSharedRecords[Integer((H + Idx) and SHARED_REC_MASK)];
+      if R <> nil then R^.RunLen := n - Idx;
+    end;
+    Inc(k, n);
+  end;
 end;
 
 function TBytecodeVM.AllocSharedRecordBlock(N, ByteSize, StrC, TypeId: Integer): Int64;
@@ -6861,6 +6904,7 @@ begin
       New(R);
       R^.TypeId := TypeId;
       R^.BlockLen := 0;
+      R^.RunLen := N - i;   // ...and every one carries how much of the block still follows it
       SetLength(R^.Bytes, ByteSize);
       SetLength(R^.StringData, StrC);
       if FSharedRecordCount >= Length(FSharedRecords) then
@@ -6906,6 +6950,7 @@ begin
       T.PtrHome := @ForeignPtrHome;
       T.NoteRegion := @ForeignNoteRegion;
       T.RecBytes := @ForeignRecBytes;
+      T.RecRun := @ForeignRecRun;    // ...and how many records an "@arr(0)" hands over (DIVERGENZE 336)
       T.CellRun := @ForeignCellRun;
       T.DeepCell := @ForeignDeepCell;
       FForeignTable := T;
@@ -7463,6 +7508,45 @@ begin
   Result := @R^.Bytes[Ofs];
 end;
 
+function TBytecodeVM.ForeignRecRun(ACtx: TObject; Value: Int64; out ACount: Integer;
+  out AStride: PtrUInt): Boolean;
+// ⭐ HOW MANY RECORDS THE ARGUMENT "@arr(k)" HANDS OVER (DIVERGENZE 336), and how wide each image is.
+// A C routine that takes an ARRAY OF STRUCTS - png_set_PLTE, qsort, writev - is given ONE pointer and a
+// COUNT, and walks the memory itself. Here every record owns its own Bytes, so the images are not
+// contiguous and C read exactly one element and then garbage. This answers the length of the
+// CONSECUTIVE run the handle starts, so the marshaller can gather it into one image.
+// ⛔ The run is what ALLOCATION recorded (RunLen), never what the values look like: two unrelated
+// records of the same type sitting side by side in the region are not an array, and promising C that
+// they are would hand it memory the argument does not name.
+var
+  Ctx: TExecutionContext;
+  R: PRecordStorage;
+  Idx, i: Integer;
+begin
+  Result := False; ACount := 0; AStride := 0;
+  Ctx := TExecutionContext(ACtx);
+  if (Ctx = nil) or (Value <= 0) or ((Value and FGNPTR_TAG) <> 0) then Exit;
+  if (Value and SHARED_REC_FLAG) = 0 then Exit;   // per-context records are never an array of UDT
+  Idx := Integer(Value and SHARED_REC_MASK);
+  if (Idx < 0) or (Idx >= FSharedRecordCount) then Exit;
+  R := FSharedRecords[Idx];
+  if (R = nil) or (Length(R^.Bytes) = 0) then Exit;
+  AStride := PtrUInt(Length(R^.Bytes));
+  ACount := R^.RunLen;
+  if ACount < 1 then ACount := 1;
+  if (ACount = 1) and (R^.BlockLen > 1) then ACount := R^.BlockLen;   // a Callocate block, first record
+  // ...and the promise is re-checked against the region before it is made: a record that has since been
+  // freed, or whose image has a different width, ends the run here.
+  for i := 1 to ACount - 1 do
+    if (Idx + i >= FSharedRecordCount) or (FSharedRecords[Idx + i] = nil) or
+       (PtrUInt(Length(FSharedRecords[Idx + i]^.Bytes)) <> AStride) then
+    begin
+      ACount := i;
+      Break;
+    end;
+  Result := ACount > 1;
+end;
+
 function TBytecodeVM.ForeignDeepCell(ACtx: TObject; Value: Int64): PInt64;
 // ⭐ THE SECOND LEVEL (DIVERGENZE 257, option B). Value is a cell of an array of pointers handed to C -
 // libffi's "values(0) = @s". When it points at a program cell whose content is itself a POINTER (s is a
@@ -7613,6 +7697,7 @@ begin
         New(Dst);
         Dst^.TypeId := TypeId;
         Dst^.BlockLen := 0;
+        Dst^.RunLen := 1;
         SetLength(Dst^.Bytes, ByteSize);
         SetLength(Dst^.StringData, StrC);
         if FSharedRecordCount >= Length(FSharedRecords) then
@@ -7622,6 +7707,9 @@ begin
         Inc(FSharedRecordCount);
       end;
       FSharedRecords[OldIdx]^.BlockLen := NewN;
+      // ...and the block is LONGER now, so every record's "how much of it follows me" moved with it.
+      for i := 0 to NewN - 1 do
+        FSharedRecords[OldIdx + i]^.RunLen := NewN - i;
       Exit(OldHandle);
     end;
   finally

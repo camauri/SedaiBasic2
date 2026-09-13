@@ -88,6 +88,13 @@ type
     BlockLen: Integer;        // records in the CONSECUTIVE block this one starts (1 for a lone record).
                               //   Only the FIRST record of a block carries it, and only a block
                               //   allocation sets it: it is what lets Reallocate know how much to keep.
+    // ⭐ HOW MANY RECORDS FOLLOW THIS ONE AT CONSECUTIVE INDICES, this one counted (0/1 = alone).
+    // Every record owns its OWN Bytes, so an array of UDT is NOT contiguous in memory - and C, handed
+    // "@arr(0)", saw exactly ONE element. This is what lets the marshaller gather the run into one
+    // contiguous image and scatter it back (DIVERGENZE 336). ⛔ It is not BlockLen: that one is the
+    // block's LENGTH and only its first record carries it, while this is a count from HERE, carried by
+    // every record of the run, so "@arr(2)" knows how much of the array still follows it.
+    RunLen: Integer;
     Bytes: array of Byte;     // the record's live C image: numeric fields at their true offsets
     StringData: array of string;
   end;

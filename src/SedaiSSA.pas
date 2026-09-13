@@ -418,6 +418,7 @@ type
                                          // address); reads/writes auto-dereference, like a BYREF-return param.
     FRawCollectChanged: Boolean;         // CollectRawPtrVars fixpoint: a new raw var was discovered this pass
     FRawUDTPtrs: TStringList;            // "T PTR" vars holding a RAW address (a UDT laid over bytes) -> T
+    FRawUDTScoped: TStringList;          // ...the same fact WITH A SCOPE: "PROC|NAME=T" ('' = module). DIVERGENZE 333.
     // WHY a pointer is raw, for the one case where it matters: it is "@x" of a raw-backed @-taken
     // SCALAR, so it addresses a VARIABLE's slot rather than owning bytes of its own.
     FRawFromAddrOf: TStringList;
@@ -1605,6 +1606,7 @@ type
     function ByrefRetCallName(Node: TASTNode): string;   // call to a BYREF-returning FUNCTION? -> its resolved label
     function EmitByrefRetAddress(Node: TASTNode): TSSAValue;   // ...lowered to the ADDRESS it returns
     function RawUDTPtrType(const Name: string): string;   // "T PTR" holding a RAW address -> T
+    function AddRawUDTPtr(const ScopeU, NameU, TypeU: string): Boolean;   // ...file it, flat AND scoped (333)
     function FoldIntNode(Node: TASTNode; out Val: Int64): Boolean;        // literal integer arithmetic, no side effects
     function UDTFieldArrayShape(UDTIdx, FieldIdx: Integer; out Count, ElemBytes: Int64;
                                 AllowRecordElems: Boolean = False): Boolean;
@@ -1963,6 +1965,8 @@ begin
   FRawFromAddrOf.CaseSensitive := False;
   FRawUDTPtrs := TIndexedStringList.Create;
   FRawUDTPtrs.CaseSensitive := False;
+  FRawUDTScoped := TIndexedStringList.Create;
+  FRawUDTScoped.CaseSensitive := False;
   FVarPtrQuals := TIndexedStringList.Create;
   FVarPtrQuals.CaseSensitive := False;
   FRawPtrVars := TIndexedStringList.Create;
@@ -2142,6 +2146,7 @@ begin
   FConstStrBytes.Free;
   FRawFromAddrOf.Free;
   FRawUDTPtrs.Free;
+  FRawUDTScoped.Free;
   FVarPtrQuals.Free;
   FWStringVars.Free;
   FRedimMultiArrays.Free;
@@ -26333,10 +26338,48 @@ end;
 
 function TSSAGenerator.RawUDTPtrType(const Name: string): string;
 // The pointee UDT of a "T PTR" variable that holds a RAW ADDRESS rather than a record handle, or ''.
+//
+// ⛔⛔ AND IT IS A QUESTION ABOUT A SCOPE, not about a NAME (DIVERGENZE 333). This registry used to be
+// flat, and the note beside it DECLARED that - "a same-named pointer elsewhere inherits the type" -
+// which is harmless while the two pointers live in the same domain. For a CALLBACK they do not: its
+// local names C's own memory, and a module variable of the same name names a record this compiler owns,
+// so the module one was read at C offsets and died on "Invalid record handle". Same shape, same cure
+// and same veto as IsRawPtrNameU: ask the scope being walked, and a procedure that DECLARES the name
+// itself is never talking about another procedure's variable.
+// ⭐ The flat list stays: the fixpoint propagates through it, and it is the union of these by
+// construction - every writer files both.
+var
+  NameU, Scope: string;
 begin
   Result := '';
   if FRawUDTPtrs = nil then Exit;
-  Result := UpperFast(FRawUDTPtrs.Values[UpperFast(Name)]);
+  NameU := UpperFast(Name);
+  if FRawUDTScoped = nil then Exit(UpperFast(FRawUDTPtrs.Values[NameU]));
+  if FRawScanning then Scope := FRawScanProc else Scope := FCurrentProcName;
+  Result := UpperFast(FRawUDTScoped.Values[Scope + '|' + NameU]);
+  if (Result <> '') or (Scope = '') then Exit;
+  if (not FRawScanning) and (FCurrentProcDeclNames <> nil) and
+     (FCurrentProcDeclNames.IndexOf(NameU) >= 0) then
+  begin
+    if (GetEnvironmentVariable('RAWPTRDIAG') <> '') and (FRawUDTPtrs.IndexOfName(NameU) >= 0) then
+      WriteLn(ErrOutput, 'RAWPTR udt veto [', Scope, '] ', NameU, '  (flat says raw UDT, this proc declares it)');
+    Exit;
+  end;
+  Result := UpperFast(FRawUDTScoped.Values['|' + NameU]);   // a SHARED the procedure only reads
+end;
+
+function TSSAGenerator.AddRawUDTPtr(const ScopeU, NameU, TypeU: string): Boolean;
+// File "this T PTR is laid over bytes" in BOTH registries - the flat one the fixpoint walks and the
+// scoped one every reader asks. True when the scoped entry is new, which is what a caller's diagnostic
+// line and FRawCollectChanged hang on.
+begin
+  Result := False;
+  if (NameU = '') or (TypeU = '') then Exit;
+  if FRawUDTPtrs.IndexOfName(NameU) < 0 then FRawUDTPtrs.Add(NameU + '=' + TypeU);
+  if FRawUDTScoped.IndexOfName(ScopeU + '|' + NameU) >= 0 then Exit;
+  FRawUDTScoped.Add(ScopeU + '|' + NameU + '=' + TypeU);
+  FRawCollectChanged := True;
+  Result := True;
 end;
 
 function TSSAGenerator.FoldIntNode(Node: TASTNode; out Val: Int64): Boolean;
@@ -26886,10 +26929,11 @@ function TSSAGenerator.ResolveRawUDTBase(ObjNode: TASTNode; out TypeName: string
 // indexed write fell through to the managed record path and faulted on a byte offset read as a handle.
 // Only the SQUARE-bracket spelling qualifies: "p(i)" on a pointer is not FreeBASIC's element access.
 var
-  OuterName: string;
+  OuterName, CastT: string;
   OuterIdx, MemIdx, k: Integer;
   OuterOfs: TInt64Array;
   OuterSize: Int64;
+  CastNode: TASTNode;
 begin
   Result := False;
   TypeName := ''; UDTIdx := -1; TotalSize := 0; BaseNode := nil; IdxNode := nil; ChainNode := nil;
@@ -26966,6 +27010,46 @@ begin
         (ObjNode.NodeType in [antParentheses, antDeref]) do
     ObjNode := ObjNode.GetChild(0);
   if ObjNode = nil then Exit;
+  // ⭐⭐ "Cast(T Ptr, p)->field" - THE CAST APPLIED IN PLACE, with no variable to carry the mark.
+  // It is how every C callback is written ("((mystruct*)data)->field"), and it is the one spelling this
+  // resolver could not see: it reads a NAME out of the object and looks it up in FRawUDTPtrs, so the
+  // same code written through a named local worked and written inline died on "Invalid record handle".
+  // ⛔ The type comes from the CAST (there is no pointer variable to ask) and the RAWNESS from what it
+  // wraps - asked with RawPtrExprName, the same predicate the marking rule uses, so a cast over a
+  // MANAGED record pointer keeps the managed path instead of being read as bytes.
+  CastNode := nil;
+  if ObjNode.NodeType = antCast then
+    CastNode := ObjNode
+  else if (ObjNode.NodeType = antArrayAccess) and (ObjNode.Attributes.Values['BRACKET'] = '1') and
+          (ObjNode.ChildCount >= 2) and (ObjNode.GetChild(0) <> nil) and
+          (ObjNode.GetChild(0).NodeType = antCast) then
+  begin
+    CastNode := ObjNode.GetChild(0);
+    IdxNode := ObjNode.GetChild(1);
+    if (IdxNode <> nil) and (IdxNode.NodeType in [antArgumentList, antExpressionList]) then
+    begin
+      if IdxNode.ChildCount <> 1 then begin IdxNode := nil; CastNode := nil; end
+      else IdxNode := IdxNode.GetChild(0);
+    end;
+    if IdxNode = nil then CastNode := nil;
+  end;
+  if CastNode <> nil then
+  begin
+    CastT := CastNode.ValueUpper;
+    if (Length(CastT) > 4) and (Copy(CastT, Length(CastT) - 3, 4) = ' PTR') and
+       (RawPtrExprName(CastNode) <> '') then
+    begin
+      TypeName := UpperFast(CanonicalType(Trim(Copy(CastT, 1, Length(CastT) - 4))));
+      UDTIdx := FindUDT(TypeName);
+      if (UDTIdx >= 0) and (not UDTBlockIsManaged(TypeName)) and
+         UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) and (TotalSize > 0) then
+      begin
+        BaseNode := CastNode;
+        Exit(True);
+      end;
+    end;
+    TypeName := ''; UDTIdx := -1; TotalSize := 0; IdxNode := nil; SetLength(Offsets, 0);
+  end;
   if ObjNode.NodeType = antIdentifier then
     BaseNode := ObjNode
   else if (ObjNode.NodeType = antArrayAccess) and (ObjNode.Attributes.Values['BRACKET'] = '1') and
@@ -43929,10 +44013,8 @@ begin
     Pointee := Trim(Copy(PT, 1, Length(PT) - 4));
     if (Pointee <> '') and (Pos(' PTR', Pointee) = 0) and (FindUDT(Pointee) >= 0) then
     begin
-      if FRawUDTPtrs.IndexOfName(PN) < 0 then
+      if AddRawUDTPtr(ProcU, PN, UpperFast(CanonicalType(Pointee))) then
       begin
-        FRawUDTPtrs.Add(PN + '=' + UpperFast(CanonicalType(Pointee)));
-        FRawCollectChanged := True;
         if GetEnvironmentVariable('RAWPTRDIAG') <> '' then
           WriteLn(ErrOutput, 'RAWPTR callback param [', ProcU, '] ', PN, ' -> ', Pointee,
                   '   <- C fills this one');
@@ -44094,9 +44176,8 @@ var
           (not TypeHasMemberProc(PointerUDTType(TargetU)))) or
          ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] = '1') and
           (not UDTBlockIsManaged(PointerUDTType(TargetU)))) then
-        if FRawUDTPtrs.IndexOfName(TargetU) < 0 then
+        if AddRawUDTPtr(FRawScanProc, TargetU, PointerUDTType(TargetU)) then
         begin
-          FRawUDTPtrs.Add(TargetU + '=' + PointerUDTType(TargetU));
           // ⛔ RAWPTRDIAG had a HOLE here: this is the busiest raw marking in the unit - every UDT
           // pointer laid over bytes - and it was the one that printed nothing, so "no RAWPTR line"
           // could not be read as "not marked". It cost a wrong diagnosis on 12 Sep 2026.
@@ -44195,10 +44276,8 @@ var
       if PointeeTypeOf(VarToStr(A.Value)) = '' then Continue;   // not a pointer variable
       if PointerUDTType(NU) <> '' then
       begin
-        if FRawUDTPtrs.IndexOfName(NU) < 0 then
+        if AddRawUDTPtr(FRawScanProc, NU, PointerUDTType(NU)) then
         begin
-          FRawUDTPtrs.Add(NU + '=' + PointerUDTType(NU));
-          FRawCollectChanged := True;
           if GetEnvironmentVariable('RAWPTRDIAG') <> '' then
             WriteLn(ErrOutput, 'RAWPTR outarg udt [', CalleeName, '] ', NU, ' -> ', PointerUDTType(NU), ' laid over C memory');
         end;
@@ -44242,11 +44321,8 @@ begin
     // definition - the parser marks it FGNDATA and the SSA binds it to the symbol's address.
     if (Node.Attributes.Values['BYREF'] = '1') and (Node.Attributes.Values['FGNDATA'] <> '') and
        (Node.GetChild(1) <> nil) and (Node.GetChild(1).NodeType = antIdentifier) and
-       (FindUDT(Node.GetChild(1).ValueUpper) >= 0) and (FRawUDTPtrs.IndexOfName(LhsU) < 0) then
-    begin
-      FRawUDTPtrs.Add(LhsU + '=' + UpperFast(CanonicalType(Node.GetChild(1).ValueUpper)));
-      FRawCollectChanged := True;
-    end;
+       (FindUDT(Node.GetChild(1).ValueUpper) >= 0) then
+      AddRawUDTPtr(FRawScanProc, LhsU, UpperFast(CanonicalType(Node.GetChild(1).ValueUpper)));
     if (Node.Attributes.Values['BYREF'] = '1') and (Node.GetChild(1) <> nil) and
        (Node.GetChild(1).NodeType = antIdentifier) and
        (FindUDT(Node.GetChild(1).ValueUpper) >= 0) then
@@ -44259,11 +44335,7 @@ begin
         Rhs := Rhs.GetChild(0).GetChild(0);
         if IsForeignPtrCall(Rhs) or (RawPtrExprName(Rhs) <> '') or IsRawPtrFieldExpr(Rhs) or
            ((Rhs.NodeType = antIdentifier) and (RawUDTPtrType(Rhs.ValueUpper) <> '')) then
-          if FRawUDTPtrs.IndexOfName(LhsU) < 0 then
-          begin
-            FRawUDTPtrs.Add(LhsU + '=' + UpperFast(CanonicalType(Node.GetChild(1).ValueUpper)));
-            FRawCollectChanged := True;
-          end;
+          AddRawUDTPtr(FRawScanProc, LhsU, UpperFast(CanonicalType(Node.GetChild(1).ValueUpper)));
       end;
     end;
   end;
@@ -50455,10 +50527,9 @@ begin
   if (Pointee <> '') and (FindUDT(Pointee) >= 0) and (Pos(' PTR', Pointee) = 0) then
   begin
     PN := ParamNode.ValueUpper;
-    if (PN <> '') and (RawArgUDTType(ArgNode) <> '') and (FRawUDTPtrs.IndexOfName(PN) < 0) then
+    if (PN <> '') and (RawArgUDTType(ArgNode) <> '') and
+       AddRawUDTPtr(CalleeU, PN, UpperFast(CanonicalType(Pointee))) then
     begin
-      FRawUDTPtrs.Add(PN + '=' + UpperFast(CanonicalType(Pointee)));
-      FRawCollectChanged := True;
       if GetEnvironmentVariable('RAWPTRDIAG') <> '' then
         WriteLn(ErrOutput, 'RAWPTR param udt [', CalleeU, '] ', PN, ' -> ', Pointee,
                 '   <- from a raw UDT argument');
@@ -51099,7 +51170,7 @@ begin
   Tst := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaCmpNeInt, Tst, Masked, EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
   EmitInstruction(ssaCopyInt, GetOrAllocateVariable(TstT), Tst, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-  if FRawUDTPtrs.IndexOfName(ElT) < 0 then FRawUDTPtrs.Add(ElT + '=' + TypeName);
+  AddRawUDTPtr('', ElT, TypeName);   // a generated unique name: no scope can collide with it
   if FPointerVars.IndexOfName(ElT) < 0 then FPointerVars.Add(ElT + '=' + TypeName);
   Result := ElT;
 end;
