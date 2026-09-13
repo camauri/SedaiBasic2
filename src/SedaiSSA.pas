@@ -51313,7 +51313,14 @@ begin
     else if ForeignNarrowArg(ArgListNode.GetChild(i), NarrowT) > 0 then
       // "sscanf(s, "%d", @n)": the tail is where C's out-parameters live (DIVERGENZE 247)
       T := 'W' + IntToStr(ForeignNarrowArg(ArgListNode.GetChild(i), NarrowT)) + ':ANY PTR'
-    else if VarArgIsAddress(ArgListNode.GetChild(i)) then
+    // ⭐⭐ ...AND A NESTED CALL THAT RETURNS A POINTER IS A POINTER. The same argument got "ANY PTR"
+    // when it came from a VARIABLE and "INTEGER" when it was written in place -
+    // "g_variant_builder_add(@b, "{sv}", "n", g_variant_new_int32(7))" - so the marshaller never
+    // resolved it to a machine address and C dereferenced the VM's own tagged value. ⛔ It is the
+    // question VarArgIsAddress is FOR ("pointer or number is the one thing the bank cannot answer"),
+    // asked of the shape a C API is most often written in: build the value and pass it, in one line.
+    else if IsForeignPtrCall(ArgListNode.GetChild(i)) or
+            VarArgIsAddress(ArgListNode.GetChild(i)) then
       T := 'ANY PTR'
     else
       case InferExprBank(ArgListNode.GetChild(i)) of
