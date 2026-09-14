@@ -3582,6 +3582,11 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   fills the terminal library's own state (`ttytype` in `ncurses.bi`, for instance). SedaiBasic makes the same
   calls **the first time a library the program opens provides `tgetent`**, once per run, and not at all when
   `TERM` is unset. A program that never opens such a library never triggers them.
+- **A terminfo symbol is found even when the named library is missing.** Every FreeBASIC program on Linux is
+  linked to `libtinfo`, so `Extern ttytype` (in `curses/pdcurses.bi`, whose `pdcurses` library may not be
+  installed) resolves there, already filled. SedaiBasic looks in `libtinfo` after the libraries the program names
+  and before its own process, and initialises terminfo as above when a symbol really comes from it. A C function
+  that `libc` provides — `printf`, `errno` — does not count.
 - **`errno` is 2 when a program starts, on Linux** — as in every FreeBASIC program, where it is what the
   system's dynamic loader leaves behind (it looks for `/etc/ld.so.preload` and does not find it). On a system
   where that file exists, both would start differently. ⚠️ Set by the `sb` command-line runner only, not by

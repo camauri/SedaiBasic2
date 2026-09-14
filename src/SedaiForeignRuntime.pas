@@ -578,6 +578,9 @@ end;
 
 {$IFDEF LINUX}
 var
+  GTinfoTried: Boolean = False;          // libtinfo, looked up the way every fbc program has it linked (ResolveSymbol)
+  GTinfoHandle: TLibHandle = NilHandle;
+  GLibcHandle: TLibHandle = NilHandle;   // ...and libc, to tell libtinfo's own symbols from those it re-exports
   GTermInited: Boolean = False;
   GTermName: AnsiString = '';
   GTermBuf: array[0..2047] of AnsiChar;
@@ -657,6 +660,36 @@ begin
     if i = 0 then H := OpenLib('msvcrt') else H := OpenLib('kernel32');
     if H <> NilHandle then Result := FFISymbol(H, B.Decl.Symbol);
     if Result <> nil then Exit;
+  end;
+  {$ENDIF}
+  {$IFDEF LINUX}
+  // ⭐ ...AND ON LINUX EVERY fbc PROGRAM IS LINKED TO libtinfo (ldd of any fbc executable: libtinfo.so.6, libm, libc),
+  // because its console runtime uses terminfo. So a terminfo symbol is found by an fbc program whatever it names:
+  // curses/pdcurses.bi reads "extern ttytype" from "#inclib pdcurses", a library this machine does not have, and fbc
+  // still finds ttytype - FILLED, by hInit's tgetent. Here it was not found, and the datum read as empty (bi_layout,
+  // 14 Sep 2026). The library is tried after the named ones and before the process, in fbc's link order, and it
+  // is opened WITHOUT OpenLib's side effect: terminfo is initialised only when the symbol is really found THERE
+  // (owner: "only if it uses terminfo") - a program that calls printf with no library never triggers it.
+  if not GTinfoTried then
+  begin
+    GTinfoTried := True;
+    GTinfoHandle := FFILoadLibrary('tinfo');
+    GLibcHandle := FFILoadLibrary('c');
+  end;
+  if GTinfoHandle <> NilHandle then
+  begin
+    Result := FFISymbol(GTinfoHandle, B.Decl.Symbol);
+    // ⛔ dlsym ON A LIBRARY HANDLE ALSO SEARCHES ITS DEPENDENCIES, and libtinfo depends on libc: the first version of
+    // this lookup found EVERY libc symbol "in libtinfo" - __errno_location included - and so initialised terminfo
+    // for any program that reads errno, whose tgetent then changed errno (m955 caught it in one run). A symbol is
+    // libtinfo's only if libc does not answer the same address.
+    if (Result <> nil) and (GLibcHandle <> NilHandle) and (FFISymbol(GLibcHandle, B.Decl.Symbol) = Result) then
+      Result := nil;
+    if Result <> nil then
+    begin
+      InitTerminfoLikeFbc(GTinfoHandle);
+      Exit;
+    end;
   end;
   {$ENDIF}
   Result := FFISelfSymbol(B.Decl.Symbol);   // the process's own symbols, and everything it loaded
