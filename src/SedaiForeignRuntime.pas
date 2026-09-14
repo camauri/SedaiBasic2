@@ -579,6 +579,7 @@ end;
 {$IFDEF LINUX}
 var
   GTinfoTried: Boolean = False;          // libtinfo, looked up the way every fbc program has it linked (ResolveSymbol)
+  GLocaleSet: Boolean = False;           // LC_CTYPE taken from the environment, as fbc's runtime does at start (431)
   GTinfoHandle: TLibHandle = NilHandle;
   GLibcHandle: TLibHandle = NilHandle;   // ...and libc, to tell libtinfo's own symbols from those it re-exports
   GTermInited: Boolean = False;
@@ -620,6 +621,12 @@ begin
 end;
 {$ENDIF}
 
+{$IFDEF LINUX}
+function c_setlocale(ACategory: LongInt; ALocale: PAnsiChar): PAnsiChar; cdecl; external 'c' name 'setlocale';
+const
+  C_LC_CTYPE = 0;                        // glibc
+{$ENDIF}
+
 function TForeignTable.ResolveSymbol(var B: TForeignBinding): Pointer;
 // Where to look, in order: the library the DECLARATION named, then each "#inclib", then the process
 // itself. The last one is what makes a symbol from the host executable or from an already-loaded
@@ -631,6 +638,18 @@ var
 begin
   Result := nil;
   Tried := '';
+  {$IFDEF LINUX}
+  // ⭐ DIVERGENZE 431 - EVERY fbc PROGRAM STARTS WITH LC_CTYPE TAKEN FROM THE ENVIRONMENT, and only that category:
+  // measured under it_IT.UTF-8, setlocale(LC_ALL, 0) answers "LC_CTYPE=it_IT.UTF-8;LC_NUMERIC=C;..." in an fbc program,
+  // so printf and strtod keep the C decimal point while a library that asks the CHARACTER encoding gets the user's.
+  // Here every category stayed "C", and aspell's default encoding answered "none" instead of "UTF-8" (pspell deck).
+  // Done once, before the first C symbol is resolved - no C code of the program can run earlier.
+  if not GLocaleSet then
+  begin
+    GLocaleSet := True;
+    c_setlocale(C_LC_CTYPE, '');
+  end;
+  {$ENDIF}
   // "@DYLIB..." is answered by the runtime itself, "*" calls the address its last argument carries
   // (strato 3): neither is a symbol to look up.
   if (B.Decl.Symbol <> '') and (B.Decl.Symbol[1] in ['@', '*']) then Exit;
@@ -876,6 +895,9 @@ var
   RPOrig, RPTr: array[0..127] of Int64;  // ...its program value, and what C was given
   NRP, RPk, RPo, RPh: Integer;
   RPElems, RPStride, RPe, RPx: Integer;  // ...over every element of a gathered run of records (428)
+  SrSize, SrAlign, SrK: Integer;         // the pointer fields of a struct returned by value (432)
+  SrFields: TForeignStructFields;
+  SrV: Int64;
   RPSig: string;                         // ...and a PROCEDURE field's closure signature (423)
   HomeV: Int64;                          // ...the VM pointer a changed field names, when it is ours
   NBase: PtrUInt;                        // the address C was actually given for a narrow copy
@@ -1462,6 +1484,28 @@ begin
             PInt64(OutLoc[i])^ := Int64(RetAddr) or FGNPTR_TAG;
             if Assigned(FNoteRegion) then FNoteRegion(ACtx, RetAddr, 0, True, False);   // DIVERGENZE 239
           end;
+        end;
+      end;
+
+  // ⭐ DIVERGENZE 432 - ...AND THE POINTER FIELDS OF A STRUCT RETURNED BY VALUE. The callee wrote machine addresses into
+  // the program's record, and they stayed bare: aspell_string_pair_enumeration_next answers {first, second} and
+  // "*pr.first" was refused as a pointer of the VM's domain. Each pointer field is given the treatment a returned
+  // pointer gets: home if it names the program's own memory, else C's mark with its region noted.
+  if (B^.RetKind = fkStruct) and (SretBuf <> nil) and Assigned(FPtrHome) and
+     ForeignStructSpec(B^.Decl.RetTypeName, SrSize, SrAlign, SrFields) then
+    for SrK := 0 to High(SrFields) do
+      if (SrFields[SrK].Kind = fkPointer) and (SrFields[SrK].Offset >= 0) and
+         (PtrUInt(SrFields[SrK].Offset) + 8 <= SretAvail) then
+      begin
+        SrV := PInt64(PByte(SretBuf) + SrFields[SrK].Offset)^;
+        if (SrV = 0) or ((SrV and FGNPTR_TAG) <> 0) then Continue;
+        ResInt := FPtrHome(ACtx, PtrUInt(SrV));
+        if ResInt <> 0 then
+          PInt64(PByte(SretBuf) + SrFields[SrK].Offset)^ := ResInt
+        else
+        begin
+          PInt64(PByte(SretBuf) + SrFields[SrK].Offset)^ := SrV or FGNPTR_TAG;
+          if Assigned(FNoteRegion) then FNoteRegion(ACtx, PtrUInt(SrV), 0, True, False);
         end;
       end;
 

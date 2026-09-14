@@ -13896,7 +13896,8 @@ begin
   // is registered ONCE per name, so objsafe's two spellings of one symbol cannot bind it twice.
   if HadConstQual then
   begin
-    if Understood and (not HasInit) and (not HasParens) and (TypeName <> '') and (FExternCDepth > 0) and
+    if Understood and (not HasInit) and (not HasParens) and (TypeName <> '') and
+       ((FExternCDepth > 0) or (AliasSym <> '')) and
        (Flags = '') and (FExternShapes.IndexOfName(Nm + '#CONSTDATA') < 0) and
        not ModuleDeclaresNameElsewhere(Nm, True) then
     begin
@@ -13912,7 +13913,10 @@ begin
   // case is new - every other check and the shape stay exactly as they were for it (skipped).
   if PtrDepth > 0 then
   begin
-    if (not HasInit) and (not HasParens) and (TypeName <> '') and (FExternCDepth > 0) and
+    // ⭐ DIVERGENZE 433 - ...or with an ALIAS, wherever it stands: crt/linux/stdio.bi declares "extern stderr alias
+    // "stderr" as FILE ptr" ABOVE its `extern "c"` block, and the stream stayed a zero variable of the program -
+    // "fprintf(stderr, ...)" died with an access violation. An alias is the exact linker symbol, as for a Declare.
+    if (not HasInit) and (not HasParens) and (TypeName <> '') and ((FExternCDepth > 0) or (AliasSym <> '')) and
        (Flags = '') and not ModuleDeclaresNameElsewhere(Nm, True) then
     begin
       Why := TypeName;
@@ -13971,7 +13975,8 @@ begin
   // ⚠️ Only where the module does not define the name itself (then it is ours, as for the array above).
   // ⚠️ The SSA binds it only if the program USES it: a header declaring data nobody reads must not make
   // the program look the symbol up at all - fbc fails only for a REFERENCED missing symbol.
-  else if (not HasParens) and (TypeName <> '') and (FExternCDepth > 0) and (Flags = '') and
+  // ...and with an ALIAS outside such a block too (DIVERGENZE 433, the rule a bodiless Declare already follows).
+  else if (not HasParens) and (TypeName <> '') and ((FExternCDepth > 0) or (AliasSym <> '')) and (Flags = '') and
           not ModuleDeclaresNameElsewhere(Nm, True) then
     AddCLibraryData(TypeName);
 end;

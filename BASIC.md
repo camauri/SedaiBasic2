@@ -3629,6 +3629,24 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   to the procedure.** `xmlMemGet(@freefn, @mallocfn, ...)` fills variables of procedure types with C functions, and
   `mallocfn(16)` calls one; it used to end the program silently. `xmlSchemaGetParserErrors(ctxt, @e, @w, @c)` after
   setting `@onerr` answers `e = @onerr` true, as in FreeBASIC.
+- **`stdin`, `stdout` and `stderr` from `crt.bi` are C's streams.** `fprintf(stderr, ...)` and `fputs(text, stdout)`
+  used to end with an access violation because the three variables read 0. More generally, an `Extern` variable
+  with an `Alias` names that C symbol even outside an `Extern "C"` block.
+- ⚠️ **A callback that a C library calls from its own thread must not run while the program runs BASIC code.** An
+  audio callback installed with `Pa_OpenDefaultStream` works when the program waits inside a C function (`Pa_Sleep`),
+  but if the program runs a loop of its own at the same time, the program can end with an error or see its
+  variables overwritten. FreeBASIC runs both at once.
+- ⚠️ **Output order in a pipe.** When standard output and standard error go to the same pipe or file, lines written
+  with `PRINT` and lines written by C functions (`printf`, `fputs`, a library's messages on `stderr`) can come out in a
+  different order than under FreeBASIC: `PRINT`'s output is flushed later. The text is the same, and on a terminal the
+  order is the same.
+- **A program that calls C starts with the character locale of its environment**, as every FreeBASIC program does:
+  `setlocale(LC_CTYPE, 0)` answers the user's locale (for example `it_IT.UTF-8`) and a library that asks for the
+  character encoding gets it (aspell's default encoding is `UTF-8`, not `none`). Only `LC_CTYPE` is set: `printf` and
+  `strtod` keep the decimal point.
+- **The pointer fields of a struct returned by value can be dereferenced.** `Dim pr As AspellStringPair =
+  aspell_string_pair_enumeration_next(e)` then `*pr.first` reads the text; it used to stop with "Null or invalid
+  pointer dereference".
 - **A procedure pointer that a C function returns compares equal to the procedure.** `PQsetNoticeProcessor(conn,
   @other, 0)` answers the processor it replaces; when that was `@onnotice`, the answer is `= @onnotice`, as in
   FreeBASIC. A C function it answers can be passed back to C.
