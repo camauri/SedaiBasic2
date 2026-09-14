@@ -1625,6 +1625,8 @@ type
     function RawChainNameIsArray(const NameU: string): Boolean;
     function RawObjectPtrFieldMulti(MemberNode: TASTNode): string;
     function RawNestedRecordAddrOf(MemberNode: TASTNode; const TargetU: string): Boolean;
+    function RawUDTArithType(Node: TASTNode): string;
+    function TryEmitRawUDTPtrArith(Node: TASTNode; out V: TSSAValue): Boolean;
     function TryEmitRawChainRead(Node: TASTNode; out Value: TSSAValue): Boolean;
     function TryEmitRawChainStore(Node, ExprNode: TASTNode): Boolean;
     function ResolveRawUDTBase(ObjNode: TASTNode; out TypeName: string; out UDTIdx: Integer;
@@ -5038,6 +5040,12 @@ begin
         EmitIsCheck(Node.GetChild(0), VarToStr(Node.GetChild(1).Value), Result);
         Exit;
       end;
+      // ...a RECORD pointer over raw memory steps in records (DIVERGENZE 381). Asked first: the scalar gate
+      // below does not see it, and the numeric fall-through steps bytes.
+      if (Node.ChildCount >= 2) and Assigned(Node.Token) and
+         ((Node.Token.TokenType = ttOpAdd) or (Node.Token.TokenType = ttOpSub)) and
+         TryEmitRawUDTPtrArith(Node, Result) then
+        Exit;
       // FreeBASIC raw pointer arithmetic: "p + n" / "p - n" (and "n + p") where p is a raw pointer.
       // The index is scaled by SizeOf(pointee) — the result is a raw byte pointer. (Managed pointers
       // keep element-unit arithmetic via the normal numeric lowering below.)
@@ -26906,6 +26914,84 @@ begin
   end;
 end;
 
+function TSSAGenerator.RawUDTArithType(Node: TASTNode): string;
+// Is this expression a RECORD POINTER OVER RAW MEMORY - a name so marked, or "p + n" / "p - n" / "n + p" on
+// one - and of what record type? '' otherwise, and '' for "p - q", which is a COUNT and not a pointer.
+// DIVERGENZE 381: the scalar raw pointers had this question (RawPtrExprName); the record pointers, filed
+// in their own registry, did not.
+begin
+  Result := '';
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if Node.NodeType = antIdentifier then Exit(RawUDTPtrType(Node.ValueUpper));
+  // "@p[k]": the address of an element, as raw as p and of the same type (EmitArrayElementAddress scales it).
+  if (Node.NodeType = antProcAddress) and (Node.ChildCount >= 1) and (Node.GetChild(0) <> nil) and
+     (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
+     (Node.GetChild(0).Attributes.Values['BRACKET'] = '1') and (Node.GetChild(0).GetChild(0) <> nil) and
+     (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) then
+    Exit(RawUDTPtrType(Node.GetChild(0).GetChild(0).ValueUpper));
+  if (Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) and Assigned(Node.Token) and
+     ((Node.Token.TokenType = ttOpAdd) or (Node.Token.TokenType = ttOpSub)) then
+  begin
+    Result := RawUDTArithType(Node.GetChild(0));
+    if (Result <> '') and (Node.Token.TokenType = ttOpSub) and (RawUDTArithType(Node.GetChild(1)) <> '') then
+      Exit('');
+    if (Result = '') and (Node.Token.TokenType = ttOpAdd) then
+      Result := RawUDTArithType(Node.GetChild(1));
+  end;
+end;
+
+function TSSAGenerator.TryEmitRawUDTPtrArith(Node: TASTNode; out V: TSSAValue): Boolean;
+// ⭐ "p + n", "p - n", "n + p" and "p - q" on RECORD POINTERS OVER RAW MEMORY, in RECORDS. They stepped one
+// BYTE: "v + 2" on a struct array calloc'd by C was v + 2, "w += 1" moved a byte, and fbc steps a record
+// (DIVERGENZE 381). The stride is the record's C size - the layout every field read of it already uses -
+// and a difference of two such pointers divides by it, as fbc's does.
+var
+  LT, RT, T: string;
+  U: Integer;
+  Ofs: TInt64Array;
+  Sz: Int64;
+  PtrSide, IntSide: TASTNode;
+  A, B, SzV, Tmp: TSSAValue;
+begin
+  Result := False;
+  V := MakeSSAValue(svkNone);
+  LT := RawUDTArithType(Node.GetChild(0));
+  RT := RawUDTArithType(Node.GetChild(1));
+  if (LT = '') and (RT = '') then Exit;
+  if (LT <> '') and (RT <> '') and (Node.Token.TokenType = ttOpAdd) then Exit;   // p + q means nothing
+  if (LT = '') and (Node.Token.TokenType = ttOpSub) then Exit;                    // n - p neither
+  if LT <> '' then T := LT else T := RT;
+  U := FindUDT(T);
+  if (U < 0) or (not UDTCLayoutRaw(U, Ofs, Sz)) or (Sz <= 0) then Exit;
+  SzV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaLoadConstInt, SzV, MakeSSAConstInt(Sz), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  if (LT <> '') and (RT <> '') then
+  begin
+    ProcessExpression(Node.GetChild(0), A);
+    ProcessExpression(Node.GetChild(1), B);
+    Tmp := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaSubInt, Tmp, EnsureIntRegister(A), EnsureIntRegister(B), MakeSSAValue(svkNone));
+    V := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaDivInt, V, Tmp, SzV, MakeSSAValue(svkNone));
+  end
+  else
+  begin
+    if LT <> '' then begin PtrSide := Node.GetChild(0); IntSide := Node.GetChild(1); end
+    else begin PtrSide := Node.GetChild(1); IntSide := Node.GetChild(0); end;
+    ProcessExpression(PtrSide, A);
+    ProcessExpression(IntSide, B);
+    Tmp := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, Tmp, EnsureIntRegister(B), SzV, MakeSSAValue(svkNone));
+    V := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    if Node.Token.TokenType = ttOpSub then
+      EmitInstruction(ssaSubInt, V, EnsureIntRegister(A), Tmp, MakeSSAValue(svkNone))
+    else
+      EmitInstruction(ssaAddInt, V, EnsureIntRegister(A), Tmp, MakeSSAValue(svkNone));
+  end;
+  Result := True;
+end;
+
 function TSSAGenerator.RawNestedRecordAddrOf(MemberNode: TASTNode; const TargetU: string): Boolean;
 // Is "@MemberNode" the address of a record nested BY VALUE inside raw memory, of the type TargetU points
 // at? ResolveRawUDTBase answers the member as an object - a record at a fixed byte offset - and emits
@@ -27310,6 +27396,22 @@ begin
         (ObjNode.NodeType in [antParentheses, antDeref]) do
     ObjNode := ObjNode.GetChild(0);
   if ObjNode = nil then Exit;
+  // ⭐ "(p - 1)->field" and "(@v[k])->field": an OBJECT that is arithmetic on a record pointer over raw
+  // memory, or the address of one of its elements. Both evaluate to a scaled address (TryEmitRawUDTPtrArith,
+  // EmitArrayElementAddress), so the expression itself is the base. Asked of a NAME only, they fell to the
+  // managed record path (DIVERGENZE 381).
+  if (ObjNode.NodeType in [antBinaryOp, antProcAddress]) and (RawUDTArithType(ObjNode) <> '') then
+  begin
+    TypeName := UpperFast(CanonicalType(RawUDTArithType(ObjNode)));
+    UDTIdx := FindUDT(TypeName);
+    if (UDTIdx >= 0) and (not UDTBlockIsManaged(TypeName)) and
+       UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) and (TotalSize > 0) then
+    begin
+      BaseNode := ObjNode;
+      Exit(True);
+    end;
+    TypeName := ''; UDTIdx := -1; TotalSize := 0; SetLength(Offsets, 0);
+  end;
   // ⭐⭐ "p->r.field" - A FIELD OF A RECORD MEMBER HELD BY VALUE, over raw memory. The object of ".field"
   // is itself a member access, and every rung of this resolver wants a name, a cast or a call there, so
   // it declined and the managed record path took the byte address for a table index: "Invalid
@@ -44667,6 +44769,8 @@ var
          ((RhsU <> nil) and (RhsU.NodeType = antIdentifier) and (RawUDTPtrType(VarToStr(RhsU.Value)) <> '')) or
          IsRawPtrFieldExpr(Rhs) or IsImageCreateExpr(Rhs) or IsForeignPtrCall(Rhs) or
          IsArrayDescPtrCall(Rhs) or
+         // ⭐ "two = v + 2" on a record pointer over raw memory is one too (DIVERGENZE 381).
+         ((Rhs.NodeType = antBinaryOp) and SameText(RawUDTArithType(Rhs), PointerUDTType(TargetU))) or
          // ⭐ "ol = @slot->outline": the ADDRESS of a record nested by value inside raw memory is an address
          // into those bytes, and FreeType's own examples write exactly this before walking the points. Left
          // unmarked, "ol->n_points" still answered (the run-time tag test of 259 covers a plain field) and
@@ -45968,6 +46072,8 @@ var
   MArrHandle, MArrIdx: TSSAValue;
   MArrBank: TSSARegisterType;
   ElemSz: Int64;
+  RawUDTOfs381: TInt64Array;   // DIVERGENZE 381: the C layout of a raw UDT pointer's record
+  RawUDTSize381: Int64;
 begin
   // ⭐ "@UDT.a(i)" / "@x.a(i)" where a is a STATIC ARRAY member: the element belongs to the backing
   // global array, so the whole ladder below works once the reference names it. Every rung here is
@@ -46113,6 +46219,30 @@ begin
     // @p[i] where p is a POINTER (a raw Allocate'd buffer, or a managed pointer) rather than a declared
     // array: FreeBASIC "@p[i]" ≡ "p + i", the very address a "p[i]" deref computes (raw pointers scale the
     // index by SizeOf(pointee); managed ones do not). Return that address directly instead of failing.
+    // ⭐ ...AND A UDT POINTER OVER RAW MEMORY steps by the RECORD's C size. It is filed in the UDT
+    // registry, not among the scalar raw pointers, so the rule below took it for a managed pointer and did
+    // not scale: "@v[2]" on a struct array calloc'd by C answered v + 2 BYTES, and a callee reading it got
+    // the middle of the first record (DIVERGENZE 381). The record's layout is the one the field reads use.
+    if (RawUDTPtrType(ArrName) <> '') and
+       (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) and
+       (FindUDT(RawUDTPtrType(ArrName)) >= 0) and
+       UDTCLayoutRaw(FindUDT(RawUDTPtrType(ArrName)), RawUDTOfs381, RawUDTSize381) and (RawUDTSize381 > 0) then
+    begin
+      AddrNd := TASTNode.CreateWithValue(antIdentifier, UpperFast(ArrName), Node.GetChild(0).Token);
+      try
+        ProcessExpression(AddrNd, BaseVal);
+      finally
+        AddrNd.Free;
+      end;
+      ProcessExpression(Node.GetChild(1).GetChild(0), TempVal);
+      StrideVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, StrideVal, MakeSSAConstInt(RawUDTSize381), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      MulResult := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaMulInt, MulResult, EnsureIntRegister(TempVal), StrideVal, MakeSSAValue(svkNone));
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaAddInt, Result, EnsureIntRegister(BaseVal), MulResult, MakeSSAValue(svkNone));
+      Exit;
+    end;
     if (IsRawPtr(ArrName) or (ManagedPtrPointee(ArrName) <> '')) and
        (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
     begin
@@ -51119,6 +51249,13 @@ begin
   while (ArgNode.ChildCount >= 1) and (ArgNode.NodeType in [antParentheses, antCast]) do
     ArgNode := ArgNode.GetChild(0);
   if ArgNode.NodeType = antIdentifier then Exit(RawUDTPtrType(ArgNode.ValueUpper));
+  if ArgNode.NodeType = antBinaryOp then Exit(RawUDTArithType(ArgNode));   // "v + 3" (DIVERGENZE 381)
+  // ⭐ ...and the address of an ELEMENT of one, "@v[k]": as raw as v, of the same type (DIVERGENZE 381).
+  if (ArgNode.NodeType = antProcAddress) and (ArgNode.ChildCount >= 1) and (ArgNode.GetChild(0) <> nil) and
+     (ArgNode.GetChild(0).NodeType = antArrayAccess) and (ArgNode.GetChild(0).ChildCount >= 1) and
+     (ArgNode.GetChild(0).Attributes.Values['BRACKET'] = '1') and
+     (ArgNode.GetChild(0).GetChild(0) <> nil) and (ArgNode.GetChild(0).GetChild(0).NodeType = antIdentifier) then
+    Exit(RawUDTPtrType(ArgNode.GetChild(0).GetChild(0).ValueUpper));
   if IsArrayDescPtrCall(ArgNode) or IsForeignPtrCall(ArgNode) or IsImageCreateExpr(ArgNode) then
     Exit('*');     // raw, and the PARAMETER's declared pointee is the type to file
 end;
