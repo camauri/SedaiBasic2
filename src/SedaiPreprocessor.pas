@@ -4229,7 +4229,11 @@ begin
   begin
     // ⛔ SETTE CARATTERI, non tutta la riga: "Copy(UpperFast(L), 1, 7)" maiuscolizzava l'INTERA riga
     // - una allocazione per ogni "declare function" di ogni header - per guardarne sette.
-    if (not SameText(Copy(L, 1, 7), 'DECLARE')) then Inc(GPPSymProcDepth);
+    // ⛔ DIVERGENZE 402 - ...and neither does a FIELD. gd.bi's gdScatter declares "sub as long", and a
+    // body opened here that nothing ever closed made every later line look like it lived inside a procedure.
+    // A procedure line is at module level and its name is not followed by AS.
+    if (not SameText(Copy(L, 1, 7), 'DECLARE')) and (GPPTypeTextDepth = 0) and
+       (UpperFast(Copy(TrimLeft(Copy(L, P, MaxInt)), 1, 3)) <> 'AS ') then Inc(GPPSymProcDepth);
   end
   else if W = 'END' then
   begin
@@ -4759,6 +4763,19 @@ var
     would change a directive nobody asked about.
     ⛔ And a one-line "If x Then y" opens nothing. The guard is the same shape the pragma already
     uses for "Sub s() : ... : End Sub": a block If is one whose line ENDS at Then. }
+  function WordFollowedByAs(const S: string): Boolean;
+  // "sub as long", "next as T ptr": the first word is a NAME (a field, a variable) when AS follows it.
+  var
+    U: string;
+    k: Integer;
+  begin
+    U := UpperFast(TrimLeft(S));
+    k := 1;
+    while (k <= Length(U)) and (U[k] in ['A'..'Z', '0'..'9', '_']) do Inc(k);
+    U := TrimLeft(Copy(U, k, MaxInt));
+    Result := (Copy(U, 1, 2) = 'AS') and ((Length(U) = 2) or (U[3] in [' ', #9]));
+  end;
+
   function DefBlockOpener(const S: string; const FullLine: string): Boolean;
   var W, U: string;
   begin
@@ -4768,6 +4785,11 @@ var
     Result := (W = 'SCOPE') or (W = 'SUB') or (W = 'FUNCTION') or (W = 'PROPERTY') or
               (W = 'CONSTRUCTOR') or (W = 'DESTRUCTOR') or (W = 'OPERATOR') or
               (W = 'FOR') or (W = 'WHILE') or (W = 'DO') or (W = 'SELECT');
+    // ⛔ DIVERGENZE 402 - A WORD FOLLOWED BY "AS" IS A NAME, NOT A STATEMENT. gd.bi's gdScatter has a FIELD
+    // "sub as long": it opened a #define block here, the "#define GD2_ID" after it was filed as local to that
+    // block, and a later FIELD "next as gdCache_element_t ptr" closed it - taking GD2_ID away (Print GD2_ID
+    // answered 0). The same test guards the closer below.
+    if Result and WordFollowedByAs(S) then Result := False;
     if Result then Exit;
     // IF, only in its BLOCK form: the line ends at THEN (or has no THEN at all, the "If x" form).
     if W <> 'IF' then Exit;
@@ -4780,7 +4802,7 @@ var
   begin
     W := Trim(UpperFast(S));
     if Pos(' ', W) > 0 then W := Copy(W, 1, Pos(' ', W) - 1);
-    Result := (W = 'NEXT') or (W = 'WEND') or (W = 'LOOP');
+    Result := ((W = 'NEXT') or (W = 'WEND') or (W = 'LOOP')) and not WordFollowedByAs(S);
   end;
 
   function EndClosesDefBlock(const S: string): Boolean;
