@@ -26977,7 +26977,13 @@ begin
   if not RawChainAddr(Node, Addr, ElemType) then Exit;
   if (Length(ElemType) < 4) or (Copy(ElemType, Length(ElemType) - 3, 4) <> ' PTR') then Exit;
   Val := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaRawLoadInt, Val, Addr, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64));
+  // ⛔ RTC_PTR64, not RTC_I64: the element IS a pointer, and one loaded out of C's memory must keep C's
+  // tag. As a bare integer it lost it, so the SECOND index of "buf[ch][i]" - the per-channel float
+  // buffers vorbis_analysis_buffer hands back as a "single ptr ptr" - took a machine address for a VM
+  // pointer and died on "Null or invalid pointer dereference", while "pc = buf[ch] : pc[i]" was right
+  // (vorbis deck). The PTR64 arm tags only when the CONTAINER carries the foreign tag, so a "New T Ptr[n]"
+  // block of the program's own is loaded exactly as before.
+  EmitInstruction(ssaRawLoadInt, Val, Addr, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_PTR64));
   Pointee := Trim(Copy(ElemType, 1, Length(ElemType) - 4));
   Result := Pointee <> '';
 end;
