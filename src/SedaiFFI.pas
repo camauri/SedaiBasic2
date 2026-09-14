@@ -46,6 +46,7 @@ function FFISelfSymbol(const AName: string): Pointer;
 implementation
 
 uses
+  {$IFNDEF WINDOWS}dl,{$ENDIF}   // dlopen with RTLD_GLOBAL, for the members of a linker script (DIVERGENZE 407)
   SedaiConfig;        // where things are: sedai.conf, the environment, the command line
 
 var
@@ -92,23 +93,151 @@ begin
   Result := AbiUnavailableReason;
 end;
 
-function TryOpen(const ASpelling: string; const APaths: TStringList): TLibHandle;
+function FFILoadLibraryDepth(const AName: string; ADepth: Integer): TLibHandle; forward;
+
+{$IFNDEF WINDOWS}
+function OpenLinkerScript(const AErr: string; ADepth: Integer): TLibHandle;
+// ⭐⭐ A "lib<name>.so" THAT IS A LINKER SCRIPT, NOT A LIBRARY (DIVERGENZE 407). On Debian libcurses.so is
+// a link to libncurses.so, and that file is TEXT: "INPUT(libncurses.so.6 -ltinfo)". ld reads it, so fbc
+// links; dlopen refuses it, and the name "curses" has no SONAME of its own to fall back on - so
+// "#inclib "curses"" opened NOTHING, every function of ncurses.bi was "not found" and every Extern of it
+// read address 0. libc.so and libm.so are scripts too ("GROUP ( /lib/.../libm.so.6 AS_NEEDED ( ... ) )").
+// ⭐ NO DIRECTORY IS WRITTEN HERE (owner: no hard-coded paths): the loader already FOUND the file and says
+// where in its refusal - "/lib/x86_64-linux-gnu/libcurses.so: file too short" / "...: invalid ELF header".
+// The script is read at that path and its members are opened the way ld would take them: "-lX" as the
+// library X, a name through the loader's own search, and an archive (".a") skipped - there is nothing to
+// load from one at run time. Every member is opened RTLD_GLOBAL, so a symbol that lives in a SIBLING (not
+// a dependency of the first) is still found by the process-wide lookup. The first member that opens is
+// the answer.
+var
+  P, Txt, Tok, LastWord, Dir: string;
+  SL: TStringList;
+  k, i, Level: Integer;
+  InList: Boolean;
+  H: TLibHandle;
+  Toks: TStringList;
+  procedure Flush;
+  begin
+    if Tok <> '' then Toks.Add(Tok);
+    Tok := '';
+  end;
+begin
+  Result := NilHandle;
+  if ADepth > 4 then Exit;
+  k := Pos(': ', AErr);
+  if k <= 1 then Exit;
+  P := Copy(AErr, 1, k - 1);
+  if (P = '') or (P[1] <> '/') or (not FileExists(P)) then Exit;
+  SL := TStringList.Create;
+  Toks := TStringList.Create;
+  try
+    try
+      SL.LoadFromFile(P);
+    except
+      Exit;
+    end;
+    Txt := SL.Text;
+    if (Length(Txt) >= 4) and (Copy(Txt, 1, 4) = #127'ELF') then Exit;
+    // comments out
+    repeat
+      k := Pos('/*', Txt);
+      if k = 0 then Break;
+      i := Pos('*/', Copy(Txt, k + 2, MaxInt));
+      if i = 0 then Txt := Copy(Txt, 1, k - 1)
+      else Delete(Txt, k, i + 3);
+    until False;
+    // the arguments of every INPUT( ... ) and GROUP( ... ), nested AS_NEEDED( ... ) included
+    // Outside a list only the LAST WORD before a "(" matters: "OUTPUT_FORMAT(elf64-x86-64) GROUP ( ... )".
+    Tok := ''; LastWord := ''; Level := 0; InList := False;
+    i := 1;
+    while i <= Length(Txt) do
+    begin
+      case Txt[i] of
+        '(':
+          begin
+            if not InList then
+            begin
+              if Tok <> '' then LastWord := Tok;
+              if SameText(LastWord, 'INPUT') or SameText(LastWord, 'GROUP') then
+              begin
+                InList := True; Level := 1;
+              end;
+              Tok := ''; LastWord := '';
+            end
+            else
+            begin
+              Flush; Inc(Level);          // AS_NEEDED ( ... ): its members count as members
+            end;
+          end;
+        ')':
+          begin
+            if InList then
+            begin
+              Flush;
+              Dec(Level);
+              if Level = 0 then InList := False;
+            end;
+            Tok := ''; LastWord := '';
+          end;
+        ' ', #9, #10, #13, ',':
+          if InList then Flush
+          else if Tok <> '' then begin LastWord := Tok; Tok := ''; end;
+      else
+        Tok := Tok + Txt[i];
+      end;
+      Inc(i);
+    end;
+    Dir := ExtractFilePath(P);
+    for i := 0 to Toks.Count - 1 do
+    begin
+      Tok := Toks[i];
+      if (Tok = '') or SameText(Tok, 'AS_NEEDED') then Continue;
+      if LowerCase(ExtractFileExt(Tok)) = '.a' then Continue;
+      if Copy(Tok, 1, 2) = '-l' then
+        H := FFILoadLibraryDepth(Copy(Tok, 3, MaxInt), ADepth + 1)
+      else
+      begin
+        H := TLibHandle(dlopen(PChar(Tok), RTLD_LAZY or RTLD_GLOBAL));
+        if (H = NilHandle) and (Tok[1] <> '/') then
+          H := TLibHandle(dlopen(PChar(Dir + Tok), RTLD_LAZY or RTLD_GLOBAL));
+      end;
+      if H = NilHandle then Continue;
+      if Result = NilHandle then Result := H;
+    end;
+  finally
+    Toks.Free;
+    SL.Free;
+  end;
+end;
+{$ENDIF}
+
+function TryOpen(const ASpelling: string; const APaths: TStringList; ADepth: Integer = 0): TLibHandle;
 // One spelling, asked of the loader first (no path: it searches where IT searches - LD_LIBRARY_PATH,
 // ld.so.cache, the standard directories) and then of every directory we were told about.
+// ...and when the loader found the file and refused it, it may be a LINKER SCRIPT (DIVERGENZE 407).
 var
   j: Integer;
 begin
   Result := LoadLibrary(ASpelling);
   if Result <> NilHandle then Exit;
+  {$IFNDEF WINDOWS}
+  Result := OpenLinkerScript(GetLoadErrorStr, ADepth);
+  if Result <> NilHandle then Exit;
+  {$ENDIF}
   if APaths = nil then Exit;
   for j := 0 to APaths.Count - 1 do
   begin
     Result := LoadLibrary(APaths[j] + ASpelling);
     if Result <> NilHandle then Exit;
+    {$IFNDEF WINDOWS}
+    Result := OpenLinkerScript(GetLoadErrorStr, ADepth);
+    if Result <> NilHandle then Exit;
+    {$ENDIF}
   end;
 end;
 
-function FFILoadLibrary(const AName: string): TLibHandle;
+function FFILoadLibraryDepth(const AName: string; ADepth: Integer): TLibHandle;
+// ADepth counts linker scripts followed into one another ("-ltinfo" inside INPUT(...)): a bound, not a feature.
 // ⛔⛔ A LIBRARY IS NOT INSTALLED UNDER THE NAME A PROGRAM WRITES. "#inclib "zip"" is what a LINKER
 // reads, and a linker resolves it through libzip.so - the DEVELOPMENT symlink, which is in the -dev
 // package and is absent on a machine that merely RUNS things. What is actually there is the SONAME:
@@ -147,7 +276,7 @@ begin
   {$ENDIF}
   for i := 0 to 3 do
   begin
-    Result := TryOpen(Cands[i], Paths);
+    Result := TryOpen(Cands[i], Paths, ADepth);
     if Result <> NilHandle then Exit;
   end;
   // A name the program already wrote WITH a version ("libzip.so.5") is done: it either opened above or
@@ -211,6 +340,11 @@ begin
       if Result <> NilHandle then Exit;
     end;
   end;
+end;
+
+function FFILoadLibrary(const AName: string): TLibHandle;
+begin
+  Result := FFILoadLibraryDepth(AName, 0);
 end;
 
 function FFISymbol(ALib: TLibHandle; const AName: string): Pointer;
