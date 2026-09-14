@@ -5210,7 +5210,22 @@ begin
   begin
     Context.Advance;                                 // AS
     SkipTypeQualifiers;                     // FB: "As Const <type>"
-    if Context.Check(ttIdentifier) then Node.Attributes.Values['FPRET'] := UpperFast(ParseDottedName);
+    // ⛔ DIVERGENZE 401 - THE RESULT MAY BE A PROCEDURE TYPE ITSELF, as a parameter may (above). ode.bi's
+    // dGeomClass declares "collider as function(byval num as long) as function(byval o1 as dGeomID, ...)
+    // as long": only a NAME was read here, the nested "function(...) as long" was left standing, and the
+    // field loop took its parameters for three more fields - SizeOf 72 against fbc's 32.
+    if Context.Check(ttProcedureStart) or
+       (Context.Check(ttIdentifier) and SameText(VarToStr(Context.CurrentToken.Value), 'TYPEOF') and
+        Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParOpen)) then
+    begin
+      NestedFp := TASTNode.Create(antIdentifier, Context.CurrentToken);
+      try
+        if TryParseProcPtrType(NestedFp) then Node.Attributes.Values['FPRET'] := 'ANY PTR';
+      finally
+        NestedFp.Free;
+      end;
+    end
+    else if Context.Check(ttIdentifier) then Node.Attributes.Values['FPRET'] := UpperFast(ParseDottedName);
     // Keep the "PTR" suffix on the return type too (a "T PTR" return is an int address).
     while AtPointerSuffix do
     begin Node.Attributes.Values['FPRET'] := Node.Attributes.Values['FPRET'] + ' PTR'; Context.Advance; end;

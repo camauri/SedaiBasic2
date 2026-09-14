@@ -3286,7 +3286,11 @@ begin
         while AtPointerSuffix do Context.Advance;
       end;
     end;
-    TypeStr := 'INTEGER';
+    // ⛔ DIVERGENZE 403 - AN ENTRY ADDRESS IS A POINTER, and the rest of the pipeline reads the type NAME to
+    // know it: 'INTEGER' made "Const STREAMPROC_PUSH = CPtr(Function(...) As DWORD, -1)" (bass.bi) a signed
+    // integer constant, printed -1 where fbc prints 18446744073709551615. The bank is the same (int), so
+    // the value and every call through it are unchanged; only the TYPE the value carries is now the right one.
+    TypeStr := 'ANY PTR';
   end;
   while (TypeOfExpr = nil) and
         (not Context.IsAtEnd) and (not Context.Check(ttSeparParam)) and (not Context.Check(ttDelimParClose)) do

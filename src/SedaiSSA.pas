@@ -9022,7 +9022,11 @@ begin
           // made SizeOf(x) answer 8 in every other scope that declared x - twelve of them, in fbc's
           // quirk/typeof. Where a block declared the name there is NO fallback to the flat entry: its
           // absence means "this declaration is not a pointer", which is the answer.
-          else if NameIsPointerHere(ArrName2) or IsRawPtr(ArrName2) or
+          // ⛔ DIVERGENZE 400 - ...BUT NOT WHEN THE NAME IS ALSO A TYPE. The rungs below all ask FindUDT < 0
+          // ("a type NAME still wins over a same-named variable", fbc's warning 37) and this one did not:
+          // allegro.bi declares "Type MOUSE_DRIVER" and "Extern mouse_driver As MOUSE_DRIVER Ptr", and
+          // SizeOf(MOUSE_DRIVER) answered the POINTER's 8 against fbc's 120 - seven types of that header.
+          else if ((FindUDT(ArrName2) < 0) and (NameIsPointerHere(ArrName2) or IsRawPtr(ArrName2))) or
              ((Length(ArrName2) >= 4) and (Copy(ArrName2, Length(ArrName2) - 3, 4) = ' PTR')) then
             Result := MakeSSAConstInt(8)
           // SIZEOF of a VARIABLE is the size of its declared type, not of the handle/slot holding it:
