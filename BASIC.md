@@ -3611,6 +3611,12 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   `WBin` are wide strings too, and print the same way. ⚠️ Linux and the `sb` command-line runner only;
   on Windows a `WString` still prints as UTF-8 text.
 
+- **A sentinel value in a procedure-pointer parameter reaches C unchanged.** C libraries use special values
+  there: `SQLITE_TRANSIENT` is `Cast(sqlite3_destructor_type, -1)`, "copy the text now", and `SQLITE_STATIC` is
+  0. Only the address of a BASIC procedure is turned into something C can call; 0, a negative value, or a
+  function address that C itself handed over is passed as it is. ⚠️ A BASIC procedure is wrapped for C when its
+  address is written in the call (`@myproc`); a **variable** of a procedure type that holds `@myproc` and is then
+  passed to C is not yet.
 - **A procedure pointer prints as an unsigned address**, as any pointer does: a `Const` or a variable of a named
   `Sub`/`Function` pointer type prints `18446744073709551615` for `Cast(T, -1)` and `0` (no sign space) for a
   null one — `sqlite3.bi`'s `SQLITE_TRANSIENT` and `SQLITE_STATIC`. A **call** through it prints what the

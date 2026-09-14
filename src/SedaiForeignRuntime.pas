@@ -1075,7 +1075,24 @@ begin
               Continue;
             end;
           end;
-          if (i <= High(B^.Decl.ParamTypeNames)) and Assigned(FMakeClosure) and
+          // ⭐ A PROCEDURE PARAMETER THE HEADER DECLARES ("PROC ANY PTR", the scanner's word for "as sub(...)") whose
+          // value is NOT a BASIC procedure goes to C AS IT IS (DIVERGENZE 420). C libraries give those parameters
+          // SENTINELS: sqlite3's SQLITE_TRANSIENT is Cast(destructor, -1), "copy the text now". Taken for a data
+          // pointer, -1 was resolved as an address of the VM - where a negative value is a record-FIELD pointer - and
+          // the call died inside the VM (access violation on the second bind_text). 0 and negative values pass
+          // unchanged; an address C handed over (FGNPTR_TAG) passes without its tag. ⚠️ Limit: a VARIABLE of a
+          // procedure type holding a BASIC procedure's address is not wrapped here (it would need the variable's
+          // signature); "@proc" written at the call site still is, through "FNPTR:" below.
+          if (i <= High(B^.Decl.ParamTypeNames)) and
+             (UpperCase(Copy(B^.Decl.ParamTypeNames[i], 1, 5)) = 'PROC ') and
+             ((XferInt[SlotI] <= 0) or ((XferInt[SlotI] and FGNPTR_TAG) <> 0)) then
+          begin
+            if XferInt[SlotI] <= 0 then
+              PPointer(Vals[i])^ := Pointer(PtrInt(XferInt[SlotI]))
+            else
+              PPointer(Vals[i])^ := Pointer(PtrInt(XferInt[SlotI] and not FGNPTR_TAG));
+          end
+          else if (i <= High(B^.Decl.ParamTypeNames)) and Assigned(FMakeClosure) and
              (UpperCase(Copy(B^.Decl.ParamTypeNames[i], 1, 6)) = 'FNPTR:') then
           // ⛔⛔ NO Inc(SlotI) HERE: the one at the bottom of this arm counts every pointer, callbacks
           // included. A second one made every argument AFTER a callback read the next slot over -

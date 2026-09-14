@@ -2069,7 +2069,11 @@ begin
        if FgnDepth = 1 then
        begin
          if FgnParams <> '' then FgnParams := FgnParams + ',';
-         FgnParams := FgnParams + 'ANY PTR';
+         // ⭐ "PROC ANY PTR", not plain "ANY PTR" (DIVERGENZE 420): still a pointer to everything that marshals it
+         // (it ends in " PTR"), but the runtime can now tell a PROCEDURE parameter from a data pointer. It must:
+         // C libraries pass SENTINELS there - sqlite3's SQLITE_TRANSIENT is Cast(destructor, -1) - and a data
+         // pointer's value is resolved as an address of the VM, where -1 is a record-field pointer.
+         FgnParams := FgnParams + 'PROC ANY PTR';
          FgnFnPtrRet := True;      // ...e cio' che segue, fino alla virgola, e' il RITORNO del callback
        end
        else if FgnDepth = 0 then
