@@ -180,6 +180,10 @@ function KindToRef(K: TForeignKind): TAbiType;
   when A is not in readable memory. It is the extent a block of unknown size can be given (DIVERGENZE
   239): not the block's own size - C does not say it - but the line past which a read would fault. }
 function ForeignMappedExtent(A: PtrUInt): PtrUInt;
+{ ...the same answer, with the map READ AGAIN first. On Linux the mappings are cached, and reloaded only
+  when an address falls in no known mapping - so an address inside a mapping that has since GROWN (a C
+  heap extended by realloc) got the OLD end. The refusing path of a bounds check asks this one. }
+function ForeignMappedExtentFresh(A: PtrUInt): PtrUInt;
 
 implementation
 
@@ -298,6 +302,11 @@ begin
   Hi := PtrUInt(M.BaseAddress) + M.RegionSize;
   if Hi > A then Result := Hi - A;
 end;
+
+function ForeignMappedExtentFresh(A: PtrUInt): PtrUInt;
+begin
+  Result := ForeignMappedExtent(A);   // VirtualQuery asks the system every time: nothing is cached here
+end;
 {$ELSE}
 var
   GMapLo, GMapHi: array of PtrUInt;        // readable mappings of this process, contiguous ones merged
@@ -390,6 +399,17 @@ begin
   finally
     LeaveCriticalSection(GMapLock);
   end;
+end;
+
+function ForeignMappedExtentFresh(A: PtrUInt): PtrUInt;
+begin
+  EnterCriticalSection(GMapLock);
+  try
+    FgnLoadMaps;
+  finally
+    LeaveCriticalSection(GMapLock);
+  end;
+  Result := ForeignMappedExtent(A);
 end;
 {$ENDIF}
 

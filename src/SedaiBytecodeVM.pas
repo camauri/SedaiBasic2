@@ -7190,6 +7190,24 @@ begin
   else if M > 0 then
   begin
     // No size stated: the mapping is the bound (see ForeignNoteRegion).
+    // ⛔ ...AS IT IS NOW, not as it was when the region was noted. A C heap GROWS - vorbis_analysis_buffer
+    // reallocates the per-channel buffers as the program feeds it - and the mapping table is cached, so
+    // "buf[ch][i] = v" was refused at the OLD end of the heap on memory libvorbis owns (DIVERGENZE 370).
+    // ⚠️ A first cure re-measured with ForeignMappedExtent, which answered from the same stale cache and
+    // changed nothing; ForeignMappedExtentFresh reads the map again. Only on the refusing path.
+    if (A - B) + NeedBytes > M then
+    begin
+      M := ForeignMappedExtentFresh(B);
+      if (A - B) + NeedBytes <= M then
+      begin
+        EnterCriticalSection(FFgnLock);
+        try
+          if (r < FFgnCount) and (FFgnBase[r] = B) then FFgnMap[r] := M;
+        finally
+          LeaveCriticalSection(FFgnLock);
+        end;
+      end;
+    end;
     if (A - B) + NeedBytes > M then
       raise ERangeError.CreateFmt('Foreign pointer dereference: offset %d + %d leaves the memory ' +
                                   'mapped at that block (%d bytes)', [Int64(A - B), Int64(NeedBytes), Int64(M)]);
