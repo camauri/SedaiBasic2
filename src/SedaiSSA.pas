@@ -27529,6 +27529,15 @@ begin
   begin
     // A fixed-length string field is its DECLARED width of bytes, terminator or not.
     Value := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    // ⛔ ...but a ZSTRING (or WSTRING) field is TEXT: it ends at its terminator, and only a "String * n"
+    // is its declared width. Read as n bytes, "h.p->name" on a ZString * 16 answered "module name" plus
+    // five NULs - length 16 where fbc says 11 (DIVERGENZE 387, found the moment string fields reached
+    // this path through a C-written pointer).
+    if F.IsZString then
+      EmitInstruction(ssaRawLoadZStr, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(0))
+    else if F.IsWString then
+      EmitInstruction(ssaRawLoadZStr, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(1))
+    else
     EmitInstruction(ssaRawLoadZStr, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(2 + F.StrCapacity));
   end
   else if F.Bank = srtFloat then
@@ -49149,6 +49158,19 @@ begin
     // stessa cosa attraverso una variabile ("dim as zstring ptr r = strrchr(...) : print *r")
     // rispondeva giusto, perche' li' il tipo lo portava la variabile. DIVERGENZE 216.
     if Result = '' then Result := ForeignRetTypeName(Nm);
+    // ⭐ ...AND A VARIABLE THAT HOLDS A PROCEDURE POINTER. "Dim As Function Cdecl () As ZString Ptr zver =
+    // sym : Print *zver()" - a C function reached through g_module_symbol - answered '' here, so the
+    // dereference took the numeric arm and printed the text's first eight bytes as 7308779456497397297
+    // where fbc prints "1.3.1", while "zp = zver() : *zp" was right (gmodule deck, DIVERGENZE 386). The
+    // signature is on record as "paramtypes|rettype".
+    if (Result = '') and (FFuncPtrSigs <> nil) and (FFuncPtrSigs.IndexOfName(Nm) >= 0) then
+    begin
+      Result := FFuncPtrSigs.ValueFromIndex[FFuncPtrSigs.IndexOfName(Nm)];
+      if Pos('|', Result) > 0 then
+        Result := Trim(Copy(Result, LastDelimiter('|', Result) + 1, MaxInt))
+      else
+        Result := '';
+    end;
   end
   else if (Callee.NodeType = antMemberAccess) and (Callee.ChildCount >= 1) then
   begin
@@ -51999,7 +52021,11 @@ begin
   if not ForeignElemObject(Node, Obj, TypeName) then Exit;
   UDTIdx := FindUDT(TypeName);
   if not UDTFieldBankSlot(UDTIdx, VarToStr(Node.Value), Bank, Slot, NestedT) then Exit;   // a method
-  if (Bank = srtString) or (NestedT <> '') then Exit;
+  // ⭐ A STRING field goes through the same test: the raw branch reads a "ZString * n" at its C offset
+  // like any other field, and IIf between two strings is ordinary BASIC. Excluded, it fell to the managed
+  // record path and died - "mi.mod_->name" after xmp_get_module_info wrote mod_ into the program's record,
+  // while "mi.mod_->pat" beside it was right (xmp deck, DIVERGENZE 387).
+  if NestedT <> '' then Exit;
   ElT := EmitForeignElemTemps(Obj, TypeName);
   TstT := ElT + '_T';
 
