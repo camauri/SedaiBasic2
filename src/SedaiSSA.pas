@@ -938,6 +938,8 @@ type
     procedure CollectEnumNames(Node: TASTNode; const Owner: string = '');    // FB: just the ENUM TYPE names, early - a declared type's BANK depends on them
     procedure CollectEarlyLayoutConsts(Node: TASTNode);      // DIVERGENZE 392: CONST / ENUM values for the layout, before RegisterUDTs
     function FoldLayoutBound(Node: TASTNode; out Val: Int64): Boolean;  // DIVERGENZE 392: fold the bound of a TYPE member
+    function FoldLayoutFloat(Node: TASTNode; out F: Double): Boolean;   // DIVERGENZE 394: ...one that is not an integer
+    function RoundedIntRegister(const V: TSSAValue): TSSAValue;         // DIVERGENZE 394: a floating bound, rounded
     procedure CollectEnumMembers(Node: TASTNode; const OwnerType: string = '');       // FB: back each module-level ENUM member with a shared global (proc-visible)
     procedure CollectTypeConsts(Node: TASTNode);        // FB: record each CONST declared inside a TYPE as "TYPE.NAME"
     function TypeScopedConstAccess(const TypeName, MemberName: string; const Tok: TLexerToken): TASTNode;  // the node that READS one
@@ -4003,6 +4005,18 @@ begin
       // offset / managed handle is reinterpreted, not changed — the receiving variable's declared type
       // drives the deref). A scalar target type converts the value to that bank.
       ArrName2 := Node.ValueUpper;
+      // ⭐ DIVERGENZE 395 - A TYPE ALIAS NAMES THE TYPE IT ALIASES. "Type cpFloat As Double : Cast(cpFloat,
+      // 3.25)" compared the name as written against 'DOUBLE' and 'SINGLE', found neither, and took the
+      // INTEGER conversion: 3. chipmunk's "Const CP_PI = Cast(cpFloat, 3.14159...)" was 3 in every
+      // program that includes it. Only when the alias resolves to a SCALAR: a pointer or a record keeps
+      // the spelling every arm below already handles.
+      if (Length(ArrName2) < 4) or (Copy(ArrName2, Length(ArrName2) - 3, 4) <> ' PTR') then
+      begin
+        TempStr := CanonicalType(ArrName2);
+        if (TempStr <> '') and (TempStr <> ArrName2) and (FindUDT(TempStr) < 0) and
+           ((Length(TempStr) < 4) or (Copy(TempStr, Length(TempStr) - 3, 4) <> ' PTR')) then
+          ArrName2 := TempStr;
+      end;
       // "Cast(T, u)" where u is a UDT that declares "Operator Cast() As T" must go THROUGH that
       // operator - it is the whole point of declaring one, and the manual's example prints the
       // operator's own trace line to prove it ran.
@@ -14494,14 +14508,14 @@ begin
         if LbVal.Kind = svkConstInt then
           LowerBounds[i] := Integer(LbVal.ConstInt)
         else if LbVal.Kind = svkConstFloat then
-          LowerBounds[i] := Integer(Trunc(LbVal.ConstFloat))
+          LowerBounds[i] := Integer(Round(LbVal.ConstFloat))   // fbc rounds a floating bound (DIVERGENZE 394)
         else if LbVal.Kind = svkRegister then
         begin
           // FreeBASIC runtime lower bound, e.g. "Dim a(Lbound(m) To Ubound(m))" where m is a parameter
           // array (its bounds are not known until run time). Keep the register: the VM computes the
           // dimension size ub - lb + 1 and records the actual lb for LBOUND/index adjustment. The upper
           // bound is forced into a register below so both are available at bcArrayDim.
-          LbVal := EnsureIntRegister(LbVal);
+          LbVal := RoundedIntRegister(LbVal);
           LowerBoundRegs[i] := LbVal.RegIndex;
           LbRegVals[i] := LbVal;
           LowerBounds[i] := 0;
@@ -14548,7 +14562,13 @@ begin
       else if TryConstFoldArrayBound(DimExpr, FoldedBound) then
         DimValue := MakeSSAConstInt(FoldedBound)   // Ubound(otherarray, d) as an upper bound
       else
+      begin
         ProcessExpression(DimExpr, DimValue);
+        // A FLOATING upper bound known only at run time is ROUNDED, half to even, as fbc converts it
+        // ("Dim a(0 To n)" with n = 3.5 has UBound 4): the VM would truncate it (DIVERGENZE 394).
+        if (DimValue.Kind = svkRegister) and (DimValue.RegType = srtFloat) then
+          DimValue := RoundedIntRegister(DimValue);
+      end;
 
       // A runtime lower bound makes the size (ub - lb + 1) a run-time quantity, so the upper bound must
       // also reach the VM in a register even when it is a compile-time constant. Materialize it and route
@@ -14557,7 +14577,7 @@ begin
       begin
         UbReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         if DimValue.Kind = svkConstFloat then
-          EmitInstruction(ssaLoadConstInt, UbReg, MakeSSAConstInt(Trunc(DimValue.ConstFloat)), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+          EmitInstruction(ssaLoadConstInt, UbReg, MakeSSAConstInt(Round(DimValue.ConstFloat)), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
         else
           EmitInstruction(ssaLoadConstInt, UbReg, MakeSSAConstInt(DimValue.ConstInt), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         DimValue := UbReg;
@@ -14607,7 +14627,7 @@ begin
       end
       else if DimValue.Kind = svkConstFloat then
       begin
-        Dimensions[i] := Integer(Trunc(DimValue.ConstFloat)) - LowerBounds[i] + 1;
+        Dimensions[i] := Integer(Round(DimValue.ConstFloat)) - LowerBounds[i] + 1;
         if Dimensions[i] < 0 then
           raise Exception.CreateFmt('Array upper bound must be >= lower bound: %s[%d]', [ArrName, i]);
         if Dimensions[i] = 0 then
@@ -41043,14 +41063,82 @@ begin
   end;
 end;
 
+function TSSAGenerator.FoldLayoutFloat(Node: TASTNode; out F: Double): Boolean;
+// DIVERGENZE 394 - the value of a bound that is not an integer: literals, the integer constants the fold
+// already knows, parentheses, unary minus, + - * and a FLOATING "/". Nothing else: a bound that needs
+// more stays unfolded, as it was.
+var
+  L, R: Double;
+  I: Int64;
+begin
+  Result := False; F := 0;
+  if Node = nil then Exit;
+  if TryFoldConstIntExpr(Node, I) then
+  begin
+    F := I;
+    Exit(True);
+  end;
+  case Node.NodeType of
+    antLiteral:
+      if VarIsNumeric(Node.Value) then
+      begin
+        F := Double(Node.Value);
+        Result := True;
+      end;
+    antParentheses:
+      Result := (Node.ChildCount >= 1) and FoldLayoutFloat(Node.GetChild(0), F);
+    antUnaryOp:
+      if (Node.ChildCount >= 1) and (Node.Token <> nil) and FoldLayoutFloat(Node.GetChild(0), L) then
+        case Node.Token.TokenType of
+          ttOpSub: begin F := -L; Result := True; end;
+          ttOpAdd: begin F := L; Result := True; end;
+        end;
+    antBinaryOp:
+      if (Node.ChildCount >= 2) and (Node.Token <> nil) and FoldLayoutFloat(Node.GetChild(0), L) and
+         FoldLayoutFloat(Node.GetChild(1), R) then
+        case Node.Token.TokenType of
+          ttOpAdd: begin F := L + R; Result := True; end;
+          ttOpSub: begin F := L - R; Result := True; end;
+          ttOpMul: begin F := L * R; Result := True; end;
+          ttOpDiv: if R <> 0 then begin F := L / R; Result := True; end;
+        end;
+  end;
+end;
+
 function TSSAGenerator.FoldLayoutBound(Node: TASTNode; out Val: Int64): Boolean;
+var
+  F: Double;
 begin
   Inc(FLayoutFold);
   try
     Result := TryFoldConstIntExpr(Node, Val);
+    // ⭐ DIVERGENZE 394 - A BOUND THAT IS NOT AN INTEGER IS ROUNDED, half to even, as fbc converts it:
+    // allegro5's "__key_down__internal__(0 To ((ALLEGRO_KEY_MAX + 31) / 32) - 1)" is 7.0625 and fbc lays
+    // out 8 elements. The integer fold takes only an EXACT "/" (DIVERGENZE 290), so the member stayed
+    // behind its handle and ALLEGRO_KEYBOARD_STATE measured 16 against 40 in ten headers.
+    if (not Result) and FoldLayoutFloat(Node, F) and (Abs(F) < 9.0E15) then
+    begin
+      Val := Round(F);
+      Result := True;
+    end;
   finally
     Dec(FLayoutFold);
   end;
+end;
+
+function TSSAGenerator.RoundedIntRegister(const V: TSSAValue): TSSAValue;
+// An integer register holding V, a FLOATING value ROUNDED half to even - the conversion fbc applies to an
+// array bound (DIVERGENZE 394). Anything else is EnsureIntRegister's.
+begin
+  if (V.Kind = svkRegister) and (V.RegType = srtFloat) then
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaFloatRound, Result, V, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  end
+  else if V.Kind = svkConstFloat then
+    Result := EnsureIntRegister(MakeSSAConstInt(Round(V.ConstFloat)))
+  else
+    Result := EnsureIntRegister(V);
 end;
 
 procedure TSSAGenerator.CollectEarlyLayoutConsts(Node: TASTNode);

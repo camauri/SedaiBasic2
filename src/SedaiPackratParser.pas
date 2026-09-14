@@ -5799,6 +5799,26 @@ var
   IsStaticField, IsStaticByref, LeadingType, FpIsFP, IsRedimField: Boolean;
   CurAccess: string;   // the Public:/Private:/Protected: section currently in force
   ImplList: string;   // MODERN: the IMPLEMENTS list, recorded on the type node
+
+  function AnonBlockWithField: Boolean;
+  // "Type Field = n" / "Union Field = n" with no name (DIVERGENZE 396): the keyword, then FIELD, then '='.
+  var
+    T2: TLexerToken;
+  begin
+    Result := False;
+    if not (Assigned(Context.PeekNext) and SameText(VarToStr(Context.PeekNext.Value), 'FIELD')) then Exit;
+    T2 := Context.PeekToken(2);
+    Result := Assigned(T2) and (T2.TokenType = ttOpEq);
+  end;
+
+  procedure SkipToLineEnd;
+  // Past the block's opening line: the keyword and whatever alignment clause follows it.
+  begin
+    Context.Advance;
+    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+      Context.Advance;
+  end;
+
 begin
   CurAccess := '';
   NestedUnionDepth := 0;
@@ -6045,6 +6065,16 @@ begin
     if Context.Check(ttUnionDecl) and
        not (Assigned(Context.PeekNext) and SameText(VarToStr(Context.PeekNext.Value), 'AS')) then
     begin
+      // ⛔ DIVERGENZE 396 - "Union Field = 1" is ANONYMOUS too: FIELD is the alignment clause, not a name.
+      // Read as the named form below it declared a nested type called FIELD, and the members left the
+      // enclosing type (a union of Byte and Long measured 4 where fbc says 8).
+      if AnonBlockWithField then
+      begin
+        Inc(NestedUnionDepth);
+        if NestedUnionDepth = 1 then begin Inc(UnionGrpSeq); UnionGrpCur := UnionGrpSeq; end;
+        SkipToLineEnd;
+        Continue;
+      end;
       // ⛔ A NAMED nested block declares a TYPE OF ITS OWN ("Union U ... End Union" then "m As U"),
       // and this model flattens the members into the enclosing type instead. Accepting the name
       // silently made "U" a FIELD and the program then computed wrong values rather than failing:
@@ -6085,12 +6115,17 @@ begin
     // and fail outright ("is a reserved word and cannot be used as a type name"), so three manual
     // examples never even parsed. Only the ANONYMOUS form is a block: "Type Name" is still a nested
     // type declaration and is left to whoever handled it before.
+    // ⛔ ...AND "Type Field = 1" IS THE SAME ANONYMOUS BLOCK (DIVERGENZE 396). Only a bare TYPE was
+    // recognised, so win/shlobj.bi's NT_CONSOLE_PROPS - "Union : Type Field = 1 : cbSize ... End Type :
+    // End Union" - fell to the field grammar, which read TYPE and FIELD as two field names, lost its place
+    // and ended the parse IN SILENCE: every statement after the #include vanished and the program exited 0.
+    // ⚠️ The block's own FIELD value is not modelled: the enclosing type's alignment lays it out.
     if Context.Check(ttTypeDecl) and Assigned(Context.PeekNext) and
-       (Context.PeekNext.TokenType = ttEndOfLine) then
+       ((Context.PeekNext.TokenType = ttEndOfLine) or AnonBlockWithField) then
     begin
       Inc(NestedStructDepth);
       if NestedStructDepth = 1 then begin Inc(UnionGrpSeq); StructGrpCur := UnionGrpSeq; end;
-      Context.Advance; Continue;
+      SkipToLineEnd; Continue;
     end;
     // ...and the NAMED nested TYPE, the mirror of the named nested UNION above: "Type Child ... End
     // Type" inside a Type declares Child, it does not add fields to the parent. (Only when a NAME
@@ -6465,6 +6500,16 @@ begin
       Context.Advance;                              // skip unexpected token (defensive)
     end;
     if Context.CurrentIndex = PrevIdx then Break;   // no progress guard
+  end;
+  // ⛔⛔ DIVERGENZE 396 - A TYPE THAT REACHES THE END OF THE FILE IS AN ERROR, NOT A PROGRAM THAT ENDS
+  // THERE. The field loop stops at end of file, and nothing said so: a block this grammar misread swallowed
+  // every token after it - the rest of the header and the whole program - and the compile succeeded with
+  // an empty program that exited 0. fbc answers "Expected 'END TYPE'".
+  if Context.Check(ttEndOfFile) then
+  begin
+    if IsUnion then TokU := 'UNION' else TokU := 'TYPE';
+    HandleError(Format('Expected END %s: the end of the source was reached inside %s %s',
+      [TokU, TokU, Result.ValueUpper]), Token);
   end;
   ConsumeEndType;
   DoNodeCreated(Result);
