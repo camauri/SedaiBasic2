@@ -1627,6 +1627,7 @@ type
     function RawNestedRecordAddrOf(MemberNode: TASTNode; const TargetU: string): Boolean;
     function RawUDTArithType(Node: TASTNode): string;
     function TryEmitRawUDTPtrArith(Node: TASTNode; out V: TSSAValue): Boolean;
+    function TryEmitForeignChainField(Node: TASTNode; out Value: TSSAValue): Boolean;
     function TryEmitRawChainRead(Node: TASTNode; out Value: TSSAValue): Boolean;
     function TryEmitRawChainStore(Node, ExprNode: TASTNode): Boolean;
     function ResolveRawUDTBase(ObjNode: TASTNode; out TypeName: string; out UDTIdx: Integer;
@@ -26992,6 +26993,66 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.TryEmitForeignChainField(Node: TASTNode; out Value: TSSAValue): Boolean;
+// ⭐ "b->g[i].f" WHERE b MAY HOLD A C ADDRESS ONLY ITS VALUE CAN REVEAL (DIVERGENZE 388): "mi.mod_->xxs[0].len"
+// after xmp_get_module_info wrote mod_ into the program's record, or "local_->xs[1].v" through a copy of it.
+// The run-time test of DIVERGENZE 259 works on a whole OBJECT ("b->f"); here the marked base sits one
+// indexed pointer field further down, and the compile-time rung for "o->g[i].f" (374) wants a base it can
+// resolve before the program runs. ⇒ The same shape as TryEmitForeignElemField, one level deeper: b goes
+// into a temporary registered over raw memory, the raw branch is "tmp->g[i].f" built afresh (the rung of 374
+// resolves it), and the managed branch is the original access, marked so it does not come back here.
+// ⚠️ ForeignElemObject keeps its own condition: b is evaluated twice, so only side-effect-free bases.
+var
+  X, M, B, ArgsN, RawM, RawX, RawAcc, MgdAcc: TASTNode;
+  TB, ElT: string;
+  BIdx, k: Integer;
+  IsPtrField: Boolean;
+begin
+  Result := False;
+  Value := MakeSSAValue(svkNone);
+  if (Node = nil) or (Node.NodeType <> antMemberAccess) or (Node.ChildCount < 1) then Exit;
+  if FProgram.ForeignDeclCount = 0 then Exit;
+  if Node.Attributes.Values['FGNELEM'] = '1' then Exit;
+  X := Node.GetChild(0);
+  if (X = nil) or (X.NodeType <> antArrayAccess) or (X.ChildCount < 2) or
+     (X.Attributes.Values['BRACKET'] <> '1') then Exit;
+  M := X.GetChild(0);
+  if (M = nil) or (M.NodeType <> antMemberAccess) or (M.ChildCount < 1) then Exit;
+  if not ForeignElemObject(M, B, TB) then Exit;
+  BIdx := FindUDT(TB);
+  if BIdx < 0 then Exit;
+  IsPtrField := False;
+  for k := 0 to High(FUDTs[BIdx].Fields) do
+    if UpperFast(FUDTs[BIdx].Fields[k].Name) = M.ValueUpper then
+    begin
+      IsPtrField := (not FUDTs[BIdx].Fields[k].IsArray) and
+                    ((FUDTs[BIdx].Fields[k].PtrPointee <> '') or (FUDTs[BIdx].Fields[k].MultiPtrPointee <> ''));
+      Break;
+    end;
+  if not IsPtrField then Exit;
+  ElT := EmitForeignElemTemps(B, TB);
+  ArgsN := TASTNode.Create(antArgumentList, Node.Token);
+  try
+    ArgsN.AddChild(TASTNode.CreateWithValue(antIdentifier, ElT + '_T', Node.Token));
+    RawM := TASTNode.CreateWithValue(antMemberAccess, VarToStr(M.Value), M.Token);
+    RawM.AddChild(TASTNode.CreateWithValue(antIdentifier, ElT, M.Token));
+    RawX := TASTNode.Create(antArrayAccess, X.Token);
+    RawX.Attributes.Values['BRACKET'] := '1';
+    RawX.AddChild(RawM);
+    RawX.AddChild(X.GetChild(1).Clone);
+    RawAcc := TASTNode.CreateWithValue(antMemberAccess, VarToStr(Node.Value), Node.Token);
+    RawAcc.AddChild(RawX);
+    ArgsN.AddChild(RawAcc);
+    MgdAcc := Node.Clone;
+    MgdAcc.Attributes.Values['FGNELEM'] := '1';
+    ArgsN.AddChild(MgdAcc);
+    EmitIif(ArgsN, Value);
+  finally
+    ArgsN.Free;
+  end;
+  Result := True;
+end;
+
 function TSSAGenerator.RawNestedRecordAddrOf(MemberNode: TASTNode; const TargetU: string): Boolean;
 // Is "@MemberNode" the address of a record nested BY VALUE inside raw memory, of the type TargetU points
 // at? ResolveRawUDTBase answers the member as an object - a record at a fixed byte offset - and emits
@@ -50337,6 +50398,8 @@ begin
   if TryEmitRawUDTField(Node.GetChild(0), VarToStr(Node.Value), Result) then Exit;
   // ...and "a(i)->field" where the ELEMENT may hold a C address (DIVERGENZE 259): decided at run time.
   if TryEmitForeignElemField(Node, Result) then Exit;
+  // ...and "b->g[i].f" where b is such a base, one indexed pointer field further down (DIVERGENZE 388).
+  if TryEmitForeignChainField(Node, Result) then Exit;
   TypeName := RecordTypeOfAddrOfObject(Node.GetChild(0));   // "(@X)->f" is "X.f"
   if TypeName = '' then TypeName := ObjectTypeName(Node.GetChild(0));
   // ...and an ENUM member named through the TYPE ITSELF ("T.member"), not through an instance. The
