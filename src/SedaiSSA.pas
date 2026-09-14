@@ -27544,10 +27544,23 @@ begin
     // The raw type code follows the field's BYTE WIDTH, which is what its declaration gave it: a UShort
     // field is two bytes at its offset, not eight.
     Value := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    // ⛔ ...AND ITS SIGN. The code was chosen by WIDTH alone, so an UNSIGNED narrow field of C's memory
+    // was sign-extended on load: SDL's palette entry "pal[255].r" (Uint8 255) printed 18446744073709551615
+    // where fbc prints 255 (SDL2 deck, DIVERGENZE 383). Nothing had shown it: every field read before sat
+    // below 128. WidthCode is the table ForeignStructRetSpec already reads (2 u8, 4 u16, 6 u32).
     case Sz of
-      1: EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I8));
-      2: EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I16));
-      4: EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I32));
+      1: if F.WidthCode = 2 then
+           EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_U8))
+         else
+           EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I8));
+      2: if F.WidthCode = 4 then
+           EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_U16))
+         else
+           EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I16));
+      4: if F.WidthCode = 6 then
+           EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_U32))
+         else
+           EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I32));
     else
       // ⭐ ...and a POINTER field says so: read out of a struct C handed back it is C's pointer, and the
       // VM tags it on the way out (DIVERGENZE 250). An INTEGER field of the same width must not be.
@@ -52067,6 +52080,12 @@ var
   SRetType, SRetSpec, SRetWhy: string;
   SRetUDT: Integer;
   SRetHandle: TSSAValue;
+  // ⭐ A STRUCT PASSED BY VALUE (DIVERGENZE 382): the declaration with each UDT parameter spelled as its
+  // C layout ("SVAL:..."), and whether any parameter needed it.
+  DeclV: TForeignDecl;
+  SValArg: Boolean;
+  SValUDT: Integer;
+  SValSpec, SValWhy: string;
 begin
   Result := False;
   ResultVal := MakeSSAValue(svkNone);
@@ -52123,14 +52142,37 @@ begin
   if GetEnvironmentVariable('FGNDIAG') = '1' then
     WriteLn(ErrOutput, 'FGN sito ', Decl.Name, ': variadic=', Decl.Variadic,
             ' NArgs=', NArgs, ' dichiarati=', Length(Decl.ParamTypeNames));
+  // ⭐⭐ A C FUNCTION THAT TAKES A STRUCT BY VALUE (DIVERGENZE 382). The twin of the return above, and it
+  // was refused by name: "TTF_RenderUTF8_Shaded(font, text, fg, bg)" takes two SDL_Color, and so does
+  // half of SDL2_ttf and SDL2_gfx. The ABI layer passes aggregates already (the FFI net exercises the
+  // classification); what was missing is the call site writing the LAYOUT where the marshaller reads it
+  // - its own entry, the parameter spelled "SVAL:<size>:<align>:<fields>", the same spelling SRET uses.
+  // ⛔ A UDT the classification cannot take is still refused, naming the field that stopped it.
+  DeclV := Decl;
+  DeclV.ParamTypeNames := Copy(Decl.ParamTypeNames, 0, Length(Decl.ParamTypeNames));
+  SValArg := False;
+  for i := 0 to High(Decl.ParamTypeNames) do
+    if (ForeignKindOf(Decl.ParamTypeNames[i]) = fkUnknown) and
+       (FEnumNames.IndexOf(UpperFast(Decl.ParamTypeNames[i])) < 0) then
+    begin
+      SValUDT := FindUDT(UpperFast(CanonicalType(Decl.ParamTypeNames[i])));
+      if SValUDT < 0 then Continue;          // not a record: the refusal below names it
+      SValSpec := ForeignStructRetSpec(SValUDT, SValWhy);
+      if SValSpec = '' then
+        raise Exception.CreateFmt('Foreign function %s: parameter %d is "%s" by value, which this path ' +
+                                  'cannot classify for the calling convention: %s',
+                                  [Decl.Name, i + 1, Decl.ParamTypeNames[i], SValWhy]);
+      DeclV.ParamTypeNames[i] := 'SVAL:' + Copy(SValSpec, 6, MaxInt);
+      SValArg := True;
+    end;
   if Decl.Variadic and (NArgs > Length(Decl.ParamTypeNames)) then
-    Idx := VariadicCallSiteDecl(Decl, ArgListNode, NArgs, SRetSpec)
+    Idx := VariadicCallSiteDecl(DeclV, ArgListNode, NArgs, SRetSpec)
   else
   begin
     if NArgs > Length(Decl.ParamTypeNames) then NArgs := Length(Decl.ParamTypeNames);
     // ...and a STRUCT RETURNED BY VALUE wants its own entry too, for the same reason a callback and a
     // record argument do: the entry is where the layout is written (DIVERGENZE 329).
-    if SRetSpec <> '' then Idx := VariadicCallSiteDecl(Decl, ArgListNode, NArgs, SRetSpec);
+    if (SRetSpec <> '') or SValArg then Idx := VariadicCallSiteDecl(DeclV, ArgListNode, NArgs, SRetSpec);
     // ...e anche una chiamata NON variadica vuole la propria voce se le si passa una procedura BASIC:
     // e' li' che la firma del callback viene scritta (DIVERGENZE 218). ...And so does one handed the
     // address of a BASIC record: the entry is where "REC:" is written (DIVERGENZE 245).
@@ -52149,7 +52191,7 @@ begin
           ForeignRecordArg(ArgListNode.GetChild(i)) or
           (ForeignNarrowArg(ArgListNode.GetChild(i), NarrowT) > 0)) then
       begin
-        Idx := VariadicCallSiteDecl(Decl, ArgListNode, NArgs);
+        Idx := VariadicCallSiteDecl(DeclV, ArgListNode, NArgs, SRetSpec);
         Break;
       end;
   end;

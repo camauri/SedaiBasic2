@@ -730,6 +730,11 @@ begin
   SetLength(B.ArgRefs, Length(B.ArgKinds));
   for i := 0 to High(B.ArgKinds) do
   begin
+    // ⭐ A STRUCT PASSED BY VALUE (DIVERGENZE 382): its ABI type comes from the layout the call site wrote,
+    // exactly as a struct RETURNED by value does.
+    if (B.ArgKinds[i] = fkStruct) and (i <= High(B.Decl.ParamTypeNames)) then
+      B.ArgRefs[i] := StructRetRef(B.Decl.ParamTypeNames[i])
+    else
     B.ArgRefs[i] := KindToRef(B.ArgKinds[i]);
     if B.ArgRefs[i] = nil then
       raise EForeignCallError.CreateFmt('%s: parameter %d - %s',
@@ -892,6 +897,20 @@ begin
       fkS8, fkU8:   begin PByte(Vals[i])^ := Byte(XferInt[SlotI]); Inc(SlotI); end;
       fkS16, fkU16: begin PWord(Vals[i])^ := Word(XferInt[SlotI]); Inc(SlotI); end;
       fkS32, fkU32: begin PLongWord(Vals[i])^ := LongWord(XferInt[SlotI]); Inc(SlotI); end;
+      // ⭐ A STRUCT BY VALUE (DIVERGENZE 382): the slot holds the record's HANDLE, and the ABI wants a
+      // pointer to the struct's bytes - the record's own C image, read at the call and never written.
+      fkStruct:
+        begin
+          if not Assigned(FRecBytes) then
+            raise EForeignCallError.CreateFmt('%s: argument %d is a struct by value and this build cannot reach a record''s image',
+                                              [B^.Decl.Name, i + 1]);
+          P := FRecBytes(ACtx, XferInt[SlotI], Avail);
+          if (P = nil) or (Avail < PtrUInt(B^.ArgRefs[i].Size)) then
+            raise EForeignCallError.CreateFmt('%s: argument %d is a struct of %d bytes and the record holds %d',
+                                              [B^.Decl.Name, i + 1, B^.ArgRefs[i].Size, Avail]);
+          Vals[i] := P;
+          Inc(SlotI);
+        end;
       fkPointer:
         begin
           // ⛔ A POINTER ARGUMENT IS NOT AN INTEGER. What the program holds is a VM-domain value - an

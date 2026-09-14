@@ -252,6 +252,8 @@ begin
   if (T = 'LONGDOUBLE') then Exit(fkLongDouble);
   // ⭐ ...and a struct RETURNED BY VALUE, written by the call site with its C layout (DIVERGENZE 329).
   if Copy(T, 1, 5) = 'SRET:' then Exit(fkStruct);
+  // ...and a struct passed BY VALUE as an argument (DIVERGENZE 382): the same layout spelling, another name.
+  if Copy(T, 1, 5) = 'SVAL:' then Exit(fkStruct);
   // ZSTRING / WSTRING with no PTR is a fixed buffer in a UDT, never a scalar parameter; a STRING
   // parameter of a foreign function is the address of its bytes.
   if (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') then Exit(fkPointer);
@@ -266,7 +268,7 @@ var
 begin
   Result := False; ASize := 0; AAlign := 0; SetLength(AFields, 0);
   T := UpperCase(Trim(ATypeName));
-  if Copy(T, 1, 5) <> 'SRET:' then Exit;
+  if (Copy(T, 1, 5) <> 'SRET:') and (Copy(T, 1, 5) <> 'SVAL:') then Exit;
   Delete(T, 1, 5);
   p := Pos(':', T); if p <= 0 then Exit;
   ASize := StrToIntDef(Copy(T, 1, p - 1), -1);
