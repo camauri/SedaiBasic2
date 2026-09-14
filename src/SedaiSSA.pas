@@ -4688,6 +4688,28 @@ begin
         else
           EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end;
+        // ⭐ DIVERGENZE 413 - AN EXTERN OF C WHOSE TYPE IS A POINTER HOLDS AN ADDRESS C WROTE, and it has to
+        // read as one. ncurses' "stdscr As WINDOW_ Ptr" came out as bare bits, so passing it to C - "wmove(
+        // stdscr, y, x)", and every window-less macro of ncurses.bi - took it for a HANDLE of a record of the
+        // program ("argument 1 is the address of a record that does not exist"), while newpad()'s result,
+        // which the runtime marks, went through. The mark is the runtime's own for a pointer C returns:
+        // FGNPTR_TAG, and a NULL stays 0 ("(v <> 0) and 1" times the tag - all C-hot-loop ops, both dialects).
+        if (FuncRetType = srtInt) and IsForeignDataScalar(UpperFast(VarName)) then
+        begin
+          TempStr := FForeignDataScalars.Values[UpperFast(VarName)];
+          if (Length(TempStr) > 4) and (Copy(TempStr, Length(TempStr) - 3, 4) = ' PTR') then
+          begin
+            Left := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaCmpNeInt, Left, Result, EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
+            Right := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaBitwiseAnd, Right, Left, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+            Left := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaMulInt, Left, Right, EnsureIntRegister(MakeSSAConstInt(FGNPTR_TAG)), MakeSSAValue(svkNone));
+            Right := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaBitwiseOr, Right, Result, Left, MakeSSAValue(svkNone));
+            Result := Right;
+          end;
+        end;
       end
       // @-taken local: read its per-frame backing record (field slot 0) through the hidden handle.
       else if IsAddrLocal(VarName) then
