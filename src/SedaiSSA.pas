@@ -1622,6 +1622,7 @@ type
     function RawChainElemBytes(const ElemType: string): Int64;
     function RawChainAddr(Node: TASTNode; out Addr: TSSAValue; out ElemType: string): Boolean;
     function RawChainValue(Node: TASTNode; out Val: TSSAValue; out Pointee: string): Boolean;
+    function RawChainNameIsArray(const NameU: string): Boolean;
     function TryEmitRawChainRead(Node: TASTNode; out Value: TSSAValue): Boolean;
     function TryEmitRawChainStore(Node, ExprNode: TASTNode): Boolean;
     function ResolveRawUDTBase(ObjNode: TASTNode; out TypeName: string; out UDTIdx: Integer;
@@ -26875,7 +26876,7 @@ begin
   if Node.GetChild(0).NodeType = antIdentifier then
   begin
     Nm := Node.GetChild(0).ValueUpper;
-    if (ArrayIndexOf(Nm) >= 0) or (not IsRawPtr(Nm)) then Exit;
+    if RawChainNameIsArray(Nm) or (not IsRawPtr(Nm)) then Exit;
     Result := UpperFast(PointeeTypeOf(Nm));
   end
   else if Node.GetChild(0).NodeType = antArrayAccess then
@@ -26884,6 +26885,24 @@ begin
     if (Length(Inner) < 4) or (Copy(Inner, Length(Inner) - 3, 4) <> ' PTR') then Exit;
     Result := Trim(Copy(Inner, 1, Length(Inner) - 4));
   end;
+end;
+
+function TSSAGenerator.RawChainNameIsArray(const NameU: string): Boolean;
+// Does "NameU[i]" index a declared ARRAY, rather than a pointer? The chain owns only the second.
+// ⛔ A module pointer whose ADDRESS is taken lives in a one-element shared array OF ITS OWN NAME
+// (FAddrSharedScalars), so "the name has an array" is true for it and says nothing: that array is the
+// variable's CELL. Asked bare, it turned away the commonest out-parameter of C - "ov_read_float(@vf,
+// @chans, ...)" then "chans[ch][i]" - and nothing else claimed the node: the read lowered to nothing and
+// printed whatever register 0 held, while "c = chans[ch]" was not marked raw and read eight bytes as a
+// Double (vorbis deck, DIVERGENZE 371). A program that WROTE "chans[0] = ..." first never saw it, because
+// that store takes another road - which is why the pure-BASIC corpus never did.
+var
+  Idx: Integer;
+begin
+  Idx := ArrayIndexOf(NameU);
+  Result := Idx >= 0;
+  if Result and (FAddrSharedScalars.IndexOfName(NameU) >= 0) and (Idx = FProgram.FindArray(NameU)) then
+    Result := False;
 end;
 
 function TSSAGenerator.RawChainElemBytes(const ElemType: string): Int64;
@@ -26931,7 +26950,7 @@ begin
   if Node.GetChild(0).NodeType = antIdentifier then
   begin
     Nm := Node.GetChild(0).ValueUpper;
-    if (ArrayIndexOf(Nm) >= 0) or (not IsRawPtr(Nm)) then Exit;
+    if RawChainNameIsArray(Nm) or (not IsRawPtr(Nm)) then Exit;
     BasePointee := UpperFast(PointeeTypeOf(Nm));
     if BasePointee = '' then Exit;
     ProcessExpression(Node.GetChild(0), BaseVal);
@@ -45642,6 +45661,22 @@ begin
   // read the address as a number (DIVERGENZE 297).
   else if (Node.NodeType = antArrayAccess) and (MemberArrayElemRawPtrPointee(Node) <> '') then
     Result := MemberArrayElemRawPtrPointee(Node)
+  // ⭐ ...and "*obj.field[k]" WHERE THE FIELD IS A POINTER TO POINTERS, indexed. "user_comments As ZString
+  // Ptr Ptr" on vorbis_comment, "argv", every "char **" of a C struct: the element is of the field's
+  // pointee type, and dereferencing it strips one more level. No arm asked about an indexing whose base
+  // is a MEMBER - the array-member arm above wants an array, the name arm below wants a name - so the
+  // answer was '' and "*vc.user_comments[0]" printed the first eight bytes of "TITLE=abc" as an integer,
+  // while "zp = vc.user_comments[0] : *zp" was right (vorbis deck, DIVERGENZE 369). Square brackets only:
+  // "obj.m(k)" is an array member or a method, and those have their own arms.
+  else if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and
+          (Node.Attributes.Values['BRACKET'] = '1') and (Node.GetChild(0) <> nil) and
+          (Node.GetChild(0).NodeType = antMemberAccess) and
+          (Length(DerefedType(Node.GetChild(0))) > 4) and
+          (Copy(DerefedType(Node.GetChild(0)), Length(DerefedType(Node.GetChild(0))) - 3, 4) = ' PTR') then
+  begin
+    T := DerefedType(Node.GetChild(0));
+    Result := Trim(Copy(T, 1, Length(T) - 4));
+  end
   else if (Node.NodeType = antMemberAccess) and (Node.ChildCount >= 1) then
   begin
     // ⭐ "*obj.field" WHERE THE FIELD IS THE POINTER. Every arm above asks a registry keyed on a
