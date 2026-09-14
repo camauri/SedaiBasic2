@@ -982,6 +982,7 @@ type
     function PtrPointeeOf(Node: TASTNode): string;
     function AddrOfScalarPointee(Target: TASTNode): string;                    // DIVERGENZE 405: "@x" / "@a(i)" on a numeric scalar
     function IsForeignDataScalar(const NameU: string): Boolean;                // ...an Extern scalar of C, visible here
+    function ForeignExternIsPointer(const NameU: string): Boolean;             // ...whose declared type is a pointer (412 · 413)
     function EmitCastToScalarPtr(Operand: TASTNode; const V: TSSAValue; const Pointee: string): TSSAValue;
     function TryEmitManagedPtrArith(Node: TASTNode; out Res: TSSAValue): Boolean;
     function StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;  // "TYPE.FIELD" backing name, or '' if not static
@@ -4680,6 +4681,17 @@ begin
         else if (RefVarNarrowCode(VarName) > 0) and (FuncRetType = srtInt) then
           EmitInstruction(ssaRawLoadInt, Result, Left, MakeSSAValue(svkNone),
                           MakeSSAConstInt(RefVarNarrowCode(VarName)))
+        // ⭐ DIVERGENZE 413 · 412 - AN EXTERN OF C WHOSE TYPE IS A POINTER HOLDS AN ADDRESS C WROTE, and it has
+        // to read as one. ncurses' "stdscr As WINDOW_ Ptr" came out as bare bits, so passing it to C - "wmove(
+        // stdscr, y, x)" and every window-less macro of ncurses.bi - took it for a HANDLE of a record of the
+        // program ("argument 1 is the address of a record that does not exist"); and "environ[0]" on a
+        // "ZString Ptr Ptr" reached memory the VM had never been told it may read.
+        // ⇒ The load a pointer read out of C's memory already has: RTC_PTR64 from the bound address, which the
+        // VM answers with C's mark AND the region noted (or brings home an address that is the VM's own).
+        // ⚠️ A first cure OR-ed the mark in by hand: it fixed stdscr - the marshaller only asks the bit - and
+        // left every READ through the pointer refused by the region check. The mark is not the whole fact.
+        else if (FuncRetType = srtInt) and ForeignExternIsPointer(UpperFast(VarName)) then
+          EmitInstruction(ssaRawLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_PTR64))
         else
         case FuncRetType of
           srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -4687,28 +4699,6 @@ begin
                                      MakeSSAConstInt(Ord(RefVarIsWide(VarName))));
         else
           EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-        end;
-        // ⭐ DIVERGENZE 413 - AN EXTERN OF C WHOSE TYPE IS A POINTER HOLDS AN ADDRESS C WROTE, and it has to
-        // read as one. ncurses' "stdscr As WINDOW_ Ptr" came out as bare bits, so passing it to C - "wmove(
-        // stdscr, y, x)", and every window-less macro of ncurses.bi - took it for a HANDLE of a record of the
-        // program ("argument 1 is the address of a record that does not exist"), while newpad()'s result,
-        // which the runtime marks, went through. The mark is the runtime's own for a pointer C returns:
-        // FGNPTR_TAG, and a NULL stays 0 ("(v <> 0) and 1" times the tag - all C-hot-loop ops, both dialects).
-        if (FuncRetType = srtInt) and IsForeignDataScalar(UpperFast(VarName)) then
-        begin
-          TempStr := FForeignDataScalars.Values[UpperFast(VarName)];
-          if (Length(TempStr) > 4) and (Copy(TempStr, Length(TempStr) - 3, 4) = ' PTR') then
-          begin
-            Left := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-            EmitInstruction(ssaCmpNeInt, Left, Result, EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
-            Right := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-            EmitInstruction(ssaBitwiseAnd, Right, Left, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
-            Left := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-            EmitInstruction(ssaMulInt, Left, Right, EnsureIntRegister(MakeSSAConstInt(FGNPTR_TAG)), MakeSSAValue(svkNone));
-            Right := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-            EmitInstruction(ssaBitwiseOr, Right, Result, Left, MakeSSAValue(svkNone));
-            Result := Right;
-          end;
         end;
       end
       // @-taken local: read its per-frame backing record (field slot 0) through the hidden handle.
@@ -33866,6 +33856,18 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.ForeignExternIsPointer(const NameU: string): Boolean;
+// An Extern of C, visible here, whose declared type is a POINTER ("WINDOW_ PTR", "ZSTRING PTR PTR"): its value
+// is an address C wrote, read with RTC_PTR64 (DIVERGENZE 412 · 413).
+var
+  T: string;
+begin
+  Result := False;
+  if not IsForeignDataScalar(NameU) then Exit;
+  T := FForeignDataScalars.Values[NameU];
+  Result := (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR');
+end;
+
 function TSSAGenerator.InlineArrayElemPointee(ElemNode: TASTNode): string;
 // DIVERGENZE 390 - "@x.m(i)" on an array member that LIVES in the record's bytes points at an ELEMENT, and
 // its pointee is the element's type. DeclaredTypeNameOf answers for the member, not for its element, so
@@ -45538,7 +45540,17 @@ begin
     if (Node.Attributes.Values['BYREF'] = '1') and (Node.Attributes.Values['FGNDATA'] <> '') and
        (Node.GetChild(1) <> nil) and (Node.GetChild(1).NodeType = antIdentifier) and
        (FindUDT(Node.GetChild(1).ValueUpper) < 0) then
+    begin
       FForeignDataScalars.Values[LhsU] := UpperFast(CanonicalType(Node.GetChild(1).ValueUpper));
+      // ⭐ DIVERGENZE 412 - ...and one whose type is a POINTER TO A SCALAR ("environ As ZString Ptr Ptr") is a
+      // raw pointer: what it holds is C's memory, so "environ[0]" steps SizeOf bytes and loads raw. A pointer to
+      // a RECORD (WINDOW_ Ptr, FILE Ptr) keeps its own road, the record-pointer one (DIVERGENZE 413).
+      if (Length(FForeignDataScalars.Values[LhsU]) > 4) and
+         (Copy(FForeignDataScalars.Values[LhsU], Length(FForeignDataScalars.Values[LhsU]) - 3, 4) = ' PTR') and
+         (FindUDT(UpperFast(CanonicalType(Trim(Copy(FForeignDataScalars.Values[LhsU], 1,
+                  Length(FForeignDataScalars.Values[LhsU]) - 4))))) < 0) then
+        MarkRaw(LhsU);
+    end;
     if (Node.Attributes.Values['BYREF'] = '1') and (Node.Attributes.Values['FGNDATA'] <> '') and
        (Node.GetChild(1) <> nil) and (Node.GetChild(1).NodeType = antIdentifier) and
        (FindUDT(Node.GetChild(1).ValueUpper) >= 0) then
@@ -47650,13 +47662,29 @@ function TSSAGenerator.EmitPointerIndexAddress(const PtrName: string; IndicesNod
 // pointer the address is a byte offset, so the index is scaled by SizeOf(pointee) — FreeBASIC semantics.
 var
   PtrReg, IdxVal, SzVal, ScaledIdx, IdxK: TSSAValue;
+  IdNode: TASTNode;
 begin
   // ⛔ The POINTER'S OWN VALUE, read the way that pointer is stored. Asking GetOrAllocateVariable gave
   // a REGISTER, and an @-taken or SHARED pointer does not live in one - it is array-backed. The emitted
   // code then added the index to an UNDEFINED register ("AddInt R4, R5, R7" with R5 never written), so
   // "p[i].field" answered rubbish and p[0] and p[1] gave the SAME wrong answer. ⚠️ The identical program
   // without "Dim pp As T Ptr Ptr = @p" worked, because without the @ the pointer does stay in a register.
-  PtrReg := RecordHandleOfVar(PtrName);
+  // ⭐ DIVERGENZE 412 - AN EXTERN OF C IS A REFERENCE, and its VALUE is the pointer. RecordHandleOfVar answers
+  // the variable's CELL - the address the Extern is bound to - so "environ[0]" indexed the binding instead of
+  // the char** C keeps there, and died on an access violation. The ordinary read of the name goes through the
+  // reference (and carries C's mark, DIVERGENZE 413): the index starts from that.
+  if IsForeignDataScalar(UpperFast(PtrName)) then
+  begin
+    IdNode := TASTNode.CreateWithValue(antIdentifier, PtrName, nil);
+    try
+      ProcessExpression(IdNode, PtrReg);
+    finally
+      IdNode.Free;
+    end;
+    PtrReg := EnsureIntRegister(PtrReg);
+  end
+  else
+    PtrReg := RecordHandleOfVar(PtrName);
   ProcessExpression(IndicesNode.GetChild(0), IdxVal);
   IdxK := IdxVal;                      // a constant index, kept for the managed step (DIVERGENZE 226)
   IdxVal := EnsureIntRegister(IdxVal);
