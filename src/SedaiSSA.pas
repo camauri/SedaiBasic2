@@ -585,6 +585,7 @@ type
     FConstDeclSeen: TStringList;         // CONST names already seen: a name declared TWICE must not fold
     FConstStrBytes: TStringList;         // STRING consts: name (UPPER) -> byte size fbc reports (length + 1)
     FTypeAliases: TStringList;           // FB "TYPE alias AS underlying": alias (UPPER) -> underlying (UPPER)
+    FTypeAliasRedecl: TStringList;       // an alias REDECLARED after #undef: key -> "line:target;..." (DIVERGENZE 418)
     // ⭐ TWO MEMBERS OF ONE TYPE THAT CARRY THE SAME "ALIAS" STRING ARE ONE PROCEDURE. Maps the label
     // the call site builds for the LATER member ("UDT.V.SET") to the one that owns the body
     // ("UDT.SETV"). Filled from the ordinal MEMALIAS entries the parser leaves on the antTypeDecl,
@@ -1932,6 +1933,7 @@ begin
   FModuleCtors := TIndexedStringList.Create;
   FModuleDtors := TIndexedStringList.Create;
   FTypeAliases := TIndexedStringList.Create;
+  FTypeAliasRedecl := TStringList.Create;
   FMemberAliasLabel := TIndexedStringList.Create;
   FMemberAliasLabel.CaseSensitive := False;
   FModuleDtorSlots := TIndexedStringList.Create;
@@ -2129,6 +2131,7 @@ begin
   FModuleCtors.Free;
   FModuleDtors.Free;
   FTypeAliases.Free;
+  FTypeAliasRedecl.Free;
   FMemberAliasLabel.Free;
   FModuleDtorSlots.Free;
   FStaticLocalOwner.Free;
@@ -31347,6 +31350,9 @@ begin
     FCanonCacheAt := FTypeAliases.Count;
   end;
   CKey := FTypeScopePath + #1 + TypeName;
+  // a redeclared alias answers per LINE (DIVERGENZE 418): only then does the line enter the key
+  if (FTypeAliasRedecl <> nil) and (FTypeAliasRedecl.Count > 0) then
+    CKey := CKey + #2 + IntToStr(FCurrentLineNumber);
   CHit := FCanonCache.Items[CKey];
   if CHit <> '' then Exit(CHit);
   Result := CanonicalTypeUncached(TypeName);
@@ -31365,8 +31371,8 @@ function TSSAGenerator.CanonicalTypeUncached(const TypeName: string): string;
 // The stars are counted off, the BASE is resolved, and they go back on - so "P PTR" becomes
 // "UDT PTR PTR" and the depth is preserved whichever spelling the program used.
 var
-  T, Next, Base: string;
-  Guard, Idx, Stars: Integer;
+  T, Next, Base, Versions, Item: string;
+  Guard, Idx, Stars, RIdx, P, Ln: Integer;
 begin
   T := UpperFast(TypeName);
   if FTypeAliases.Count = 0 then Exit(T);
@@ -31379,6 +31385,25 @@ begin
     Idx := ScopedNameIndex(FTypeAliases, T);
     if Idx < 0 then Break;
     Next := UpperFast(FTypeAliases.ValueFromIndex[Idx]);
+    // ⭐ A REDECLARED alias (DIVERGENZE 418) answers the LAST version declared at or above the line being
+    // generated; above its first redeclaration it is still the original.
+    if (FTypeAliasRedecl.Count > 0) and (FCurrentLineNumber > 0) then
+    begin
+      RIdx := FTypeAliasRedecl.IndexOfName(FTypeAliases.Names[Idx]);
+      if RIdx >= 0 then
+      begin
+        Versions := FTypeAliasRedecl.ValueFromIndex[RIdx];
+        while Versions <> '' do
+        begin
+          P := Pos(';', Versions);
+          if P = 0 then P := Length(Versions) + 1;
+          Item := Copy(Versions, 1, P - 1);
+          Delete(Versions, 1, P);
+          Ln := StrToIntDef(Copy(Item, 1, Pos(':', Item) - 1), MaxInt);
+          if Ln <= FCurrentLineNumber then Next := Copy(Item, Pos(':', Item) + 1, MaxInt);
+        end;
+      end;
+    end;
     if (Next = '') or (Next = T) then Break;
     T := Next;
     Inc(Guard);
@@ -32506,7 +32531,16 @@ begin
     if Node.Attributes.Values['ALIAS'] <> '' then
     begin
       if FTypeAliases.IndexOfName(Path + Name) < 0 then
-        FTypeAliases.Values[Path + Name] := UpperFast(Node.Attributes.Values['ALIAS']);
+        FTypeAliases.Values[Path + Name] := UpperFast(Node.Attributes.Values['ALIAS'])
+      // ⭐ ...AND A REDECLARATION WITH ANOTHER TARGET IS KEPT, WITH ITS LINE (DIVERGENZE 418). fbc accepts it only
+      // after "#undef NAME" - which removes the TYPE symbol too, not just a macro - and the new alias holds FROM
+      // THAT LINE ON: "Dim x As FOO" above it stays the old size. fastcgi/fcgi_stdio.bi does exactly that to crt's
+      // FILE ("#undef FILE : Type FILE As FCGI_FILE"), and SizeOf(FILE) answered 8 instead of 16. The first
+      // declaration stays in FTypeAliases; CanonicalTypeUncached picks the version for the line being generated.
+      else if (Node.SourceLine > 0) and
+              (UpperFast(Node.Attributes.Values['ALIAS']) <> UpperFast(FTypeAliases.Values[Path + Name])) then
+        FTypeAliasRedecl.Values[Path + Name] := FTypeAliasRedecl.Values[Path + Name] +
+          IntToStr(Node.SourceLine) + ':' + UpperFast(Node.Attributes.Values['ALIAS']) + ';';
       // FreeBASIC named function-pointer type "TYPE X As Function(params) As R": record its signature so a
       // var/param declared "As X" becomes an int-banked function pointer (aliased to INTEGER above) whose
       // "f(args)" lowers to an indirect call. The signature is copied into the per-proc FFuncPtrSigs.

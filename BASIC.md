@@ -3611,10 +3611,12 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   null one — `sqlite3.bi`'s `SQLITE_TRANSIENT` and `SQLITE_STATIC`. A **call** through it prints what the
   procedure returns: `Print f(21)` is ` 42` for a `Function(...) As Long`, `true` for one `As Boolean`.
 
+- **A type alias redeclared after `#undef` holds from that line on**, as in FreeBASIC: `#undef FILE` then
+  `Type FILE As FCGI_FILE` (what `fastcgi/fcgi_stdio.bi` does after `crt.bi`) makes `SizeOf(FILE)` the size of
+  `FCGI_FILE` below it, while a variable declared above keeps the old type. ⚠️ A redeclaration **without** the
+  `#undef`, which FreeBASIC refuses as a duplicated definition, is accepted here with the same rule.
+
 ⚠️ **Known differences still open**, named so they are not mistaken for something else:
-A type alias **redeclared after `#undef`** (`#undef FILE` then `Type FILE As FCGI_FILE`, as `fastcgi/fcgi_stdio.bi`
-does) keeps its FIRST meaning here, where FreeBASIC applies the new one from that line on: `SizeOf(FILE)` answers the
-size of the C library's `FILE` instead of `FCGI_FILE`.
 On a **terminal**, every FreeBASIC program writes a few control sequences when it starts (keypad mode and two
 cursor-position queries, whose answer it waits for) and when it ends; SedaiBasic writes none. `SizeOf(1UL)` and
 `SizeOf(1L)` answer 8 where FreeBASIC answers 4. `TypeOf` of a narrow scalar or of an array element answers a
