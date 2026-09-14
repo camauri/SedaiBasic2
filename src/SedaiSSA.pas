@@ -633,6 +633,7 @@ type
     FIifCopySites: Integer;
     FVarExplicitType: TStringList;       // var name (UPPER) -> TSSARegisterType (Objects[]) for DIM..AS
     FArrayRecordType: TStringList;       // array name (UPPER) -> element UDT type name (UPPER)
+    FForeignDataScalars: TStringList;    // DIVERGENZE 405: an Extern of a C library whose type is a SCALAR (its address is C's)
     FArrayScalarType: TStringList;       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
     FArrayFuncPtrSig: TStringList;       // array-of-funcptr (DIM As <named funcptr type> a(..)) -> "params|ret" signature, so "a(i)(args)" is an indirect call
     FArrayPtrPointee: TStringList;       // array of UDT POINTERS ("DIM As T PTR a(..)", "a() AS T PTR" param) -> T, so "a(i)->field" resolves (params under their mangled name)
@@ -979,6 +980,8 @@ type
     function EmitRecPtrRestamp(const V: TSSAValue; W: Integer): TSSAValue;     // ...a field pointer re-read at another width
     function IsRecordHandleExpr(Node: TASTNode): Boolean;                      // ...a value that is a record handle or VIEW
     function PtrPointeeOf(Node: TASTNode): string;
+    function AddrOfScalarPointee(Target: TASTNode): string;                    // DIVERGENZE 405: "@x" / "@a(i)" on a numeric scalar
+    function IsForeignDataScalar(const NameU: string): Boolean;                // ...an Extern scalar of C, visible here
     function EmitCastToScalarPtr(Operand: TASTNode; const V: TSSAValue; const Pointee: string): TSSAValue;
     function TryEmitManagedPtrArith(Node: TASTNode; out Res: TSSAValue): Boolean;
     function StaticMemberBackingName(ObjNode: TASTNode; const FieldName: string): string;  // "TYPE.FIELD" backing name, or '' if not static
@@ -1882,6 +1885,8 @@ begin
   FVarExplicitType := TIndexedStringList.Create;
   FVarExplicitType.CaseSensitive := False;
   FArrayRecordType := TIndexedStringList.Create;
+  FForeignDataScalars := TIndexedStringList.Create;
+  FForeignDataScalars.CaseSensitive := False;
   FArrayScalarType := TIndexedStringList.Create;
   FArrayRecordType.CaseSensitive := False;
   FArrayFuncPtrSig := TIndexedStringList.Create;
@@ -2092,6 +2097,7 @@ begin
   FPreVarDeclType.Free;
   FResultTemps.Free;
   FArrayRecordType.Free;
+  FForeignDataScalars.Free;
   FArrayScalarType.Free;
   FArrayFuncPtrSig.Free;
   FArrayScalarPointee.Free;
@@ -4364,6 +4370,29 @@ begin
                           MakeSSAConstInt(RawStrModeOf(TempStr)));
           NoteZStrTextRead(Result, Left, RawStrModeOf(TempStr));
           Exit;
+        end;
+        // ⭐ ...and when the name is NOT a pointer but a raw-backed VARIABLE reached through "@x ± n", the
+        // name has no pointee to ask: x's own declared type is what is read (DIVERGENZE 405). "*(@d + 0)" on
+        // a Double local to a Sub read its eight bytes as an integer, while "(@d)[0]" beside it was right.
+        if TempStr = '' then
+        begin
+          TempStr := UpperFast(DerefedType(Node.GetChild(0)));
+          if (TempStr <> '') and IsBuiltinScalarTypeName(TempStr) and (not IsBuiltinStringTypeName(TempStr)) then
+          begin
+            if TypeNameToBank(TempStr, '') = srtFloat then
+            begin
+              Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+              EmitInstruction(ssaRawLoadFloat, Result, Left, MakeSSAValue(svkNone),
+                              MakeSSAConstInt(RawTypeCodeOfPointee(TempStr)));
+            end
+            else
+            begin
+              Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaRawLoadInt, Result, Left, MakeSSAValue(svkNone),
+                              MakeSSAConstInt(RawTypeCodeOfPointee(TempStr)));
+            end;
+            Exit;
+          end;
         end;
         if PointeeBankOf(ArrName2) = srtFloat then
         begin
@@ -30445,6 +30474,8 @@ begin
   if Node = nil then Exit;
   while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
   if Node.NodeType = antIdentifier then Exit(PointeeTypeOf(VarToStr(Node.Value)));
+  // "@x" / "@a(i)" on a numeric scalar: "(@ua(0))[2]" on a UByte array printed a sign column (DIVERGENZE 405).
+  if Node.NodeType = antProcAddress then Exit(AddrOfScalarPointee(Node));
   if Node.NodeType = antCast then
   begin
     T := UpperFast(Trim(VarToStr(Node.Value)));
@@ -33717,6 +33748,100 @@ begin
     Result := UpperFast(DeclaredTypeNameOf(N.GetChild(0)));
     if Result = '' then Result := InlineArrayElemPointee(N.GetChild(0));
   end;
+end;
+
+function TSSAGenerator.AddrOfScalarPointee(Target: TASTNode): string;
+// DIVERGENZE 405 - what the address-of node Target points at, when its operand is a VARIABLE or an element
+// of a declared ARRAY whose type is a plain NUMERIC scalar; '' for anything else (a procedure, a string, a
+// record, a pointer element), which keeps every other shape on the road it already had.
+// ⚠️ The parser gives the two operands two SHAPES: "@a(0)" is an antProcAddress over an antArrayAccess,
+// "@x" is an antProcAddress with NO child and the name in its Value.
+// ⛔ DerefedType had an arm for "@Cast(T, x)" only, so "(@a(0))[2]" missed the parenthesised-base branch
+// and lowered to NOTHING, "*(@a(0) + 2)" read eight bytes of a Long array in a PRINT, a Double's bits as
+// an integer, and on a UByte array died on "reading 8 bytes at offset 1 of a 4-byte array". The same
+// address through a declared "Long Ptr" was right: the TYPE of "@x" was known and nobody was asked it.
+// It is ncurses.bi's "#define acs_map(i) ((@__acs_map)[i])".
+var
+  NameU: string;
+  ArrIdx, k: Integer;
+  ArrInfo: TSSAArrayInfo;
+  Tmp: TASTNode;
+begin
+  Result := '';
+  if (Target = nil) or (Target.NodeType <> antProcAddress) then Exit;
+  if Target.ChildCount = 0 then
+  begin
+    NameU := Target.ValueUpper;
+    if (NameU = '') or (FProcedureNames.IndexOf(NameU) >= 0) then Exit;   // "@proc" is an entry point
+    // ⭐ An Extern of C files its declared type with it: DeclaredTypeNameOf knows only its BANK, and
+    // "(@tbl)[2]" over a C ULong array then stepped and read eight bytes as an INTEGER.
+    if IsForeignDataScalar(NameU) then
+      Result := UpperFast(FForeignDataScalars.Values[NameU])
+    else
+    begin
+      Tmp := TASTNode.CreateWithValue(antIdentifier, VarToStr(Target.Value), Target.Token);
+      try
+        Result := UpperFast(DeclaredTypeNameOf(Tmp));
+      finally
+        Tmp.Free;
+      end;
+    end;
+    // ...a procedure's own variable is filed under "PROC|NAME" in the explicit-type registry.
+    if (Result = '') and FInProcedure and (FCurrentProcName <> '') then
+    begin
+      k := FVarExplicitType.IndexOf(UpperFast(FCurrentProcName) + '|' + NameU);
+      if (k >= 0) and (TSSARegisterType(PtrInt(FVarExplicitType.Objects[k])) = srtFloat) then
+        Result := 'DOUBLE';
+    end;
+    if (Result = '') or (not IsBuiltinScalarTypeName(Result)) or IsBuiltinStringTypeName(Result) then
+      Result := '';
+    Exit;
+  end;
+  Target := Target.GetChild(0);
+  while (Target <> nil) and (Target.NodeType = antParentheses) and (Target.ChildCount >= 1) do
+    Target := Target.GetChild(0);
+  if Target = nil then Exit;
+  if Target.NodeType = antIdentifier then
+  begin
+    if FProcedureNames.IndexOf(Target.ValueUpper) >= 0 then Exit;   // "@proc" is an entry point, not a value
+    Result := UpperFast(DeclaredTypeNameOf(Target));
+  end
+  else if (Target.NodeType = antArrayAccess) and (Target.ChildCount >= 2) and
+          (Target.Attributes.Values['BRACKET'] <> '1') and (Target.GetChild(0) <> nil) and
+          (Target.GetChild(0).NodeType = antIdentifier) then
+  begin
+    NameU := Target.GetChild(0).ValueUpper;
+    ArrIdx := ArrayIndexOf(NameU);
+    if ArrIdx < 0 then Exit;
+    if (FArrayRecordType.Values[ArrayFactKey(NameU)] <> '') or
+       (FArrayScalarPointee.Values[ArrayFactKey(NameU)] <> '') or
+       (FArrayPtrPointee.Values[ArrayFactKey(NameU)] <> '') then Exit;
+    case Declared32Code(Target) of
+      1: Result := 'BYTE';   2: Result := 'UBYTE';
+      3: Result := 'SHORT';  4: Result := 'USHORT';
+      5: Result := 'LONG';   6: Result := 'ULONG';
+      7: Result := 'SINGLE';
+    else
+      ArrInfo := FProgram.GetArray(ArrIdx);
+      case ArrInfo.ElementType of
+        srtFloat: Result := 'DOUBLE';
+        srtInt:   Result := 'INTEGER';
+      end;
+    end;
+  end;
+  if (Result = '') or (not IsBuiltinScalarTypeName(Result)) or IsBuiltinStringTypeName(Result) then
+    Result := '';
+end;
+
+function TSSAGenerator.IsForeignDataScalar(const NameU: string): Boolean;
+// Is NameU an Extern of a C library whose type is a scalar, as seen from here? The registry is keyed on the
+// bare name (an Extern lives at module level), so a procedure that declares the same name itself shadows it:
+// the same veto ManagedPtrPointee applies to its own flat map.
+begin
+  Result := False;
+  if (NameU = '') or (FForeignDataScalars.IndexOfName(NameU) < 0) then Exit;
+  if FInProcedure and (FCurrentProcDeclNames <> nil) and (FCurrentProcDeclNames.IndexOf(NameU) >= 0) then Exit;
+  Result := True;
 end;
 
 function TSSAGenerator.InlineArrayElemPointee(ElemNode: TASTNode): string;
@@ -43224,7 +43349,7 @@ procedure TSSAGenerator.EmitRawPtrArith(Node: TASTNode; out Result: TSSAValue);
 // pointer. The raw pointer side is identified by RawPtrExprName; the other side is the integer index.
 var
   PtrName: string;
-  PtrSide, IntSide: TASTNode;
+  PtrSide, IntSide, BareSide: TASTNode;
   PtrVal, IntVal, SzVal, Scaled: TSSAValue;
   sz: Int64;
 begin
@@ -43236,6 +43361,9 @@ begin
   else
   begin PtrSide := Node.GetChild(1); IntSide := Node.GetChild(0); end;
   PtrName := RawPtrExprName(PtrSide);
+  BareSide := PtrSide;
+  while (BareSide <> nil) and (BareSide.NodeType = antParentheses) and (BareSide.ChildCount >= 1) do
+    BareSide := BareSide.GetChild(0);
   ProcessExpression(PtrSide, PtrVal); PtrVal := EnsureIntRegister(PtrVal);
   ProcessExpression(IntSide, IntVal); IntVal := EnsureIntRegister(IntVal);
   // ⛔⛔ A CHARACTER BUFFER STEPS ONE BYTE, AND THE POINTEE LOOKUP HAS NOTHING TO SAY ABOUT IT.
@@ -43251,6 +43379,11 @@ begin
   begin
     if (PointeeTypeOf(PtrName) = '') and IsCharBufName(PtrName) then
       sz := ZStringBufElemBytes(PtrName)
+    // ⭐ "@x ± n" where x is a numeric VARIABLE, not a pointer: the name has no pointee, and the step is
+    // SizeOf(x) (DIVERGENZE 405). An Extern ULong over a C array stepped eight bytes: "*(@tbl + 3)" read
+    // the low half of the Double that follows it in C's data.
+    else if (PointeeTypeOf(PtrName) = '') and (AddrOfScalarPointee(BareSide) <> '') then
+      sz := RawElemSizeOfPointee(AddrOfScalarPointee(BareSide))
     else
       sz := RawElemSizeOf(PtrName);
   end
@@ -43298,7 +43431,7 @@ begin
   else if (Node.NodeType = antProcAddress) and (Node.ChildCount = 0) and
           (Node.Value <> Null) and
           (IsRawModuleScalar(VarToStr(Node.Value)) or (RawZStringBufBytes(VarToStr(Node.Value)) > 0) or
-           IsRawAddrLocal(VarToStr(Node.Value))) then
+           IsRawAddrLocal(VarToStr(Node.Value)) or IsForeignDataScalar(Node.ValueUpper)) then
     Result := Node.ValueUpper
   // @p[i] where p is a raw pointer: FreeBASIC "@p[i]" ≡ "p + i", a raw pointer of the same element type
   // (EmitArrayElementAddress emits the SizeOf-scaled byte address). Treat it as the raw pointer p so a
@@ -45377,6 +45510,13 @@ begin
     // The parser writes the initializer of a ByRef as "@(*expr)".
     // ...and an Extern of a C library whose type is a record (DIVERGENZE 253): its storage is C's by
     // definition - the parser marks it FGNDATA and the SSA binds it to the symbol's address.
+    // ⭐ ...and one whose type is a SCALAR (DIVERGENZE 405): "@__acs_map" in ncurses.bi, "@tbl" over a C
+    // array. Nothing marked its address raw, so "(@x)[i]", "*(@x + n)" and a "p = @x" pointer all stepped it
+    // as a packed VM pointer - one ELEMENT per unit instead of SizeOf bytes - and read eight bytes.
+    if (Node.Attributes.Values['BYREF'] = '1') and (Node.Attributes.Values['FGNDATA'] <> '') and
+       (Node.GetChild(1) <> nil) and (Node.GetChild(1).NodeType = antIdentifier) and
+       (FindUDT(Node.GetChild(1).ValueUpper) < 0) then
+      FForeignDataScalars.Values[LhsU] := UpperFast(CanonicalType(Node.GetChild(1).ValueUpper));
     if (Node.Attributes.Values['BYREF'] = '1') and (Node.Attributes.Values['FGNDATA'] <> '') and
        (Node.GetChild(1) <> nil) and (Node.GetChild(1).NodeType = antIdentifier) and
        (FindUDT(Node.GetChild(1).ValueUpper) >= 0) then
@@ -46346,6 +46486,9 @@ begin
     // array's declared element type, and answered -22 where fbc answers 234. The cast is there to say
     // what width and signedness to read at; taking its address does not take that away.
     Result := Node.GetChild(0).ValueUpper
+  // ⭐ ...and "@x" / "@a(i)" on a NUMERIC scalar points at x's own declared type (DIVERGENZE 405).
+  else if (Node.NodeType = antProcAddress) and (AddrOfScalarPointee(Node) <> '') then
+    Result := AddrOfScalarPointee(Node)
   // ⭐ "VarPtr(v)" / "Pointer(v)" NAME THEIR POINTEE THROUGH THEIR ARGUMENT: they are "@v" written as a
   // call, so what they dereference to is v's own declared type. Without this arm the reader answered ''
   // for them and "VarPtr(i)[0]" - fbc's own pointers/indexing-syntax - fell off the indexed-read branch
@@ -55344,6 +55487,7 @@ begin
   FRawModuleScalars.Clear;
   FAddrLocalVars.Clear;
   FRawPtrVars.Clear;
+  FForeignDataScalars.Clear;
   FRawPtrScoped.Clear;    // beside FRawPtrVars: the same fact with the SCOPE it was learnt in
   FRawFromAddrOf.Clear;   // beside FRawPtrVars: it records WHY one of them is raw
   FWStringVars.Clear;
