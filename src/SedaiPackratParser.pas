@@ -2156,6 +2156,10 @@ begin
        if FgnParams <> '' then FgnParams := FgnParams + ',';
        FgnParams := FgnParams + '...';
      end;
+     // ⭐ A declaration inside `extern "rtlib"` carries "#rtlib" where the LIB goes (DIVERGENZE 427). The SSA reads
+     // the mark and removes it before the table is built, so no loader ever sees it.
+     if (FgnLib = '') and (FExternKinds <> '') and (FExternKinds[Length(FExternKinds)] = 'R') then
+       FgnLib := '#rtlib';
      FForeignDecls.Add(FgnName + '|' + FgnAlias + '|' + FgnLib + '|' + FgnRet + '|' + FgnParams);
    end;
    Result := nil;
@@ -2193,6 +2197,10 @@ begin
          Inc(FExternCDepth);
          FExternKinds := FExternKinds + '1';
        end
+       // ...and "rtlib", FreeBASIC's own runtime, is REMEMBERED as such (DIVERGENZE 427): its declarations are
+       // marked, so a routine that has the same name and symbol as a C one (memmove) is told apart from it.
+       else if ExternName = 'RTLIB' then
+         FExternKinds := FExternKinds + 'R'
        else
          FExternKinds := FExternKinds + '0';
        Context.Advance;                   // the "C" / "Windows" linkage name

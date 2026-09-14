@@ -7291,7 +7291,16 @@ end;
 
 function TBytecodeVM.ForeignPtrHome(ACtx: TObject; A: PtrUInt): Int64;
 // Il ponte verso la FFI: un indirizzo macchina riportato a casa, se casa e' nostra. 0 altrimenti.
+// ⭐ DIVERGENZE 425 - ...and the CLOSURE of a procedure of the program is home too: C hands back what it was given
+// ("xmlSchemaGetParserErrors" writes the handler set with "@onerr"), and it must read as "@onerr" again - under fbc
+// both are the same machine address, so "e = @onerr" is true there.
+var
+  k: Integer;
 begin
+  if (A <> 0) and (FClosures <> nil) then
+    for k := 0 to FClosures.Count - 1 do
+      if PtrUInt(TAbiClosure(PSbClosureCtx(FClosures.Objects[k])^.Closure).Code) = A then
+        Exit(PSbClosureCtx(FClosures.Objects[k])^.EntryPC);
   Result := VMPointerForMachineAddr(TExecutionContext(ACtx), A);
 end;
 

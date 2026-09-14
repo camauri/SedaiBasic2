@@ -635,6 +635,7 @@ type
     FVarExplicitType: TStringList;       // var name (UPPER) -> TSSARegisterType (Objects[]) for DIM..AS
     FArrayRecordType: TStringList;       // array name (UPPER) -> element UDT type name (UPPER)
     FForeignDataScalars: TStringList;    // DIVERGENZE 405: an Extern of a C library whose type is a SCALAR (its address is C's)
+    FForeignProcExterns: TStringList;    // DIVERGENZE 422: ...whose type is a named PROCEDURE type (libxml's xmlFree)
     FArrayScalarType: TStringList;       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
     FArrayFuncPtrSig: TStringList;       // array-of-funcptr (DIM As <named funcptr type> a(..)) -> "params|ret" signature, so "a(i)(args)" is an indirect call
     FArrayPtrPointee: TStringList;       // array of UDT POINTERS ("DIM As T PTR a(..)", "a() AS T PTR" param) -> T, so "a(i)->field" resolves (params under their mangled name)
@@ -712,6 +713,7 @@ type
     function ForeignElemObject(Node: TASTNode; out Obj: TASTNode; out TypeName: string): Boolean;  // the shape both ask
     function EmitForeignElemTemps(Obj: TASTNode; const TypeName: string): string;      // the temporaries both use
     function ForeignRecPtrOffsets(ArgNode: TASTNode): string;                          // "@o1/o2": a REC's pointer fields (259 b)
+    function ForeignFieldClosureSig(const FieldSig: string): string;                   // "p,p|r" -> "FNPTR:r:p~p" for a procedure field (423)
     function ForeignDynEntry(const Sig: string): string;                               // the "*" entry calling a C address with Sig
     function EmitIndirectCallVM(const PCValIn: TSSAValue; const Sig: string; ArgListNode: TASTNode): TSSAValue;
     function DeclTypeIsPointer(const T: string): Boolean;                              // "T Ptr" / "T Pointer", aliases resolved
@@ -1889,6 +1891,7 @@ begin
   FVarExplicitType.CaseSensitive := False;
   FArrayRecordType := TIndexedStringList.Create;
   FForeignDataScalars := TIndexedStringList.Create;
+  FForeignProcExterns := TIndexedStringList.Create;
   FForeignDataScalars.CaseSensitive := False;
   FArrayScalarType := TIndexedStringList.Create;
   FArrayRecordType.CaseSensitive := False;
@@ -2102,6 +2105,7 @@ begin
   FResultTemps.Free;
   FArrayRecordType.Free;
   FForeignDataScalars.Free;
+  FForeignProcExterns.Free;
   FArrayScalarType.Free;
   FArrayFuncPtrSig.Free;
   FArrayScalarPointee.Free;
@@ -2659,7 +2663,7 @@ begin
   if Cond then Result := WhenTrue else Result := WhenFalse;
 end;
 
-function IsOurRuntimeForeignDecl(const Line: string): Boolean;
+function IsOurRuntimeForeignDecl(const Line: string; FromRtlib: Boolean): Boolean;
 // ⭐⭐ A DECLARATION OF THE FreeBASIC RUNTIME IS NOT A FOREIGN SYMBOL - it is a declaration of what
 // THIS ENGINE already is. `fbc-int/*.bi` declare their routines inside `extern "rtlib"`, and reading
 // those headers for real (12 Sep 2026) made every one of them a call into a `libfb` we do not ship:
@@ -2695,7 +2699,10 @@ begin
     'DEALLOCATE':      Result := Alias_ = 'free';
     'CLEAR':           Result := Alias_ = 'memset';
     'MEMCOPY':         Result := Alias_ = 'memcpy';
-    'MEMMOVE':         Result := Alias_ = 'memmove';
+    // ⛔ DIVERGENZE 427 - the one pair a C header spells identically: crt/mem.bi declares MEMMOVE as "memmove" too,
+    // so the pair alone took crt's memmove away ("declared and never defined"). Only fbc-int's, inside
+    // `extern "rtlib"`, is ours.
+    'MEMMOVE':         Result := FromRtlib and (Alias_ = 'memmove');
     'COPYCLEAR':       Result := Alias_ = 'fb_MemCopyClear';
     'ARRAYLEN':        Result := Alias_ = 'fb_ArrayLen';
     'ARRAYSIZE':       Result := Alias_ = 'fb_ArraySize';
@@ -33946,6 +33953,8 @@ var
 begin
   Result := False;
   if not IsForeignDataScalar(NameU) then Exit;
+  // ...and an Extern whose type is a named procedure type holds a C function's address (DIVERGENZE 422)
+  if FForeignProcExterns.IndexOf(NameU) >= 0 then Exit(True);
   T := FForeignDataScalars.Values[NameU];
   Result := (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR');
 end;
@@ -45624,6 +45633,12 @@ begin
        (FindUDT(Node.GetChild(1).ValueUpper) < 0) then
     begin
       FForeignDataScalars.Values[LhsU] := UpperFast(CanonicalType(Node.GetChild(1).ValueUpper));
+      // ⭐ DIVERGENZE 422 - ...and one whose type is a named PROCEDURE type ("Extern xmlFree As xmlFreeFunc") holds the
+      // address of a C FUNCTION. CanonicalType answers INTEGER for it (a procedure type's storage alias), so the
+      // name is asked HERE, where the declared spelling still exists: ForeignExternIsPointer then loads it with C's
+      // mark, and a call through it takes the C branch of the indirect call instead of jumping to a BASIC PC.
+      if FuncPtrTypeSig(Node.GetChild(1).ValueUpper) <> '' then
+        FForeignProcExterns.Add(LhsU);
       // ⭐ DIVERGENZE 412 - ...and one whose type is a POINTER TO A SCALAR ("environ As ZString Ptr Ptr") is a
       // raw pointer: what it holds is C's memory, so "environ[0]" steps SizeOf bytes and loads raw. A pointer to
       // a RECORD (WINDOW_ Ptr, FILE Ptr) keeps its own road, the record-pointer one (DIVERGENZE 413).
@@ -48485,7 +48500,12 @@ begin
   // restarted for ever ("call:call:call:..."), fbc's dim/byref.bas. The entry PC is what p1 holds, so it
   // is read THROUGH the reference first. Asked before the Shared branch, which would otherwise hand the
   // reference's own home (the address) to the call as a PC.
-  if IsRefVar(FPName) then
+  // ⭐ DIVERGENZE 422 - an Extern of C whose type is a procedure type ("extern xmlFree as xmlFreeFunc") holds a C
+  // function's ADDRESS: read it as every other read of that name is read (RTC_PTR64, C's mark), so the indirect
+  // call takes the branch into C instead of jumping to a bytecode PC that is really a machine address.
+  if IsRefVar(FPName) and ForeignExternIsPointer(UpperFast(FPName)) then
+    EmitInstruction(ssaRawLoadInt, PCVal, RefVarAddrValue(FPName), MakeSSAValue(svkNone), MakeSSAConstInt(RTC_PTR64))
+  else if IsRefVar(FPName) then
     EmitInstruction(ssaRefLoadInt, PCVal, RefVarAddrValue(FPName), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
   else if IsRawAddrLocal(FPName) then
     EmitInstruction(ssaRawLoadInt, PCVal, EnsureIntRegister(AddrLocalHandle(UpperFast(FPName))),
@@ -52450,7 +52470,14 @@ begin
       Params := Params + '...';
     end;
     Line := D.Name + '|' + D.Symbol + '|' + D.LibName + '|';
-    if D.RetTypeName <> '' then Line := Line + CanonicalType(D.RetTypeName);
+    // ⭐ DIVERGENZE 430 - ...and a RETURN typed by a procedure-pointer alias is a pointer too. Resolved to its INTEGER
+    // alias, the value came back bare: PQsetNoticeProcessor answers the processor it replaces, and the closure of
+    // "@onnotice" never read as "@onnotice" again (the runtime brings a returned POINTER home, not an integer).
+    if (D.RetTypeName <> '') and
+       ((FuncPtrTypeSig(UpperFast(D.RetTypeName)) <> '') or
+        (FuncPtrTypeSig(UpperFast(CanonicalType(D.RetTypeName))) <> '')) then
+      Line := Line + 'ANY PTR'
+    else if D.RetTypeName <> '' then Line := Line + CanonicalType(D.RetTypeName);
     FProgram.SetForeignDecl(i, Line + '|' + Params);
   end;
 end;
@@ -52777,6 +52804,40 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.ForeignFieldClosureSig(const FieldSig: string): string;
+// The closure signature of a PROCEDURE field (DIVERGENZE 423), from the field's "p1,p2|ret": each type spelled
+// as the marshaller names it, "~" between parameters (a comma separates the parameters of an entry). '' when a
+// type is one no closure can pass - the field is then left as it was, as before.
+var
+  Params, Ret, Piece, T: string;
+  Bar, i, Start: Integer;
+begin
+  Result := '';
+  Bar := Pos('|', FieldSig);
+  if Bar = 0 then Exit;
+  Ret := UpperFast(Trim(Copy(FieldSig, Bar + 1, MaxInt)));
+  if Ret <> '' then Ret := UpperFast(CanonicalType(Ret));
+  if (Ret <> '') and (ForeignKindOf(Ret) = fkUnknown) then Exit;
+  Params := Copy(FieldSig, 1, Bar - 1);
+  T := '';
+  if Trim(Params) <> '' then
+  begin
+    Start := 1;
+    for i := 1 to Length(Params) + 1 do
+      if (i > Length(Params)) or (Params[i] = ',') then
+      begin
+        Piece := UpperFast(Trim(Copy(Params, Start, i - Start)));
+        Start := i + 1;
+        if Piece = '#P' then Piece := 'ANY PTR'          // a procedure pointer is a pointer to C
+        else if Piece <> '' then Piece := UpperFast(CanonicalType(Piece));
+        if (Piece = '') or (ForeignKindOf(Piece) = fkUnknown) then Exit;
+        if T <> '' then T := T + '~';
+        T := T + Piece;
+      end;
+  end;
+  Result := 'FNPTR:' + Ret + ':' + T;
+end;
+
 function TSSAGenerator.ForeignRecPtrOffsets(ArgNode: TASTNode): string;
 // ⭐ The C offsets of the POINTER fields of the record an argument hands to C (DIVERGENZE 259 b), spelled
 // "@o1/o2/..." after the REC: parameter - no commas, which separate the parameters of an entry. The
@@ -52784,7 +52845,7 @@ function TSSAGenerator.ForeignRecPtrOffsets(ArgNode: TASTNode): string;
 // program value and tags a CHANGED one as a C address: ffi_prep_cif writes cif.rtype and cif.arg_types,
 // and the program read 0 there in silence. '' when the record has no C layout or no pointer field.
 var
-  TypeName: string;
+  TypeName, Sig: string;
   Child: TASTNode;
   UDTIdx, i: Integer;
   Offsets: TInt64Array;
@@ -52815,7 +52876,16 @@ begin
   begin
     if i > High(Offsets) then Break;
     if FUDTs[UDTIdx].Fields[i].IsArray then Continue;
-    if (FUDTs[UDTIdx].Fields[i].PtrPointee <> '') or (FUDTs[UDTIdx].Fields[i].MultiPtrPointee <> '') or
+    // ⭐ DIVERGENZE 423 - A PROCEDURE FIELD holds a BASIC entry PC, and C calls what it finds there: libxml's
+    // xmlSAXHandler (startElement, endElement, characters) jumped to the PC as if it were code. Spelled
+    // "o#FNPTR:<ret>:<p1~p2>" so the runtime builds the closure for the call, exactly as for "@proc" passed
+    // as an argument; a signature this call path cannot pass leaves the field as it was.
+    if FUDTs[UDTIdx].Fields[i].FuncPtrSig <> '' then
+    begin
+      Sig := ForeignFieldClosureSig(FUDTs[UDTIdx].Fields[i].FuncPtrSig);
+      if Sig <> '' then Result := Result + '/' + IntToStr(Offsets[i]) + '#' + Sig;
+    end
+    else if (FUDTs[UDTIdx].Fields[i].PtrPointee <> '') or (FUDTs[UDTIdx].Fields[i].MultiPtrPointee <> '') or
        (FUDTs[UDTIdx].Fields[i].RawPtrPointee <> '') then
       Result := Result + '/' + IntToStr(Offsets[i]);
   end;
@@ -52969,7 +53039,7 @@ var
   // ⭐ A STRUCT PASSED BY VALUE (DIVERGENZE 382): the declaration with each UDT parameter spelled as its
   // C layout ("SVAL:..."), and whether any parameter needed it.
   DeclV: TForeignDecl;
-  SValArg: Boolean;
+  SValArg, ProcPtrOut: Boolean;
   SValUDT: Integer;
   SValSpec, SValWhy: string;
 begin
@@ -53051,6 +53121,19 @@ begin
       DeclV.ParamTypeNames[i] := 'SVAL:' + Copy(SValSpec, 6, MaxInt);
       SValArg := True;
     end;
+  // ⭐ DIVERGENZE 425 - "X Ptr" where X is a PROCEDURE type is a pointer to a POINTER: C writes a function's address
+  // there (xmlMemGet(@freefn, ...), xmlSchemaGetParserErrors(ctxt, @err, ...)). The declaration hides the second level
+  // inside the type name, so the runtime did not bring the cell home: the address came back without C's mark and a
+  // call through it jumped into the bytecode. The call's own entry spells it " PTR PTR", which is what the runtime asks.
+  ProcPtrOut := False;
+  for i := 0 to High(Decl.ParamTypeNames) do
+    if (Length(Decl.ParamTypeNames[i]) > 4) and
+       SameText(Copy(Decl.ParamTypeNames[i], Length(Decl.ParamTypeNames[i]) - 3, 4), ' PTR') and
+       (FuncPtrTypeSig(Trim(Copy(Decl.ParamTypeNames[i], 1, Length(Decl.ParamTypeNames[i]) - 4))) <> '') then
+    begin
+      DeclV.ParamTypeNames[i] := 'ANY PTR PTR';
+      ProcPtrOut := True;
+    end;
   if Decl.Variadic and (NArgs > Length(Decl.ParamTypeNames)) then
     Idx := VariadicCallSiteDecl(DeclV, ArgListNode, NArgs, SRetSpec)
   else
@@ -53058,7 +53141,7 @@ begin
     if NArgs > Length(Decl.ParamTypeNames) then NArgs := Length(Decl.ParamTypeNames);
     // ...and a STRUCT RETURNED BY VALUE wants its own entry too, for the same reason a callback and a
     // record argument do: the entry is where the layout is written (DIVERGENZE 329).
-    if (SRetSpec <> '') or SValArg then Idx := VariadicCallSiteDecl(DeclV, ArgListNode, NArgs, SRetSpec);
+    if (SRetSpec <> '') or SValArg or ProcPtrOut then Idx := VariadicCallSiteDecl(DeclV, ArgListNode, NArgs, SRetSpec);
     // ...e anche una chiamata NON variadica vuole la propria voce se le si passa una procedura BASIC:
     // e' li' che la firma del callback viene scritta (DIVERGENZE 218). ...And so does one handed the
     // address of a BASIC record: the entry is where "REC:" is written (DIVERGENZE 245).
@@ -55416,6 +55499,8 @@ var
   PsI: Integer;          // pre-scan cursor over the static ARRAY members
   DefCh: Char;
   FgnText: string;       // the foreign declarations, ';'-separated
+  FgnLine: string;       // ...one of them, with the "#rtlib" mark removed (DIVERGENZE 427)
+  FgnRtlib: Boolean;     // ...and whether it carried the mark
   FgnStart: Integer;
   FgnDecl: TForeignDecl; // ...and one of them, split, to read its return type's print kind
   FgnKind: Integer;
@@ -55461,9 +55546,12 @@ begin
     for PsI := 1 to Length(FgnText) do
       if FgnText[PsI] = ';' then
       begin
-        if (Trim(Copy(FgnText, FgnStart, PsI - FgnStart)) <> '') and
-           not IsOurRuntimeForeignDecl(Trim(Copy(FgnText, FgnStart, PsI - FgnStart))) then
-          FProgram.AddForeignDecl(Trim(Copy(FgnText, FgnStart, PsI - FgnStart)));
+        FgnLine := Trim(Copy(FgnText, FgnStart, PsI - FgnStart));
+        // "#rtlib" in the LIB field: declared inside `extern "rtlib"` (DIVERGENZE 427). The mark is removed here.
+        FgnRtlib := Pos('|#rtlib|', FgnLine) > 0;
+        if FgnRtlib then FgnLine := StringReplace(FgnLine, '|#rtlib|', '||', []);
+        if (FgnLine <> '') and not IsOurRuntimeForeignDecl(FgnLine, FgnRtlib) then
+          FProgram.AddForeignDecl(FgnLine);
         FgnStart := PsI + 1;
       end;
     // ⭐ FGNDIAG=1 stampa la TABELLA ESTERNA come il compilatore l'ha letta - una riga per
@@ -55624,6 +55712,7 @@ begin
   FAddrLocalVars.Clear;
   FRawPtrVars.Clear;
   FForeignDataScalars.Clear;
+  FForeignProcExterns.Clear;
   FRawPtrScoped.Clear;    // beside FRawPtrVars: the same fact with the SCOPE it was learnt in
   FRawFromAddrOf.Clear;   // beside FRawPtrVars: it records WHY one of them is raw
   FWStringVars.Clear;

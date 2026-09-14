@@ -874,7 +874,9 @@ var
   Sh: PInt64;                            // W8: the translated copies of pointed POINTER cells (257 B)
   RPAddr: array[0..127] of PInt64;       // REC: a pointer FIELD of a record handed to C (259 b)
   RPOrig, RPTr: array[0..127] of Int64;  // ...its program value, and what C was given
-  NRP, RPk, RPo: Integer;
+  NRP, RPk, RPo, RPh: Integer;
+  RPElems, RPStride, RPe, RPx: Integer;  // ...over every element of a gathered run of records (428)
+  RPSig: string;                         // ...and a PROCEDURE field's closure signature (423)
   HomeV: Int64;                          // ...the VM pointer a changed field names, when it is ours
   NBase: PtrUInt;                        // the address C was actually given for a narrow copy
   RPS: string;
@@ -1116,6 +1118,8 @@ begin
             // COUNT read past it into whatever followed. The run is gathered into one persistent buffer -
             // the same shape as the translated copy of an array of pointers (257 b), and for the same
             // reason: a copy that died with the call would leave C a dangling pointer.
+            RPElems := 1;                        // ...one record, unless the run below gathers more (428)
+            RPStride := 0;
             if Assigned(FRecRun) and (NRun <= High(RunBuf)) and
                FRecRun(ACtx, XferInt[SlotI], RunN, RunW) and (RunN > 1) then
             begin
@@ -1133,6 +1137,8 @@ begin
               begin
                 P := RunP;
                 Avail := PtrUInt(RunN) * RunW;
+                RPElems := RunN;
+                RPStride := RunW;
                 RunBuf[NRun] := RunP; RunVM[NRun] := XferInt[SlotI];
                 RunCnt[NRun] := RunN; RunStride[NRun] := RunW;
                 Inc(NRun);
@@ -1150,17 +1156,55 @@ begin
               while (RPS <> '') and (NRP <= High(RPAddr)) do
               begin
                 RPk := Pos('/', RPS);
-                RPo := StrToIntDef(Copy(RPS, 1, RPk - 1), -1);
+                RPSig := Copy(RPS, 1, RPk - 1);
                 Delete(RPS, 1, RPk);
-                if (RPo < 0) or (PtrUInt(RPo) + 8 > Avail) then Continue;
-                RPAddr[NRP] := PInt64(PByte(P) + RPo);
-                RPOrig[NRP] := RPAddr[NRP]^;
-                if (RPOrig[NRP] <> 0) and Assigned(FResolvePtr) then
-                  RPTr[NRP] := Int64(PtrUInt(FResolvePtr(ACtx, RPOrig[NRP])))
+                // "o#FNPTR:..." is a PROCEDURE field (DIVERGENZE 423): its signature follows the offset.
+                RPh := Pos('#', RPSig);
+                if RPh > 0 then
+                begin
+                  RPo := StrToIntDef(Copy(RPSig, 1, RPh - 1), -1);
+                  RPSig := Copy(RPSig, RPh + 1, MaxInt);
+                end
                 else
-                  RPTr[NRP] := RPOrig[NRP];
-                RPAddr[NRP]^ := RPTr[NRP];
-                Inc(NRP);
+                begin
+                  RPo := StrToIntDef(RPSig, -1);
+                  RPSig := '';
+                end;
+                if RPo < 0 then Continue;
+                // ⭐ DIVERGENZE 428 - ...in EVERY element of a gathered run, not only the first. The offsets are
+                // those of ONE record; "zmq_poll(@items(0), 2, t)" handed C a second element whose `socket` still
+                // carried the program's tagged value, and C dereferenced it (access violation).
+                for RPe := 0 to RPElems - 1 do
+                begin
+                  if NRP > High(RPAddr) then Break;
+                  RPx := RPo + RPe * RPStride;
+                  if PtrUInt(RPx) + 8 > Avail then Break;
+                  RPAddr[NRP] := PInt64(PByte(P) + RPx);
+                  RPOrig[NRP] := RPAddr[NRP]^;
+                  if RPSig <> '' then
+                  begin
+                    // A C address ("@c_function", a value C wrote) is passed as it is; a BASIC entry PC becomes
+                    // the closure C can call. It is given back after the call by the loop below AbiCall.
+                    if (RPOrig[NRP] and FGNPTR_TAG) <> 0 then
+                      RPTr[NRP] := RPOrig[NRP] and not FGNPTR_TAG
+                    else if (RPOrig[NRP] > 0) and Assigned(FMakeClosure) then
+                    begin
+                      RPTr[NRP] := Int64(PtrUInt(FMakeClosure(ACtx, RPOrig[NRP], RPSig)));
+                      if RPTr[NRP] = 0 then
+                        raise EForeignCallError.CreateFmt(
+                          '%s: argument %d is a record whose procedure field at offset %d cannot be called from C',
+                          [B^.Decl.Name, i + 1, RPx]);
+                    end
+                    else
+                      RPTr[NRP] := RPOrig[NRP];
+                  end
+                  else if (RPOrig[NRP] <> 0) and Assigned(FResolvePtr) then
+                    RPTr[NRP] := Int64(PtrUInt(FResolvePtr(ACtx, RPOrig[NRP])))
+                  else
+                    RPTr[NRP] := RPOrig[NRP];
+                  RPAddr[NRP]^ := RPTr[NRP];
+                  Inc(NRP);
+                end;
               end;
             end;
             if NRec <= High(RecBase) then

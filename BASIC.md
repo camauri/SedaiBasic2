@@ -3617,6 +3617,38 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   function address that C itself handed over is passed as it is. ⚠️ A BASIC procedure is wrapped for C when its
   address is written in the call (`@myproc`); a **variable** of a procedure type that holds `@myproc` and is then
   passed to C is not yet.
+- **A C variable that holds a function pointer can be called.** libxml exports `xmlFree` as a variable
+  (`Extern xmlFree As xmlFreeFunc`), not as a function; `xmlFree(p)` calls the C function it holds, directly or
+  through a copy (`Dim f As xmlFreeFunc = xmlFree : f(p)`). It used to stop the program with an execution error.
+- **Procedures stored in the fields of a record handed to C are called back by C.** A SAX parse fills an
+  `xmlSAXHandler` with `@onstart`, `@onend`, `@onchars` and passes `@h`; C calls those procedures while it parses,
+  as in FreeBASIC. It used to end with an access violation at the first callback. After the call the fields still
+  hold the program's own procedure pointers. The procedure is called with the parameter types of the **field's**
+  type.
+- **A procedure pointer that C writes into the program can be called, and a handler C gives back compares equal
+  to the procedure.** `xmlMemGet(@freefn, @mallocfn, ...)` fills variables of procedure types with C functions, and
+  `mallocfn(16)` calls one; it used to end the program silently. `xmlSchemaGetParserErrors(ctxt, @e, @w, @c)` after
+  setting `@onerr` answers `e = @onerr` true, as in FreeBASIC.
+- **A procedure pointer that a C function returns compares equal to the procedure.** `PQsetNoticeProcessor(conn,
+  @other, 0)` answers the processor it replaces; when that was `@onnotice`, the answer is `= @onnotice`, as in
+  FreeBASIC. A C function it answers can be passed back to C.
+- **An array of records with pointer fields can be handed to C.** `zmq_poll(@items(0), n, timeout)` reads `n`
+  `zmq_pollitem_t`, each with a `socket` pointer; with more than one element it used to end with an access
+  violation. What C writes back into the elements (`revents`) reaches every one of them. ⚠️ At most 128 pointer
+  fields are translated per call.
+- **`memmove` from `crt.bi` can be called.** It used to stop with "undefined reference to `MEMMOVE`: the procedure
+  is declared and never defined", while `memcpy` and `memset` from the same header worked. `FBC.memmove` from
+  `fbc-int/memory.bi` is still the built-in routine.
+- ⚠️ **A byte view of an array of wider elements does not read bytes.** `Cast(UByte Ptr, @s(0))[k]` over a `Short`
+  array reads the low byte of element `k`, not byte `k`, and past the last element it stops with "Null or invalid
+  pointer dereference". The same happens when C hands a callback the program's own `Short` buffer and the callback
+  reads it byte by byte. Over `UByte` and `ZString` data the two readings coincide.
+- ⚠️ **A pointer that C hands back does not compare equal to the address of a `String` it was given.**
+  `rs = memcpy(@s, @s, 0)` then `rs = @s` is false, although `Hex(rs)` and `Hex(@s)` print the same number; with the
+  address of a numeric variable or of a record the comparison is right.
+- ⚠️ **A variadic procedure called by C cannot read its variadic arguments yet.** A libxml error handler
+  `Sub h Cdecl(ByVal ctx As Any Ptr, ByVal msg As Const ZString Ptr, ...)` is called and `msg` is right, but
+  `cva_arg` reads 0 where FreeBASIC reads the formatted text.
 - **A procedure pointer prints as an unsigned address**, as any pointer does: a `Const` or a variable of a named
   `Sub`/`Function` pointer type prints `18446744073709551615` for `Cast(T, -1)` and `0` (no sign space) for a
   null one — `sqlite3.bi`'s `SQLITE_TRANSIENT` and `SQLITE_STATIC`. A **call** through it prints what the
