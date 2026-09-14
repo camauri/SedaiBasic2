@@ -2518,6 +2518,20 @@ var
     end;
   end;
 
+  function WithoutParens(const Hay: string): string;
+  // The line with every parenthesised part blanked (nesting counted), so its words are only the ones the
+  // declaration itself stands on.
+  var
+    k, Depth: Integer;
+  begin
+    Result := Hay;
+    Depth := 0;
+    for k := 1 to Length(Result) do
+      if Result[k] = '(' then begin Inc(Depth); Result[k] := ' '; end
+      else if Result[k] = ')' then begin if Depth > 0 then Dec(Depth); Result[k] := ' '; end
+      else if Depth > 0 then Result[k] := ' ';
+  end;
+
   function TokenAt(const Hay: string; var At: Integer): string;
   // The next word of a member declaration, stopping at whitespace or '(' - so an OPERATOR name comes
   // out whole ("+=", "[]", "NEW[]", "DELETE[]"), which no identifier scan would have reached.
@@ -2656,10 +2670,28 @@ begin
         Inc(EnumDepth);
         Continue;
       end;
-      if (W = 'CONST') or (W = 'DIM') or (W = 'REDIM') or (W = 'STATIC') or (W = 'VAR') or
-         (W = 'SUB') or (W = 'FUNCTION') or (W = 'DECLARE') or (W = 'TYPE') or
-         (W = 'ENUM') or (W = 'COMMON') then
-        if (Qual = '') and LineMentions(U, Nm) then Exit(True);
+      // ⛔ DIVERGENZE 404 - A DECLARATION LINE DECLARES ITS NAMES, NOT EVERY WORD ON IT. A line that merely
+      // MENTIONED the name counted, and a parameter is a mention: cairo/cairo.bi's
+      //   type cairo_user_scaled_font_unicode_to_glyph_func_t as function(..., byval unicode as culong, ...)
+      // made "#ifdef UNICODE" true for every program that includes cairo, so windows.bi then chose the WIDE
+      // character set - TCHAR 4 bytes where fbc says 1. fbc's #ifdef asks the symbol table, and a parameter
+      // of a procedure TYPE is not in it.
+      // ⇒ An alias "Type X As ...", a "Sub"/"Function" and a "Declare" declare exactly one name, read at its
+      // position; the other declaration lines are asked with their parenthesised parts removed (parameter
+      // lists, bounds and initialisers name nothing that line declares).
+      if (Qual = '') and ((W = 'SUB') or (W = 'FUNCTION') or
+         ((W = 'TYPE') and (Pos(' AS ', ' ' + Trim(Copy(U, p, MaxInt)) + ' ') > 0))) then
+      begin
+        q := p;
+        if TokenAt(U, q) = Nm then Exit(True);
+      end
+      else if (Qual = '') and (W = 'DECLARE') then
+      begin
+        if MemberNameOfLine(U) = Nm then Exit(True);
+      end
+      else if (W = 'CONST') or (W = 'DIM') or (W = 'REDIM') or (W = 'STATIC') or (W = 'VAR') or
+         (W = 'TYPE') or (W = 'ENUM') or (W = 'COMMON') then
+        if (Qual = '') and LineMentions(WithoutParens(U), Nm) then Exit(True);
       // ...and only AFTER the line has been read: "Type T" declares T itself, which IS a symbol, and
       // fbc's own test asks for it from inside the body ("check_Y( T )").
       if (W = 'TYPE') or (W = 'UNION') or (W = 'CLASS') then
