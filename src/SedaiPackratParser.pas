@@ -209,6 +209,10 @@ type
     // direction that must never happen. Measured over the whole fbc suite: 36 of 36 rejections landed,
     // 0 valid programs refused.
     FExternShapes: TStringList;      // UPPER name -> shape, encoded by EncodeDeclShape
+    FDeclNamesLoose: TStringList;    // every name ModuleDeclaresNameElsewhere would find, built ONCE per token list
+    FDeclNamesPrecise: TStringList;  // ...and in its PRECISE mode
+    FDeclNamesList: TObject;         // the token list the two indexes were built from (nil: stale)
+    FDeclNamesCount: Integer;        // ...and its length then
     // The declaration a lone "Extern a() As Integer" owes the SSA, built by ScanModuleLevelExtern and
     // handed back by the caller that would otherwise throw the whole line away.
     FPendingExternArray: TASTNode;
@@ -247,6 +251,7 @@ type
     procedure CheckDeclAgainstExtern(Node: TASTNode; IsRedim: Boolean);
     procedure ScanModuleLevelExtern;
     function  ModuleDeclaresNameElsewhere(const Nm: string; Precise: Boolean = False): Boolean;
+    procedure ScanDeclNames(Precise: Boolean; Into: TStringList; const Nm: string; out Found: Boolean);
     procedure RejectEmptyAliasNames;
     function SkipAliasClause: Boolean;   // consume a linkage 'ALIAS "name"' where one is allowed
     procedure RejectStaticVarLenStringInit(Node: TASTNode; InNamespace: Boolean);
@@ -735,6 +740,9 @@ begin
   FExternShapes := TIndexedStringList.Create;   // IndexOfName from a hash: asked per declaration
 
   FExternShapes.CaseSensitive := False;
+  FDeclNamesLoose := TIndexedStringList.Create;
+  FDeclNamesPrecise := TIndexedStringList.Create;
+  FDeclNamesList := nil;
   FModuleLocalNames := TStringList.Create;
   FModuleLocalNames.CaseSensitive := False;
   FModuleLocalNames.Sorted := True;
@@ -777,6 +785,8 @@ begin
   ClearTypeMethodDefaults;
   FTypeMethodDefaults.Free;
   FExternShapes.Free;
+  FDeclNamesLoose.Free;
+  FDeclNamesPrecise.Free;
   FModuleLocalNames.Free;
   FTypesWithCtorDtor.Free;
   FConstPointeeNames.Free;
@@ -1418,6 +1428,7 @@ begin
   FStaticMemberProcs.Clear;
   ClearTypeMethodDefaults;   // ...and the declared default arguments
   FExternShapes.Clear;       // ...and the module-level EXTERN shapes
+  FDeclNamesList := nil;     // ...and the declared-name index (another token list)
   FModuleLocalNames.Clear;
   FTypesWithCtorDtor.Clear;
   FConstPointeeNames.Clear;
@@ -1517,6 +1528,7 @@ begin
   FStaticMemberProcs.Clear;
   ClearTypeMethodDefaults;   // ...and the declared default arguments
   FExternShapes.Clear;       // ...and the module-level EXTERN shapes
+  FDeclNamesList := nil;     // ...and the declared-name index (another token list)
   FModuleLocalNames.Clear;
   FTypesWithCtorDtor.Clear;
   FConstPointeeNames.Clear;
@@ -13892,7 +13904,7 @@ begin
     AddCLibraryData(TypeName);
 end;
 
-function TPackratParser.ModuleDeclaresNameElsewhere(const Nm: string; Precise: Boolean): Boolean;
+procedure TPackratParser.ScanDeclNames(Precise: Boolean; Into: TStringList; const Nm: string; out Found: Boolean);
 // Does any DECLARATION STATEMENT in this module name Nm? Asked of the token stream, so what the
 // preprocessor removed (a "#if 0" block) is invisible here - which is the whole point: fbc's
 // dim/all-kinds-of-vars hides the DIM of its EXTERN array inside one and defines its other extern
@@ -13913,7 +13925,7 @@ var
   W: string;
   OnDeclLine, InInit: Boolean;
 begin
-  Result := False;
+  Found := False;
   if not HasValidContext then Exit;
   if Context.TokenList = nil then Exit;
   OnDeclLine := False;
@@ -13954,7 +13966,49 @@ begin
       end;
       Continue;
     end;
-    if UpperFast(VarToStr(T.Value)) = Nm then Exit(True);
+    W := UpperFast(VarToStr(T.Value));
+    if Into <> nil then
+    begin
+      if Into.IndexOf(W) < 0 then Into.Add(W);
+    end
+    else if W = Nm then
+    begin
+      Found := True;
+      Exit;
+    end;
+  end;
+end;
+
+function TPackratParser.ModuleDeclaresNameElsewhere(const Nm: string; Precise: Boolean): Boolean;
+// ⭐⭐ THE SCAN ABOVE, ASKED ONCE (14 Sep 2026). ScanModuleLevelExtern asks this for every EXTERN of a C
+// library, and the scan walked the WHOLE token list each time: win/shlwapi.bi expands to 86 281 lines with
+// 2 059 EXTERNs, and parsing it took 38.6 s where it took 0.6 s before those questions existed - perf named
+// this routine and the string copies of TLexerToken.GetValue under it as most of the time.
+// ⇒ The same walk, run once per token list, files every name it would have matched; each question is then
+// a hashed lookup. The answer cannot differ by construction - it IS the same loop - and DECLNAMES_CHECK=1
+// asks both ways and prints every disagreement.
+var
+  Old: Boolean;
+begin
+  Result := False;
+  if not HasValidContext then Exit;
+  if Context.TokenList = nil then Exit;
+  if (FDeclNamesList <> TObject(Context.TokenList)) or (FDeclNamesCount <> Context.TokenList.Count) then
+  begin
+    FDeclNamesLoose.Clear;
+    FDeclNamesPrecise.Clear;
+    ScanDeclNames(False, FDeclNamesLoose, '', Old);
+    ScanDeclNames(True, FDeclNamesPrecise, '', Old);
+    FDeclNamesList := TObject(Context.TokenList);
+    FDeclNamesCount := Context.TokenList.Count;
+  end;
+  if Precise then Result := FDeclNamesPrecise.IndexOf(Nm) >= 0
+  else Result := FDeclNamesLoose.IndexOf(Nm) >= 0;
+  if GetEnvironmentVariable('DECLNAMES_CHECK') = '1' then
+  begin
+    ScanDeclNames(Precise, nil, Nm, Old);
+    if Old <> Result then
+      WriteLn(StdErr, 'DECLNAMES_CHECK: MISMATCH ', Nm, ' precise=', Precise, ' index=', Result, ' scan=', Old);
   end;
 end;
 
