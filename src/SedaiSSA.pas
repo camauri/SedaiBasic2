@@ -385,6 +385,8 @@ type
     // took the first one's storage ("E1.X, E2.X" answered 5 5 for 3 and 5). Qualified by the enum it
     // belongs to, and folded to an immediate, both stop being possible.
     FEnumQualVals: TStringList;
+    FEarlyConstVals: TStringList;  // DIVERGENZE 392: module CONST / ENUM member values known BEFORE RegisterUDTs
+    FLayoutFold: Integer;          // ...read by TryFoldConstIntExpr only while a layout bound is being folded
     FVarEnumType: TStringList;           // "DIM AS <enum> v" variable (UPPER) -> its enum type name (UPPER): same, for a variable operand
     FFixedStrNames: TStringList;         // names DIM'd as a FIXED-LENGTH ZSTRING/WSTRING ("ZString * n").
                                          // Collected before the @-taken pass so STRPTR/SADD of one can be
@@ -934,6 +936,8 @@ type
     procedure EmitStaticMemberAllocs;                   // OOP: allocate the static members' backing arrays at program start
     procedure EmitStaticMemberRecords;                  // ...and construct the ones whose type is a UDT (after the ctor labels exist)
     procedure CollectEnumNames(Node: TASTNode; const Owner: string = '');    // FB: just the ENUM TYPE names, early - a declared type's BANK depends on them
+    procedure CollectEarlyLayoutConsts(Node: TASTNode);      // DIVERGENZE 392: CONST / ENUM values for the layout, before RegisterUDTs
+    function FoldLayoutBound(Node: TASTNode; out Val: Int64): Boolean;  // DIVERGENZE 392: fold the bound of a TYPE member
     procedure CollectEnumMembers(Node: TASTNode; const OwnerType: string = '');       // FB: back each module-level ENUM member with a shared global (proc-visible)
     procedure CollectTypeConsts(Node: TASTNode);        // FB: record each CONST declared inside a TYPE as "TYPE.NAME"
     function TypeScopedConstAccess(const TypeName, MemberName: string; const Tok: TLexerToken): TASTNode;  // the node that READS one
@@ -1952,6 +1956,8 @@ begin
   FEnumNames.CaseSensitive := False;
   FEnumMemberType := TIndexedStringList.Create;
   FEnumQualVals := TIndexedStringList.Create;
+  FEarlyConstVals := TIndexedStringList.Create;
+  FEarlyConstVals.CaseSensitive := False;
   FEnumQualVals.CaseSensitive := False;
   FEnumMemberType.CaseSensitive := False;
   FVarEnumType := TIndexedStringList.Create;
@@ -2140,6 +2146,7 @@ begin
   FTypeDeclLine.Free;
   FEnumMemberType.Free;
   FEnumQualVals.Free;
+  FEarlyConstVals.Free;
   FVarEnumType.Free;
   FFixedStrNames.Free;
   FVarDeclTypeName.Free;
@@ -12828,7 +12835,18 @@ begin
         // not fold, the array member kept its handle, and SizeOf(FB_GFXCTX) answered 144 against 216.
         // SDL2's SDL_MessageBoxColorScheme is the same shape.
         if not Result then Result := TryFoldEnumMemberName(Node.ValueUpper, Val);
+        // ...and while a TYPE member's bound is folded, the values CollectEarlyLayoutConsts took before the
+        // types were laid out (DIVERGENZE 392). Only then: a name inside a procedure may be a local that
+        // shadows a module constant, and a type declaration's bound cannot be.
+        if (not Result) and (FLayoutFold > 0) and (FEarlyConstVals <> nil) then
+          Result := TryStrToInt64(FEarlyConstVals.Values[Node.ValueUpper], Val);
       end;
+    // "Enum.Member", the qualified spelling of an enum member (DIVERGENZE 392): "v(0 To E.LAST)".
+    antMemberAccess:
+      if (Node.ChildCount >= 1) and (Node.GetChild(0) <> nil) and
+         (Node.GetChild(0).NodeType = antIdentifier) and (FEnumNames <> nil) and (FEnumQualVals <> nil) and
+         (FEnumNames.IndexOf(Node.GetChild(0).ValueUpper) >= 0) then
+        Result := TryStrToInt64(FEnumQualVals.Values[Node.GetChild(0).ValueUpper + '.' + Node.ValueUpper], Val);
     // ⛔ PARENTHESES ARE TRANSPARENT TO A CONSTANT. Without this case "(3) - 1" is not a constant at
     // all - the fold declines on the left operand - and every caller that asks "is this bound / this
     // initialiser a compile-time integer?" answers no for a shape a program actually writes. fbc's own
@@ -26635,10 +26653,10 @@ begin
   if D.NodeType = antDimRange then
   begin
     if D.ChildCount < 2 then Exit;
-    if not FoldIntNode(D.GetChild(0), Lb) then Exit;
-    if not FoldIntNode(D.GetChild(1), Ub) then Exit;
+    if not FoldLayoutBound(D.GetChild(0), Lb) then Exit;
+    if not FoldLayoutBound(D.GetChild(1), Ub) then Exit;
   end
-  else if not FoldIntNode(D, Ub) then Exit;
+  else if not FoldLayoutBound(D, Ub) then Exit;
   if Ub < Lb then Exit;
   Count := Ub - Lb + 1;
   // An array of POINTERS to records: one element is a pointer (see the note above).
@@ -29042,7 +29060,7 @@ begin
     begin
       LbExpr := D.GetChild(di).GetChild(0);
       UbExpr := D.GetChild(di).GetChild(1);
-      if not TryFoldConstIntExpr(LbExpr, Lb) then Exit;
+      if not FoldLayoutBound(LbExpr, Lb) then Exit;
     end
     else
     begin
@@ -29050,7 +29068,7 @@ begin
       UbExpr := D.GetChild(di);
       Lb := 0;
     end;
-    if not TryFoldConstIntExpr(UbExpr, Ub) then Exit;
+    if not FoldLayoutBound(UbExpr, Ub) then Exit;
     if Ub < Lb then Exit;
     Count := Count * (Ub - Lb + 1);
   end;
@@ -33098,13 +33116,13 @@ begin
   for di := 0 to D.ChildCount - 1 do
     if D.GetChild(di).NodeType = antDimRange then
     begin
-      if not TryFoldConstIntExpr(D.GetChild(di).GetChild(0), Lbs[di]) then Lbs[di] := 0;
-      if not TryFoldConstIntExpr(D.GetChild(di).GetChild(1), Ubs[di]) then Ubs[di] := -1;
+      if not FoldLayoutBound(D.GetChild(di).GetChild(0), Lbs[di]) then Lbs[di] := 0;
+      if not FoldLayoutBound(D.GetChild(di).GetChild(1), Ubs[di]) then Ubs[di] := -1;
     end
     else
     begin
       Lbs[di] := 0;
-      if not TryFoldConstIntExpr(D.GetChild(di), Ubs[di]) then Ubs[di] := -1;
+      if not FoldLayoutBound(D.GetChild(di), Ubs[di]) then Ubs[di] := -1;
     end;
   Result := D.ChildCount;
 end;
@@ -41025,6 +41043,106 @@ begin
   end;
 end;
 
+function TSSAGenerator.FoldLayoutBound(Node: TASTNode; out Val: Int64): Boolean;
+begin
+  Inc(FLayoutFold);
+  try
+    Result := TryFoldConstIntExpr(Node, Val);
+  finally
+    Dec(FLayoutFold);
+  end;
+end;
+
+procedure TSSAGenerator.CollectEarlyLayoutConsts(Node: TASTNode);
+// ⭐⭐ DIVERGENZE 392 - THE VALUES A TYPE'S ARRAY BOUNDS NAME, BEFORE THE TYPES ARE LAID OUT. Generate lays
+// the types out (RegisterUDTs) long before it collects the module CONSTs (CollectSharedVars) and the ENUM
+// members (CollectEnumMembers), so "v(0 To N - 1) As Long" with N a Const or an enum member did not fold
+// there: the member kept its handle, eight bytes where C has the elements, and every field after it moved.
+// SizeOf still answered right - it folds again later, when the constants exist - which is why no layout
+// net could see it: only a record that C FILLS showed the wrong bytes. SDL2's SDL_MessageBoxColorScheme is
+// "colors(0 To SDL_MESSAGEBOX_COLOR_MAX - 1)" over an anonymous enum, and did not even get SizeOf right.
+// ⇒ One walk in source order, outside procedure bodies, that takes the value of every integer CONST (at
+// its declared width, as CollectSharedVars does) and of every enum member (implicit ones included, by the
+// same fold CollectEnumMembers uses), into FEarlyConstVals. A name met twice with two values is dropped:
+// no scope is known here, and not folding is the answer the code had before.
+var
+  Anon: Integer;
+  Ambiguous: TStringList;
+
+  procedure Note(const NameU: string; V: Int64);
+  var
+    i: Integer;
+  begin
+    if (NameU = '') or (Ambiguous.IndexOf(NameU) >= 0) then Exit;
+    i := FEarlyConstVals.IndexOfName(NameU);
+    if i < 0 then
+      FEarlyConstVals.Values[NameU] := IntToStr(V)
+    else if FEarlyConstVals.ValueFromIndex[i] <> IntToStr(V) then
+    begin
+      FEarlyConstVals.Delete(i);
+      Ambiguous.Add(NameU);
+    end;
+  end;
+
+  procedure Walk(N: TASTNode);
+  var
+    k, W: Integer;
+    Decl: TASTNode;
+    EName: string;
+    V: Int64;
+  begin
+    if N = nil then Exit;
+    if N.NodeType = antProcedureDecl then Exit;
+    if N.NodeType = antDim then
+      for k := 0 to N.ChildCount - 1 do
+      begin
+        Decl := N.GetChild(k);
+        if (Decl <> nil) and (Decl.NodeType = antArrayDecl) and (Decl.Attributes.Values['SHARED'] = '1') and
+           (Decl.Attributes.Values['CONSTDECL'] = '1') and (Decl.ChildCount >= 3) and
+           (Decl.GetChild(1).NodeType = antIdentifier) and TryFoldConstIntExpr(Decl.GetChild(2), V) then
+        begin
+          W := TypeNameWidthCode(Decl.GetChild(1).ValueUpper);
+          if W = 11 then V := Ord(V <> 0) * -1 else V := NarrowConstInt(V, W);
+          Note(Decl.GetChild(0).ValueUpper, V);
+        end;
+      end;
+    if N.NodeType = antEnum then
+    begin
+      if VarToStr(N.Value) <> '' then EName := N.ValueUpper
+      else
+      begin
+        Inc(Anon);
+        EName := '#EARLYENUM' + IntToStr(Anon);   // no program can spell it: an anonymous enum's own key
+      end;
+      for k := 0 to N.ChildCount - 1 do
+      begin
+        Decl := N.GetChild(k);
+        if (Decl <> nil) and (Decl.NodeType = antAssignment) and (Decl.ChildCount >= 2) and
+           (Decl.GetChild(0).NodeType = antIdentifier) and FoldEnumMemberExpr(Decl.GetChild(1), EName, V) then
+        begin
+          if FEnumQualVals.IndexOfName(EName + '.' + Decl.GetChild(0).ValueUpper) < 0 then
+            FEnumQualVals.Values[EName + '.' + Decl.GetChild(0).ValueUpper] := IntToStr(V);
+          Note(Decl.GetChild(0).ValueUpper, V);
+        end;
+      end;
+      Exit;
+    end;
+    for k := 0 to N.ChildCount - 1 do Walk(N.GetChild(k));
+  end;
+
+begin
+  if (Node = nil) or (FEarlyConstVals = nil) then Exit;
+  Anon := 0;
+  Ambiguous := TStringList.Create;
+  Inc(FLayoutFold);                // a CONST may name an earlier one: the walk folds with what it has taken
+  try
+    Walk(Node);
+  finally
+    Dec(FLayoutFold);
+    Ambiguous.Free;
+  end;
+end;
+
 procedure TSSAGenerator.CollectEnumMembers(Node: TASTNode; const OwnerType: string = '');
 // FreeBASIC ENUM members are module-wide integer constants: like a module-level CONST they must be
 // visible INSIDE SUB/FUNCTION bodies. The parser lowers an ENUM to a sequence of plain assignments
@@ -44143,6 +44261,8 @@ begin
   NoteDeclaredProcNames(AST);   // DECLPROCS: i nomi dichiarati come procedura
   PreMarkStart; CountIdentifierUses(AST); PreMarkEnd('CountIdentifierUses');   // ...and BEFORE it: which names occur more than once (see CONSTNOSTORE)
   PreMarkStart; CollectSharedVars(AST); PreMarkEnd('CollectSharedVars');     // fills FModuleConstVals: a field array bound is routinely a CONST
+  FEarlyConstVals.Clear;
+  CollectEarlyLayoutConsts(AST);   // DIVERGENZE 392: the enum members too (the CONSTs are in already)
   PreMarkStart; RegisterUDTs(AST); PreMarkEnd('RegisterUDTs');
   // An ENUM is an Integer to SizeOf, and it is registered as a type name rather than a UDT.
   if FEnumNames.IndexOf(U) >= 0 then
@@ -55020,6 +55140,8 @@ begin
   FEnumNames.Clear;
   FEnumQualVals.Clear;
   CollectEnumNames(AST);
+  FEarlyConstVals.Clear;
+  CollectEarlyLayoutConsts(AST);   // DIVERGENZE 392: the values a TYPE's bounds name, before the types
   RegisterUDTs(AST);
   // ⭐ NOW the foreign declarations can be resolved through the TYPE ALIASES, and this is the only
   // moment when both exist: the declarations were read off the program node before anything was
