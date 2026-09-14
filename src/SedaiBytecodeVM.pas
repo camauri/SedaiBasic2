@@ -594,6 +594,9 @@ type
     FOnFileQuery: TFileQueryEvent;   // optional numeric fast path for bcFileQuery
     // Current CMD file handle (0 = screen, >0 = redirected to file)
     FCmdHandle: Integer;
+    // The last PRINT item went out WIDE (a WSTRING on the terminal controller, DIVERGENZE 414): the comma
+    // padding and the line break that belong to it are written wide too. Cleared by every other I/O op.
+    FPrintWideTail: Boolean;
     // Sprite manager (nil in CLI mode — sprite commands become no-ops)
     FSpriteManager: ISpriteManager;
     // Event polling callback for UI responsiveness
@@ -1867,6 +1870,7 @@ begin
   FOwnsConsoleBehavior := True;
   // Initialize CMD handle (0 = output to screen)
   FCmdHandle := 0;
+  FPrintWideTail := False;
   // Initialize event polling (nil = disabled)
   FEventPollCallback := nil;
   FPresentCadenceMs := 0;      // off unless a windowed front end asks for it
@@ -12358,6 +12362,7 @@ begin
   if not Assigned(VM.FOutputDevice) then Exit;
   C := TExecutionContext(CtxObj);
   S := VM.FConsoleBehavior.FormatString(C.StringRegs[SrcSlot]);
+  VM.FPrintWideTail := False;   // a NARROW item: a WSTRING one never reaches this leaf (SedaiAot, DIVERGENZE 414)
   VM.FOutputDevice.Print(S);
   if WithNewline <> 0 then
   begin
@@ -12385,6 +12390,7 @@ var
   VM: TBytecodeVM;
 begin
   VM := TBytecodeVM(VMSelf);
+  VM.FPrintWideTail := False;   // as the interpreter's prologue does for PRINT END (DIVERGENZE 414)
   if Assigned(VM.FOutputDevice) then
     VM.FOutputDevice.ResetPrintState;
 end;
@@ -17408,6 +17414,7 @@ var
   NextTabCol, TabIdx: Integer;
   CmdErr: Integer;  // Error code for CMD-redirected output
   ScreenCol, ScreenRow: Integer;  // SCREEN(row, col): the cell, converted to the console's 0-based grid
+  WideCtrl: TTerminalController;  // a WSTRING item / its separators on the terminal (DIVERGENZE 414)
 begin
   CmdErr := 0;
   CmdNewLine := #13;  // CR for file newlines
@@ -17424,6 +17431,9 @@ begin
   // ⭐ And it costs NOTHING where nobody looks: FProgReadsER is false for a program that never reads
   // Err, which is every program in the corpus but one.
   if (SubOp <= 11) or (SubOp = 21) then OutputWroteErr(Ctx);   // the PRINT family, and LOCATE
+  // ⭐ A WIDE TAIL survives only the separators that belong to the item (comma, semicolon, TAB, SPC, line
+  // break: sub-ops 6..10). Any other I/O op - a narrow item, PRINT END, INPUT - closes it (DIVERGENZE 414).
+  if FPrintWideTail and not ((SubOp >= 6) and (SubOp <= 10)) then FPrintWideTail := False;
   case SubOp of
     0: // bcPrint (float). Immediate = 1 when the value is SINGLE-typed: print it with a SINGLE's
        // 7 significant digits, which is what hides its representation error (8.300000190734863 -> "8.3").
@@ -17453,18 +17463,28 @@ begin
           Inc(Ctx.CursorRow);  // CSRLIN: advance to next text row on a print newline
         end;
       end;
-    2: // bcPrintString
+    2: // bcPrintString. Immediate bit 0 = the item is a WSTRING (DIVERGENZE 414): on the terminal
+       // controller it is written as fbc's runtime writes it (UTF-32 cells, or "\e%G"..."\e%@" on an
+       // initialised console) and the column counts CHARACTERS.
       begin
         PrintStr := FConsoleBehavior.FormatString(Ctx.StringRegs[Instr.Src1]);
         if (FCmdHandle > 0) and Assigned(FOnFileData) then
           FOnFileData(Self, 'PRINT#', FCmdHandle, PrintStr, CmdErr)
         else if Assigned(FOutputDevice) then
         begin
-          FOutputDevice.Print(PrintStr);
-          AdvancePrintCol(Ctx, Length(PrintStr));
+          WideCtrl := nil;
+          if (Instr.Immediate and 1) <> 0 then WideCtrl := TerminalControllerOf(FOutputDevice);
+          if WideCtrl <> nil then
+            AdvancePrintCol(Ctx, WideCtrl.PrintWide(PrintStr))
+          else
+          begin
+            FOutputDevice.Print(PrintStr);
+            AdvancePrintCol(Ctx, Length(PrintStr));
+          end;
+          FPrintWideTail := WideCtrl <> nil;
         end;
       end;
-    3: // bcPrintStringLn
+    3: // bcPrintStringLn (Immediate bit 0 = WSTRING, as bcPrintString)
       begin
         PrintStr := FConsoleBehavior.FormatString(Ctx.StringRegs[Instr.Src1]);
         if (FCmdHandle > 0) and Assigned(FOnFileData) then
@@ -17474,8 +17494,18 @@ begin
         end
         else if Assigned(FOutputDevice) then
         begin
-          FOutputDevice.Print(PrintStr);
-          FOutputDevice.NewLine;  // NewLine already calls Present
+          WideCtrl := nil;
+          if (Instr.Immediate and 1) <> 0 then WideCtrl := TerminalControllerOf(FOutputDevice);
+          if WideCtrl <> nil then
+          begin
+            WideCtrl.PrintWide(PrintStr);
+            WideCtrl.NewLineWide;
+          end
+          else
+          begin
+            FOutputDevice.Print(PrintStr);
+            FOutputDevice.NewLine;  // NewLine already calls Present
+          end;
           Ctx.CursorCol := 0;
           Inc(Ctx.CursorRow);  // CSRLIN: advance to next text row on a print newline
         end;
@@ -17533,11 +17563,22 @@ begin
       if Assigned(FOutputDevice) then
       begin
         NextTabCol := FConsoleBehavior.GetNextTabPosition(Ctx.CursorCol);
+        // after a WSTRING item the padding is wide: fbc wrote "G" then 13 four-byte spaces (DIVERGENZE 414)
+        WideCtrl := nil;
+        if FPrintWideTail then WideCtrl := TerminalControllerOf(FOutputDevice);
         if NextTabCol = 0 then
         begin
-          FOutputDevice.NewLine;
+          if WideCtrl <> nil then WideCtrl.NewLineWide else FOutputDevice.NewLine;
           Ctx.CursorCol := 0;
           Inc(Ctx.CursorRow);  // CSRLIN: advance to next text row on a print newline
+        end
+        else if (FConsoleBehavior.CommaAction = caTabZone) and (WideCtrl <> nil) then
+        begin
+          if Ctx.CursorCol < NextTabCol then
+          begin
+            WideCtrl.PrintWide(StringOfChar(' ', NextTabCol - Ctx.CursorCol));
+            Ctx.CursorCol := NextTabCol;
+          end;
         end
         else if FConsoleBehavior.CommaAction = caTabZone then
         begin
@@ -17619,7 +17660,10 @@ begin
           FOnFileData(Self, 'PRINT#', FCmdHandle, CmdNewLine, CmdErr)
         else if Assigned(FOutputDevice) then
         begin
-          FOutputDevice.NewLine;
+          // the line break of a WSTRING item is wide: "\n\0\0\0" (DIVERGENZE 414)
+          WideCtrl := nil;
+          if FPrintWideTail then WideCtrl := TerminalControllerOf(FOutputDevice);
+          if WideCtrl <> nil then WideCtrl.NewLineWide else FOutputDevice.NewLine;
           Ctx.CursorCol := 0;
           Inc(Ctx.CursorRow);  // CSRLIN: advance to next text row on a print newline
         end;

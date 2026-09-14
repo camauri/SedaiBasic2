@@ -52,7 +52,7 @@ uses
   {$IFDEF WINDOWS}
   , Windows
   {$ELSE}
-  , termio
+  , termio, BaseUnix
   {$ENDIF}
   ;
 
@@ -216,6 +216,15 @@ type
     function GetColorAt(Col, Row: Integer): Byte;
     function GetBackColorAt(Col, Row: Integer): Byte;
     procedure SetColorAt(Col, Row: Integer; Color: Byte);
+
+    // ⭐ PRINT of a WSTRING, as fbc's runtime writes it on Linux (DIVERGENZE 414, owner 14 Sep 2026: conform).
+    // libfb's fb_ConsolePrintBufferWstrEx: a console that is NOT initialised gets the raw UTF-32 cells
+    // (fwrite of 4-byte wchar_t), an initialised one gets "\e%G" + UTF-8 + "\e%@". See FbConsoleInited.
+    // Text is the value as the string bank holds it (UTF-8); the result is the number of CHARACTERS, which
+    // is what the cursor column advances by. An empty value writes nothing, on both roads (measured).
+    function PrintWide(const Text: string): Integer;
+    // The line break that closes a WSTRING item is wide too: "\n\0\0\0", or "\e%G\n\e%@" on a console.
+    procedure NewLineWide;
   end;
 
   { TTerminalInput - Console input device (stdin) }
@@ -256,6 +265,17 @@ type
 // while a program's output may still be buffered MUST call this first, or its text jumps ahead of
 // text that was produced before it -- which is exactly what a runtime error message does.
 procedure TerminalOutFlush;
+
+// The terminal controller behind an output device, or nil when the device is another one (the SDL2 console,
+// the web output) - and always nil off UNIX, where the WSTRING print keeps writing UTF-8 (DIVERGENZE 414: fbc
+// on Windows is UTF-16 and WSTRING is PORTABLE here, voce 237; that half is not decided).
+function TerminalControllerOf(const Dev: IOutputDevice): TTerminalController;
+
+// Would fbc's runtime call this console INITIALISED? libfb decides it once, in hInit() before main
+// (src/rtlib/unix/hinit.c): TERM is set, tgetent finds its entry, stdout is a terminal, the entry has the
+// "am" flag, stdin is a terminal too, /dev/tty opens, and the process is in the foreground. Answered here
+// without libtinfo - the entry is read from the terminfo database directly - and cached for the process.
+function FbConsoleInited: Boolean;
 
 implementation
 
@@ -342,6 +362,192 @@ begin
   Inc(GOutLen, L);
 end;
 
+{ ============================================================================
+  WSTRING print as libfb writes it (DIVERGENZE 414)
+  ============================================================================ }
+var
+  GLastTermCtrl: TTerminalController = nil;   // set by Create: the device TerminalControllerOf recognises
+  GFbConInited: Integer = -1;                  // -1 not asked yet, 0 no, 1 yes
+
+var
+  GWidePrintKnob: Integer = -1;   // SB_WSTRING_PRINT_UTF8=1: the A/B knob, -1 not read yet
+
+function TerminalControllerOf(const Dev: IOutputDevice): TTerminalController;
+begin
+  Result := nil;
+  {$IFDEF UNIX}
+  // ⭐ SB_WSTRING_PRINT_UTF8=1 restores the print before DIVERGENZE 414 (every WSTRING item as UTF-8 text) on
+  // ONE binary: with it set, a program's output must equal its pre-414 baseline byte for byte, which is what
+  // proves that the wide road is the only thing the cure changed.
+  if GWidePrintKnob < 0 then
+    if SysUtils.GetEnvironmentVariable('SB_WSTRING_PRINT_UTF8') = '1' then GWidePrintKnob := 1
+    else GWidePrintKnob := 0;
+  if GWidePrintKnob = 1 then Exit;
+  if (GLastTermCtrl <> nil) and (Dev <> nil) and (Pointer(Dev) = Pointer(IOutputDevice(GLastTermCtrl))) then
+    Result := GLastTermCtrl;
+  {$ENDIF}
+end;
+
+{$IFDEF UNIX}
+// tgetent(TERM) succeeded AND tgetflag("am") is true, read from the compiled terminfo entry. The search is
+// ncurses': $TERMINFO, ~/.terminfo, $TERMINFO_DIRS (an empty element is the system list), then the system
+// list; an entry lives under its first letter or that letter's hex code. The first entry found decides.
+// Format (term(5)): six little-endian shorts - magic 0432 or 01036, names size, boolean count, ... - then
+// the names, then one byte per boolean; "am" (auto_right_margin) is boolean 1.
+function TerminfoAutoMargins(const Term: string): Boolean;
+const
+  SystemDirs: array[0..2] of string = ('/etc/terminfo', '/lib/terminfo', '/usr/share/terminfo');
+
+  function TryEntry(const FN: string; out Found: Boolean): Boolean;
+  var
+    H: THandle;
+    Hdr: array[0..5] of Word;
+    B: Byte;
+  begin
+    Result := False;
+    Found := False;
+    if not FileExists(FN) then Exit;
+    H := FileOpen(FN, fmOpenRead or fmShareDenyNone);
+    if H = THandle(-1) then Exit;
+    try
+      if FileRead(H, Hdr, SizeOf(Hdr)) <> SizeOf(Hdr) then Exit;
+      if (LEtoN(Hdr[0]) <> $011A) and (LEtoN(Hdr[0]) <> $021E) then Exit;
+      Found := True;
+      if LEtoN(Hdr[2]) < 2 then Exit;
+      if FileSeek(H, SizeOf(Hdr) + LEtoN(Hdr[1]) + 1, fsFromBeginning) < 0 then Exit;
+      Result := (FileRead(H, B, 1) = 1) and (B = 1);
+    finally
+      FileClose(H);
+    end;
+  end;
+
+  function TryDir(const Dir: string; out Found: Boolean): Boolean;
+  begin
+    Found := False;
+    Result := False;
+    if Dir = '' then Exit;
+    Result := TryEntry(Dir + '/' + Term[1] + '/' + Term, Found);
+    if not Found then
+      Result := TryEntry(Dir + '/' + LowerCase(IntToHex(Ord(Term[1]), 2)) + '/' + Term, Found);
+  end;
+
+var
+  Dirs: TStringList;
+  S, Home: string;
+  i, j: Integer;
+  Found: Boolean;
+begin
+  Result := False;
+  if (Term = '') or (Pos('/', Term) > 0) then Exit;
+  Dirs := TStringList.Create;
+  try
+    S := SysUtils.GetEnvironmentVariable('TERMINFO');
+    if S <> '' then Dirs.Add(S);
+    Home := SysUtils.GetEnvironmentVariable('HOME');
+    if Home <> '' then Dirs.Add(Home + '/.terminfo');
+    S := SysUtils.GetEnvironmentVariable('TERMINFO_DIRS');
+    if S <> '' then
+    begin
+      S := S + ':';
+      while S <> '' do
+      begin
+        j := Pos(':', S);
+        if j = 1 then
+          for i := Low(SystemDirs) to High(SystemDirs) do Dirs.Add(SystemDirs[i])
+        else
+          Dirs.Add(Copy(S, 1, j - 1));
+        Delete(S, 1, j);
+      end;
+    end;
+    for i := Low(SystemDirs) to High(SystemDirs) do Dirs.Add(SystemDirs[i]);
+    for i := 0 to Dirs.Count - 1 do
+    begin
+      Result := TryDir(Dirs[i], Found);
+      if Found then Exit;
+    end;
+  finally
+    Dirs.Free;
+  end;
+end;
+{$ENDIF}
+
+function FbConsoleInited: Boolean;
+{$IFDEF UNIX}
+var
+  Fd: cint;
+  Pg: LongInt;
+begin
+  if GFbConInited < 0 then
+  begin
+    GFbConInited := 0;
+    if TerminfoAutoMargins(SysUtils.GetEnvironmentVariable('TERM')) and
+       (IsATTY(1) <> 0) and (IsATTY(0) <> 0) then
+    begin
+      Fd := FpOpen('/dev/tty', O_RDWR);
+      if Fd >= 0 then
+      begin
+        FpClose(Fd);
+        // not started in the background (FPC 3.2.2: TCGetPGrp(fd, var pgrp) answers 0 on success)
+        if (TCGetPGrp(1, Pg) = 0) and (Pg = FpGetpgrp) then GFbConInited := 1;
+      end;
+    end;
+  end;
+  Result := GFbConInited = 1;
+end;
+{$ELSE}
+begin
+  Result := False;
+end;
+{$ENDIF}
+
+// UTF-8 as the string bank holds it -> little-endian UTF-32 cells, one per character. A byte that starts no
+// valid sequence is a cell of its own value, as Utf8FirstCP reads it in the VM.
+function Utf8ToUtf32Cells(const S: string; out Count: Integer): string;
+var
+  i, k, n, b, cp, need: Integer;
+  P: PByte;
+begin
+  n := Length(S);
+  SetLength(Result, n * 4);
+  Count := 0;
+  i := 1;
+  while i <= n do
+  begin
+    b := Ord(S[i]);
+    if b < $80 then begin cp := b; need := 0; end
+    else if (b and $E0) = $C0 then begin cp := b and $1F; need := 1; end
+    else if (b and $F0) = $E0 then begin cp := b and $0F; need := 2; end
+    else if (b and $F8) = $F0 then begin cp := b and $07; need := 3; end
+    else begin cp := b; need := 0; end;
+    if need > 0 then
+    begin
+      if i + need > n then
+      begin
+        cp := b;
+        need := 0;
+      end
+      else
+        for k := 1 to need do
+          if (Ord(S[i + k]) and $C0) <> $80 then
+          begin
+            cp := b;
+            need := 0;
+            Break;
+          end
+          else
+            cp := (cp shl 6) or (Ord(S[i + k]) and $3F);
+    end;
+    P := @Result[Count * 4 + 1];
+    P[0] := cp and $FF;
+    P[1] := (cp shr 8) and $FF;
+    P[2] := (cp shr 16) and $FF;
+    P[3] := (cp shr 24) and $FF;
+    Inc(Count);
+    Inc(i, 1 + need);
+  end;
+  SetLength(Result, Count * 4);
+end;
+
 {$IFDEF WINDOWS}
 var
   GCtrlCPressed: Boolean = False;
@@ -367,6 +573,7 @@ end;
 constructor TTerminalController.Create;
 begin
   inherited Create;
+  GLastTermCtrl := Self;
   // Qualified: this unit uses Windows, whose GetEnvironmentVariable is the 3-argument API call.
   GCellRotate := SysUtils.GetEnvironmentVariable('SB_CELLROT') <> '0';
   GOutBuffered := SysUtils.GetEnvironmentVariable('SB_OUTBUF') <> '0';
@@ -577,6 +784,33 @@ end;
 procedure TTerminalController.NewLine;
 begin
   OutWrite(LineEnding);
+  if GOutIsTerminal then TerminalOutFlush;
+  CellNextRow;
+  FCursorX := 0;
+  Inc(FCursorY);
+end;
+
+function TTerminalController.PrintWide(const Text: string): Integer;
+var
+  Cells: string;
+begin
+  Cells := Utf8ToUtf32Cells(Text, Result);
+  if Result = 0 then Exit;
+  if FbConsoleInited then
+    OutWrite(#27'%G' + Text + #27'%@')
+  else
+    OutWrite(Cells);
+  PutCells(Text);
+  MirrorTextToSurface(Text);
+  Inc(FCursorX, Result);
+end;
+
+procedure TTerminalController.NewLineWide;
+begin
+  if FbConsoleInited then
+    OutWrite(#27'%G'#10#27'%@')
+  else
+    OutWrite(#10#0#0#0);
   if GOutIsTerminal then TerminalOutFlush;
   CellNextRow;
   FCursorX := 0;

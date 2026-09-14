@@ -12580,7 +12580,10 @@ begin
     // invokes the cast and prints the resulting string (e.g. "Print v" on a vector type).
     if TryEmitUDTCastToString(Child, ExprValue) then
     begin
-      EmitInstruction(ssaPrintString, MakeSSAValue(svkNone), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      if IsWStringExpr(Child) then   // a cast that returns WSTRING prints wide (DIVERGENZE 414)
+        EmitInstruction(ssaPrintString, MakeSSAValue(svkNone), ExprValue, MakeSSAValue(svkNone), MakeSSAConstInt(1))
+      else
+        EmitInstruction(ssaPrintString, MakeSSAValue(svkNone), ExprValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       Continue;
     end;
 
@@ -12691,8 +12694,16 @@ begin
           EmitInstruction(ssaPrint, MakeSSAValue(svkNone), ExprValue,
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       srtString:
-        EmitInstruction(ssaPrintString, MakeSSAValue(svkNone), ExprValue,
-                       MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // ⭐ A WSTRING item carries Immediate = 1 (DIVERGENZE 414, owner 14 Sep 2026: conform to fbc). On Linux
+        // fbc's runtime writes it as UTF-32 cells to a stream that is not an initialised console, and wraps
+        // it in "\e%G"..."\e%@" on one that is - and the comma padding and line break that follow it are
+        // written the same way. The VM decides the road; the SSA only says which items are wide.
+        if IsWStringExpr(Child) then
+          EmitInstruction(ssaPrintString, MakeSSAValue(svkNone), ExprValue,
+                         MakeSSAValue(svkNone), MakeSSAConstInt(1))
+        else
+          EmitInstruction(ssaPrintString, MakeSSAValue(svkNone), ExprValue,
+                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
   end;
 
@@ -46245,7 +46256,11 @@ begin
           NameU := Node.GetChild(0).ValueUpper
         else
           NameU := Node.ValueUpper;
+        // ⭐ ...and WSPACE / WHEX / WOCT / WBIN, whose result is ASCII but WIDE: fbc prints
+        // "[" + WSpace(3) + "]" and WHex(255) as 4-byte cells (m100, DIVERGENZE 414). Their text is the same
+        // in bytes and in codepoints, so counting them wide changes no Len / Mid answer.
         Result := (NameU = kWSTR) or (NameU = kWCHR) or (NameU = kWSTRING) or (NameU = kWINPUT) or
+                  (NameU = kWSPACE) or (NameU = kWHEX) or (NameU = kWOCT) or (NameU = kWBIN) or
                   IsWStringVar(NameU);
         // ⛔ ...AND WIDENESS FLOWS THROUGH THE BUILTINS THAT RETURN A PIECE OF THEIR ARGUMENT. Each of
         // these was lowered to its WIDE form correctly - "r = Mid(w, 2)" puts two codepoints in r - and

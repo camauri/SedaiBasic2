@@ -3595,10 +3595,20 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   step at the width of `x` or of the array's element, including `Double`, narrow and unsigned types.
 - **A size suffix narrows a decimal literal of any magnitude**: `18446744073709551615UL` is `4294967295` (a
   32-bit `ULong`), as FreeBASIC answers with its "Literal number too big, truncated" warning.
+- **`Print` of a `WString` writes what FreeBASIC's runtime writes on Linux.** To a **file or a pipe** (standard
+  output redirected) each character is its raw **4-byte cell**, and so are the line break and the comma padding
+  that follow a `WString` item: `Print "A="; WStr("AB")` writes `A=A\0\0\0B\0\0\0\n\0\0\0`. A separator takes the
+  width of the item it follows, so `Print WStr("E"); "F"` writes `F` and its line break as ordinary bytes. On a
+  **terminal** the text is UTF-8 wrapped in the two escapes `ESC % G` … `ESC % @`, and so are its comma padding
+  and its line break. The terminal counts as a console under FreeBASIC's own conditions: `TERM` names a terminfo
+  entry with automatic margins, standard input and output are both terminals, `/dev/tty` opens and the program
+  runs in the foreground. An empty `WString` item writes nothing. The results of `WSpace`, `WHex`, `WOct` and
+  `WBin` are wide strings too, and print the same way. ⚠️ Linux and the `sb` command-line runner only;
+  on Windows a `WString` still prints as UTF-8 text.
 
 ⚠️ **Known differences still open**, named so they are not mistaken for something else:
-`Print` of a `WString` to a **file or a pipe** writes UTF-8 text here, where FreeBASIC on Linux writes the raw
-4-byte cells (on a terminal FreeBASIC converts to UTF-8); SedaiBasic will conform. `SizeOf(1UL)` and
+On a **terminal**, every FreeBASIC program writes a few control sequences when it starts (keypad mode and two
+cursor-position queries, whose answer it waits for) and when it ends; SedaiBasic writes none. `SizeOf(1UL)` and
 `SizeOf(1L)` answer 8 where FreeBASIC answers 4. `TypeOf` of a narrow scalar or of an array element answers a
 64-bit type, so `Dim As TypeOf(a(0)) z` allocates 8 bytes for a `Long` array.
 ⚠️ **And one defect of a FreeBASIC header, not of either compiler**: `ncurses.bi` declares `chtype` as

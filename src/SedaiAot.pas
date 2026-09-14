@@ -6693,7 +6693,12 @@ var
       ssaPrintString, ssaPrintStringLn:
       begin
         apc := NeedPC; if not OK then Exit;
-        EmitPrintStringNative(apc, Cur.OpCode = ssaPrintStringLn);
+        // ⛔ A WSTRING item (Src3 = 1, DIVERGENZE 414) takes the interpreter arm: the leaf writes UTF-8
+        // through the device, and it is the arm that knows the wide roads and sets the wide tail.
+        if (Cur.Src3.Kind = svkConstInt) and ((Cur.Src3.ConstInt and 1) <> 0) then
+          EmitHelperCall(apc)
+        else
+          EmitPrintStringNative(apc, Cur.OpCode = ssaPrintStringLn);
       end;
 
       // C9: the math family. No PC is needed - none of these can raise, which is precisely the
