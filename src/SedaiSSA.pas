@@ -949,6 +949,11 @@ type
     procedure CollectCtorDtorTypes(N: TASTNode);      // ...fills FCtorDtorTypes from the procedures DEFINED
     function NestedMemberHandle(const Parent: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;  // ...the member's handle or VIEW
     function ArrayMemberInlineCandidate(UDTIdx, FieldIdx: Integer; out Size, Align: Int64): Boolean;  // DIVERGENZE 226: may this array member live in the bytes?
+    function InlineRecordElemTypeOK(UIdx: Integer): Boolean;                  // DIVERGENZE 389: may a record of it be such an element?
+    function RecordTypeHasFieldDefaults(UIdx, Depth: Integer): Boolean;
+    function InlineRecordArrayElemUDT(ArrAccessNode: TASTNode): Integer;      // DIVERGENZE 389: "obj.m(i)" on an inline array of records
+    function InlineMemberRecordElem(ArrAccessNode: TASTNode; out View: TSSAValue): Boolean;
+    function InlineArrayElemPointee(ElemNode: TASTNode): string;              // DIVERGENZE 390: pointee of "@x.m(i)" in the bytes
     function ArrayMemberInlineShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64): Boolean;      // ...and does it, within the type's budget
     function FieldArrayInline(UDTIdx, FieldIdx: Integer): Boolean;
     function MemberArrayInline(UDTIdx: Integer; const FieldName: string): Boolean;
@@ -32933,6 +32938,41 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.InlineRecordElemTypeOK(UIdx: Integer): Boolean;
+// DIVERGENZE 389 - may a record of this type be an ELEMENT of an array member that lives in the bytes?
+//   - it must be plain data (UDTInlinePOD): an element is a view, with no string vector or type id of its own;
+//   - its live image must BE its C image, byte for byte: an element sits at lin * SizeOf(element), and the
+//     field ops on the view read the element's LIVE offsets - the two must be the same numbers;
+//   - no field DEFAULT anywhere inside it: a nested member runs its defaults on its view (EmitRecordInit),
+//     and an array of them would need a loop per element that nothing emits. A C header has none.
+var
+  S, A: Int64;
+begin
+  Result := False;
+  if (UIdx < 0) or (UIdx > High(FUDTs)) then Exit;
+  if (Length(FUDTs[UIdx].Fields) = 0) or (FUDTs[UIdx].LiveBytes <= 0) then Exit;
+  if not UDTInlinePOD(UIdx) then Exit;
+  if RecordTypeHasFieldDefaults(UIdx, 0) then Exit;
+  if not NestedMemberShape(FUDTs[UIdx].Name, True, S, A) then Exit;
+  Result := S = FUDTs[UIdx].LiveBytes;
+end;
+
+function TSSAGenerator.RecordTypeHasFieldDefaults(UIdx, Depth: Integer): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  if (UIdx < 0) or (UIdx > High(FUDTs)) or (Depth > 16) then Exit;
+  for i := 0 to High(FUDTs[UIdx].Fields) do
+  begin
+    if FUDTs[UIdx].Fields[i].DefaultExpr <> nil then Exit(True);
+    if (FUDTs[UIdx].Fields[i].NestedType <> '') and
+       RecordTypeHasFieldDefaults(FindUDT(FUDTs[UIdx].Fields[i].NestedType), Depth + 1) then Exit(True);
+    if (FUDTs[UIdx].Fields[i].ArrayElemType <> '') and
+       RecordTypeHasFieldDefaults(FindUDT(FUDTs[UIdx].Fields[i].ArrayElemType), Depth + 1) then Exit(True);
+  end;
+end;
+
 function TSSAGenerator.ArrayMemberInlineCandidate(UDTIdx, FieldIdx: Integer; out Size, Align: Int64): Boolean;
 // ⭐⭐ DIVERGENZE 226, SECOND STEP - MAY THIS ARRAY MEMBER LIVE IN ITS RECORD'S BYTES? A fixed-size array of
 // numbers may: its elements at fbc's offsets, which is what a Union overlaps ("m(0 To 3, 0 To 3)" over
@@ -32958,6 +32998,21 @@ begin
   if (FieldIdx < 0) or (FieldIdx > High(FUDTs[UDTIdx].Fields)) then Exit;
   if not FUDTs[UDTIdx].Fields[FieldIdx].IsArray then Exit;
   if FUDTs[UDTIdx].Fields[FieldIdx].DeclaredRedim then Exit;   // "ReDim m(0 To 0)": dynamic by declaration
+  // ⭐⭐ DIVERGENZE 389 - AN ARRAY OF RECORDS OF PLAIN DATA LIVES THERE TOO. libxmp's xmp_frame_info carries
+  // "channel_info(0 To 63) As xmp_channel_info" and C fills it through "@fi": behind a handle, the eight
+  // bytes of that handle were where C wrote the first channel, and "fi.channel_info(0).period" died on
+  // the next access. An element is then a VIEW of the container at the element's offset - the same place
+  // a nested member that lives in the bytes is (InlineRecordArrayElemUDT, InlineMemberRecordElem).
+  if FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemType <> '' then
+  begin
+    if FWholeArrayFields.IndexOf(FUDTs[UDTIdx].Fields[FieldIdx].Name) >= 0 then Exit;
+    if not InlineRecordElemTypeOK(FindUDT(FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemType)) then Exit;
+    if not FixedArrayMemberCShape(UDTIdx, FieldIdx, Size, Align, True) then
+    begin
+      Size := 8; Align := 8; Exit;
+    end;
+    Exit(True);
+  end;
   if not (FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemBank in [srtInt, srtFloat]) then Exit;
   if (FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemType <> '') or
      (FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemPtrPointee <> '') then Exit;
@@ -33096,7 +33151,10 @@ begin
   if not ResolveRecordObject(MemberNode.GetChild(0), ObjHandle, TypeName) then Exit;
   ElemBank := FUDTs[U].Fields[FI].ArrayElemBank;
   W := FUDTs[U].Fields[FI].Slot and $F;
-  Esz := TypeSizeBytes(FUDTs[U].Fields[FI].ArrayElemScalarType);
+  if FUDTs[U].Fields[FI].ArrayElemType <> '' then            // a record element (DIVERGENZE 389): its image
+    Esz := FUDTs[FindUDT(FUDTs[U].Fields[FI].ArrayElemType)].LiveBytes
+  else
+    Esz := TypeSizeBytes(FUDTs[U].Fields[FI].ArrayElemScalarType);
   // Row-major, as fbc lays it out: the LAST index moves fastest.
   SetLength(Strides, n);
   Strides[n - 1] := 1;
@@ -33185,6 +33243,50 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.InlineRecordArrayElemUDT(ArrAccessNode: TASTNode): Integer;
+// DIVERGENZE 389 - the element type of "obj.m(i)" when m is an array of RECORDS that lives in the bytes,
+// or -1. Asks the node and the layout only: nothing is emitted, so a caller can choose its path first.
+var
+  MemberNode, IdxN: TASTNode;
+  TypeName: string;
+  U, FI: Integer;
+begin
+  Result := -1;
+  if (ArrAccessNode = nil) or (ArrAccessNode.NodeType <> antArrayAccess) or (ArrAccessNode.ChildCount < 2) then Exit;
+  MemberNode := ArrAccessNode.GetChild(0);
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  IdxN := ArrAccessNode.GetChild(1);
+  if (IdxN = nil) or (IdxN.ChildCount = 0) then Exit;
+  TypeName := ObjectTypeName(MemberNode.GetChild(0));
+  if TypeName = '' then Exit;
+  U := FindUDT(TypeName);
+  if U < 0 then Exit;
+  FI := UDTFieldIndex(U, VarToStr(MemberNode.Value));
+  if (FI < 0) or not FUDTs[U].Fields[FI].InlineArray or (FUDTs[U].Fields[FI].ArrayElemType = '') then Exit;
+  Result := FindUDT(FUDTs[U].Fields[FI].ArrayElemType);
+end;
+
+function TSSAGenerator.InlineMemberRecordElem(ArrAccessNode: TASTNode; out View: TSSAValue): Boolean;
+// "obj.m(i)" as a RECORD (DIVERGENZE 389): the element is a place inside the container, reached the way a
+// nested member that lives there is (NestedMemberHandle) - the container itself at offset 0, otherwise a
+// view. InlineMemberArrayElem answers (record, encoding) with width 0, so the encoding IS the offset.
+var
+  R: TSSAValue;
+  E: Int64;
+  B: TSSARegisterType;
+begin
+  View := MakeSSAValue(svkNone);
+  Result := InlineMemberArrayElem(ArrAccessNode, R, E, B);
+  if not Result then Exit;
+  if E = 0 then
+  begin
+    View := EnsureIntRegister(R);
+    Exit;
+  end;
+  View := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaRefAddrField, View, EnsureIntRegister(R), MakeSSAValue(svkNone), MakeSSAConstInt(E));
+end;
+
 function TSSAGenerator.EmitInlineMemberArrayLoad(ArrAccessNode: TASTNode; out Res: TSSAValue): Boolean;
 var
   R: TSSAValue;
@@ -33192,6 +33294,9 @@ var
   B: TSSARegisterType;
 begin
   Res := MakeSSAValue(svkNone);
+  // A record element's value is the record - its view (DIVERGENZE 389).
+  if InlineRecordArrayElemUDT(ArrAccessNode) >= 0 then
+    Exit(InlineMemberRecordElem(ArrAccessNode, Res));
   Result := InlineMemberArrayElem(ArrAccessNode, R, E, B);
   if not Result then Exit;
   if B = srtFloat then
@@ -33211,7 +33316,24 @@ var
   R, V: TSSAValue;
   E: Int64;
   B: TSSARegisterType;
+  EU: Integer;
+  SrcT: string;
 begin
+  // "obj.m(i) = rec" on a record element (DIVERGENZE 389) COPIES the record into the element's bytes, as
+  // fbc does - the element is a place, and there is no handle in it to point elsewhere.
+  EU := InlineRecordArrayElemUDT(ArrAccessNode);
+  if EU >= 0 then
+  begin
+    Result := InlineMemberRecordElem(ArrAccessNode, R);
+    if not Result then Exit;
+    if not ResolveRecordObject(ExprNode, V, SrcT) then
+    begin
+      ProcessExpression(ExprNode, V);
+      V := EnsureIntRegister(V);
+    end;
+    EmitRecordCopy(R, EnsureIntRegister(V), EU);
+    Exit;
+  end;
   Result := InlineMemberArrayElem(ArrAccessNode, R, E, B);
   if not Result then Exit;
   ProcessExpression(ExprNode, V);
@@ -33232,6 +33354,9 @@ var
   B: TSSARegisterType;
 begin
   Res := MakeSSAValue(svkNone);
+  // "@obj.m(i)" of a record element is the element - its view - which is what "p->field" reads (389).
+  if InlineRecordArrayElemUDT(ArrAccessNode) >= 0 then
+    Exit(InlineMemberRecordElem(ArrAccessNode, Res));
   Result := InlineMemberArrayElem(ArrAccessNode, R, E, B);
   if not Result then Exit;
   Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -33546,7 +33671,38 @@ begin
   if N = nil then Exit;
   while (N.NodeType = antParentheses) and (N.ChildCount >= 1) do N := N.GetChild(0);
   if (N.NodeType = antProcAddress) and (N.ChildCount >= 1) then
+  begin
     Result := UpperFast(DeclaredTypeNameOf(N.GetChild(0)));
+    if Result = '' then Result := InlineArrayElemPointee(N.GetChild(0));
+  end;
+end;
+
+function TSSAGenerator.InlineArrayElemPointee(ElemNode: TASTNode): string;
+// DIVERGENZE 390 - "@x.m(i)" on an array member that LIVES in the record's bytes points at an ELEMENT, and
+// its pointee is the element's type. DeclaredTypeNameOf answers for the member, not for its element, so
+// "@v.m(4) - @v.m(1)" subtracted two record-field pointers as plain integers: 192 (3 elements * 4 bytes
+// * 16, the offset's unit) where fbc says 3. Only a member that lives in the bytes: there the address is a
+// record-field pointer, the one kind TryEmitManagedPtrArith divides by SizeOf.
+var
+  MemberNode: TASTNode;
+  TypeName: string;
+  U, FI: Integer;
+begin
+  Result := '';
+  if (ElemNode = nil) or (ElemNode.NodeType <> antArrayAccess) or (ElemNode.ChildCount < 2) then Exit;
+  MemberNode := ElemNode.GetChild(0);
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  if (ElemNode.GetChild(1) = nil) or (ElemNode.GetChild(1).ChildCount = 0) then Exit;
+  TypeName := ObjectTypeName(MemberNode.GetChild(0));
+  if TypeName = '' then Exit;
+  U := FindUDT(TypeName);
+  if U < 0 then Exit;
+  FI := UDTFieldIndex(U, VarToStr(MemberNode.Value));
+  if (FI < 0) or not FUDTs[U].Fields[FI].InlineArray then Exit;
+  if FUDTs[U].Fields[FI].ArrayElemType <> '' then
+    Result := UpperFast(FUDTs[U].Fields[FI].ArrayElemType)
+  else
+    Result := UpperFast(Trim(FUDTs[U].Fields[FI].ArrayElemScalarType));
 end;
 
 function TSSAGenerator.EmitCastToScalarPtr(Operand: TASTNode; const V: TSSAValue; const Pointee: string): TSSAValue;
@@ -33905,8 +34061,14 @@ begin
     // ELEMENT 0 - the offset, and the element's width - and an element is that plus lin * SizeOf(element).
     FUDTs[UDTIdx].Fields[i].InlineArray := FUDTs[UDTIdx].Fields[i].IsArray and FieldArrayInline(UDTIdx, i);
     if FUDTs[UDTIdx].Fields[i].InlineArray then
-      FUDTs[UDTIdx].Fields[i].Slot := (FUDTs[UDTIdx].Fields[i].ByteOffset shl 4) or
-        (InlineArrayElemWidthCode(FUDTs[UDTIdx].Fields[i].ArrayElemScalarType) and $F);
+    begin
+      // ...an element that is a RECORD (DIVERGENZE 389) is a place, not a value: width 0, as a nested one.
+      if FUDTs[UDTIdx].Fields[i].ArrayElemType <> '' then
+        FUDTs[UDTIdx].Fields[i].Slot := Integer(FUDTs[UDTIdx].Fields[i].ByteOffset shl 4)
+      else
+        FUDTs[UDTIdx].Fields[i].Slot := (FUDTs[UDTIdx].Fields[i].ByteOffset shl 4) or
+          (InlineArrayElemWidthCode(FUDTs[UDTIdx].Fields[i].ArrayElemScalarType) and $F);
+    end;
     // The two facts the ACCESSORS read: which bit of the unit this member starts at, and whether it
     // shares a unit with the member before it (the C layouts ask PlaceBitField again rather than this
     // mark, because their own field sizes - and so their offsets - can differ from the live image's).
@@ -50028,6 +50190,13 @@ begin
     // member access, not a plain identifier. IsMemberArrayAccess loads the member's FArrays handle and the
     // linear index; an indirect int load then yields the element's record handle. The element UDT type is
     // the field's ArrayElemType.
+    // ...unless the member LIVES in the record's bytes (DIVERGENZE 389): the element is a view, no handle.
+    if InlineRecordArrayElemUDT(ObjNode) >= 0 then
+    begin
+      TypeName := FUDTs[InlineRecordArrayElemUDT(ObjNode)].Name;
+      Result := InlineMemberRecordElem(ObjNode, HandleVal);
+      Exit;
+    end;
     if (ObjNode.ChildCount >= 2) and (ObjNode.GetChild(0).NodeType = antMemberAccess) then
     begin
       MemberArrElemType := '';
