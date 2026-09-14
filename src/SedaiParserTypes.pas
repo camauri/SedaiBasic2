@@ -303,8 +303,13 @@ type
     precComparison,     // < > <= >=
     precConcat,         // & (FreeBASIC string concat: looser than +/-, tighter than comparisons)
     precTerm,           // + -
-    precShift,          // SHL SHR (FreeBASIC: tighter than +/-, looser than * / \ MOD)
-    precFactor,         // * / \ MOD
+    precShift,          // SHL SHR (FreeBASIC: tighter than +/-, looser than MOD)
+    // ⛔ THREE levels, not one. FreeBASIC (and QBasic before it) ranks * and / above \, and \ above MOD -
+    // measured on fbc 1.10.1: "21 \ 2 * 3" is 3, "21 Mod 5 \ 2" is 1, "21 Mod 5 * 3" is 6. With the four
+    // on one level they associated left to right and answered 30, 0 and 3, in silence (DIVERGENZE 373).
+    precMod,            // MOD
+    precIntDiv,         // \
+    precFactor,         // * /
     precUnary,          // - NOT
     precPower,          // ^
     precCall,           // Function calls, array access
@@ -397,7 +402,9 @@ begin
     ttOpAdd, ttOpSub: Result := precTerm;
 
     // Multiplication/Division (\ = integer division)
-    ttOpMul, ttOpDiv, ttOpMod, ttOpIntDiv: Result := precFactor;
+    ttOpMul, ttOpDiv: Result := precFactor;
+    ttOpIntDiv: Result := precIntDiv;
+    ttOpMod: Result := precMod;
 
     // Bit shifts (FreeBASIC)
     ttOpShl, ttOpShr: Result := precShift;
@@ -428,6 +435,8 @@ begin
     precShift: Result := 'Shift';
     precConcat: Result := 'Concat';
     precTerm: Result := 'Term';
+    precMod: Result := 'Mod';
+    precIntDiv: Result := 'IntDiv';
     precFactor: Result := 'Factor';
     precUnary: Result := 'Unary';
     precPower: Result := 'Power';

@@ -6723,6 +6723,23 @@ begin
     RTC_U8:  PByte(RawAddr(RawPtr, 1, True))^ := Byte(Value);
     RTC_U16: PWord(RawAddr(RawPtr, 2, True))^ := Word(Value);
     RTC_U32: PLongWord(RawAddr(RawPtr, 4, True))^ := LongWord(Value);
+    // ⭐ A POINTER written INTO C's memory - the write twin of the RTC_PTR64 load. Inside the VM a machine
+    // address carries FGNPTR_TAG (that is what keeps it from being decoded as one of the VM's own
+    // pointers); in C's bytes it must be the bare address, because C dereferences it. Written tagged,
+    // "ci->err = jpeg_std_error(je)" left bit 61 set in libjpeg's struct and jpeg_start_compress died
+    // calling "cinfo->err->reset_error_mgr" (jpeglib deck, DIVERGENZE 376). Only the exact tag pattern
+    // (bits 63-61 = 0 0 1) is taken off, and only when the DESTINATION is C's memory: a pointer stored in
+    // the VM's own raw heap stays in the VM's domain, as it always did.
+    // ⛔ A VM-domain pointer written into C's memory is NOT translated here, and that was tried: a
+    // "CAllocate" assigned to a UDT pointer is a block of SHARED RECORDS on the same bit as RAWPTR_TAG,
+    // not the raw heap, so resolving it as raw memory failed on the first store (DIVERGENZE 379). Handing
+    // C an address it will KEEP is the native-memory question of DIVERGENZE 257, not a store-time patch.
+    RTC_PTR64:
+      if ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) and
+         ((Value shr 61) and 7 = 1) then
+        PInt64(RawAddr(RawPtr, 8, True))^ := Value and not FGNPTR_TAG
+      else
+        PInt64(RawAddr(RawPtr, 8, True))^ := Value;
   else
     PInt64(RawAddr(RawPtr, 8, True))^ := Value;
   end;

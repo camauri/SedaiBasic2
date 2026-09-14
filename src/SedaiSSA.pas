@@ -1623,6 +1623,8 @@ type
     function RawChainAddr(Node: TASTNode; out Addr: TSSAValue; out ElemType: string): Boolean;
     function RawChainValue(Node: TASTNode; out Val: TSSAValue; out Pointee: string): Boolean;
     function RawChainNameIsArray(const NameU: string): Boolean;
+    function RawObjectPtrFieldMulti(MemberNode: TASTNode): string;
+    function RawNestedRecordAddrOf(MemberNode: TASTNode; const TargetU: string): Boolean;
     function TryEmitRawChainRead(Node: TASTNode; out Value: TSSAValue): Boolean;
     function TryEmitRawChainStore(Node, ExprNode: TASTNode): Boolean;
     function ResolveRawUDTBase(ObjNode: TASTNode; out TypeName: string; out UDTIdx: Integer;
@@ -8476,6 +8478,12 @@ begin
             TempStr := MemberRawPtrPointee(Node.GetChild(0))
           else
             TempStr := MemberArrayElemRawPtrPointee(Node.GetChild(0));
+          // ⭐ ...and a "<UDT> Ptr Ptr" field of a struct C owns: "face->charmaps[0]" on FreeType's
+          // FT_FaceRec. Its pointee is filed in MultiPtrPointee, not RawPtrPointee, so the question above
+          // answered '' and the element read fell through to 0 (freetype2 deck, DIVERGENZE 374). The
+          // element is a pointer - eight bytes, loaded as RTC_PTR64 - which the ladder already knows.
+          if (TempStr = '') and (Node.GetChild(0).NodeType = antMemberAccess) then
+            TempStr := RawObjectPtrFieldMulti(Node.GetChild(0));
           if TempStr <> '' then
           begin
             Left := EmitRawFieldIndexAddress(Node.GetChild(0), Node.GetChild(1), TempStr);
@@ -26600,7 +26608,12 @@ begin
   if not F.IsArray then Exit;
   if (F.ArrayBounds = nil) or (F.ArrayBounds.ChildCount <> 1) then Exit;
   if F.ArrayElemBank = srtString then Exit;
-  if F.ArrayElemPtrPointee <> '' then Exit;
+  // ⛔ An array of "<UDT> Ptr" is eight bytes an element in C, and the RAW layout must say so. Refusing it
+  // here refused the WHOLE type: libjpeg's jpeg_compress_struct carries "quant_tbl_ptrs(0 To 3) As
+  // JQUANT_TBL Ptr", and "ci->image_width = 16" on a struct calloc'd by C died on "Invalid record handle"
+  // - every field of it, not only the array (jpeglib deck, DIVERGENZE 375). The other caller copies the
+  // member into a hidden array of scalars and keeps refusing, as before.
+  if (F.ArrayElemPtrPointee <> '') and not AllowRecordElems then Exit;
   if (F.ArrayElemType <> '') and
      not (AllowRecordElems and NestedMemberShape(F.ArrayElemType, False, NSz, NAl) and (NSz > 0)) then Exit;
   D := F.ArrayBounds.GetChild(0);
@@ -26614,6 +26627,12 @@ begin
   else if not FoldIntNode(D, Ub) then Exit;
   if Ub < Lb then Exit;
   Count := Ub - Lb + 1;
+  // An array of POINTERS to records: one element is a pointer (see the note above).
+  if F.ArrayElemPtrPointee <> '' then
+  begin
+    ElemBytes := 8;
+    Exit(Count > 0);
+  end;
   // An array of RECORDS: one element is the nested type, laid out inline as C lays it.
   if F.ArrayElemType <> '' then
   begin
@@ -26885,6 +26904,42 @@ begin
     if (Length(Inner) < 4) or (Copy(Inner, Length(Inner) - 3, 4) <> ' PTR') then Exit;
     Result := Trim(Copy(Inner, 1, Length(Inner) - 4));
   end;
+end;
+
+function TSSAGenerator.RawNestedRecordAddrOf(MemberNode: TASTNode; const TargetU: string): Boolean;
+// Is "@MemberNode" the address of a record nested BY VALUE inside raw memory, of the type TargetU points
+// at? ResolveRawUDTBase answers the member as an object - a record at a fixed byte offset - and emits
+// nothing. An element of a block ("@p[i].r") is refused: one variable cannot be laid over every element.
+var
+  T: string;
+  U: Integer;
+  Ofs: TInt64Array;
+  Sz: Int64;
+  B, I, C: TASTNode;
+begin
+  Result := False;
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) then Exit;
+  if not ResolveRawUDTBase(MemberNode, T, U, Ofs, Sz, B, I, C) then Exit;
+  if (U < 0) or (I <> nil) or (C <> nil) then Exit;
+  Result := SameText(UpperFast(CanonicalType(T)), UpperFast(CanonicalType(PointerUDTType(TargetU))));
+end;
+
+function TSSAGenerator.RawObjectPtrFieldMulti(MemberNode: TASTNode): string;
+// "o->f" where o is RAW memory and f a "<UDT> Ptr Ptr" field: the field's full pointee ("<UDT> PTR"),
+// else ''. Asked only of raw objects on purpose - a record of the program with such a field keeps the
+// path it has always had. Emits nothing.
+var
+  T: string;
+  U: Integer;
+  Ofs: TInt64Array;
+  Sz: Int64;
+  B, I, C: TASTNode;
+begin
+  Result := '';
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  if not ResolveRawUDTBase(MemberNode.GetChild(0), T, U, Ofs, Sz, B, I, C) then Exit;
+  if (U < 0) or (I <> nil) then Exit;
+  Result := UpperFast(CanonicalType(UDTFieldMultiPtrPointee(U, MemberNode.ValueUpper)));
 end;
 
 function TSSAGenerator.RawChainNameIsArray(const NameU: string): Boolean;
@@ -27191,6 +27246,61 @@ begin
     end;
     TypeName := ''; UDTIdx := -1; TotalSize := 0; SetLength(Offsets, 0);
   end;
+  // ⭐⭐ "o->f[i].x" AND "o->f[i]->x" - A POINTER FIELD OF RAW MEMORY, INDEXED. The rung above wants an
+  // ARRAY member; a C struct holds a POINTER to a block instead, and that is FreeType's shape twice over:
+  // "slot->outline.points[k].x" (a "FT_Vector Ptr" field of a record nested by value) and
+  // "face->charmaps[k]->encoding" (a "FT_CharMap Ptr" field - a pointer to POINTERS to records). Both took
+  // the managed record path and died on "Invalid record handle" (freetype2 deck, DIVERGENZE 374).
+  // The FIELD decides which of the two the element is, so the spelling never has to: a "<UDT> Ptr" field
+  // names a block of RECORDS (base = the field, stride = the record), a "<UDT> Ptr Ptr" one a block of
+  // POINTERS (base = the loaded element itself).
+  if (ObjNode.NodeType = antArrayAccess) and (ObjNode.Attributes.Values['BRACKET'] = '1') and
+     (ObjNode.ChildCount >= 2) and (ObjNode.GetChild(0) <> nil) and
+     (ObjNode.GetChild(0).NodeType = antMemberAccess) and (ObjNode.GetChild(0).ChildCount >= 1) and
+     // ⚠️ asked of the MEMBER, not of the indexing: SideEffectFreeObject says no to every indexing, and
+     // this rung evaluates the object and the index ONCE each (EmitRawUDTFieldAddr), so it needs no more.
+     SideEffectFreeObject(ObjNode.GetChild(0)) and
+     ResolveRawUDTBase(ObjNode.GetChild(0).GetChild(0), OuterName, OuterIdx, OuterOfs, OuterSize,
+                       BaseNode, IdxNode, ChainNode) then
+  begin
+    MemIdx := -1;
+    for k := 0 to High(FUDTs[OuterIdx].Fields) do
+      if UpperFast(FUDTs[OuterIdx].Fields[k].Name) = ObjNode.GetChild(0).ValueUpper then
+        begin MemIdx := k; Break; end;
+    BaseNode := nil; IdxNode := nil; ChainNode := nil;
+    if (MemIdx >= 0) and (not FUDTs[OuterIdx].Fields[MemIdx].IsArray) and
+       (FUDTs[OuterIdx].Fields[MemIdx].NestedType = '') then
+    begin
+      if FUDTs[OuterIdx].Fields[MemIdx].PtrPointee <> '' then
+      begin
+        TypeName := UpperFast(CanonicalType(FUDTs[OuterIdx].Fields[MemIdx].PtrPointee));
+        IdxNode := ObjNode.GetChild(1);
+        if (IdxNode <> nil) and (IdxNode.NodeType in [antArgumentList, antExpressionList]) then
+        begin
+          if IdxNode.ChildCount = 1 then IdxNode := IdxNode.GetChild(0) else IdxNode := nil;
+        end;
+        if IdxNode <> nil then BaseNode := ObjNode.GetChild(0) else TypeName := '';
+      end
+      else
+      begin
+        CastT := UpperFast(FUDTs[OuterIdx].Fields[MemIdx].MultiPtrPointee);
+        if (Length(CastT) > 4) and (Copy(CastT, Length(CastT) - 3, 4) = ' PTR') then
+        begin
+          TypeName := UpperFast(CanonicalType(Trim(Copy(CastT, 1, Length(CastT) - 4))));
+          if Pos(' PTR', TypeName) = 0 then BaseNode := ObjNode else TypeName := '';
+        end;
+      end;
+      if TypeName <> '' then
+      begin
+        UDTIdx := FindUDT(TypeName);
+        if (UDTIdx >= 0) and (not UDTBlockIsManaged(TypeName)) and
+           UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) and (TotalSize > 0) then
+          Exit(True);
+      end;
+    end;
+    TypeName := ''; UDTIdx := -1; TotalSize := 0; SetLength(Offsets, 0);
+    BaseNode := nil; IdxNode := nil; ChainNode := nil;
+  end;
   // ⭐ "(*p).field" IS "p->field", and it used to reach here as a shape this routine did not know:
   // an antDeref, possibly parenthesised, instead of the bare name. So the raw byte-offset path
   // declined, the managed record path took the raw address for a table index, and the VM died - on
@@ -27441,7 +27551,10 @@ begin
     else
       // ⭐ ...and a POINTER field says so: read out of a struct C handed back it is C's pointer, and the
       // VM tags it on the way out (DIVERGENZE 250). An INTEGER field of the same width must not be.
-      if (F.PtrPointee <> '') or (F.RawPtrPointee <> '') then
+      // ⛔ ...and a "<UDT> Ptr Ptr" field is a pointer as surely as the other two: its pointee is filed in
+      // MultiPtrPointee, so "face->charmaps" (FreeType's "FT_CharMap Ptr") came out UNTAGGED and every read
+      // through it took a machine address for one of the VM's own (freetype2 deck, DIVERGENZE 374).
+      if (F.PtrPointee <> '') or (F.RawPtrPointee <> '') or (F.MultiPtrPointee <> '') then
         EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_PTR64))
       else
         EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64));
@@ -27510,7 +27623,12 @@ begin
       2: EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I16));
       4: EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I32));
     else
-      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I64));
+      // ⭐ ...and a POINTER field says so on the way IN too, the twin of the load half: written into C's
+      // memory a machine address must lose the VM's tag, or C dereferences bit 61 (DIVERGENZE 376).
+      if (F.PtrPointee <> '') or (F.RawPtrPointee <> '') or (F.MultiPtrPointee <> '') then
+        EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_PTR64))
+      else
+        EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I64));
     end;
   end;
   Result := True;
@@ -44434,18 +44552,32 @@ var
   // same program written with a temporary ("dim t as uc ptr = CAllocate(...) : a->b = t") worked,
   // because there the temporary was marked raw by the ordinary Allocate rule.
   var
-    ObjNode: TASTNode;
+    ObjNode, BN, IN_, CN: TASTNode;
     ObjT, FieldT: string;
     UDTIdx: Integer;
+    Ofs: TInt64Array;
+    TotSz: Int64;
   begin
     Result := False;
     if (Rhs = nil) or (Rhs.NodeType <> antMemberAccess) or (Rhs.ChildCount < 1) then Exit;
     ObjNode := Rhs.GetChild(0);
     while (ObjNode.NodeType = antParentheses) and (ObjNode.ChildCount >= 1) do ObjNode := ObjNode.GetChild(0);
-    if ObjNode.NodeType <> antIdentifier then Exit;
-    ObjT := RawUDTPtrType(VarToStr(ObjNode.Value));      // '' unless the object is a RAW UDT pointer
-    if ObjT = '' then Exit;
-    UDTIdx := FindUDT(ObjT);
+    if ObjNode.NodeType = antIdentifier then
+    begin
+      ObjT := RawUDTPtrType(VarToStr(ObjNode.Value));      // '' unless the object is a RAW UDT pointer
+      if ObjT = '' then Exit;
+      UDTIdx := FindUDT(ObjT);
+    end
+    // ⭐ ...and an object that is itself a path through raw memory: "p = slot->outline.points", a field
+    // of a record NESTED BY VALUE in a struct C owns (FreeType's FT_GlyphSlotRec). Only the name was
+    // asked, so the local stayed a record handle and "p[k].x" died (DIVERGENZE 374). The resolver the
+    // field READ uses answers it, and it emits nothing.
+    else if ResolveRawUDTBase(ObjNode, ObjT, UDTIdx, Ofs, TotSz, BN, IN_, CN) then
+    begin
+      if IN_ <> nil then Exit;    // "p[i].r.f": an element of a block, not one fixed record
+    end
+    else
+      Exit;
     if UDTIdx < 0 then Exit;
     FieldT := UpperFast(UDTFieldPtrPointee(UDTIdx, Rhs.ValueUpper));
     if FieldT <> '' then
@@ -44513,6 +44645,17 @@ var
          ((RhsU <> nil) and (RhsU.NodeType = antIdentifier) and (RawUDTPtrType(VarToStr(RhsU.Value)) <> '')) or
          IsRawPtrFieldExpr(Rhs) or IsImageCreateExpr(Rhs) or IsForeignPtrCall(Rhs) or
          IsArrayDescPtrCall(Rhs) or
+         // ⭐ "ol = @slot->outline": the ADDRESS of a record nested by value inside raw memory is an address
+         // into those bytes, and FreeType's own examples write exactly this before walking the points. Left
+         // unmarked, "ol->n_points" still answered (the run-time tag test of 259 covers a plain field) and
+         // "ol->points[k].x" died, because the indexed rung wants a base it can resolve (DIVERGENZE 374).
+         ((Rhs.NodeType = antProcAddress) and (Rhs.ChildCount >= 1) and (Rhs.GetChild(0) <> nil) and
+          (Rhs.GetChild(0).NodeType = antMemberAccess) and RawNestedRecordAddrOf(Rhs.GetChild(0), TargetU)) or
+         // ⭐ "cm = face->charmaps[k]": an ELEMENT of a "<UDT> Ptr Ptr" field of raw memory is a pointer
+         // to a record C owns. Nothing here asked about an indexed field (DIVERGENZE 374).
+         ((Rhs.NodeType = antArrayAccess) and (Rhs.Attributes.Values['BRACKET'] = '1') and
+          (Rhs.ChildCount >= 1) and (Rhs.GetChild(0) <> nil) and
+          (UpperFast(RawObjectPtrFieldMulti(Rhs.GetChild(0))) = UpperFast(PointerUDTType(TargetU)) + ' PTR')) or
          ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] <> '1') and
           TypeDeclaresAllocOperator(PointerUDTType(TargetU), 'OPERATORNEW') and
           (not TypeHasMemberProc(PointerUDTType(TargetU)))) or
@@ -48812,6 +48955,17 @@ begin
   // (atk deck; the rule is DIVERGENZE 235's, this is one more spelling of its operand).
   if (Node.NodeType = antArrayAccess) and (Node.Attributes.Values['BRACKET'] = '1') and
      (Node.ChildCount >= 1) and EndsPtr(DerefedType(Node.GetChild(0))) then Exit(True);
+  // ⭐ ...and a FIELD declared as a pointer, at ANY level. The type-name question below knew "<UDT> Ptr"
+  // and missed "<UDT> Ptr Ptr", whose pointee lives in its own registry: "Cast(Integer, face->charmaps)"
+  // kept the C tag - 2^61 + the address, where fbc prints the address - once that field started coming
+  // out of C's struct TAGGED, as a pointer must (DIVERGENZE 374). The three registries a field's pointee
+  // can be filed in are asked together, so a fourth spelling cannot fall between them again.
+  if (Node.NodeType = antMemberAccess) and (Node.ChildCount >= 1) and (Node.GetChild(0) <> nil) and
+     (FindUDT(UpperFast(ObjectTypeName(Node.GetChild(0)))) >= 0) and
+     ((UDTFieldPtrPointee(FindUDT(UpperFast(ObjectTypeName(Node.GetChild(0)))), Node.ValueUpper) <> '') or
+      (UDTFieldRawPtrPointee(FindUDT(UpperFast(ObjectTypeName(Node.GetChild(0)))), Node.ValueUpper) <> '') or
+      (UDTFieldMultiPtrPointee(FindUDT(UpperFast(ObjectTypeName(Node.GetChild(0)))), Node.ValueUpper) <> '')) then
+    Exit(True);
   Result := EndsPtr(DeclaredTypeNameOf(Node)) or EndsPtr(CalleeRetTypeName(Node));
 end;
 
@@ -50957,6 +51111,13 @@ var
 begin
   if (ParamNode = nil) or (ArgNode = nil) or (ParamNode.ChildCount < 1) then Exit;
   PT := ParamNode.GetChild(0).ValueUpper;
+  // ⭐ ...THROUGH A TYPEDEF. "byval cinfo as j_decompress_ptr" is a "jpeg_decompress_struct Ptr" as surely
+  // as the spelled-out form, and every C binding writes its parameters this way. Tested on the SPELLING,
+  // the name has no " PTR" in it and the rawness stopped at the call: libjpeg's marker processor handed
+  // its cinfo to a BASIC helper, and the helper read "cinfo->src" as a managed record handle
+  // (jpeglib deck, DIVERGENZE 380). Only the type is resolved; the rest of the rule is unchanged.
+  if (Length(PT) < 5) or (Copy(PT, Length(PT) - 3, 4) <> ' PTR') then
+    PT := UpperFast(CanonicalType(PT));
   if (Length(PT) < 5) or (Copy(PT, Length(PT) - 3, 4) <> ' PTR') then Exit;
   Pointee := Trim(Copy(PT, 1, Length(PT) - 4));
   // ⭐⭐ A "T PTR" PARAMETER WHOSE ARGUMENT IS A UDT POINTER OVER RAW BYTES. "T Ptr" with T a UDT is

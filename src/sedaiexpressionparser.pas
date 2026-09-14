@@ -578,8 +578,9 @@ begin
   Rule.Prefix := @StaticParseDeref;
   Context.SetParseRule(ttOpMul, Rule);
   Context.SetParseRule(ttOpDiv, MakeInfixRule(@StaticParseBinaryOperator, precFactor));
-  Context.SetParseRule(ttOpMod, MakeInfixRule(@StaticParseBinaryOperator, precFactor));
-  Context.SetParseRule(ttOpIntDiv, MakeInfixRule(@StaticParseBinaryOperator, precFactor));  // \ integer division
+  // ⛔ * / above \ above MOD, as FreeBASIC ranks them - see the note on TPrecedence (DIVERGENZE 373).
+  Context.SetParseRule(ttOpMod, MakeInfixRule(@StaticParseBinaryOperator, precMod));
+  Context.SetParseRule(ttOpIntDiv, MakeInfixRule(@StaticParseBinaryOperator, precIntDiv));  // \ integer division
   // Bit shifts (FreeBASIC): tighter than +/-, looser than * / \ MOD. Per the FB precedence
   // table, `a Shl n + 1` parses as `(a Shl n) + 1`, so SHL/SHR bind tighter than binary +/-.
   Context.SetParseRule(ttOpShl, MakeInfixRule(@StaticParseBinaryOperator, precShift));

@@ -1110,7 +1110,13 @@ begin
             // dentro deve restare un indirizzo macchina.
             // ⭐ "T PTR PTR": la dichiarazione dice che LI' DENTRO c'e' un puntatore, quindi dopo la
             // chiamata quel valore va riportato a casa (DIVERGENZE 219). Solo dove il tipo lo dice.
+            // ⛔ ...ma SOLO se l'argomento e' memoria della VM. Quando e' GIA' un indirizzo di C la cella
+            // appartiene a C: riscriverla col valore marcato lasciava il bit 61 DENTRO i byte di C.
+            // "jpeg_write_scanlines(ci, rows, 1)" - JSAMPARRAY e' "JSAMPLE ptr ptr", rows un blocco di calloc
+            // - funzionava alla prima riga e faultava alla seconda, perche' rows[0] era stato marcato in C
+            // (mazzo jpeglib, DIVERGENZE 378). E' la stessa condizione che la regione qui sotto ha sempre avuto.
             if (P <> nil) and (NOut <= High(OutLoc)) and (i <= High(B^.Decl.ParamTypeNames)) and
+               ((XferInt[SlotI] and FGNPTR_TAG) = 0) and
                (Pos(' PTR PTR', UpperCase(B^.Decl.ParamTypeNames[i])) > 0) then
             begin
               OutLoc[NOut] := P; Inc(NOut);
