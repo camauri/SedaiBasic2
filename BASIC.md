@@ -2572,7 +2572,7 @@ asks fbc itself in a single compile. It moves the day the oracle moves.
 | `#PRAGMA RESERVE` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
 | `#CMDLINE` | ✓ | Accepted; `Command()` answers as fbc does. Verified against fbc 1.10.1 (28 Aug 2026). |
 | `#LANG` | ✗ | N/A — compiler/build control directive; no separate compile/link step. |
-| `#PRINT` | ✓ | `#print msg` emits a macro-expanded compile-time message to stderr. |
+| `#PRINT` | ✓ | `#print msg` emits a compile-time message to stderr, as FreeBASIC does: the line is macro-expanded **only when it begins with a macro** (`#print VER tail` → `217 tail`, `#print __FB_EVAL__(1+2)` → `3`), otherwise it is printed as written (`#print please define VER` keeps the name); a string literal at the **start** loses its quotes (`#print "a""b" x` → `a"b x`), any other literal keeps them. |
 | `#ERROR` | ✓ | `#error msg` aborts compilation with a macro-expanded diagnostic (skipped inside a false `#if`/`#ifdef` branch). |
 | `#ASSERT` | ✓ | `#assert <expr>` aborts compilation if the constant integer expression is false. |
 | `#LINE` | ✓ | `#line n` sets what `__LINE__` reports. Verified against fbc 1.10.1 (28 Aug 2026). |
@@ -3606,7 +3606,15 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   `WBin` are wide strings too, and print the same way. ⚠️ Linux and the `sb` command-line runner only;
   on Windows a `WString` still prints as UTF-8 text.
 
+- **A procedure pointer prints as an unsigned address**, as any pointer does: a `Const` or a variable of a named
+  `Sub`/`Function` pointer type prints `18446744073709551615` for `Cast(T, -1)` and `0` (no sign space) for a
+  null one — `sqlite3.bi`'s `SQLITE_TRANSIENT` and `SQLITE_STATIC`. A **call** through it prints what the
+  procedure returns: `Print f(21)` is ` 42` for a `Function(...) As Long`, `true` for one `As Boolean`.
+
 ⚠️ **Known differences still open**, named so they are not mistaken for something else:
+A type alias **redeclared after `#undef`** (`#undef FILE` then `Type FILE As FCGI_FILE`, as `fastcgi/fcgi_stdio.bi`
+does) keeps its FIRST meaning here, where FreeBASIC applies the new one from that line on: `SizeOf(FILE)` answers the
+size of the C library's `FILE` instead of `FCGI_FILE`.
 On a **terminal**, every FreeBASIC program writes a few control sequences when it starts (keypad mode and two
 cursor-position queries, whose answer it waits for) and when it ends; SedaiBasic writes none. `SizeOf(1UL)` and
 `SizeOf(1L)` answer 8 where FreeBASIC answers 4. `TypeOf` of a narrow scalar or of an array element answers a

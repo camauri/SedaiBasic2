@@ -1175,6 +1175,7 @@ type
     function PushTypeScope(Node: TASTNode): string;           // enter Node's children's type scope; returns the path to restore
     function ScopedNameIndex(L: TStringList; const Name: string): Integer;  // IndexOfName over the live chain
     function FuncPtrTypeSig(const TypeName: string): string;  // named funcptr TYPE -> "FPPARAMS|FPRET", scope-aware ('' if none)
+    function PrintKindOfTypeName(const TypeName: string): Integer;  // print form of a type name; a funcptr type is a pointer
     function IndexedFuncPtrSig(BaseNode: TASTNode): string;   // signature of the funcptr at "p[j]" / "a(i)[j]", '' if none
     function MemberAccessLevel(const TypeName, MemberName: string; out Owner: string): string;  // OOP: '', 'PRIVATE', 'PROTECTED'
     function UDTExtendsUDT(const DerivedName, BaseName: string): Boolean;  // reaches it through EXTENDS
@@ -29878,7 +29879,7 @@ begin
   SetIdentUnderKey(Nm, TypeName);
   // Through the TYPEDEF: "Type HND As Any Ptr : Dim h As HND" is a pointer and prints unsigned, as
   // windows.bi's HANDLE / HKEY / HWND all are; asked on the spelling it printed signed.
-  PK := PrintKindOfType(UpperFast(CanonicalType(T)));
+  PK := PrintKindOfTypeName(T);   // ...and a procedure-pointer type is a pointer too
   Idx := FVarPrintKind.IndexOf(Nm);
   if PK = 0 then
   begin
@@ -29936,7 +29937,7 @@ var
   PK, Idx: Integer;
   Key: string;
 begin
-  PK := PrintKindOfType(UpperFast(CanonicalType(UpperFast(TypeName))));   // through the typedef
+  PK := PrintKindOfTypeName(TypeName);   // through the typedef, and a procedure-pointer type is a pointer
   Key := UpperFast(ProcName) + '|' + UpperFast(VarName);
   Idx := FVarPrintKind.IndexOf(Key);
   if Idx >= 0 then
@@ -30026,7 +30027,7 @@ begin
     else
       FArrayElemWidth.AddObject(Nm, TObject(PtrInt(W)));
   end;
-  PK := PrintKindOfType(UpperFast(CanonicalType(UpperFast(TypeName))));   // through the typedef
+  PK := PrintKindOfTypeName(TypeName);   // through the typedef, and a procedure-pointer type is a pointer
   if PK = 0 then Exit;                         // plain signed: nothing more to record
   Idx := FVarPrintKind.IndexOf(Nm);
   if Idx >= 0 then
@@ -30528,9 +30529,27 @@ var
   I64, NodeVal: Int64;
   AwIdx, AwCode: Integer;
   MNode: TASTNode;
+  FpName, FpSig: string;
 begin
   Result := 0;
   if Node = nil then Exit;
+  // ⛔ A CALL THROUGH A PROCEDURE POINTER prints as what the procedure RETURNS, not as the pointer (DIVERGENZE
+  // 417). "Sub s5(ByVal f As FN_) : Print f(21)" with "Type FN_ As Function(ByVal As Long) As Long" is a Long, and
+  // fbc prints " 42" - the name f is a pointer (kind 3) since 417, and m907o caught its call taking that too.
+  // The return type is the part of the signature after '|'.
+  FpName := '';
+  if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antIdentifier) then
+    FpName := Node.GetChild(0).ValueUpper
+  else if Node.NodeType = antFunctionCall then
+    FpName := Node.ValueUpper;
+  if (FpName <> '') and FModernMode then
+  begin
+    FpSig := FFuncPtrSigs.Values[FpName];
+    if FpSig = '' then FpSig := FModuleFuncPtrSigs.Values[FpName];
+    if FpSig <> '' then
+      Exit(PrintKindOfTypeName(Copy(FpSig, Pos('|', FpSig) + 1, MaxInt)));
+  end;
   case Node.NodeType of
     antIdentifier:
       begin
@@ -30544,6 +30563,13 @@ begin
            (not IsDeclaredVariable(Node.ValueUpper)) then
           Exit(1);
         Result := PrintKindOf(VarToStr(Node.Value));
+        // ⭐ ...and a PROCEDURE POINTER prints as the pointer it is (unsigned): "Dim p As dtor" with "Type dtor As
+        // Sub(ByVal As Any Ptr)" is int-banked and was recorded through its INTEGER alias, so it printed -1 where
+        // fbc prints 18446744073709551615 - and so did sqlite3.bi's SQLITE_TRANSIENT (bi_layout, 14 Sep 2026).
+        if (Result = 0) and FModernMode and
+           ((FFuncPtrSigs.IndexOfName(Node.ValueUpper) >= 0) or
+            (FModuleFuncPtrSigs.IndexOfName(Node.ValueUpper) >= 0)) then
+          Result := 3;
       end;
     antFunctionCall:
     begin
@@ -31515,6 +31541,17 @@ begin
   Result := '';
   Idx := ScopedNameIndex(FFuncPtrTypes, UpperFast(TypeName));
   if Idx >= 0 then Result := FFuncPtrTypes.ValueFromIndex[Idx];
+end;
+
+function TSSAGenerator.PrintKindOfTypeName(const TypeName: string): Integer;
+// The print form of a declared TYPE NAME, through its typedef - and the one case CanonicalType cannot
+// answer: a PROCEDURE-POINTER type. "Type dtor As Sub(ByVal As Any Ptr)" is aliased to INTEGER so its
+// values live in the int bank, and INTEGER prints signed; but it is a pointer, and fbc prints a pointer
+// unsigned. sqlite3.bi's "Const SQLITE_TRANSIENT = Cast(sqlite3_destructor_type, -1)" printed -1 here and
+// 18446744073709551615 under fbc, and so did any "Dim p As dtor" (bi_layout, 14 Sep 2026).
+begin
+  if FuncPtrTypeSig(TypeName) <> '' then Exit(3);
+  Result := PrintKindOfType(UpperFast(CanonicalType(UpperFast(TypeName))));
 end;
 
 procedure TSSAGenerator.NoteDeclaredProcNames(AST: TASTNode);
@@ -37364,7 +37401,7 @@ begin
           SetPrintKindScoped(FPreScanProcName, VarName, TypeName)
         else
           SetNameEntryValue(FVarPrintKind, UpperFast(VarName),
-                            PrintKindOfType(UpperFast(CanonicalType(UpperFast(TypeName)))));
+                            PrintKindOfTypeName(TypeName));
         Continue;
       end;
       // DIM name AS type  -> typed scalar (child[1] = antIdentifier type). M4.4b: a parameterised

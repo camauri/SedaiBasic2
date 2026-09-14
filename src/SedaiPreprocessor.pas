@@ -1667,30 +1667,44 @@ begin
 end;
 
 function UnquotePPMessage(const S: string): string;
-// A "#print" message that is EXACTLY one string literal prints as its content: fbc shows
+// A "#print" message that BEGINS with a string literal prints that literal as its content: fbc shows
 //   #print "quoted"      -> quoted
 //   #print #arg          -> whatever arg expanded to, unquoted
-// and the second is the whole point of stringizing an argument to look at it. Anything else - a bare
-// word, a literal with something after it, an unterminated quote - is echoed verbatim, because then
-// the quotes are part of what the author wrote rather than a wrapper the expansion put on.
-// Escaped quotes inside are left alone: fbc does not process escapes here either.
+// and the second is the whole point of stringizing an argument to look at it.
+// ⛔ ...AND ONLY THE FIRST LITERAL, with the rest of the line as written (14 Sep 2026, measured against fbc
+// 1.10.1): "#print "lit" VER" -> lit VER · "#print "x" "y"" -> x "y" · "#print A "b  c" D" -> unchanged ·
+// "#print "a""b"" -> a"b (a doubled quote is one quote). This function used to unquote only a message that
+// was EXACTLY one literal with no quote inside, so the first two printed their quotes. An unterminated
+// literal is echoed verbatim.
 //
-// ⚠️ The SURROUNDING whitespace is kept: only the two quote characters go. Trimming it away as well
+// ⚠️ The SURROUNDING whitespace is kept: only the quote characters go. Trimming it away as well
 // cost the trailing space fbc leaves where a comment followed the literal - the message is built by
 // PPPrintMessage, which has already decided what whitespace belongs there.
 var
-  T: string;
-  L, R: Integer;
+  L, i: Integer;
+  Body: string;
 begin
   Result := S;
-  T := Trim(S);
-  if (Length(T) >= 2) and (T[1] = '"') and (T[Length(T)] = '"') and
-     (Pos('"', Copy(T, 2, Length(T) - 2)) = 0) then
+  L := 1;
+  while (L <= Length(S)) and (S[L] in [' ', #9]) do Inc(L);
+  if (L > Length(S)) or (S[L] <> '"') then Exit;
+  Body := '';
+  i := L + 1;
+  while i <= Length(S) do
   begin
-    L := Pos('"', S);
-    R := Length(S);
-    while (R > 0) and (S[R] <> '"') do Dec(R);
-    Result := Copy(S, 1, L - 1) + Copy(S, L + 1, R - L - 1) + Copy(S, R + 1, MaxInt);
+    if S[i] = '"' then
+    begin
+      if (i < Length(S)) and (S[i + 1] = '"') then
+      begin
+        Body := Body + '"';
+        Inc(i, 2);
+        Continue;
+      end;
+      Result := Copy(S, 1, L - 1) + Body + Copy(S, i + 1, MaxInt);
+      Exit;
+    end;
+    Body := Body + S[i];
+    Inc(i);
   end;
 end;
 
@@ -2716,6 +2730,27 @@ begin
   finally
     L.Free;
   end;
+end;
+
+function PPPrintStartsWithMacro(const Msg: string; Defs, FnDefs: TStringList): Boolean;
+// Does a "#print" message BEGIN with a macro - object-like (Defs), function-like (FnDefs) or a builtin
+// spelled "__NAME__" (__FB_EVAL__, __FB_ARG_COUNT__, __FB_VERSION__...)? That is fbc's condition for
+// expanding the line (measured, see the #print branch). Not PPNameIsDefined: a KEYWORD or a declared
+// symbol at the start of the message is not a macro, and fbc prints it as written.
+var
+  i, j: Integer;
+  W: string;
+begin
+  Result := False;
+  i := 1;
+  while (i <= Length(Msg)) and (Msg[i] in [' ', #9]) do Inc(i);
+  j := i;
+  while (j <= Length(Msg)) and (Msg[j] in ['A'..'Z', 'a'..'z', '0'..'9', '_']) do Inc(j);
+  if (j = i) or (Msg[i] in ['0'..'9']) then Exit;
+  W := UpperFast(Copy(Msg, i, j - i));
+  Result := ((Defs <> nil) and (Defs.IndexOfName(W) >= 0)) or
+            ((FnDefs <> nil) and (FnDefs.IndexOfName(W) >= 0)) or
+            ((Length(W) > 4) and (Copy(W, 1, 2) = '__') and (Copy(W, Length(W) - 1, 2) = '__'));
 end;
 
 function PPNameIsDefined(const Nm: string; Defs, FnDefs: TStringList): Boolean;
@@ -5659,8 +5694,17 @@ var
             // CONTENT, not the quotes. That is what makes "#print #arg" - the standard way to see what
             // a macro argument expanded to - readable: stringizing adds the quotes, and #print takes
             // them back off. We echoed them, so every such line differed from fbc by two characters.
-            WriteLn(StdErr, PPPrintLine(PPPrintMessage(SubstituteMacros(TrimRight(DRest) +
-                            Copy(Raw, Length(TrimRight(Raw)) + 1, MaxInt), Defs, FnDefs, 0))))
+            // ⛔ ...AND #print EXPANDS ONLY A MESSAGE THAT BEGINS WITH A MACRO (14 Sep 2026, measured against fbc
+            // 1.10.1): "#print VER tail" is "217 tail", "#print __FB_EVAL__(1+2) tail" is "3 tail", "#print F(2)" is
+            // "2+1" - but "#print tail VER" and "#print "lit" VER" come out as written, and so does bfd.bi's
+            // "#print bfd.bi: warning: ... please define __BFD_VER__" right after "#define __BFD_VER__ 217". We
+            // expanded every line and printed "please define 217". The first word decides for the whole line.
+            if PPPrintStartsWithMacro(DRest, Defs, FnDefs) then
+              WriteLn(StdErr, PPPrintLine(PPPrintMessage(SubstituteMacros(TrimRight(DRest) +
+                              Copy(Raw, Length(TrimRight(Raw)) + 1, MaxInt), Defs, FnDefs, 0))))
+            else
+              WriteLn(StdErr, PPPrintLine(PPPrintMessage(TrimRight(DRest) +
+                              Copy(Raw, Length(TrimRight(Raw)) + 1, MaxInt))))
           else if (DName = 'cmdline') and Emitting then
           begin
             // #cmdline "opts" - fbc appends the quoted text to its own command line. Almost none of
