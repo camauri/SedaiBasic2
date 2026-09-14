@@ -1474,6 +1474,8 @@ var
  i: Integer;
  HasDExp: Boolean;
  LongVal: Int64;
+ LongQ: QWord;
+ LongOk: Boolean;
  IsIntText: Boolean;
 begin
  Result := nil;
@@ -1514,7 +1516,19 @@ begin
      IsIntText := True;
      for i := 1 to Length(TokenText) do
        if not ((TokenText[i] >= '0') and (TokenText[i] <= '9')) then begin IsIntText := False; Break; end;
-     if IsIntText and TryStrToInt64(TokenText, LongVal) then
+     LongOk := IsIntText and TryStrToInt64(TokenText, LongVal);
+     // ⭐ DIVERGENZE 409 - ...and a literal PAST Int64 narrows too: "18446744073709551615UL" is lzo.bi's
+     // LZO_UINT64_MAX on 64-bit Unix ("c##UL"), and fbc answers 4294967295 ("warning 8: Literal number too
+     // big, truncated"). TryStrToInt64 refused it, so the suffix did nothing and all 64 bits stayed.
+     // MEASURED: every decimal from 2^63 up truncates modulo 2^32 exactly like the ones below it.
+     if IsIntText and (not LongOk) and TryStrToQWord(TokenText, LongQ) then
+     begin
+       {$PUSH}{$R-}{$Q-}
+       LongVal := Int64(LongQ);
+       {$POP}
+       LongOk := True;
+     end;
+     if LongOk then
      begin
        if FPendingLong32Unsigned then
          Result.SetExtractedValue(IntToStr(Int64(LongVal and $FFFFFFFF)))
