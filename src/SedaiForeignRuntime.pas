@@ -1303,6 +1303,12 @@ begin
                (Pos(' PTR PTR', UpperCase(B^.Decl.ParamTypeNames[i])) > 0) then
             begin
               OutLoc[NOut] := P; Inc(NOut);
+              // ⭐ DIVERGENZE 436 - ...and the cell is IN-OUT as often as it is out: "XrmPutStringResource(@db, ...)"
+              // reads the database pointer the program holds there before writing the new one. It held C's
+              // address WITH the program's mark, and C dereferenced the mark (access violation). For the call the
+              // cell holds the machine address; the loop below AbiCall brings it home or marks it again.
+              if (PInt64(P)^ and FGNPTR_TAG) <> 0 then
+                PInt64(P)^ := PInt64(P)^ and not FGNPTR_TAG;
             end;
             if (P <> nil) and (NReg <= High(RegBase)) and Assigned(FPtrRegion) and
                ((XferInt[SlotI] and FGNPTR_TAG) = 0) and FPtrRegion(ACtx, XferInt[SlotI], Avail, ElemW) then

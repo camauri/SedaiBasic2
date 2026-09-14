@@ -3629,9 +3629,21 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   to the procedure.** `xmlMemGet(@freefn, @mallocfn, ...)` fills variables of procedure types with C functions, and
   `mallocfn(16)` calls one; it used to end the program silently. `xmlSchemaGetParserErrors(ctxt, @e, @w, @c)` after
   setting `@onerr` answers `e = @onerr` true, as in FreeBASIC.
+- **A variable that holds a C pointer can be passed by address to a C function that reads and replaces it.**
+  `XrmPutStringResource(@db, name, value)` reads the database in `db` and writes the updated one back; it used to end
+  with an access violation.
 - **`stdin`, `stdout` and `stderr` from `crt.bi` are C's streams.** `fprintf(stderr, ...)` and `fputs(text, stdout)`
   used to end with an access violation because the three variables read 0. More generally, an `Extern` variable
   with an `Alias` names that C symbol even outside an `Extern "C"` block.
+- ⚠️ **A field inside a union, read through a pointer a C library passes to a callback, stops the program** with
+  "Invalid record-field pointer" (for example `ev->u.media_meta_changed.meta_type` in a libvlc event callback). Fields
+  outside the union read right.
+- ⚠️ **A block from `calloc` in `crt.bi`, read before anything is written to it, stops the program** with "Raw pointer
+  dereference out of bounds". Writing a field first and then reading it works.
+- ⚠️ **An address the program gives to C and C hands back LATER is not the same pointer again.** After
+  `set_user_data(x, @v)`, the pointer C answers in a later call reads the right value but does not compare equal to
+  `@v`, and a callback that receives `@v` as its user data cannot read through it. A pointer C returns in the same call
+  that received it (`memcpy(@n, @n, 0)`) is right for a numeric variable.
 - ⚠️ **A callback that a C library calls from its own thread must not run while the program runs BASIC code.** An
   audio callback installed with `Pa_OpenDefaultStream` works when the program waits inside a C function (`Pa_Sleep`),
   but if the program runs a loop of its own at the same time, the program can end with an error or see its
