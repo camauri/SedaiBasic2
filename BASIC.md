@@ -3565,6 +3565,47 @@ qualified — `Sub T.U.proc` — and `This` inside it is the *nested* type. A ne
 enclosing type's **private** members, as it does in FreeBASIC and in C++. The **anonymous** form is
 what it has always been: a layout block whose members are sequential inside the surrounding union.
 
+### Calling C libraries: what the runtime does on the program's behalf (14 September 2026)
+
+Written down so that a program that behaves unexpectedly with a C library can be traced to a cause without
+reading the implementation. Everything here **matches FreeBASIC** unless it says otherwise.
+
+- **A library name may resolve through a linker script.** `#inclib "curses"` asks for `libcurses.so`, which on
+  Debian is not a library but a text file — `INPUT(libncurses.so.6 -ltinfo)` — that the system linker follows.
+  SedaiBasic follows it too: the file is read where the system loader found it, and every library it names is
+  opened (`-lX` as library X, archives skipped). ⚠️ **Those libraries are opened with global symbol visibility**
+  (`RTLD_GLOBAL`), so a symbol of one of them is found by any later lookup in the process — if two libraries
+  of a program define the same name, this is where the first one wins.
+- **Terminfo is initialised the way FreeBASIC's runtime initialises it — only for a program that uses it.**
+  Every FreeBASIC program on Linux calls, before its first line, `tgetent` with `$TERM` and `tgetstr("pc")`,
+  and — when standard output is a terminal — `tgetflag("am")` and the capabilities its console uses. That call
+  fills the terminal library's own state (`ttytype` in `ncurses.bi`, for instance). SedaiBasic makes the same
+  calls **the first time a library the program opens provides `tgetent`**, once per run, and not at all when
+  `TERM` is unset. A program that never opens such a library never triggers them.
+- **`errno` is 2 when a program starts, on Linux** — as in every FreeBASIC program, where it is what the
+  system's dynamic loader leaves behind (it looks for `/etc/ld.so.preload` and does not find it). On a system
+  where that file exists, both would start differently. ⚠️ Set by the `sb` command-line runner only, not by
+  `sbv` or the web runner, and not on Windows.
+- **A C variable declared with `Extern` inside `Extern "C"`** holds C's memory. When its type is a pointer —
+  `Extern stdscr As WINDOW Ptr`, `Extern environ As ZString Ptr Ptr` — its value is C's address: it can be
+  passed to C, indexed (`environ[0]`), stepped (`p + 1` moves by the pointee's size) and copied into a local
+  pointer, exactly as in FreeBASIC. Reading through it is bounded by the memory mapping the address lies in,
+  like any other address C hands over (see *Memory a foreign function hands back* above).
+- **The address of a variable keeps the variable's type**: `(@x)[i]`, `*(@a(0) + n)` and `@a(0) + n` read and
+  step at the width of `x` or of the array's element, including `Double`, narrow and unsigned types.
+- **A size suffix narrows a decimal literal of any magnitude**: `18446744073709551615UL` is `4294967295` (a
+  32-bit `ULong`), as FreeBASIC answers with its "Literal number too big, truncated" warning.
+
+⚠️ **Known differences still open**, named so they are not mistaken for something else:
+`Print` of a `WString` to a **file or a pipe** writes UTF-8 text here, where FreeBASIC on Linux writes the raw
+4-byte cells (on a terminal FreeBASIC converts to UTF-8); SedaiBasic will conform. `SizeOf(1UL)` and
+`SizeOf(1L)` answer 8 where FreeBASIC answers 4. `TypeOf` of a narrow scalar or of an array element answers a
+64-bit type, so `Dim As TypeOf(a(0)) z` allocates 8 bytes for a `Long` array.
+⚠️ **And one defect of a FreeBASIC header, not of either compiler**: `ncurses.bi` declares `chtype` as
+`culong` (8 bytes on 64-bit Linux) where the C library uses 32 bits, so the `ACS_*` line-drawing constants read
+past the end of `acs_map` — with FreeBASIC too, and the values differ between the two because FreeBASIC copies
+that array into its executable.
+
 ### Declared divergence: integer division by zero
 
 `x \ 0` and `x Mod 0` raise a **catchable runtime error** here. `fbc` emits the bare machine
