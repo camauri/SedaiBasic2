@@ -19,7 +19,7 @@ unit SedaiForeignRuntime;
 interface
 
 uses
-  Classes, SysUtils, dynlibs, SedaiSSATypes, SedaiForeignDecl, SedaiAbi, SedaiFFI;
+  Classes, SysUtils, dynlibs, SedaiSSATypes, SedaiForeignDecl, SedaiAbi, SedaiFFI{$IFDEF LINUX}, termio{$ENDIF};
 
 type
   EForeignCallError = class(Exception);
@@ -557,6 +557,10 @@ begin
   Result := Length(FEntries);
 end;
 
+{$IFDEF LINUX}
+procedure InitTerminfoLikeFbc(H: TLibHandle); forward;   // below, with its state (DIVERGENZE 407 · 411)
+{$ENDIF}
+
 function TForeignTable.OpenLib(const AName: string): TLibHandle;
 var
   k: Integer;
@@ -566,8 +570,52 @@ begin
   if k >= 0 then Exit(TLibHandle(PtrUInt(FOpened.Objects[k])));
   H := FFILoadLibrary(AName);
   FOpened.AddObject(AName, TObject(PtrUInt(H)));
+  {$IFDEF LINUX}
+  InitTerminfoLikeFbc(H);
+  {$ENDIF}
   Result := H;
 end;
+
+{$IFDEF LINUX}
+var
+  GTermInited: Boolean = False;
+  GTermName: AnsiString = '';
+  GTermBuf: array[0..2047] of AnsiChar;
+
+procedure InitTerminfoLikeFbc(H: TLibHandle);
+// ⭐ DIVERGENZE 407 · 411 - WHAT fbc's RUNTIME DOES WITH TERMINFO BEFORE main, done here the first time a library
+// the program opens can answer tgetent (owner, 14 Sep 2026: "only if it uses terminfo" - the core keeps no
+// dependency). Every fbc program on Linux is linked to libtinfo and runs hInit() (src/rtlib/unix/hinit.c):
+// tgetent(buffer, TERM), tgetstr("pc"), and - only when stdout is a terminal - tgetflag("am") and the seventeen
+// capabilities its console uses. That call is what fills libtinfo's own state: ncurses.bi's acs_map, ttytype,
+// and errno. A program here that never opens terminfo never pays for it.
+type
+  TTgetent = function(buf: PAnsiChar; name: PAnsiChar): LongInt; cdecl;
+  TTgetstr = function(id: PAnsiChar; area: PPAnsiChar): PAnsiChar; cdecl;
+  TTgetflag = function(id: PAnsiChar): LongInt; cdecl;
+const
+  Seq: array[0..16] of AnsiString =
+    ('cm', 'ho', 'cs', 'cl', 'ce', 'WS', 'bl', 'AF', 'AB', 'me', 'md', 'SF', 've', 'vi', 'dc', 'ks', 'ke');
+var
+  PEnt, PStr, PFlag: Pointer;
+  i: Integer;
+begin
+  if GTermInited or (H = NilHandle) then Exit;
+  PEnt := FFISymbol(H, 'tgetent');
+  if PEnt = nil then Exit;
+  GTermInited := True;
+  GTermName := GetEnvironmentVariable('TERM');
+  if GTermName = '' then Exit;
+  if TTgetent(PEnt)(@GTermBuf[0], PAnsiChar(GTermName)) <= 0 then Exit;
+  PStr := FFISymbol(H, 'tgetstr');
+  if PStr <> nil then TTgetstr(PStr)('pc', nil);
+  if IsATTY(1) <> 1 then Exit;                     // hInit: tcgetattr(1) fails - no console
+  PFlag := FFISymbol(H, 'tgetflag');
+  if (PFlag = nil) or (TTgetflag(PFlag)('am') = 0) then Exit;
+  if PStr <> nil then
+    for i := 0 to High(Seq) do TTgetstr(PStr)(PAnsiChar(Seq[i]), nil);
+end;
+{$ENDIF}
 
 function TForeignTable.ResolveSymbol(var B: TForeignBinding): Pointer;
 // Where to look, in order: the library the DECLARATION named, then each "#inclib", then the process

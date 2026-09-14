@@ -679,6 +679,24 @@ begin
   {$ENDIF}
 end;
 
+{$IFDEF LINUX}
+function libc_errno_location: PLongInt; cdecl; external 'c' name '__errno_location';
+{$ENDIF}
+
+procedure SetProgramStartErrno;
+// ⭐ DIVERGENZE 411 - ERRNO AS A PROGRAM OF fbc FINDS IT (owner, 14 Sep 2026: conform). "Print errno" answers 2
+// in every fbc program on Linux - WITH TERM unset too, so it is not libfb's tgetent (hInit returns before it).
+// It is what the dynamic loader leaves: the first thing any dynamically linked process does is
+// access("/etc/ld.so.preload") = ENOENT (strace), and nothing in fbc's startup touches errno after that. sb goes
+// through the same loader, but its own runtime sets errno back to 0 before a program can read it.
+// Once per program, on the main thread, right before the VM starts - never inside the run loop, which TROFF
+// re-enters mid-program and every worker thread runs too (a new thread's errno is its own).
+begin
+  {$IFDEF LINUX}
+  libc_errno_location^ := 2;
+  {$ENDIF}
+end;
+
 procedure TestBytecodeCompilation(const SourceFile: string;
   OptVerbose, OptDumpAST, OptDisasm, OptDisasmPre, OptStats, OptNoExec: Boolean
   {$IFDEF ENABLE_PROFILER}; OptProfile: Boolean; ProfileMode: string; ProfileExport: string{$ENDIF});
@@ -2083,6 +2101,7 @@ begin
       end;
 
       try
+        SetProgramStartErrno;
         Timer := CreateHiResTimer;
         {$IFDEF ENABLE_PROFILER}
         if OptProfile then
@@ -2427,6 +2446,7 @@ begin
         VM.LoadProgram(BytecodeProgram);
 
         try
+          SetProgramStartErrno;
           Timer := CreateHiResTimer;
           {$IFDEF ENABLE_PROFILER}
           if OptProfile then
