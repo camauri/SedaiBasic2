@@ -1288,6 +1288,16 @@ var
   GADDirtySrc: array[0..5] of Int64;   // 0 funnel · 1 ArrPrivRestore · 2 BindArrayMap ·
                                        // 3 ReleaseArrayMap · 4 RegisterAotFunc · 5 altro
   GArrDescReported: Boolean = False;
+  // ⭐ PACKED_DIAG=1 (phase 2.0 of the pointer model, FASE2-INVENTARIO-B §8): how many times each site that DECODES a
+  // packed array pointer - "(array+1) shl 32 or index", a NAME of the VM - actually ran, per SOURCE LINE and per memory
+  // mode. Phase 2 turns those names into machine addresses in the fb mode; this is the counter that says which decoders
+  // are still reached there, and so when a branch is dead. None of the compiled engines decodes a packed pointer
+  // natively (the bcRef* arms always run here), so the census covers the interpreter, the C loop, the AOT and the JIT.
+  // ⚠️ Increments are not atomic, like HOTC_DIAG's: with workers the totals are approximate, the ranking survives.
+  GPackedDiag: Boolean = False;
+  GPackedReported: Boolean = False;
+  GPackedHitsFb: array[0..32767] of Int64;       // by source line of SedaiBytecodeVM.pas, fb memory mode
+  GPackedHitsStrict: array[0..32767] of Int64;   // ...strict memory mode
   GRecDiag: Boolean = False;       // RECDIAG=1: name a record handle that is out of its context's range
   // AOT_EXCFRAME=1 rimette il frame di eccezione su OGNI chiamata (il comportamento fino al
   // 21 ago 2026): e' l'A/B su un binario solo per la modifica che lo salta quando nulla puo' allocare.
@@ -1343,6 +1353,14 @@ var
   GSuperDiag: Boolean = False;      // SUPER_DIAG=1: census of the NESTED superinstruction dispatch
   GSuperCount: array[0..255] of Int64;
   GHotCExit: array[0..65535] of Int64;
+
+procedure PackedDiagNote(Line: Integer; NativeMem: Boolean);
+// PACKED_DIAG=1: one decode of a packed array pointer at this SOURCE LINE (see GPackedDiag). Called only behind the
+// GPackedDiag test, so a run without the knob pays one Boolean test per decode.
+begin
+  if (Line < 0) or (Line > High(GPackedHitsFb)) then Exit;
+  if NativeMem then Inc(GPackedHitsFb[Line]) else Inc(GPackedHitsStrict[Line]);
+end;
 
 function PairSlot(Op: Word): Integer;
 // group -> a small dense id, sub kept whole: slot = gid*256 + sub, so no two opcodes share a slot.
@@ -1813,6 +1831,7 @@ begin
   GArrPrivDiag := SysUtils.GetEnvironmentVariable('ARRPRIV_DIAG') = '1';
   GArrDescLockDiag := SysUtils.GetEnvironmentVariable('ARRDESCLOCK_DIAG') = '1';
   GArrDescDiag := SysUtils.GetEnvironmentVariable('ARRDESC_DIAG') = '1';
+  GPackedDiag := SysUtils.GetEnvironmentVariable('PACKED_DIAG') = '1';
   GSpinDiag := StrToIntDef(SysUtils.GetEnvironmentVariable('SPINDIAG'), 0);
   GNoProgDirFallback := SysUtils.GetEnvironmentVariable('SB_NO_PROGDIR_FALLBACK') = '1';
   GLegacyPaths := SysUtils.GetEnvironmentVariable('SB_LEGACY_PATHS') = '1';
@@ -6022,7 +6041,7 @@ begin
       Result := Result + StringOfChar(#0, ExactBytes - Length(Result));
     Exit;
   end;
-  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
   PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
@@ -6064,7 +6083,7 @@ begin
     RawStoreZStrVal(PtrAddr, Value, Wide);               // C's memory - DIVERGENZE 239
     Exit;
   end;
-  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
   PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
   if SysUtils.GetEnvironmentVariable('ZPTR_DIAG') = '1' then
     WriteLn(StdErr, '[ZPTR] store addr=', PtrAddr, ' idx=', ArrayIdx, ' off=', PtrOffset,
@@ -6409,7 +6428,7 @@ begin
     Rec := RecPtrNum(Ctx, PtrAddr, RecSlot);
     Exit(RecFieldInt(Rec, RecSlot));
   end;
-  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
   PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
@@ -6442,7 +6461,7 @@ begin
     Rec := RecPtrNum(Ctx, PtrAddr, RecSlot);
     Exit(RecFieldFloat(Rec, RecSlot));
   end;
-  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
   PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
@@ -6471,7 +6490,7 @@ begin
     RecSetFieldInt(Rec, RecSlot, Value);
     Exit;
   end;
-  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
   PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
@@ -6500,7 +6519,7 @@ begin
     RecSetFieldFloat(Rec, RecSlot, Value);
     Exit;
   end;
-  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+  ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
   PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
@@ -6986,7 +7005,7 @@ begin
   if Ptr = 0 then
     raise ERangeError.Create('Null or invalid raw pointer dereference');
 
-  ArrayIdx := MapArrDyn(Ctx, (Ptr shr POINTER_ARRAY_SHIFT) - 1);
+  ArrayIdx := MapArrDyn(Ctx, (Ptr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
   PtrOffset := Ptr and POINTER_OFFSET_MASK;
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [Ptr]);
@@ -7692,7 +7711,7 @@ begin
     Exit(True);
   end;
   if Tagged < 0 then Exit;                          // puntatore a CAMPO di record: non e' un blocco
-  ArrayIdx := MapArrDyn(TExecutionContext(ACtx), (Tagged shr POINTER_ARRAY_SHIFT) - 1);
+  ArrayIdx := MapArrDyn(TExecutionContext(ACtx), (Tagged shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
   PtrOffset := Tagged and POINTER_OFFSET_MASK;
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then Exit;
   // ⭐ La larghezza d'elemento viaggia con la regione: chi traduce all'indietro divide per lei.
@@ -7868,7 +7887,7 @@ var
 begin
   Result := nil; ACells := 0; AIsFloat := False;
   if (Value <= 0) or ((Value and (RAWPTR_TAG or FGNPTR_TAG)) <> 0) then Exit;
-  ArrayIdx := MapArrDyn(TExecutionContext(ACtx), (Value shr POINTER_ARRAY_SHIFT) - 1);
+  ArrayIdx := MapArrDyn(TExecutionContext(ACtx), (Value shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
   Ofs := Value and POINTER_OFFSET_MASK;
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (Ofs < 0) then Exit;
   if FArrays[ArrayIdx].ElemWidth <> 0 then Exit;            // packed: already C's layout
@@ -16904,7 +16923,7 @@ begin
             Ctx.IntRegs[Instr.Dest] := RawLoadInt(PtrAddr, Instr.Immediate)
           else
           begin
-            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
             PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
             // ⛔ ...AND THE BANK OF THE POINTER NEED NOT BE THE BANK OF THE STORAGE. These six arms chose
             // which vector to read from the OPCODE, while a TArrayStorage populates exactly ONE of
@@ -16949,7 +16968,7 @@ begin
             Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(PtrAddr, 0)
           else
           begin
-            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
             PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
             // The bank of the pointer need not be the bank of the storage - see bcRefLoadInt above.
             if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
@@ -16982,7 +17001,7 @@ begin
             Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(PtrAddr, Instr.Immediate = 1)
           else
           begin
-            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
             PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
             if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].StringData)) then
               raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
@@ -17006,7 +17025,7 @@ begin
             RawStoreInt(PtrAddr, Instr.Immediate, Ctx.IntRegs[Instr.Src2])
           else
           begin
-            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
             PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
             // The bank of the pointer need not be the bank of the storage - see bcRefLoadInt above. The
             // WRITE half needs it too, or "*Cast(ULongInt Ptr, @d) = bits" raises where the read works.
@@ -17042,7 +17061,7 @@ begin
             RawStoreFloat(PtrAddr, 0, Ctx.FloatRegs[Instr.Src2])
           else
           begin
-            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
             PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
             // The bank of the pointer need not be the bank of the storage - see bcRefLoadInt above.
             if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
@@ -17071,7 +17090,7 @@ begin
             RawStoreZStrVal(PtrAddr, Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1)
           else
           begin
-            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1);
+            ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
             PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
             if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].StringData)) then
               raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
@@ -18831,7 +18850,7 @@ begin
         if (Instr.Immediate and 2) <> 0 then
         begin
           PalPtr := Ctx.IntRegs[Instr.Src1];
-          PalIdx := MapArrDyn(Ctx, (PalPtr shr POINTER_ARRAY_SHIFT) - 1);
+          PalIdx := MapArrDyn(Ctx, (PalPtr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
           if (PalIdx < 0) or (PalIdx > High(FArrays)) then Exit;
           PalArr := @FArrays[PalIdx];
           PalStart := PalPtr and POINTER_OFFSET_MASK;
@@ -22074,6 +22093,31 @@ begin
             OpcodeToString(Word(Idx[i])));
 end;
 
+procedure ReportPackedDiag;
+// The PACKED_DIAG census (phase 2.0 of the pointer model), printed once at shutdown so it covers every engine and every
+// thread: each SOURCE LINE of this unit that decoded a packed array pointer, with how many times, per memory mode.
+// ⭐ The fb column is the one to drive to zero: a line still counting there is a name of the VM that phase 2 has not
+// turned into a machine address yet. Zero lines is an answer too, and it is printed as one.
+var
+  L: Integer;
+  TotFb, TotStrict: Int64;
+begin
+  if (not GPackedDiag) or GPackedReported then Exit;
+  GPackedReported := True;
+  TotFb := 0; TotStrict := 0;
+  for L := 0 to High(GPackedHitsFb) do
+  begin
+    TotFb := TotFb + GPackedHitsFb[L];
+    TotStrict := TotStrict + GPackedHitsStrict[L];
+  end;
+  WriteLn(ErrOutput, '[PACKED] packed array pointers decoded: fb ', TotFb, '   strict ', TotStrict);
+  for L := 0 to High(GPackedHitsFb) do
+    if (GPackedHitsFb[L] > 0) or (GPackedHitsStrict[L] > 0) then
+      // ⚠️ the line number is NOT padded: "pas: 6036" split into two fields under awk and misread a census (15 Sep 2026)
+      WriteLn(ErrOutput, '[PACKED]   SedaiBytecodeVM.pas:', L, '   fb ', GPackedHitsFb[L]:12,
+              '   strict ', GPackedHitsStrict[L]:12);
+end;
+
 
 initialization
   if SysUtils.GetEnvironmentVariable('FRAMESAVE_NOSTR') = '1' then GFrameSaveNoStr := 1;
@@ -22094,6 +22138,7 @@ initialization
   AddExitProc(@ReportHotCExits);
   AddExitProc(@ReportAotHelperExits);
   AddExitProc(@ReportArrDescWork);
+  AddExitProc(@ReportPackedDiag);
   AddExitProc(@ReportSuperCounts);
   AddExitProc(@ReportPairCounts);
 
