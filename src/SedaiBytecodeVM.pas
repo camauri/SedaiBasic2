@@ -881,9 +881,10 @@ type
     procedure BuildArrayDescriptor(Slot, LogicalId: Integer);
     // FreeBASIC raw byte heap (Allocate family). All return/take RAWPTR_TAG-tagged byte offsets.
     function RawAlloc(ByteCount: PtrUInt): Int64;
-    function NativeAlloc(ByteCount: PtrUInt): Int64;              // fb mode: calloc, C's mark, region noted
-    procedure NativeFree(P: Int64);                               // fb mode: free (a VM raw block goes to RawFree)
+    function NativeAlloc(ByteCount: PtrUInt; NoteRegion: Boolean = True): Int64;  // fb mode: calloc, C's mark, region noted
+    procedure NativeFree(P: Int64; NoteRegion: Boolean = True);                   // fb mode: free (a VM raw block goes to RawFree)
     function NativeRealloc(P: Int64; ByteCount: PtrUInt): Int64;  // fb mode: realloc
+    function ExecRawAlloc(Ctx: TExecutionContext; ByteCount, Imm: Int64): Int64;  // bcRawAlloc, shared by the arm and the AOT leaf
     procedure PushFrameCell(Ctx: TExecutionContext; Cell: Int64);   // phase 2.1b: a cell the running frame owns
     procedure FreeFrameCells(Ctx: TExecutionContext; Mark: Integer); // phase 2.1b: release the frame's cells down to Mark
     function StrSAdd(const S: string): Int64;   // SADD(s) -> raw pointer to a NUL-terminated byte copy
@@ -5863,7 +5864,7 @@ function libc_realloc(p: Pointer; size: PtrUInt): Pointer; cdecl; external 'c' n
 procedure libc_free(p: Pointer); cdecl; external 'c' name 'free';
 {$ENDIF}
 
-function TBytecodeVM.NativeAlloc(ByteCount: PtrUInt): Int64;
+function TBytecodeVM.NativeAlloc(ByteCount: PtrUInt; NoteRegion: Boolean): Int64;
 // Allocate / CAllocate / New <builtin> / crt's malloc and calloc in the fb memory mode (phase 1 of the pointer
 // model). ⭐ The answer is the machine address with FGNPTR_TAG: the mark a pointer C returned has always carried,
 // so every arm that reads, writes, indexes, prints or passes such a pointer takes it unchanged, Print and
@@ -5876,8 +5877,27 @@ var
 begin
   Mem := libc_calloc(1, ByteCount);
   if Mem = nil then Exit(0);
-  ForeignNoteRegion(nil, PtrUInt(Mem), ByteCount, True, False);
+  // ⭐ ...except a cell of a procedure's FRAME when no bounds are checked (NoteRegion False): the region map has two
+  // readers, ForeignRegionAddr (asked only under --bounds-check or in strict) and ForeignWideUnit (Windows WSTRING blocks),
+  // and neither ever asks about such a cell - while the note cost a lock, a binary search and a Move on every call.
+  // Measured on 3 M calls taking "@" of two parameters: RawAlloc was 99.9% of the AOT's exits (AOT-PRESTAZIONI §8).
+  if NoteRegion then
+    ForeignNoteRegion(nil, PtrUInt(Mem), ByteCount, True, False);
   Result := Int64(PtrUInt(Mem)) or FGNPTR_TAG;
+end;
+
+function TBytecodeVM.ExecRawAlloc(Ctx: TExecutionContext; ByteCount, Imm: Int64): Int64;
+// bcRawAlloc, ONCE: the interpreter's arm and the AOT's leaf (AotRawAlloc) both call this, so there is no second copy of
+// the decision to drift (AOT-PRESTAZIONI §4).
+begin
+  // ⭐ ...from LIBC for a program allocation or a native compiler slot in the fb mode, and a FRAME cell is not noted in
+  // the region map unless --bounds-check will ask for it (see NativeAlloc).
+  if FNativeMemory and ((Imm and (RAWALLOC_PROGRAM or RAWALLOC_NATIVE_SLOT)) <> 0) then
+    Result := NativeAlloc(PtrUInt(ByteCount), FBoundsCheck or ((Imm and RAWALLOC_FRAME_CELL) = 0))
+  else
+    Result := RawAlloc(PtrUInt(ByteCount));
+  // ⭐ phase 2.1b: a cell of the running frame is stacked, and FramePop gives it back (DIVERGENZE 458)
+  if (Imm and RAWALLOC_FRAME_CELL) <> 0 then PushFrameCell(Ctx, Result);
 end;
 
 procedure TBytecodeVM.PushFrameCell(Ctx: TExecutionContext; Cell: Int64);
@@ -5902,15 +5922,16 @@ begin
   while Ctx.FrameCellTop > Mark do
   begin
     Dec(Ctx.FrameCellTop);
-    if FNativeMemory then NativeFree(Ctx.FrameCells[Ctx.FrameCellTop])
+    if FNativeMemory then NativeFree(Ctx.FrameCells[Ctx.FrameCellTop], FBoundsCheck)   // noted only under --bounds-check
     else RawFree(Ctx.FrameCells[Ctx.FrameCellTop]);
   end;
 end;
 
-procedure TBytecodeVM.NativeFree(P: Int64);
+procedure TBytecodeVM.NativeFree(P: Int64; NoteRegion: Boolean);
 // Deallocate / Delete / crt's free in the fb memory mode. A block from libc - the program's own, or one C
 // allocated and handed over - goes back to libc, as under fbc; a block of the VM's raw heap (a SADD copy, an
-// address-taken slot) goes back where it came from.
+// address-taken slot) goes back where it came from. NoteRegion False: the block was never noted (a frame cell, see
+// NativeAlloc), so there is no region to withdraw.
 begin
   if P = 0 then Exit;
   if (P and RAWPTR_TAG) <> 0 then
@@ -5920,7 +5941,8 @@ begin
   end;
   if (P > 0) and ((P and FGNPTR_TAG) <> 0) then
   begin
-    ForeignNoteRegion(nil, PtrUInt(P and not FGNPTR_TAG), 0, False, False);
+    if NoteRegion then
+      ForeignNoteRegion(nil, PtrUInt(P and not FGNPTR_TAG), 0, False, False);
     libc_free(Pointer(PtrUInt(P and not FGNPTR_TAG)));
   end;
 end;
@@ -13824,6 +13846,15 @@ begin
   else Result := V;
 end;
 
+function AotRawAlloc(VMSelf, CtxObj: Pointer; ByteCount, Imm: PtrInt): PtrInt; cdecl;
+// C14: bcRawAlloc of a NATIVE cell as a leaf call. The AOT emits it only for RAWALLOC_NATIVE_SLOT, which the SSA writes only
+// in the fb memory mode, so what runs is calloc plus a push on the frame-cell stack: nothing raises, nothing hands the
+// invocation back. Measured 15 Sep 2026 (AOTC_DIAG, bench_param_at): 6 000 000 helper calls, 99.9% of the AOT's exits,
+// and --aot slower than the interpreter.
+begin
+  Result := PtrInt(TBytecodeVM(VMSelf).ExecRawAlloc(TExecutionContext(CtxObj), ByteCount, Imm));
+end;
+
 function AotFloatRoundU(D: Double): PtrInt; cdecl;
 // C13: bcFloatRound with an unsigned-64 destination. It passes True unconditionally - unlike
 // bcFloatToInt, which reads the runtime dialect - so this shim carries no decision of its own and
@@ -13849,6 +13880,7 @@ begin
   C.GfxSetTarget := @AotGfxSetTarget;
   C.IntToFloatU := @AotIntToFloatFlags;
   C.FloatRoundU := @AotFloatRoundU;
+  C.RawAlloc := @AotRawAlloc;
   // C5: native string lowering - the leaf primitives compiled code calls directly for the hot
   // string ops. (The bank base itself is per-context and is set by the caller.)
   C.StrCmp := @AotStrCmp;
@@ -17064,12 +17096,7 @@ begin
       // local, a fixed ZString buffer - share this opcode and stay in the raw heap. Sending them to libc gave calloc
       // a size carrying RAW_PTRCELL_REQ (bit 62), NULL came back, and every "@v" in a procedure read address 0.
       // ⭐ ...and a compiler slot the SSA marked RAWALLOC_NATIVE_SLOT (phase 2: the cell of an @-taken module scalar).
-      20: begin                                                                                      // bcRawAlloc
-            if FNativeMemory and ((Instr.Immediate and (RAWALLOC_PROGRAM or RAWALLOC_NATIVE_SLOT)) <> 0) then Ctx.IntRegs[Instr.Dest] := NativeAlloc(Ctx.IntRegs[Instr.Src1])
-            else Ctx.IntRegs[Instr.Dest] := RawAlloc(Ctx.IntRegs[Instr.Src1]);
-            // ⭐ phase 2.1b: a cell of the running frame is stacked, and FramePop gives it back (DIVERGENZE 458)
-            if (Instr.Immediate and RAWALLOC_FRAME_CELL) <> 0 then PushFrameCell(Ctx, Ctx.IntRegs[Instr.Dest]);
-          end;
+      20: Ctx.IntRegs[Instr.Dest] := ExecRawAlloc(Ctx, Ctx.IntRegs[Instr.Src1], Instr.Immediate);  // bcRawAlloc
       21: if FNativeMemory then NativeFree(Ctx.IntRegs[Instr.Src1])
           else RawFree(Ctx.IntRegs[Instr.Src1]);                                                     // bcRawFree
       22: if FNativeMemory then Ctx.IntRegs[Instr.Dest] := NativeRealloc(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2])

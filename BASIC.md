@@ -3792,6 +3792,11 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   into `Allocate` memory, to a local variable or a parameter, between two pointer variables, and (in the default
   `fb` memory mode) to a module-level variable; pointers into an array were already right. A nested step such as
   `(@x + 1) + 1` now also advances by the size of `x`.
+- ⚠️ **Inside a procedure that resizes an array parameter, the original array seen by its own name keeps its old
+  size until the procedure returns.** With `Sub grow(a() As Integer) : ReDim a(0 To 5) : a(5) = 55 : Print UBound(g);
+  g(5) : End Sub` called as `grow(g())`, the `Print` shows `2 0` where FreeBASIC shows `5 55` (the same with
+  `ReDim Preserve`). After the call returns, `g` has the new size and contents, and writing an element through the
+  parameter is seen at once, as in FreeBASIC.
 - **A `ByRef` temporary made in the main program no longer grows memory.** When the argument of a `ByRef`
   parameter is not a variable — `g(5)`, `g(a + b)`, `g(f())` — the call binds a temporary. In the main program each
   such call site now reuses one temporary for as long as the program runs, instead of allocating a new one on every

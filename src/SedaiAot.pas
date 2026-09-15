@@ -162,6 +162,11 @@ type
     // everywhere. FloatRound's unsigned arm passes True unconditionally, so it has no such tie.
     IntToFloatU: Pointer;  // offset 328: @AotIntToFloatFlags (v, flags) -> Double
     FloatRoundU: Pointer;  // offset 336: @AotFloatRoundU (d) -> Int64
+    // C14: bcRawAlloc of a NATIVE cell (RAWALLOC_NATIVE_SLOT, fb mode only) as a leaf call - calloc plus a push on the
+    // frame-cell stack, both inside TBytecodeVM.ExecRawAlloc, which the interpreter's arm calls too. Measured 15 Sep
+    // 2026 (AOTC_DIAG, a procedure taking "@" of two parameters, 3 M calls): 6 000 000 helper calls, 99.9% of the exits,
+    // and --aot slower than the interpreter.
+    RawAlloc: Pointer;     // offset 344: @AotRawAlloc (VMSelf, CtxObj, bytes, imm) -> Int64
   end;
   PAotCtx = ^TAotCtx;
 
@@ -200,6 +205,7 @@ const
   AOTCTX_GFXSETTGT   = 320;
   AOTCTX_INTTOFLTU   = 328;
   AOTCTX_FLTROUNDU   = 336;
+  AOTCTX_RAWALLOC    = 344;
 
   // C9 math table indices. ⛔ ONE list, two users: SedaiAot emits `call [table + INDEX*8]` and
   // SedaiBytecodeVM fills the table at those indices.
@@ -737,6 +743,20 @@ end;
 // ⚠️ Independent of AotRecNative: that one needs the record LAYOUT (field access reads
 // Records[h].IntData[slot] by address), these primitives do not - they call the same VM routines
 // the interpreter calls, so they work with or without a layout.
+var
+  GRawAllocState: Integer = -1;
+
+function AotRawAllocNative: Boolean;
+// C14: AOT_RAWALLOC=0 sends bcRawAlloc back to the runtime helper - the A/B on one binary.
+begin
+  if GRawAllocState < 0 then
+  begin
+    if GetEnvironmentVariable('AOT_RAWALLOC') = '0' then GRawAllocState := 0
+    else GRawAllocState := 1;
+  end;
+  Result := GRawAllocState = 1;
+end;
+
 function AotRecAllocNative: Boolean;
 begin
   if GRecAllocState < 0 then
@@ -1267,6 +1287,8 @@ begin
     // C6: record ALLOCATION as a leaf call to the VM's own AllocRecord/FreeSharedRecord
     // (AotIsNative checks the gate and the operand shape).
     ssaRecordNew, ssaRecordFree,
+    // C14: the allocation of a NATIVE cell as a leaf call (AotIsNative checks the gate and RAWALLOC_NATIVE_SLOT).
+    ssaRawAlloc,
     // Phase 2 of the pointer model: raw memory through a machine address. A CONDITIONAL native form -
     // anything that is not an fb-mode address falls back to the helper - so it needs a PC.
     ssaRawLoadInt, ssaRawLoadFloat, ssaRawStoreInt, ssaRawStoreFloat,
@@ -1560,6 +1582,13 @@ begin
       Result := AotRecAllocNative and (Ins.Dest.Kind = svkRegister) and (Ins.Dest.RegType = srtInt);
     ssaRecordFree:
       Result := AotRecAllocNative and (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt);
+    // C14: only a NATIVE cell - the flag exists only in the fb memory mode, where the arm is calloc and a push and nothing
+    // raises. Every other allocation (the raw heap, a program block, a pointer cell) keeps the helper road.
+    ssaRawAlloc:
+      Result := AotRawAllocNative and (Ins.Src3.Kind = svkConstInt) and
+                ((Ins.Src3.ConstInt and RAWALLOC_NATIVE_SLOT) <> 0) and
+                (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt) and
+                (Ins.Dest.Kind = svkRegister) and (Ins.Dest.RegType = srtInt);
     // C7: the two print bookkeeping opcodes. No operands to check - only the A/B gate.
     ssaPrintSemicolon, ssaPrintEnd:
       Result := AotPrintOpNative and (not AotProgReadsER(SSAProg));
@@ -3223,6 +3252,25 @@ var
     E.EmitBytes([$41, $FF, $D3]);                         // call r11
     StrCallEpilogue;
     IStore(d, RAX);                                       // rax = handle -> int Dest
+  end;
+
+  // C14: IntRegs[dest] := AotRawAlloc(VMSelf, CtxObj, IntRegs[src], flags) - a NATIVE cell (AotIsNative admits only
+  // RAWALLOC_NATIVE_SLOT). No PC and no deopt: TBytecodeVM.ExecRawAlloc is calloc plus a push, and cannot hand back.
+  // ⛔ arg2 is r8 on Win64, and r8 IS the context register: every load relative to it happens first, the byte count is
+  // loaded last (ILoadArgSpilled reads the bank through rbx or a callee-saved register, never through r8).
+  procedure EmitRawAllocNative;
+  var d, s: Integer;
+  begin
+    d := IReg(Cur.Dest); s := IReg(Cur.Src1); if not OK then Exit;
+    SpillVolatiles;
+    E.MemOp([$4D, $8B], R11, R8, AOTCTX_RAWALLOC);        // r11 = primitive
+    E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);     // arg0 = VMSelf
+    E.MemOp([$49, $8B], ABI_ARG1, R8, AOTCTX_CTXOBJ);     // arg1 = CtxObj (the active context: its frame-cell stack)
+    MovImm64(ABI_ARG3, Cur.Src3.ConstInt);                // arg3 = the RAWALLOC_* flags
+    ILoadArgSpilled(ABI_ARG2, s);                         // arg2 = the byte count (last: may be r8)
+    E.EmitBytes([$41, $FF, $D3]);                         // call r11
+    StrCallEpilogue;
+    IStore(d, RAX);                                       // rax = the cell's address -> int Dest
   end;
 
   // C6: AotRecordFree(VMSelf, IntRegs[src]) - DELETE p. The handle is read with the SPILLED
@@ -5423,6 +5471,17 @@ var
                 CountVal(Ins.Src1);                   // the handle to release
             end;
           end;
+          // C14: the allocation of a native cell as a leaf call - a call-ready frame, and it always completes natively.
+          ssaRawAlloc:
+          begin
+            if not AotIsNative(SSAProg, Ins) then NoteHelperOp
+            else
+            begin
+              HasHelperCall := True;
+              CountVal(Ins.Dest);                     // the cell's address
+              CountVal(Ins.Src1);                     // the byte count
+            end;
+          end;
           ssaJump: ;
           ssaJumpIfZero, ssaJumpIfNotZero: CountVal(Ins.Src1);
           ssaReturnSub, ssaEnd, ssaStop:
@@ -6828,6 +6887,7 @@ var
         EmitRecordNew(apc);
       end;
       ssaRecordFree: EmitRecordFree;
+      ssaRawAlloc: EmitRawAllocNative;             // C14: only a native cell reaches here (AotIsNative)
 
       // C7: PRINT's bookkeeping pair as leaf calls. No PC is needed - neither can deopt.
       ssaPrintSemicolon: EmitPrintSemi;
