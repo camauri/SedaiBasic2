@@ -1403,6 +1403,10 @@ type
     procedure EnsureSharedBackingSized(const VarName: string);
     procedure PublishScalarToHome(const VarName: string; const Val: TSSAValue);
     procedure PublishInputTarget(const VarName: string; const Reg: TSSAValue);
+    function ForCounterHasHome(const VarName: string): Boolean;               // DIVERGENZE 460
+    procedure DeclareForCounterHome(ForNode: TASTNode; const VarName: string);
+    procedure EmitForCounterPublish(const VarName: string; const VarReg: TSSAValue);
+    procedure EmitForCounterReload(const VarName: string; const VarReg: TSSAValue);
     function TryAllocAssign(const VarName: string; ExprNode: TASTNode): Boolean;
     function TryFixedLenStore(const VarName: string; ExprNode: TASTNode): Boolean;
     procedure ScanForNulStrLiteral(Node: TASTNode);   // DIVERGENZE 98: a literal with an embedded NUL
@@ -11982,6 +11986,96 @@ begin
   try ProcessAssignment(Assign); finally Assign.Free; end;
 end;
 
+function TSSAGenerator.ForCounterHasHome(const VarName: string): Boolean;
+// Does this FOR counter live in a HOME - a raw module cell, a per-frame raw slot, a SHARED backing - rather than only in
+// the register the loop steps? The three homes PublishScalarToHome knows.
+begin
+  Result := IsRawModuleScalar(VarName) or IsRawAddrLocal(VarName) or IsSharedScalar(VarName);
+end;
+
+procedure TSSAGenerator.DeclareForCounterHome(ForNode: TASTNode; const VarName: string);
+// "For i As T" DECLARES i, and a counter whose address a procedure is handed needs the home a "Dim i As T" gets
+// (DIVERGENZE 460). MarkAddressTaken put the mark on the FOR node; the declaration goes through ProcessDim, the one road
+// that knows the per-block filing (BlockScalarName) and the native cell of the fb mode.
+// ⚠️ A per-frame slot's handle "<name>$REC" is bound HERE, in the counter's own frame: resolved as an implicit use it
+// would land on an outer "Dim i"'s handle, and the loop would replace the outer variable's slot.
+var
+  Tok: TLexerToken;
+  Dm, Decl: TASTNode;
+begin
+  Tok := ForNode.GetChild(0).Token;
+  if ForNode.Attributes.Values['ADDRLOCAL'] = '1' then
+    DeclareVariableTyped(UpperFast(VarName) + '$REC', srtInt);
+  Dm := TASTNode.Create(antDim, Tok);
+  try
+    Decl := TASTNode.Create(antArrayDecl, Tok);
+    Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, VarName, Tok));
+    Decl.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperFast(ForNode.Attributes.Values['VARTYPE']), Tok));
+    if ForNode.Attributes.Values['ADDRLOCAL'] = '1' then
+      Decl.Attributes.Values['ADDRLOCAL'] := '1'
+    else
+      Decl.Attributes.Values['RAWMODULE'] := '1';
+    Dm.AddChild(Decl);
+    ProcessDim(Dm);
+  finally
+    Dm.Free;
+  end;
+end;
+
+procedure TSSAGenerator.EmitForCounterPublish(const VarName: string; const VarReg: TSSAValue);
+// The loop steps its counter in a register; a counter with a HOME is read from the home by the body and by every
+// procedure it was handed to, so each value the loop gives it is written there too. ⛔ Only the SHARED home was ever
+// written (IsSharedScalar): a raw module cell - every @-taken module scalar of the fb mode - never saw the loop's
+// value, and "Dim k : For k = 1 To 5 : bump(k) : Print k" printed what the callee had made of a cell stuck at 0.
+// ⚠️ A raw home is written at its DECLARED width and bank, as EmitTempCellFor writes a cell: PublishScalarToHome
+// converts every value to an integer, which is wrong for a Double counter.
+var
+  Addr: TSSAValue;
+  Code: Integer;
+begin
+  if IsRawModuleScalar(VarName) then
+  begin
+    Addr := RawModuleAddrReg(VarName);
+    Code := RawTypeCodeOfPointee(RawModuleScalarType(VarName));
+  end
+  else if IsRawAddrLocal(VarName) then
+  begin
+    Addr := EnsureIntRegister(AddrLocalHandle(VarName));
+    Code := RawTypeCodeOfPointee(AddrLocalType(VarName));
+  end
+  else
+  begin
+    if IsSharedScalar(VarName) then EmitSharedScalarStoreVal(VarName, VarReg);
+    Exit;
+  end;
+  if VarReg.RegType = srtFloat then
+    EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), Addr, EnsureFloatRegister(VarReg), MakeSSAConstInt(Code))
+  else
+    EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), Addr, EnsureIntRegister(VarReg), MakeSSAConstInt(Code));
+end;
+
+procedure TSSAGenerator.EmitForCounterReload(const VarName: string; const VarReg: TSSAValue);
+// ⭐ DIVERGENZE 460: before NEXT steps the counter, take it back from its HOME. A procedure the counter was passed to
+// BYREF - or a "*p = v" through its address - writes the home and never the loop's register, so the loop kept
+// counting from its own copy: "For i = 1 To 5 : bump(i) : Print i; : Next" printed 1 2 3 4 5 where fbc prints 2 4 6.
+// The read goes through ProcessExpression, the funnel every reader of the name uses (width, bank, block filing).
+var
+  Id: TASTNode;
+  V: TSSAValue;
+begin
+  if not ForCounterHasHome(VarName) then Exit;
+  Id := TASTNode.CreateWithValue(antIdentifier, VarName);
+  try
+    ProcessExpression(Id, V);
+  finally
+    Id.Free;
+  end;
+  if VarReg.RegType = srtFloat then
+    EmitInstruction(ssaCopyFloat, VarReg, EnsureFloatRegister(V), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+  else
+    EmitInstruction(ssaCopyInt, VarReg, EnsureIntRegister(V), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+end;
+
 function TSSAGenerator.TryAllocAssign(const VarName: string; ExprNode: TASTNode): Boolean;
 // FreeBASIC raw heap: "p = Allocate(n)" / "CAllocate(n)" / "Reallocate(q,n)" — allocate/resize a byte
 // block and store the raw pointer (a RAWPTR_TAG byte offset) into p. Probe included.
@@ -18702,6 +18796,12 @@ begin
       else SavedSPK := -1;
     end;
     RecordVarWidth(VarName, Node.Attributes.Values['VARTYPE']);
+    // ...and a counter handed BYREF to a procedure, or whose address is taken, gets the home a Dim would give it
+    // (MarkAddressTaken marks the FOR node as it marks a Dim). DIVERGENZE 460.
+    if CounterScoped and
+       (((Node.Attributes.Values['ADDRLOCAL'] = '1') and FInProcedure) or
+        ((Node.Attributes.Values['RAWMODULE'] = '1') and not FInProcedure)) then
+      DeclareForCounterHome(Node, VarName);
   end
   else
     VarReg := GetOrAllocateVariable(VarName);
@@ -18805,9 +18905,9 @@ begin
 
   // A SHARED scalar loop counter is stepped in a register (VarReg), but reads of it inside the body
   // resolve to its backing array (element 0). Publish the start value to the backing now so the first
-  // iteration's body sees it; ProcessNext republishes after each step. (No-op for a non-shared counter.)
-  if IsSharedScalar(VarName) then
-    EmitSharedScalarStoreVal(VarName, VarReg);
+  // iteration's body sees it; ProcessNext republishes after each step. (No-op for a counter with no home.)
+  // ⭐ Every home, not only the SHARED one (DIVERGENZE 460): see EmitForCounterPublish.
+  EmitForCounterPublish(VarName, VarReg);
 
   // Materialize constants into registers for EndValue and StepValue (after var init!)
   // Convert to same type as VarReg for proper comparison
@@ -19568,6 +19668,10 @@ begin
     FCurrentBlock := ContBlock;
   end;
 
+  // A counter with a HOME may have been written there by the body - a BYREF call, "*p = v" - and the step starts from
+  // that value, as in fbc (DIVERGENZE 460).
+  EmitForCounterReload(LoopInfo.VarName, LoopInfo.VarReg);
+
   // Increment loop variable by step
   if LoopInfo.VarReg.RegType = srtInt then
   begin
@@ -19582,10 +19686,9 @@ begin
     EmitInstruction(ssaCopyFloat, LoopInfo.VarReg, MakeSSARegister(srtFloat, NewVarReg), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end;
 
-  // A SHARED scalar counter is stepped in the register above; republish it to the backing array so the
-  // next iteration's body (which reads the shared scalar from its backing) sees the updated value.
-  if IsSharedScalar(LoopInfo.VarName) then
-    EmitSharedScalarStoreVal(LoopInfo.VarName, LoopInfo.VarReg);
+  // A counter with a home is stepped in the register above; republish it so the next iteration's body (which reads
+  // the home) sees the updated value. Every home, not only the SHARED one (DIVERGENZE 460).
+  EmitForCounterPublish(LoopInfo.VarName, LoopInfo.VarReg);
 
   // Jump back to condition check
   if LoopInfo.NeedRuntimeCheck then
@@ -42752,6 +42855,25 @@ begin
       // See the note below.
     end;
   end;
+  // ⭐ "For i As T" DECLARES i as a Dim does, and a counter handed to a BYREF parameter (or whose "@" is taken) needs a
+  // home the same way: this pass only looked at antDim, so the counter kept only its register, the call was given a
+  // TEMPORARY cell, and the callee's write vanished (DIVERGENZE 460). Same tests as a Dim, same two homes a builtin
+  // scalar gets from them; the FOR head creates it (DeclareForCounterHome). MODERN only - CLASSIC has no "As".
+  if (Node.NodeType = antForLoop) and FModernMode and (Node.ChildCount >= 1) and
+     (Node.GetChild(0).NodeType = antIdentifier) and (Node.Attributes.Values['VARTYPE'] <> '') then
+  begin
+    VNameU := Node.GetChild(0).ValueUpper;
+    VTypeU := UpperFast(Node.Attributes.Values['VARTYPE']);
+    VTypeC := CanonicalType(VTypeU);
+    if (Dict.IndexOf(VNameU) >= 0) and (FindUDT(VTypeU) < 0) and (VTypeC <> 'STRING') and
+       ((not InProc) or (ProcOwn = nil) or (FAtTakenOnly.IndexOf(VNameU) < 0) or
+        (ProcOwn.IndexOf(VNameU) >= 0)) then
+    begin
+      if InProc then Node.Attributes.Values['ADDRLOCAL'] := '1'
+      else Node.Attributes.Values['RAWMODULE'] := '1';
+      if FAddrTakenScalars.IndexOfName(VNameU) < 0 then FAddrTakenScalars.Add(VNameU + '=' + VTypeC);
+    end;
+  end;
   if Node.NodeType = antProcedureDecl then InProc := True;
   // ⛔ A BLOCK IS A SCOPE TOO, AND MAKING THIS MARKING SEE THAT WAS TRIED TWICE AND WITHDRAWN
   // (26 Aug 2026). The marking applies RETROACTIVELY BY NAME: two sibling Scopes each declaring "a",
@@ -46830,7 +46952,12 @@ var
   m: string;
 begin
   m := BlockScalarName(Name);          // this block's own declaration, if it made one (DIVERGENZE 56)
-  if m = '' then m := UpperFast(Name);
+  // ⛔ ...and when an open block declared it, THAT declaration answers, with no shadow test - as IsAddrLocal answers.
+  // A "For i As Integer" counter with a home is bound in its own frame by the FOR head, and SharedScalarShadowed reads
+  // that binding as a local hiding the module cell: the body then passed a temporary to a BYREF call and read the
+  // register, and the cell the head had just allocated was never used (DIVERGENZE 460).
+  if m <> '' then Exit(FRawModuleScalars.IndexOfName(m) >= 0);
+  m := UpperFast(Name);
   Result := (FRawModuleScalars.IndexOfName(m) >= 0) and not SharedScalarShadowed(Name);
 end;
 
@@ -46849,11 +46976,16 @@ end;
 function TSSAGenerator.RawModuleAddrArrayId(const Name: string): Integer;
 // The shared 1-element INT array "<name>$RA" that holds this module scalar's raw-block address. Declared
 // on first use and registered as a shared scalar so it is cross-procedure visible (like any DIM SHARED).
+// ⭐ Filed under the BLOCK that declared the name when one did (BlockScalarName, DIVERGENZE 56): a "For i As Integer"
+// counter with a home and a module "Dim i" are two variables, and one "$RA" array for both made the loop's cell replace
+// the module variable's (DIVERGENZE 460).
 var
   AName: string;
   idx: Integer;
 begin
-  AName := UpperFast(Name) + '$RA';
+  AName := BlockScalarName(Name);
+  if AName = '' then AName := UpperFast(Name);
+  AName := AName + '$RA';
   idx := FSharedScalarArr.IndexOf(AName);
   if idx >= 0 then Exit(PtrInt(FSharedScalarArr.Objects[idx]));
   Result := FProgram.DeclareArray(AName, srtInt, [1]);
