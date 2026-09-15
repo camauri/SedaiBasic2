@@ -152,31 +152,51 @@ type
 
 
   { One suspended invocation's copy of a proc-local array. The storage record is copied WHOLE, which
-    is O(1): its dynamic fields share by reference, exactly as TArrayBindEntry.Saved already relies on. }
+    is O(1): its dynamic fields share by reference. }
   TArrayPrivSave = record
     SlotId: Integer;          // PHYSICAL slot in the VM's array table
     Saved: TArrayStorage;     // what the caller's invocation had there
+    { ⛔⛔ A SPILL, NOT A SAVE, when the slot is what a live array PARAMETER names (DIVERGENZE 462). Since
+      a parameter is the caller's array itself (Ctx.ArrMap redirected at the bind), saving the slot and
+      clearing it for the new invocation would hand that parameter the NEW invocation's array: a
+      recursive procedure passing its own local array to itself read the wrong level (1003 where fbc
+      answers 1006). So the new invocation's array goes to a slot of its own instead, the suspended one
+      stays where the parameter points, and the restore puts the map back and gives the slot up.
+        Spill     - this entry is a spill: SlotId is the spill slot, Saved holds nothing
+        LogicalId - the array id whose Ctx.ArrMap entry was pointed at the spill
+        HomeSlot  - what that entry held before }
+    Spill: Boolean;
+    LogicalId: Integer;
+    HomeSlot: Integer;
   end;
 
+  { ⭐⭐ ONE PENDING ARRAY-PARAMETER BIND. THE PARAMETER IS THE CALLER'S ARRAY, NOT A COPY OF ITS STORAGE
+    (DIVERGENZE 462, 15 Sep 2026). fbc passes an array parameter as an FBARRAY*: callee and caller name
+    ONE descriptor at every instant. The protocol this replaced shared the element DATA through a
+    counted second reference and copied the record back at the unbind, so a REDIM or an ERASE in the
+    callee reached the caller only when the call returned - and the caller's own name, read inside the
+    callee, still saw the old array.
+    ⇒ No storage moves and no reference is taken: the apply points Ctx.ArrMap[ParamId] at the
+    argument's PHYSICAL slot and the unbind puts OldMap back. Every access to the parameter -
+    interpreter, C loop, AOT, JIT, all of which resolve through ArrMap or the per-context descriptor
+    built from it - IS an access to the argument. 📊 arraybind_probe.bas, 2 M calls: 593-616 ms ->
+    389-408 ms, because the managed copies are gone.
+    ⛔ What makes it safe across recursion is TArrayPrivSave.Spill: a slot a live bind names is never
+    cleared under it.
+      ParamId   - the parameter's LOGICAL id. The unbind matches on it: while the bind is live,
+                  ArrMap[ParamId] answers the argument's slot, not the placeholder's.
+      ArgId     - the argument's PHYSICAL slot, captured at phase 1 from the UNMODIFIED map (so a batch
+                  that swaps a()/b() reads every argument before any apply)
+      OldMap    - what ArrMap[ParamId] held before the apply
+      Applied   - the apply ran: an unbind of an entry that never reached it restores nothing
+      OwnsSpill - ArgId is a spill slot taken for this bind (a UDT member array never allocated, which
+                  has no slot of its own to name) and the unbind gives it back }
   TArrayBindEntry = record
-    SlotId: Integer;
+    ParamId: Integer;
     ArgId: Integer;
-    Saved: TArrayStorage;
-    Snapshot: TArrayStorage;
-    // ⛔⛔ THE BIND PROTOCOL MOVES OWNERSHIP, IT NO LONGER COPIES IT, and these two fields are what
-    // makes that safe. A managed TArrayStorage assignment walks the record's RTTI and touches the
-    // reference count of FIVE dynamic-array fields; the protocol did four of them per call, where the
-    // cycle genuinely needs ONE reference taken (the alias) and ONE released. Measured 2 Sep 2026 on
-    // job/tests/bench/arraybind_probe.bas - a SUB with an array parameter and an EMPTY body -
-    // RecordRTTI 23.6% of the program, fpc_copy 16.8%, FillChar 21%.
-    //   Applied  - the SAVE now happens at bcArrayBindApply, not at bind, so an unbind that never saw
-    //              an apply must restore NOTHING: the slot was never overwritten. With the old
-    //              eager copy that case restored correctly by accident; here it would destroy it.
-    //   SnapData - the element-bank pointer the snapshot was installed with. The REDIM-detection at
-    //              unbind used to compare against the whole Snapshot record, which now no longer owns
-    //              anything after apply. One pointer answers the same question.
+    OldMap: Integer;
     Applied: Boolean;
-    SnapData: Pointer;
+    OwnsSpill: Boolean;
   end;
 
   { One call frame's bookkeeping, pushed by FramePush and read back by FramePop. 32 bytes, so two
@@ -490,13 +510,13 @@ const
     hot path of every array parameter (~177 ns per bind/unbind pair, measured). A field added to the
     record and not to those lists compiles, runs, and is wrong in silence: ByteData was added on 8 Sep
     2026 and an array of UByte passed to a SUB aliased an EMPTY packed bank, so the first element store
-    took an access violation.
+    took an access violation. (Since 15 Sep 2026 an array parameter no longer copies the record at all -
+    TArrayBindEntry - but a private array's save still aliases it.)
     ⇒ This constant is the tripwire. It is checked at VM start-up (CheckArrayStorageLayout), so the
     forgetting cannot SHIP: the next person to add a field gets a message naming the routines to visit
     rather than an access violation three layers away. Update it ONLY together with them.
-    The list, in SedaiBytecodeVM.pas: ArrayDataShared - ArrayDataStillAt - ArrayBankData -
-    AliasArrayStorage - ReleaseArrayStorage - MoveArrayStorage - ClearArrayStorage - EraseArray -
-    RedimArray - RedimArrayN, plus the two loops that clear FArrays wholesale.
+    The list, in SedaiBytecodeVM.pas: AliasArrayStorage - ReleaseArrayStorage - ClearArrayStorage -
+    EraseArray - RedimArray - RedimArrayN, plus the two loops that clear FArrays wholesale.
     ⭐ It earned its keep again on 12 Sep 2026: RankStated and DescDims went in for
     FBC.ArrayDescriptorPtr and it named every routine to visit, at the first run.
     ⚠️ It fires when a VM is CONSTRUCTED, so a command that answers before that - "sb
@@ -516,9 +536,8 @@ begin
   // exception out of a constructor unwinds through a half-built object - the message is the point.
   WriteLn(ErrOutput, Format(
     'TArrayStorage is %d bytes, expected %d: a field was added or removed. The routines that spell its ' +
-    'fields out BY HAND must be updated too (ArrayDataShared, ArrayDataStillAt, ArrayBankData, ' +
-    'AliasArrayStorage, ReleaseArrayStorage, MoveArrayStorage, ClearArrayStorage, EraseArray, ' +
-    'RedimArray, RedimArrayN), then set ARRAY_STORAGE_FIELD_BYTES to %d.',
+    'fields out BY HAND must be updated too (AliasArrayStorage, ReleaseArrayStorage, ClearArrayStorage, ' +
+    'EraseArray, RedimArray, RedimArrayN), then set ARRAY_STORAGE_FIELD_BYTES to %d.',
     [SizeOf(TArrayStorage), ARRAY_STORAGE_FIELD_BYTES, SizeOf(TArrayStorage)]));
   Halt(2);
 end;

@@ -575,6 +575,10 @@ type
     // a way that could make a live descriptor entry unreachable.
     FPrivBlockHigh: Integer;
     FStaticArrCount: Integer;         // size of the compile-time id space (ArrMap covers exactly this)
+    // Spill slots given back and ready for reuse (see SpillSlotTake). VM-wide: every caller holds
+    // LockArrays whenever workers exist.
+    FSpillFree: array of Integer;
+    FSpillFreeTop: Integer;
     // The array BYREF bind save-stack moved to TExecutionContext (per-context since 21 Aug 2026).
     FRedimPendingUBs: array of Integer;   // REDIM multi-dim: upper bounds accumulated by bcArrayRedimPush, consumed by bcArrayRedimN
     FRedimPendingLBs: array of Integer;   // REDIM "lb TO ub" with a RUNTIME lb: lower bounds accumulated (immediate flag on the push)
@@ -729,6 +733,10 @@ type
     procedure ReleaseArrayMap(Ctx: TExecutionContext);      // give the block back (and clear its storage)
     function MemberElemNeedsLbSub(Slot: Integer): Boolean;   // a 1-D member index still needs its lower bound off
     function MapArrDyn(Ctx: TExecutionContext; Id: Int64): Integer;  // id carried in a register/pointer
+    function SpillSlotTake: Integer;                                 // an empty slot no declaration owns
+    procedure SpillSlotGive(Slot: Integer);
+    function IsLiveBindTarget(Ctx: TExecutionContext; Slot: Integer): Boolean;
+    procedure NoteDescMapSlot(Slot: Integer);                        // NoteDescSlot for a map redirect
     procedure CheckPrivDesc(Ctx: TExecutionContext; Desc: Pointer);  // ARRPRIV_DIAG: descriptor vs storage
     function ActiveCtx: TExecutionContext; inline;   // this thread's context (GActiveCtx, or the main one)
     procedure RebuildJitArrDesc;
@@ -4637,10 +4645,19 @@ begin
 // four other callers rest on ("so the region stays a plain pair").
   Locked := LockArrays;
   for i := Ctx.ArrPrivSaveTop - 1 downto Base do
-  begin
-    FArrays[Ctx.ArrPrivSave[i].SlotId] := Ctx.ArrPrivSave[i].Saved;
-    Ctx.ArrPrivSave[i].Saved := Default(TArrayStorage);   // drop this stack slot's references
-  end;
+    if Ctx.ArrPrivSave[i].Spill then
+    begin
+      // The invocation that is ending had its array in a spill slot (see TArrayPrivSave.Spill): the
+      // name goes back to the suspended invocation's slot, which nobody cleared, and the spill is freed.
+      Ctx.ArrMap[Ctx.ArrPrivSave[i].LogicalId] := Ctx.ArrPrivSave[i].HomeSlot;
+      SpillSlotGive(Ctx.ArrPrivSave[i].SlotId);
+      Ctx.ArrPrivSave[i].Spill := False;
+    end
+    else
+    begin
+      FArrays[Ctx.ArrPrivSave[i].SlotId] := Ctx.ArrPrivSave[i].Saved;
+      Ctx.ArrPrivSave[i].Saved := Default(TArrayStorage);   // drop this stack slot's references
+    end;
   Ctx.ArrPrivSaveTop := Base;
   MarkArraysDirtyAll(1);  // arbitrary slots got their storage back
   UnlockArrays(Locked);
@@ -14255,6 +14272,66 @@ begin
     Result := Ctx.ArrMap[Result];
 end;
 
+function TBytecodeVM.SpillSlotTake: Integer;
+// An EMPTY slot of the array table that no declaration owns: a recursion level's own copy of a private
+// array whose home slot a live parameter names (TArrayPrivSave.Spill), or the empty array a parameter
+// names when its argument is a UDT member never allocated (TArrayBindEntry.OwnsSpill).
+// ⚠️ Appended past everything - the private blocks and the runtime member slots - so it lies beyond
+// the bound RebuildJitArrDesc works to: whoever points a logical id at one must mark the table in full
+// (MarkArraysDirtyAll, NoteDescMapSlot). Reused LIFO, so the table grows by the deepest simultaneous
+// need and not by the number of calls.
+// ⛔ The caller holds LockArrays when workers exist (ExecuteArrayOp's funnel, ArrPrivRestoreSlow): the
+// free list is VM-wide and GrowArrays moves the table.
+begin
+  if FSpillFreeTop > 0 then
+  begin
+    Dec(FSpillFreeTop);
+    Result := FSpillFree[FSpillFreeTop];
+  end
+  else
+  begin
+    Result := Length(FArrays);
+    GrowArrays(Result + 1);
+  end;
+end;
+
+procedure TBytecodeVM.SpillSlotGive(Slot: Integer);
+// Release a spill slot's storage and keep the slot for the next SpillSlotTake. A writer of FArrays:
+// same lock as SpillSlotTake (arrdesc_writers_check.sh lists it with that reason).
+begin
+  if (Slot < 0) or (Slot > High(FArrays)) then Exit;
+  FArrays[Slot] := Default(TArrayStorage);
+  if FSpillFreeTop >= Length(FSpillFree) then SetLength(FSpillFree, FSpillFreeTop * 2 + 4);
+  FSpillFree[FSpillFreeTop] := Slot;
+  Inc(FSpillFreeTop);
+end;
+
+function TBytecodeVM.IsLiveBindTarget(Ctx: TExecutionContext; Slot: Integer): Boolean;
+// Does an applied array-parameter bind of this context name this physical slot? Only a recursion (or a
+// re-entry) can make the answer yes - see TArrayPrivSave.Spill - and the stack is as deep as the calls
+// with array arguments that are running, so the walk is short.
+var
+  k: Integer;
+begin
+  for k := Ctx.ArrayBindTop - 1 downto 0 do
+    if Ctx.ArrayBindStack[k].Applied and (Ctx.ArrayBindStack[k].ArgId = Slot) then Exit(True);
+  Result := False;
+end;
+
+procedure TBytecodeVM.NoteDescMapSlot(Slot: Integer);
+// NoteDescSlot for a logical id pointed at a new physical slot by a bind or an unbind. A per-context
+// copy refreshes a private entry when its CURRENT slot falls in the rebuilt range - but that range is
+// clamped to the last private block, and a spill or a UDT member slot lies past it. For those the
+// narrow form would publish nothing, so the rebuild is widened to everything.
+begin
+  if (FPrivArrCount > 0) and (Slot >= FPrivBlockBase + (FPrivBlockHigh + 1) * FPrivArrCount) then
+  begin
+    FDescAllPending := True;
+    Exit;
+  end;
+  NoteDescSlot(Slot);
+end;
+
 procedure TBytecodeVM.RebuildJitArrDesc;
 // ⛔ CALL ONLY WITH FArrDescLock HELD - use EnsureArrDesc, which is the whole public entry point.
 var
@@ -16374,50 +16451,6 @@ begin
 end;
 
 
-function ArrayDataShared(const A, B: TArrayStorage): Boolean;
-// True if A and B still reference the SAME element-data buffer (a dynamic array shares its reference on
-// a struct copy; SetLength/REDIM reallocates and breaks the sharing). Used to detect whether a byref
-// array parameter was resized during a call. Compared by the array's element bank.
-begin
-  case A.ElementType of
-    1: Result := Pointer(A.FloatData) = Pointer(B.FloatData);
-    2: Result := Pointer(A.StringData) = Pointer(B.StringData);
-  else
-    // ⛔ THE INT BANK OF A PACKED ARRAY IS ByteData. An array of a narrow type keeps IntData empty on
-    // purpose (that is what makes the compiled engines deopt), so comparing IntData here answered
-    // "nil = nil" - SHARED - for two arrays that share nothing at all. Guard m884.
-    if A.ElemWidth > 0 then Result := Pointer(A.ByteData) = Pointer(B.ByteData)
-    else Result := Pointer(A.IntData) = Pointer(B.IntData);
-  end;
-end;
-
-function ArrayDataStillAt(const A: TArrayStorage; P: Pointer): Boolean;
-// ArrayDataShared, asked of a POINTER instead of a whole record: the bind entry keeps the element-bank
-// pointer the snapshot was installed with, because after the ownership move the Snapshot record no
-// longer holds anything. Same selection rule, same answer.
-begin
-  case A.ElementType of
-    1: Result := Pointer(A.FloatData) = P;
-    2: Result := Pointer(A.StringData) = P;
-  else
-    if A.ElemWidth > 0 then Result := Pointer(A.ByteData) = P    // the packed bank - see ArrayDataShared
-    else Result := Pointer(A.IntData) = P;
-  end;
-end;
-
-function ArrayBankData(const A: TArrayStorage): Pointer;
-// The element-bank pointer ArrayDataStillAt will compare against - one place, so the capture and the
-// test cannot pick different banks.
-begin
-  case A.ElementType of
-    1: Result := Pointer(A.FloatData);
-    2: Result := Pointer(A.StringData);
-  else
-    if A.ElemWidth > 0 then Result := Pointer(A.ByteData)        // the packed bank - see ArrayDataShared
-    else Result := Pointer(A.IntData);
-  end;
-end;
-
 procedure AliasArrayStorage(const Src: TArrayStorage; var Dst: TArrayStorage);
 // A SECOND reference to Src's storage - exactly what `Dst := Src` does, and exactly as many
 // reference counts moved - written out FIELD BY FIELD.
@@ -16534,26 +16567,6 @@ begin
   if GArrDescDiag and (Src <= High(GADDirtySrc)) then Inc(GADDirtySrc[Src]);
 end;
 
-procedure MoveArrayStorage(var Src, Dst: TArrayStorage);
-// TRANSFER ownership of a storage record: Dst releases whatever it held, takes Src's bits, and Src is
-// left owning nothing. No reference count moves, because none needs to: the value has one owner before
-// and one after.
-//
-// ⛔ THE GUARD IS NOT DECORATION. On the normal path Dst is empty - unbind zeroes what it takes and a
-// fresh stack entry is zero-initialised - so the five pointer tests fall through and the whole thing is
-// a 64-byte Move plus a FillChar. But an invocation abandoned without its unbind (a raise inside the
-// callee) leaves a stack entry still owning storage, and reusing that entry with a bare Move would leak
-// it forever. The old eager assignment released it as a side effect of copying; this releases it on
-// purpose, and only when there is something to release.
-begin
-  if (Pointer(Dst.IntData) <> nil) or (Pointer(Dst.FloatData) <> nil) or
-     (Pointer(Dst.StringData) <> nil) or (Pointer(Dst.ByteData) <> nil) or
-     (Pointer(Dst.Dimensions) <> nil) or (Pointer(Dst.LowerBounds) <> nil) then
-    ReleaseArrayStorage(Dst);   // Finalize(Dst) is the same thing through the RTTI - see above
-  Move(Src, Dst, SizeOf(TArrayStorage));
-  FillChar(Src, SizeOf(TArrayStorage), 0);
-end;
-
 procedure ClearArrayStorage(var A: TArrayStorage);
 // Reset a storage record to a well-formed EMPTY array (no dimensions, no data). Field-by-field, not
 // FillChar: the dynamic-array fields are managed and must be released, not zeroed behind the RTL's back.
@@ -16610,12 +16623,34 @@ begin
         begin
           if Ctx.ArrPrivSaveTop >= Length(Ctx.ArrPrivSave) then
             SetLength(Ctx.ArrPrivSave, (Ctx.ArrPrivSaveTop + 1) * 2);
-          Ctx.ArrPrivSave[Ctx.ArrPrivSaveTop].SlotId := ArrayIdx;
-          AliasArrayStorage(FArrays[ArrayIdx], Ctx.ArrPrivSave[Ctx.ArrPrivSaveTop].Saved);
-          Inc(Ctx.ArrPrivSaveTop);
-          if GArrPrivDiag then
-            WriteLn(ErrOutput, Format('[arrpriv] SALVA phys %d, pila -> %d', [ArrayIdx, Ctx.ArrPrivSaveTop]));
-          FArrays[ArrayIdx] := Default(TArrayStorage);
+          if IsLiveBindTarget(Ctx, ArrayIdx) then
+          begin
+            // ⛔⛔ A LIVE ARRAY PARAMETER NAMES THIS SLOT: an invocation below passed its own copy of this
+            // array to a call that is still running, and that parameter IS this slot (DIVERGENZE 462).
+            // Clearing it here would hand the parameter the array about to be DIMmed. The new invocation
+            // takes a spill slot instead; the restore puts the map back. See TArrayPrivSave.Spill.
+            Ctx.ArrPrivSave[Ctx.ArrPrivSaveTop].Spill := True;
+            Ctx.ArrPrivSave[Ctx.ArrPrivSaveTop].LogicalId := Instr.Src1;
+            Ctx.ArrPrivSave[Ctx.ArrPrivSaveTop].HomeSlot := ArrayIdx;
+            ArrayIdx := SpillSlotTake;
+            Ctx.ArrPrivSave[Ctx.ArrPrivSaveTop].SlotId := ArrayIdx;
+            Ctx.ArrMap[Instr.Src1] := ArrayIdx;
+            Inc(Ctx.ArrPrivSaveTop);
+            if GArrPrivDiag then
+              WriteLn(ErrOutput, Format('[arrpriv] SPILL ARR[%d] -> phys %d, pila -> %d',
+                      [Instr.Src1, ArrayIdx, Ctx.ArrPrivSaveTop]));
+            MarkArraysDirtyAll(1);   // a logical id changed slot: past the rebuild bound, nothing narrow sees it
+          end
+          else
+          begin
+            Ctx.ArrPrivSave[Ctx.ArrPrivSaveTop].Spill := False;
+            Ctx.ArrPrivSave[Ctx.ArrPrivSaveTop].SlotId := ArrayIdx;
+            AliasArrayStorage(FArrays[ArrayIdx], Ctx.ArrPrivSave[Ctx.ArrPrivSaveTop].Saved);
+            Inc(Ctx.ArrPrivSaveTop);
+            if GArrPrivDiag then
+              WriteLn(ErrOutput, Format('[arrpriv] SALVA phys %d, pila -> %d', [ArrayIdx, Ctx.ArrPrivSaveTop]));
+            FArrays[ArrayIdx] := Default(TArrayStorage);
+          end;
         end;
         FArrays[ArrayIdx].ElementType := Byte(ArrInfo.ElementType);
         FArrays[ArrayIdx].DimCount := ArrInfo.DimCount;
@@ -17264,109 +17299,88 @@ begin
                                        (Int64(ArrayIdx) shl RAWPTR_ADESC_PHYS_SHIFT) or
                                        (Int64(LinearIdx) shl RAWPTR_ADESC_LOG_SHIFT);
         end;
-      34: // bcArrayBind - array BYREF param (PHASE 1): save FArrays[Src1] and snapshot the arg FArrays[Immediate],
-        begin  // but DEFER the alias to bcArrayBindApply. Two-phase so a batch of binds that swaps arrays
-               // (recursive "proc(a(),b())" -> "proc(b(),a())", where param and arg slots coincide) reads every
-               // arg from the UNMODIFIED table before any assignment. Src1=param id, Imm=arg id.
-          if (Instr.Src1 >= 0) and (Instr.Immediate >= 0) and (Instr.Immediate <= High(FArrays)) then
+      34: // bcArrayBind - array BYREF param (PHASE 1): capture the argument's PHYSICAL slot now; the parameter
+        begin  // is pointed at it by bcArrayBindApply. Two-phase so a batch of binds that swaps arrays
+               // (recursive "proc(a(),b())" -> "proc(b(),a())", where param and arg ids coincide) reads every
+               // arg from the UNMODIFIED map before any apply. Src1=param id, Imm=arg id. See TArrayBindEntry.
+          if (Instr.Src1 >= 0) and (Instr.Src1 < Length(Ctx.ArrMap)) and
+             (Instr.Immediate >= 0) and (Instr.Immediate <= High(FArrays)) then
           begin
-            // Both ids are logical. The ARGUMENT in particular may be a proc-local array being passed
-            // on, so it has to name this context's copy and not the dead compile-time slot.
-            ArrayIdx := Ctx.ArrMap[Instr.Src1];
-            LinearIdx := Ctx.ArrMap[Instr.Immediate];
-            // The param placeholder array is never runtime-DIM'd, so grow FArrays to hold its slot.
-            if ArrayIdx > High(FArrays) then GrowArrays(ArrayIdx + 1);
             if Ctx.ArrayBindTop >= Length(Ctx.ArrayBindStack) then
               SetLength(Ctx.ArrayBindStack, (Ctx.ArrayBindTop + 1) * 2);
-            Ctx.ArrayBindStack[Ctx.ArrayBindTop].SlotId := ArrayIdx;
-            Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := LinearIdx;
+            Ctx.ArrayBindStack[Ctx.ArrayBindTop].ParamId := Instr.Src1;
+            // The argument is a logical id: a proc-local array being passed on names this context's copy,
+            // and an argument that is itself a bound parameter already names the ROOT array - a chain of
+            // forwards collapses to one slot.
+            Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := MapArrDyn(Ctx, Instr.Immediate);
             Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied := False;
-            // ⭐ The ONE managed copy of the whole cycle, and it is the one that is genuinely a second
-            // reference: the parameter is about to share the argument's storage. The SAVE of what the
-            // parameter slot held is deferred to bcArrayBindApply, where it becomes a MOVE - see
-            // TArrayBindEntry and MoveArrayStorage.
-            AliasArrayStorage(FArrays[LinearIdx],
-                              Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot);   // the arg, captured now
+            Ctx.ArrayBindStack[Ctx.ArrayBindTop].OwnsSpill := False;
             Inc(Ctx.ArrayBindTop);
-            NoteDescNoChange;   // phase one only SNAPSHOTS: no slot's storage moved
+            NoteDescNoChange;   // phase one only captures: nothing is pointed anywhere yet
           end;
         end;
       49: // bcArrayBindInd - PHASE 1 bind whose arg is a UDT ARRAY MEMBER: its FArrays handle is only known at
         begin  // runtime (per instance), so it arrives in a register instead of an immediate. Src1=param id,
-               // Src2=handle reg. Always pushes a save-stack entry — bcArrayBindApply commits a FIXED count and
-               // bcArrayUnbind pops LIFO by SlotId, so skipping a push here would desynchronize both.
+               // Src2=handle reg. Always pushes an entry - bcArrayBindApply commits a FIXED count and
+               // bcArrayUnbind pops LIFO, so skipping a push here would desynchronize both.
           PtrAddr := MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src2]);
-          if Instr.Src1 >= 0 then
+          if (Instr.Src1 >= 0) and (Instr.Src1 < Length(Ctx.ArrMap)) then
           begin
-            ArrayIdx := Ctx.ArrMap[Instr.Src1];
-            if ArrayIdx > High(FArrays) then GrowArrays(ArrayIdx + 1);  // grow AFTER reading the handle
             if Ctx.ArrayBindTop >= Length(Ctx.ArrayBindStack) then
               SetLength(Ctx.ArrayBindStack, (Ctx.ArrayBindTop + 1) * 2);
-            Ctx.ArrayBindStack[Ctx.ArrayBindTop].SlotId := ArrayIdx;
-            Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied := False;   // the save is deferred to Apply
+            Ctx.ArrayBindStack[Ctx.ArrayBindTop].ParamId := Instr.Src1;
+            Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied := False;
             if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
             begin
-              Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := PtrAddr;
-              AliasArrayStorage(FArrays[PtrAddr],
-                                Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot);  // alias the member's storage
+              Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := PtrAddr;   // the member's own slot
+              Ctx.ArrayBindStack[Ctx.ArrayBindTop].OwnsSpill := False;
             end
             else
-            begin  // handle < 1 = member array never allocated: bind an EMPTY array (UBOUND = -1), and set
-                   // ArgId = -1 so unbind performs no copy-back (there is no caller slot to write to).
-              Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := -1;
-              ClearArrayStorage(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Snapshot);
+            begin
+              // handle < 1 = member array never allocated: the parameter names an EMPTY array (UBOUND = -1)
+              // in a spill slot of its own, given back at the unbind. ⚠️ A ReDim through it does not
+              // allocate the member, as fbc would: it lands in the spill and ends with the call - which is
+              // what binding a cleared copy did before.
+              Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := SpillSlotTake;
+              Ctx.ArrayBindStack[Ctx.ArrayBindTop].OwnsSpill := True;
             end;
             Inc(Ctx.ArrayBindTop);
           end;
         end;
-      36: // bcArrayBindApply - commit the top N pending binds (Immediate=N): alias each param slot to its
-        begin  // snapshotted arg. All snapshots were captured (in phase 1) from the unmodified table.
+      36: // bcArrayBindApply - commit the top N pending binds (Immediate=N): point each parameter at the
+        begin  // argument slot phase 1 captured from the unmodified map.
           for I := Ctx.ArrayBindTop - Instr.Immediate to Ctx.ArrayBindTop - 1 do
-            if (I >= 0) and (Ctx.ArrayBindStack[I].SlotId <= High(FArrays)) then
+            if I >= 0 then
             begin
-              // Two MOVES and no reference count: the parameter slot's old value goes to Saved, the
-              // snapshot goes into the slot. The snapshot's reference - taken once, at bind - is what
-              // the slot now owns, and unbind releases it. SnapData remembers which buffer that was,
-              // because the Snapshot record owns nothing after this.
-              Ctx.ArrayBindStack[I].SnapData := ArrayBankData(Ctx.ArrayBindStack[I].Snapshot);
-              MoveArrayStorage(FArrays[Ctx.ArrayBindStack[I].SlotId], Ctx.ArrayBindStack[I].Saved);
-              MoveArrayStorage(Ctx.ArrayBindStack[I].Snapshot, FArrays[Ctx.ArrayBindStack[I].SlotId]);
+              // ⭐ THE ALIAS OF THE DESCRIPTOR: the parameter's logical id now resolves to the argument's
+              // slot, so a REDIM, an ERASE or a read by the caller's own name inside the callee all reach
+              // ONE array - fbc's FBARRAY* (DIVERGENZE 462). Nothing in FArrays moves.
+              // ⚠️ The descriptor mark names the ARGUMENT's slot: a per-context copy refreshes a private
+              // entry whose CURRENT physical slot falls in the rebuilt range, and the parameter's now does.
+              Ctx.ArrayBindStack[I].OldMap := Ctx.ArrMap[Ctx.ArrayBindStack[I].ParamId];
+              Ctx.ArrMap[Ctx.ArrayBindStack[I].ParamId] := Ctx.ArrayBindStack[I].ArgId;
               Ctx.ArrayBindStack[I].Applied := True;
-              NoteDescSlot(Ctx.ArrayBindStack[I].SlotId);   // this slot, and only this slot, moved
+              NoteDescMapSlot(Ctx.ArrayBindStack[I].ArgId);
             end;
         end;
-      35: // bcArrayUnbind - restore the last saved FArrays[Src1] (Src1 = param array id).
+      35: // bcArrayUnbind - undo the last bind of parameter Src1: its logical id resolves to what it did before.
         begin
-          ArrayIdx := Ctx.ArrMap[Instr.Src1];
-          if (Ctx.ArrayBindTop > 0) and (Ctx.ArrayBindStack[Ctx.ArrayBindTop - 1].SlotId = ArrayIdx) then
+          // ⛔ MATCHED ON THE LOGICAL id: while the bind is live ArrMap[Src1] answers the ARGUMENT's slot.
+          if (Ctx.ArrayBindTop > 0) and (Ctx.ArrayBindStack[Ctx.ArrayBindTop - 1].ParamId = Instr.Src1) then
           begin
             Dec(Ctx.ArrayBindTop);
-            // Propagate the callee's final array back to the caller's slot ONLY if a REDIM [PRESERVE]
-            // reallocated the param's storage — detected by its data no longer sharing the reference we
-            // snapshotted from the arg at bind time. Without a resize the caller already sees the writes via
-            // the shared reference, and copying would be wrong: in deep recursion the arg slot may have been
-            // rebound at an outer level (merge sort's swapped a()/b()), so an unconditional copy corrupts it.
-            // ⛔ ONLY IF THE BIND WAS APPLIED. The save is deferred to Apply now, so an entry that never
-            // reached it holds nothing and the slot was never overwritten: restoring would install an
-            // EMPTY array over the live one. The old eager copy got this case right by accident.
+            // ⛔ ONLY IF THE BIND WAS APPLIED: an entry that never reached the apply pointed nothing anywhere.
             if Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied then
             begin
-              if (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId >= 0) and
-                 (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId <= High(FArrays)) and
-                 (Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId <> ArrayIdx) and
-                 not ArrayDataStillAt(FArrays[ArrayIdx], Ctx.ArrayBindStack[Ctx.ArrayBindTop].SnapData) then
-                FArrays[Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId] := FArrays[ArrayIdx];
-              // The move releases the alias (Finalize inside) and hands the slot its own value back;
-              // Saved is left owning nothing, so the entry is ready for reuse with no explicit clearing.
-              MoveArrayStorage(Ctx.ArrayBindStack[Ctx.ArrayBindTop].Saved, FArrays[ArrayIdx]);
+              Ctx.ArrMap[Instr.Src1] := Ctx.ArrayBindStack[Ctx.ArrayBindTop].OldMap;
               Ctx.ArrayBindStack[Ctx.ArrayBindTop].Applied := False;
-              // Both slots the branch above can write: the parameter always, and the argument when a
-              // REDIM inside the callee moved the storage. Marking the argument unconditionally is
-              // one slot too many at worst, which is the safe direction here.
-              NoteDescSlot(ArrayIdx);
-              NoteDescSlot(Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId);
+              NoteDescMapSlot(Ctx.ArrayBindStack[Ctx.ArrayBindTop].OldMap);   // the parameter's entry, back home
             end;
-            Ctx.ArrayBindStack[Ctx.ArrayBindTop].SnapData := nil;
+            if Ctx.ArrayBindStack[Ctx.ArrayBindTop].OwnsSpill then
+            begin
+              SpillSlotGive(Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId);
+              Ctx.ArrayBindStack[Ctx.ArrayBindTop].OwnsSpill := False;
+            end;
           end;
         end;
       27: // bcArrayRedimPush - push one bound onto the pending REDIM list (Immediate bit0 = it is a
