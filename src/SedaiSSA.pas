@@ -636,6 +636,7 @@ type
     FArrayRecordType: TStringList;       // array name (UPPER) -> element UDT type name (UPPER)
     FForeignDataScalars: TStringList;    // DIVERGENZE 405: an Extern of a C library whose type is a SCALAR (its address is C's)
     FForeignProcExterns: TStringList;    // DIVERGENZE 422: ...whose type is a named PROCEDURE type (libxml's xmlFree)
+    FForeignDataArrays: TStringList;     // DIVERGENZE 441: "NAME=symbol|T|lb:ub,..." - a C library's data ARRAY
     FArrayScalarType: TStringList;       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
     FArrayFuncPtrSig: TStringList;       // array-of-funcptr (DIM As <named funcptr type> a(..)) -> "params|ret" signature, so "a(i)(args)" is an indirect call
     FArrayPtrPointee: TStringList;       // array of UDT POINTERS ("DIM As T PTR a(..)", "a() AS T PTR" param) -> T, so "a(i)->field" resolves (params under their mangled name)
@@ -707,6 +708,9 @@ type
     function ForeignNarrowArg(Node: TASTNode; out TypeU: string): Integer;  // "@n" of a narrow value -> width code (DIVERGENZE 247)
     function EmitForeignDataAddr(const VarName, Symbol, TypeName: string;
       const LibName: string = ''): TSSAValue;  // an Extern of a C library: its address (DIVERGENZE 253)
+    function ForeignDataArrayElemAddr(Node: TASTNode; out Addr: TSSAValue; out ElemType: string): Boolean;  // 441
+    function TryForeignDataArrayRead(Node: TASTNode; out Value: TSSAValue): Boolean;   // "v(i)", v a C data array (441)
+    function TryForeignDataArrayStore(Node, ExprNode: TASTNode): Boolean;             // "v(i) = x" (441)
     function TryForeignFuncAddr(const NameU: string; out V: TSSAValue): Boolean;  // "@f" of a declared C function (261)
     function TryEmitForeignElemField(Node: TASTNode; out Value: TSSAValue): Boolean;  // "a(i)->f", a(i) a C address (259)
     function TryEmitForeignElemFieldStore(MemberNode, ExprNode: TASTNode): Boolean;    // ...its WRITE half (259)
@@ -1892,6 +1896,7 @@ begin
   FArrayRecordType := TIndexedStringList.Create;
   FForeignDataScalars := TIndexedStringList.Create;
   FForeignProcExterns := TIndexedStringList.Create;
+  FForeignDataArrays := TStringList.Create;
   FForeignDataScalars.CaseSensitive := False;
   FArrayScalarType := TIndexedStringList.Create;
   FArrayRecordType.CaseSensitive := False;
@@ -2106,6 +2111,7 @@ begin
   FArrayRecordType.Free;
   FForeignDataScalars.Free;
   FForeignProcExterns.Free;
+  FForeignDataArrays.Free;
   FArrayScalarType.Free;
   FArrayFuncPtrSig.Free;
   FArrayScalarPointee.Free;
@@ -10173,6 +10179,8 @@ begin
           // ⭐ ...or it is a call to a C FUNCTION the program declared. A foreign name has no array and
           // no procedure body, so it arrives here - which is where "Array not declared: ZIP_OPEN" came
           // from. DIVERGENZE 183.
+          // ⭐ ...or an element of a C library's data ARRAY (DIVERGENZE 441).
+          if TryForeignDataArrayRead(Node, Result) then Exit;
           if TryForeignCall(UpperFast(ArrName), Node.GetChild(1), Result) then Exit;
           // ⭐⭐ ...OPPURE E' UNA PROCEDURA DICHIARATA E MAI DEFINITA, e allora NON e' un errore di
           // compilazione. Misurato contro l'oracolo: `fbc` compila "declare sub Foo(...)" seguito da
@@ -13310,6 +13318,9 @@ begin
     end;
     Exit;
   end;
+
+  // ⭐ An element of a C library's data ARRAY (DIVERGENZE 441): written at its address.
+  if (ArrayIndexOf(ArrName) < 0) and TryForeignDataArrayStore(TargetNode, ExprNode) then Exit;
 
   if not ResolveArrayElementTarget(TargetNode, ArrName, ArrayIdx, ArrInfo, LinearIndex) then Exit;
 
@@ -30559,6 +30570,16 @@ begin
     if FpSig = '' then FpSig := FModuleFuncPtrSigs.Values[FpName];
     if FpSig <> '' then
       Exit(PrintKindOfTypeName(Copy(FpSig, Pos('|', FpSig) + 1, MaxInt)));
+  end;
+  // ⭐ DIVERGENZE 441 - an element of a C library's data ARRAY prints as its declared element type: a UByte of
+  // giflib's font table has no sign column under fbc (m974).
+  if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and (Node.GetChild(0).NodeType = antIdentifier) and
+     (FForeignDataArrays.Count > 0) and (FForeignDataArrays.IndexOfName(Node.GetChild(0).ValueUpper) >= 0) and
+     (ArrayIndexOf(Node.GetChild(0).ValueUpper) < 0) then
+  begin
+    Txt := FForeignDataArrays.Values[Node.GetChild(0).ValueUpper];
+    Txt := Copy(Txt, Pos('|', Txt) + 1, MaxInt);
+    Exit(PrintKindOfTypeName(Copy(Txt, 1, Pos('|', Txt) - 1)));
   end;
   case Node.NodeType of
     antIdentifier:
@@ -52548,6 +52569,7 @@ function TSSAGenerator.VariadicCallSiteDecl(const Decl: TForeignDecl; ArgListNod
 var
   i, k: Integer;
   Params, T, Line, NarrowT, RetT: string;
+  AddrOp: TASTNode;
 begin
   Params := '';
   for i := 0 to High(Decl.ParamTypeNames) do
@@ -52600,7 +52622,24 @@ begin
     // asked of the shape a C API is most often written in: build the value and pass it, in one line.
     else if IsForeignPtrCall(ArgListNode.GetChild(i)) or
             VarArgIsAddress(ArgListNode.GetChild(i)) then
-      T := 'ANY PTR'
+    begin
+      T := 'ANY PTR';
+      // ⭐ DIVERGENZE 443 - ...and the ADDRESS OF A POINTER VARIABLE is a cell C may fill with one of ITS pointers:
+      // "curl_easy_getinfo(h, CURLINFO_EFFECTIVE_URL, @eff)". A declared "T Ptr Ptr" parameter says so and the
+      // runtime brings the cell home (219, 436); in the tail nothing did, and "*eff" read C's address as the VM's.
+      AddrOp := ArgListNode.GetChild(i);
+      if (AddrOp.NodeType = antProcAddress) and (AddrOp.ChildCount = 0) and (AddrOp.ValueUpper <> '') and
+         (FProcedureNames.IndexOf(AddrOp.ValueUpper) < 0) then
+      begin
+        AddrOp := TASTNode.CreateWithValue(antIdentifier, VarToStr(ArgListNode.GetChild(i).Value),
+                                           ArgListNode.GetChild(i).Token);
+        try
+          if ExprIsPointerTyped(AddrOp) then T := 'ANY PTR PTR';
+        finally
+          AddrOp.Free;
+        end;
+      end;
+    end
     else
       case InferExprBank(ArgListNode.GetChild(i)) of
         srtFloat:  T := 'DOUBLE';          // the C default promotion: a variadic float IS a double
@@ -53003,6 +53042,119 @@ begin
     FCurrentBlock := FProgram.GetOrCreateBlock(GenerateUniqueLabel('fgndata'));
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaForeignCall, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAConstInt(Idx));
+end;
+
+function TSSAGenerator.ForeignDataArrayElemAddr(Node: TASTNode; out Addr: TSSAValue; out ElemType: string): Boolean;
+// ⭐ DIVERGENZE 441 - THE ADDRESS OF AN ELEMENT OF A C LIBRARY'S DATA ARRAY. "extern gdbm_version_number(0 to 2) as
+// const long" names storage of libgdbm; the parser registers it (FGNDATAARRS) instead of making it an array of the
+// program, which is what it was - zeros, or "Array not declared" for the CONST form. The element is at
+// symbol + sum((index_k - lb_k) * stride_k), row-major as fbc lays a multi-dimensional array, and read at its width
+// by the raw load that every other address C hands over goes through.
+// ⚠️ A RECORD element declines (its fields are reached through a different path); so does a subscript count that is
+// not the declared rank - the ordinary "Array not declared" then answers, as before.
+var
+  Spec, Sym, Bounds, Piece, NameU: string;
+  Lbs, Exts: array of Int64;
+  p, k, j, n: Integer;
+  IdxList: TASTNode;
+  IdxVal, C, Tmp, Prod, Lin, Sum, Base: TSSAValue;
+  Stride: Int64;
+begin
+  Result := False;
+  Addr := MakeSSAValue(svkNone);
+  ElemType := '';
+  if (FForeignDataArrays.Count = 0) or (Node = nil) or (Node.ChildCount < 2) or
+     (Node.GetChild(0).NodeType <> antIdentifier) then Exit;
+  NameU := UpperFast(VarToStr(Node.GetChild(0).Value));
+  if FForeignDataArrays.IndexOfName(NameU) < 0 then Exit;
+  Spec := FForeignDataArrays.Values[NameU];
+  p := Pos('|', Spec); if p <= 0 then Exit;
+  Sym := Copy(Spec, 1, p - 1); Delete(Spec, 1, p);
+  p := Pos('|', Spec); if p <= 0 then Exit;
+  ElemType := Copy(Spec, 1, p - 1);
+  Bounds := Copy(Spec, p + 1, MaxInt) + ',';
+  n := 0;
+  while Bounds <> '' do
+  begin
+    p := Pos(',', Bounds);
+    Piece := Copy(Bounds, 1, p - 1);
+    Delete(Bounds, 1, p);
+    k := Pos(':', Piece);
+    if k <= 0 then Exit;
+    SetLength(Lbs, n + 1); SetLength(Exts, n + 1);
+    Lbs[n] := StrToInt64Def(Copy(Piece, 1, k - 1), 0);
+    Exts[n] := StrToInt64Def(Copy(Piece, k + 1, MaxInt), -1) - Lbs[n] + 1;
+    Inc(n);
+  end;
+  IdxList := Node.GetChild(1);
+  if (n = 0) or (IdxList = nil) or (IdxList.NodeType <> antExpressionList) or (IdxList.ChildCount <> n) then Exit;
+  if FindUDT(ElemType) >= 0 then Exit;
+  Lin := MakeSSAValue(svkNone);
+  for k := 0 to n - 1 do
+  begin
+    ProcessExpression(IdxList.GetChild(k), IdxVal);
+    IdxVal := EnsureIntRegister(IdxVal);
+    Stride := RawElemSizeOfPointee(ElemType);
+    for j := k + 1 to n - 1 do Stride := Stride * Exts[j];
+    // ⚠️ ssaSubInt / ssaMulInt / ssaAddInt take REGISTERS: every constant is materialised first.
+    C := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, C, MakeSSAConstInt(Lbs[k]), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Tmp := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaSubInt, Tmp, IdxVal, C, MakeSSAValue(svkNone));
+    C := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, C, MakeSSAConstInt(Stride), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Prod := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, Prod, Tmp, C, MakeSSAValue(svkNone));
+    if Lin.Kind = svkNone then Lin := Prod
+    else
+    begin
+      Sum := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaAddInt, Sum, Lin, Prod, MakeSSAValue(svkNone));
+      Lin := Sum;
+    end;
+  end;
+  Base := EmitForeignDataAddr(NameU + '#ARR', Sym, ElemType);
+  Addr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, Addr, Base, Lin, MakeSSAValue(svkNone));
+  Result := True;
+end;
+
+function TSSAGenerator.TryForeignDataArrayRead(Node: TASTNode; out Value: TSSAValue): Boolean;
+var
+  Addr: TSSAValue;
+  ElemType: string;
+begin
+  Result := False;
+  Value := MakeSSAValue(svkNone);
+  if not ForeignDataArrayElemAddr(Node, Addr, ElemType) then Exit;
+  if RawTypeCodeOfPointee(ElemType) in [RTC_SINGLE, RTC_DOUBLE] then
+  begin
+    Value := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+    EmitInstruction(ssaRawLoadFloat, Value, Addr, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(ElemType)));
+  end
+  else
+  begin
+    Value := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRawLoadInt, Value, Addr, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(ElemType)));
+  end;
+  Result := True;
+end;
+
+function TSSAGenerator.TryForeignDataArrayStore(Node, ExprNode: TASTNode): Boolean;
+var
+  Addr, ExprVal: TSSAValue;
+  ElemType: string;
+begin
+  Result := False;
+  if not ForeignDataArrayElemAddr(Node, Addr, ElemType) then Exit;
+  ProcessExpression(ExprNode, ExprVal);
+  if RawTypeCodeOfPointee(ElemType) in [RTC_SINGLE, RTC_DOUBLE] then
+    EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), Addr, EnsureFloatRegister(ExprVal),
+                    MakeSSAConstInt(RawTypeCodeOfPointee(ElemType)))
+  else
+    EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), Addr, EnsureIntRegister(ExprVal),
+                    MakeSSAConstInt(RawTypeCodeOfPointee(ElemType)));
+  Result := True;
 end;
 
 function TSSAGenerator.TryForeignCall(const NameU: string; ArgListNode: TASTNode;
@@ -55562,6 +55714,20 @@ begin
     if GetEnvironmentVariable('FGNDIAG') = '1' then
       for PsI := 0 to FProgram.ForeignDeclCount - 1 do
         WriteLn(ErrOutput, 'FGN[', PsI, '] ', FProgram.GetForeignDecl(PsI));
+  end;
+  // ⭐ DIVERGENZE 441 - the data ARRAYS of C libraries, read the same way: an element is addressed from the symbol.
+  FForeignDataArrays.Clear;
+  if AST.Attributes.Values['FGNDATAARRS'] <> '' then
+  begin
+    FgnText := AST.Attributes.Values['FGNDATAARRS'] + ';';
+    FgnStart := 1;
+    for PsI := 1 to Length(FgnText) do
+      if FgnText[PsI] = ';' then
+      begin
+        FgnLine := Trim(Copy(FgnText, FgnStart, PsI - FgnStart));
+        if FgnLine <> '' then FForeignDataArrays.Add(FgnLine);
+        FgnStart := PsI + 1;
+      end;
   end;
 
   // FreeBASIC NAMESPACE: flatten namespace blocks into mangled, module-level declarations before any

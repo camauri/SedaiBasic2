@@ -127,6 +127,7 @@ type
     // A DECLARE carrying an ALIAS is a FOREIGN procedure: NAME|SYMBOL|LIBRARY|RETURN|PARAMS, one per
     // line, handed to the SSA on the program node (DIVERGENZE 183).
     FForeignDecls: TStringList;
+    FForeignDataArrays: TStringList;   // DIVERGENZE 441: "NAME=symbol|T|lb:ub,..." - the data ARRAYS of C libraries
     // ⛔ EVERY TYPE NAME A "DECLARE" NAMES, with the line it stands on. fbc's single pass refuses a
     // declaration whose return or parameter type has not been declared ("error 14: Expected
     // identifier" for the return, "error 59: Illegal specification" for a parameter); this parser
@@ -680,6 +681,7 @@ begin
   MemoizationThreshold := 3;  // Cache after 3 recursion levels
 
   FForeignDecls := TStringList.Create;
+  FForeignDataArrays := TStringList.Create;
   FDeclTypeUses := TStringList.Create;
   FForwardDeclNames := TStringList.Create;
   FForwardDeclNames.CaseSensitive := False;
@@ -766,6 +768,7 @@ begin
     FExpressionParser.Free;
 
   FForeignDecls.Free;
+  FForeignDataArrays.Free;
   FDeclTypeUses.Free;
   FForwardDeclNames.Free;
   FProcSeen.Free;
@@ -1688,6 +1691,9 @@ begin
  // knows what a CALL is, and it needs the symbol, the library and the signature to build the call.
  if FForeignDecls.Count > 0 then
    Result.Attributes.Values['FOREIGNDECLS'] := StringReplace(FForeignDecls.Text, sLineBreak, ';', [rfReplaceAll]);
+ // ...and the data ARRAYS of C libraries (DIVERGENZE 441), which have no node either.
+ if FForeignDataArrays.Count > 0 then
+   Result.Attributes.Values['FGNDATAARRS'] := StringReplace(FForeignDataArrays.Text, sLineBreak, ';', [rfReplaceAll]);
  // ⭐ ...and so do the TYPE NAMES every DECLARE mentions: the SSA is the only pass that knows which
  // types the program declares, and a bodiless DECLARE leaves no node for it to look at.
  if FDeclTypeUses.Count > 0 then
@@ -13761,6 +13767,10 @@ var
   CapVal: Int64;
   HasParens, HasInit, HasEllipsis, Understood, HadConstQual: Boolean;
   PtrDepth, k: Integer;       // "As T Ptr [Ptr]": how many PTR/POINTER follow the type
+  DArrBounds: string;         // a C library's data ARRAY: "lb:ub,lb:ub", when every bound is a constant (441)
+  DArrOK: Boolean;
+  DaLb, DaUb: Int64;
+  DimC: TASTNode;
 
   procedure AddCLibraryData(const DataType: string);
   // The Extern names a C library's VARIABLE (DIVERGENZE 253): "Dim Shared ByRef v As T", FGNDATA naming
@@ -13778,8 +13788,19 @@ var
     FPendingExternArray.AddChild(Decl);
   end;
 
+  procedure AddCLibraryArray(const DataType: string);
+  // ⭐ DIVERGENZE 441 - the Extern names a C library's data ARRAY: "extern gdbm_version_number(0 to 2) as const
+  // long", "extern GifAsciiTable8x8(0 to 127, 0 to 7) as const ubyte". No node: an array whose storage is C's is
+  // not a variable of the program, and the SSA's pre-passes must not take it for one. The name, the symbol, the
+  // element type and the bounds travel to the SSA beside FOREIGNDECLS, and an element is read at its address.
+  begin
+    if AliasSym <> '' then FForeignDataArrays.Add(Nm + '=' + AliasSym + '|' + DataType + '|' + DArrBounds)
+    else FForeignDataArrays.Add(Nm + '=' + NmOrig + '|' + DataType + '|' + DArrBounds);
+  end;
+
 begin
   SavedIdx := Context.CurrentIndex;
+  DArrOK := False; DArrBounds := '';
   Dims := nil;
   PtrDepth := 0;
   Nm := ''; TypeName := ''; Flags := ''; Understood := False; HadConstQual := False;
@@ -13820,6 +13841,26 @@ begin
       Context.Advance;                                    // ')'
       for Idx := 0 to Dims.ChildCount - 1 do
         if Dims.GetChild(Idx).Attributes.Values['ELLIPSIS'] = '1' then HasEllipsis := True;
+      // The bounds of a C data array (441), only if every one is a constant: C's storage has a fixed shape.
+      DArrOK := Dims.ChildCount > 0;
+      for Idx := 0 to Dims.ChildCount - 1 do
+      begin
+        DimC := Dims.GetChild(Idx);
+        if DimC.NodeType = antDimRange then
+        begin
+          if (DimC.ChildCount < 2) or (DimC.Attributes.Values['ELLIPSIS'] = '1') or
+             not TryConstIntExpr(DimC.GetChild(0), DaLb) or not TryConstIntExpr(DimC.GetChild(1), DaUb) then
+            DArrOK := False;
+        end
+        else
+        begin
+          DaLb := 0;
+          if not TryConstIntExpr(DimC, DaUb) then DArrOK := False;
+        end;
+        if (not DArrOK) or (DaUb < DaLb) then begin DArrOK := False; Break; end;
+        if DArrBounds <> '' then DArrBounds := DArrBounds + ',';
+        DArrBounds := DArrBounds + IntToStr(DaLb) + ':' + IntToStr(DaUb);
+      end;
     end;
     if Context.Check(ttAsType) then
     begin
@@ -13896,6 +13937,15 @@ begin
   // is registered ONCE per name, so objsafe's two spellings of one symbol cannot bind it twice.
   if HadConstQual then
   begin
+    // ⭐ DIVERGENZE 441 - ...and a CONST data ARRAY of C, the version-number form (gdbm, giflib's font table).
+    if Understood and HasParens and DArrOK and (not HasInit) and (TypeName <> '') and
+       ((FExternCDepth > 0) or (AliasSym <> '')) and (Flags = '') and
+       (FForeignDataArrays.IndexOfName(Nm) < 0) and not ModuleDeclaresNameElsewhere(Nm, True) then
+    begin
+      Why := TypeName;
+      for k := 1 to PtrDepth do Why := Why + ' PTR';
+      AddCLibraryArray(Why);
+    end;
     if Understood and (not HasInit) and (not HasParens) and (TypeName <> '') and
        ((FExternCDepth > 0) or (AliasSym <> '')) and
        (Flags = '') and (FExternShapes.IndexOfName(Nm + '#CONSTDATA') < 0) and
@@ -13913,6 +13963,15 @@ begin
   // case is new - every other check and the shape stay exactly as they were for it (skipped).
   if PtrDepth > 0 then
   begin
+    // ⭐ DIVERGENZE 441 - an array of C's POINTERS ("extern tzname(0 to 1) as zstring ptr").
+    if HasParens and DArrOK and (not HasInit) and (TypeName <> '') and ((FExternCDepth > 0) or (AliasSym <> '')) and
+       (Flags = '') and (FForeignDataArrays.IndexOfName(Nm) < 0) and not ModuleDeclaresNameElsewhere(Nm, True) then
+    begin
+      Why := TypeName;
+      for k := 1 to PtrDepth do Why := Why + ' PTR';
+      AddCLibraryArray(Why);
+      Exit;
+    end;
     // ⭐ DIVERGENZE 433 - ...or with an ALIAS, wherever it stands: crt/linux/stdio.bi declares "extern stderr alias
     // "stderr" as FILE ptr" ABOVE its `extern "c"` block, and the stream stayed a zero variable of the program -
     // "fprintf(stderr, ...)" died with an access violation. An alias is the exact linker symbol, as for a Declare.
@@ -13956,7 +14015,14 @@ begin
   // "extern publicarray()" and "dim publicarray()" together and fbc answers "error 4: Duplicated
   // definition" to two definitions. ModuleDeclaresNameElsewhere over-matches on purpose: a false
   // "yes" leaves the behaviour exactly as it was, a false "no" would invent a duplicate.
-  if HasParens and (TypeName <> '') and not ModuleDeclaresNameElsewhere(Nm) then
+  // ⭐ DIVERGENZE 441 - ...BUT INSIDE `EXTERN "C"` (or with an ALIAS) AN ARRAY WITH CONSTANT BOUNDS IS C's DATA. It
+  // became the dynamic array below: storage of the program, all zeros, where fbc reads the library's values.
+  if HasParens and DArrOK and (TypeName <> '') and ((FExternCDepth > 0) or (AliasSym <> '')) and (Flags = '') and
+     not ModuleDeclaresNameElsewhere(Nm, True) then
+  begin
+    if FForeignDataArrays.IndexOfName(Nm) < 0 then AddCLibraryArray(TypeName);
+  end
+  else if HasParens and (TypeName <> '') and not ModuleDeclaresNameElsewhere(Nm) then
   begin
     FPendingExternArray := TASTNode.Create(antDim, BlameTok);
     Decl := TASTNode.Create(antArrayDecl, BlameTok);

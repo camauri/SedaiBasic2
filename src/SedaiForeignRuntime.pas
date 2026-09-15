@@ -898,6 +898,7 @@ var
   SrSize, SrAlign, SrK: Integer;         // the pointer fields of a struct returned by value (432)
   SrFields: TForeignStructFields;
   SrV: Int64;
+  SvTmp: array[0..63] of array of Byte;  // the translated copy of a struct passed BY VALUE with pointer fields (440)
   RPSig: string;                         // ...and a PROCEDURE field's closure signature (423)
   HomeV: Int64;                          // ...the VM pointer a changed field names, when it is ours
   NBase: PtrUInt;                        // the address C was actually given for a narrow copy
@@ -1014,6 +1015,26 @@ begin
             raise EForeignCallError.CreateFmt('%s: argument %d is a struct of %d bytes and the record holds %d',
                                               [B^.Decl.Name, i + 1, B^.ArgRefs[i].Size, Avail]);
           Vals[i] := P;
+          // ⭐ DIVERGENZE 440 - ...AND ITS POINTER FIELDS, the argument-side twin of 432. The image holds the PROGRAM's
+          // values - a VM pointer from StrPtr, a C address with its FGNPTR tag - and C reads machine pointers there:
+          // gdbm's `datum` {dptr, dsize} crashed inside gdbm_store with either. C gets a translated COPY, so the
+          // record is never written (by value, C cannot change the caller's struct) and nothing needs restoring.
+          if (i <= High(B^.Decl.ParamTypeNames)) and Assigned(FResolvePtr) and
+             ForeignStructSpec(B^.Decl.ParamTypeNames[i], SrSize, SrAlign, SrFields) then
+            for SrK := 0 to High(SrFields) do
+              if (SrFields[SrK].Kind = fkPointer) and (SrFields[SrK].Offset >= 0) and
+                 (PtrUInt(SrFields[SrK].Offset) + 8 <= PtrUInt(B^.ArgRefs[i].Size)) then
+              begin
+                if Length(SvTmp[i]) = 0 then
+                begin
+                  SetLength(SvTmp[i], B^.ArgRefs[i].Size);
+                  Move(P^, SvTmp[i][0], B^.ArgRefs[i].Size);
+                  Vals[i] := @SvTmp[i][0];
+                end;
+                SrV := PInt64(@SvTmp[i][SrFields[SrK].Offset])^;
+                if SrV <> 0 then
+                  PInt64(@SvTmp[i][SrFields[SrK].Offset])^ := Int64(PtrUInt(FResolvePtr(ACtx, SrV)));
+              end;
           Inc(SlotI);
         end;
       fkPointer:

@@ -3638,6 +3638,22 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
 - ⚠️ **A field inside a union, read through a pointer a C library passes to a callback, stops the program** with
   "Invalid record-field pointer" (for example `ev->u.media_meta_changed.meta_type` in a libvlc event callback). Fields
   outside the union read right.
+- **A struct passed to C by value reaches it with its pointer fields as addresses C can follow.** gdbm's `datum`
+  (`dptr As ZString Ptr`, `dsize As Long`) goes by value to every gdbm call; `gdbm_store(db, key, value, flag)` used
+  to end with an access violation. C receives a copy, so the program's record is never changed. ⚠️ A field of a
+  procedure type inside a struct passed by value is not yet made callable from C.
+- **An `Extern` array inside `Extern "C"` is the library's data.** `gdbm_version_number(1)` and
+  `GifAsciiTable8x8(65, 3)` read the library's own values, row-major for more than one dimension, at the element's
+  width; an unsigned element prints without the sign column. The `Const` form used to be refused ("Array not
+  declared"), and without `Const` the array was the program's own, full of zeros. ⚠️ Only bounds that are constants;
+  an array of records, and `LBound`/`UBound` on such a name, are not covered yet.
+- **A pointer that C writes into a variable passed in a variadic call can be followed.**
+  `curl_easy_getinfo(h, CURLINFO_EFFECTIVE_URL, @url)` fills `url` with a string libcurl owns, and `*url` reads it;
+  it used to stop with "Null or invalid pointer dereference". ⚠️ Only the address of a variable written in the call
+  (`@url`); the address of a pointer field or array element in the variadic part is not yet brought back.
+- ⚠️ **The address of an element of a record array that C owns, taken with `@`, is wrong.**
+  `@img->SavedImages[1]` answers a different address, and `@p[1]` answers the right number that `->` cannot follow.
+  Write `p + 1` (or read `p[1].field` directly), which works as in FreeBASIC.
 - ⚠️ **A block from `calloc` in `crt.bi`, read before anything is written to it, stops the program** with "Raw pointer
   dereference out of bounds". Writing a field first and then reading it works.
 - ⚠️ **An address the program gives to C and C hands back LATER is not the same pointer again.** After
