@@ -206,6 +206,11 @@ const
     header, which every reader of the header masks off. }
   RAW_PTRCELL_REQ = Int64(1) shl 62;
   RAW_HDR_PTRFLAG = QWord(1) shl 63;
+  // ⭐ The Immediate of a bcRawAlloc that is a PROGRAM allocation - Allocate, CAllocate, crt's malloc/calloc, New -
+  // as opposed to a slot the compiler reserves for itself (an address-taken local, a fixed ZString buffer, a temp
+  // cell). In the fb memory mode only the first kind comes from libc (pointer model, phase 1); the second stays in
+  // the VM's raw heap, where the rest of the compiler expects it (RAW_PTRCELL_REQ rides on ITS size).
+  RAWALLOC_PROGRAM = 1;
 
   { ⭐ A POINTER THAT CAME FROM OUTSIDE (DIVERGENZE 183). Everything above is a VM-internal offset - no
     machine address is ever handed to a BASIC program - but a C function RETURNS one, and the program

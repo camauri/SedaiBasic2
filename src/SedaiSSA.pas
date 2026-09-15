@@ -4153,7 +4153,9 @@ begin
         // ⭐ ...and a POINTER cast to an integer becomes its NUMBER, without the foreign-address tag
         // (DIVERGENZE 235). Only when the source IS a pointer: a plain integer in [2^61, 2^62) keeps
         // every bit it has.
-        if ExprIsPointerTyped(Node.GetChild(0)) then
+        // ...and "@expr" IS a pointer, whatever the expression's name says: "Cast(Integer, @acc[4]) - Cast(Integer, acc)"
+        // stripped the mark from one side only once acc came from libc (fb memory mode), and answered 2^61 + 4.
+        if ExprIsPointerTyped(Node.GetChild(0)) or (Node.GetChild(0).NodeType = antProcAddress) then
           Result := ApplyNarrowCode(TypeNameWidthCode(ArrName2), EmitStripForeignTag(Left))
         else
         Result := ApplyNarrowCode(TypeNameWidthCode(ArrName2), EnsureIntRegister(Left));
@@ -12693,7 +12695,7 @@ begin
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone))
         // ⭐ Kind 3 is a narrow unsigned or a POINTER; a pointer prints its NUMBER, without the
         // foreign-address tag (DIVERGENZE 235). Harmless on a narrow unsigned, which never reaches bit 61.
-        else if (PKidx = 3) and ExprIsPointerTyped(Child) then
+        else if (PKidx = 3) and (ExprIsPointerTyped(Child) or (Child.NodeType = antProcAddress)) then
           EmitInstruction(ssaPrintUInt, MakeSSAValue(svkNone), EmitStripForeignTag(ExprValue),
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone))
         else
@@ -44815,7 +44817,8 @@ begin
       EmitInstruction(ssaMulInt, ProdV, CountV, SizeV, MakeSSAValue(svkNone));
       CountV := ProdV;
     end;
-    EmitInstruction(ssaRawAlloc, Result, CountV, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    // RAWALLOC_PROGRAM: a block the PROGRAM asked for - from libc in the fb memory mode (pointer model, phase 1).
+    EmitInstruction(ssaRawAlloc, Result, CountV, MakeSSAValue(svkNone), MakeSSAConstInt(RAWALLOC_PROGRAM));
   end;
 end;
 
@@ -47612,7 +47615,7 @@ begin
     BytesVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaMulInt, BytesVal, EnsureIntRegister(CountVal), ElemVal, MakeSSAValue(svkNone));
     Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaRawAlloc, Result, BytesVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    EmitInstruction(ssaRawAlloc, Result, BytesVal, MakeSSAValue(svkNone), MakeSSAConstInt(RAWALLOC_PROGRAM));   // New: the program's block
     Exit;
   end;
   // "New <builtin>": one instance of a scalar type on the heap, the value being a pointer to it -
@@ -47625,7 +47628,7 @@ begin
     EmitInstruction(ssaLoadConstInt, BytesVal, MakeSSAConstInt(TypeSizeBytes(NewType)),
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaRawAlloc, Result, BytesVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    EmitInstruction(ssaRawAlloc, Result, BytesVal, MakeSSAValue(svkNone), MakeSSAConstInt(RAWALLOC_PROGRAM));   // New: the program's block
     Exit;
   end;
   if UDTIdx < 0 then

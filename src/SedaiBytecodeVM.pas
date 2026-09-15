@@ -285,6 +285,10 @@ type
     FRawFreeCount: Integer;
     FRawHeapLock: TRTLCriticalSection;
     FProgram: TBytecodeProgram;
+    // ⭐ The MEMORY MODE of the loaded program (SedaiMemoryMode): True = fb. Phase 1 of the pointer model: in fb
+    // Allocate & co. answer LIBC blocks - the machine address with FGNPTR_TAG, the mark every C-address arm
+    // already reads - so C can free what the program allocated and the other way round, as under fbc.
+    FNativeMemory: Boolean;
     // Decode-once dense dispatch (VM perf plan, milestone M2): the 16-bit (group.sub) opcode of each
     // instruction, translated ONCE to its dense linear index (Op16ToDense). The hot loop dispatches on
     // this instead of extracting the group every instruction. Rebuilt when the loaded program changes;
@@ -877,6 +881,9 @@ type
     procedure BuildArrayDescriptor(Slot, LogicalId: Integer);
     // FreeBASIC raw byte heap (Allocate family). All return/take RAWPTR_TAG-tagged byte offsets.
     function RawAlloc(ByteCount: PtrUInt): Int64;
+    function NativeAlloc(ByteCount: PtrUInt): Int64;              // fb mode: calloc, C's mark, region noted
+    procedure NativeFree(P: Int64);                               // fb mode: free (a VM raw block goes to RawFree)
+    function NativeRealloc(P: Int64; ByteCount: PtrUInt): Int64;  // fb mode: realloc
     function StrSAdd(const S: string): Int64;   // SADD(s) -> raw pointer to a NUL-terminated byte copy
     function FormatNumber(Value: Double; const Mask: string): string;  // FORMAT(num, mask) -> formatted string (numeric masks)
     function FormatDateMask(Value: Double; const Mask: string): string;  // FORMAT(serial, mask) -> date/time formatted string
@@ -5824,6 +5831,86 @@ begin
   end;
 end;
 
+// libc's allocator, which is FreeBASIC's (its Allocate is malloc): a block the program allocates, C can free,
+// and the other way round.
+{$IFDEF WINDOWS}
+function libc_calloc(n, size: PtrUInt): Pointer; cdecl; external 'msvcrt' name 'calloc';
+function libc_realloc(p: Pointer; size: PtrUInt): Pointer; cdecl; external 'msvcrt' name 'realloc';
+procedure libc_free(p: Pointer); cdecl; external 'msvcrt' name 'free';
+{$ELSE}
+function libc_calloc(n, size: PtrUInt): Pointer; cdecl; external 'c' name 'calloc';
+function libc_realloc(p: Pointer; size: PtrUInt): Pointer; cdecl; external 'c' name 'realloc';
+procedure libc_free(p: Pointer); cdecl; external 'c' name 'free';
+{$ENDIF}
+
+function TBytecodeVM.NativeAlloc(ByteCount: PtrUInt): Int64;
+// Allocate / CAllocate / New <builtin> / crt's malloc and calloc in the fb memory mode (phase 1 of the pointer
+// model). ⭐ The answer is the machine address with FGNPTR_TAG: the mark a pointer C returned has always carried,
+// so every arm that reads, writes, indexes, prints or passes such a pointer takes it unchanged, Print and
+// Cast(Integer, p) strip the mark and show the real address, and C receives the address itself.
+// ⚠️ calloc for every block: Allocate does not zero in FreeBASIC, but the raw heap always did, and a program
+// reading a block before writing it would otherwise change its output between the two modes.
+// The region is noted with its size, so --bounds-check can still bound it (ForeignRegionAddr).
+var
+  Mem: Pointer;
+begin
+  Mem := libc_calloc(1, ByteCount);
+  if Mem = nil then Exit(0);
+  ForeignNoteRegion(nil, PtrUInt(Mem), ByteCount, True, False);
+  Result := Int64(PtrUInt(Mem)) or FGNPTR_TAG;
+end;
+
+procedure TBytecodeVM.NativeFree(P: Int64);
+// Deallocate / Delete / crt's free in the fb memory mode. A block from libc - the program's own, or one C
+// allocated and handed over - goes back to libc, as under fbc; a block of the VM's raw heap (a SADD copy, an
+// address-taken slot) goes back where it came from.
+begin
+  if P = 0 then Exit;
+  if (P and RAWPTR_TAG) <> 0 then
+  begin
+    RawFree(P);
+    Exit;
+  end;
+  if (P > 0) and ((P and FGNPTR_TAG) <> 0) then
+  begin
+    ForeignNoteRegion(nil, PtrUInt(P and not FGNPTR_TAG), 0, False, False);
+    libc_free(Pointer(PtrUInt(P and not FGNPTR_TAG)));
+  end;
+end;
+
+function TBytecodeVM.NativeRealloc(P: Int64; ByteCount: PtrUInt): Int64;
+// Reallocate / crt's realloc in the fb memory mode.
+var
+  Mem: Pointer;
+  Old: PtrUInt;
+  Src: Pointer;
+  Avail: PtrUInt;
+begin
+  if P = 0 then Exit(NativeAlloc(ByteCount));
+  if (P and RAWPTR_TAG) <> 0 then
+  begin
+    // A raw-heap block asked to grow in the fb mode: move it into libc memory, as much as both hold.
+    Result := NativeAlloc(ByteCount);
+    if Result = 0 then Exit;
+    Src := RawAddr(P, 0);
+    Old := PtrUInt((PByte(Src) - 8)^) and not PtrUInt(RAW_HDR_PTRFLAG);
+    if Old > ByteCount then Old := ByteCount;
+    Move(Src^, Pointer(PtrUInt(Result and not FGNPTR_TAG))^, Old);
+    RawFree(P);
+    Exit;
+  end;
+  if not ((P > 0) and ((P and FGNPTR_TAG) <> 0)) then
+    raise ERangeError.Create('Reallocate: the pointer does not name a block of memory');
+  Old := PtrUInt(P and not FGNPTR_TAG);
+  Mem := libc_realloc(Pointer(Old), ByteCount);
+  if (Mem = nil) and (ByteCount > 0) then Exit(0);                   // the old block stays, as realloc leaves it
+  ForeignNoteRegion(nil, Old, 0, False, False);
+  if Mem = nil then Exit(0);
+  ForeignNoteRegion(nil, PtrUInt(Mem), ByteCount, True, False);
+  Avail := 0;
+  Result := Int64(PtrUInt(Mem)) or FGNPTR_TAG;
+end;
+
 function TBytecodeVM.RawRealloc(RawPtr: Int64; ByteCount: PtrUInt): Int64;
 var
   oldOfs, oldSz, newOfs, copySz: PtrUInt;
@@ -6067,7 +6154,14 @@ begin
   // region C handed back. ⛔ Asked BEFORE the raw test: the tag is bit 61, which under RAWPTR_TAG means
   // the framebuffer - so the two are told apart by bit 62, never by bit 61 alone.
   if (RawPtr > 0) and ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) then
+  begin
+    // ⭐ In the fb memory mode a machine address is used as it is, as fbc uses it: no region lookup - a lock and a
+    // binary search on EVERY load and store of an Allocate'd block - and no bounds check unless --bounds-check
+    // asked for one (decision D3 of the pointer model).
+    if FNativeMemory and not FBoundsCheck then
+      Exit(Pointer(PtrUInt(RawPtr and not FGNPTR_TAG)));
     Exit(ForeignRegionAddr(PtrUInt(RawPtr and not FGNPTR_TAG), NeedBytes, FgnAvail));
+  end;
   if (RawPtr and RAWPTR_TAG) = 0 then
     raise ERangeError.Create('Null or invalid raw pointer dereference');
   ofs := PtrUInt(RawPtr and RAWPTR_OFS_MASK);
@@ -6566,7 +6660,15 @@ begin
   P := PByte(RawAddr(RawPtr, 1));                      // validates region + at least one byte
   ofs := PtrUInt(RawPtr and RAWPTR_OFS_MASK);
   if ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) then
-    ForeignRegionAddr(PtrUInt(RawPtr and not FGNPTR_TAG), 1, Limit)   // C's memory: its region's extent
+  begin
+    // ⭐ In the fb memory mode a C string is read to its terminator, as fbc reads it: no region lookup, no bound
+    // unless --bounds-check (decision D3). A block from Allocate is noted with its EXACT size, and the raw heap
+    // used to leave slack after it - a string written one cell past the block still read whole there.
+    if FNativeMemory and not FBoundsCheck then
+      Limit := High(PtrUInt) shr 1
+    else
+      ForeignRegionAddr(PtrUInt(RawPtr and not FGNPTR_TAG), 1, Limit);  // C's memory: its region's extent
+  end
   else if (RawPtr and RAWPTR_REGION_FB) <> 0 then
     Limit := 0                                          // a framebuffer is not text: empty string
   else
@@ -6744,6 +6846,24 @@ begin
       if ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) and
          ((Value shr 61) and 7 = 1) then
         PInt64(RawAddr(RawPtr, 8, True))^ := Value and not FGNPTR_TAG
+      // ⭐ ...and in the fb memory mode a PACKED ARRAY POINTER written into C's memory becomes the address of its element
+      // (pointer model, phase 1). Its bits - (array+1) shl 32 + index - lie inside the machine-address range, so read
+      // back it was taken for one of C's addresses: "b(2) = Allocate(...) : b(2)[1] = @t : Print *b(2)[1]" died with an
+      // access violation (guard m799) once b(2) came from libc. The address comes home as the same packed pointer
+      // (VMPointerForMachineAddr), and it is what C would have to read anyway.
+      // ⚠️ Only a packed pointer: a raw-heap pointer (bit 62) already comes back as it was (DIVERGENZE 451), and resolving
+      // one as raw memory is the trap of DIVERGENZE 379 - a CAllocate'd UDT block is a shared RECORD on that same bit.
+      // ⚠️ Not while worker-private arrays exist: there the id is per context, and this store has none.
+      else if ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) and FNativeMemory and
+              (Value >= (Int64(1) shl POINTER_ARRAY_SHIFT)) and ((Value and (RAWPTR_TAG or FGNPTR_TAG)) = 0) and
+              (FPrivArrCount = 0) then
+      begin
+        try
+          PInt64(RawAddr(RawPtr, 8, True))^ := Int64(PtrUInt(BlockAddr(nil, Value, 1)));
+        except
+          on ERangeError do PInt64(RawAddr(RawPtr, 8, True))^ := Value;   // not an array pointer after all: as it was
+        end;
+      end
       else
         PInt64(RawAddr(RawPtr, 8, True))^ := Value;
   else
@@ -8390,6 +8510,7 @@ var
 
 begin
   FProgram := Program_;
+  FNativeMemory := Assigned(Program_) and Program_.NativeMemory;   // decided when it was compiled
 
   // Does anything in this program read the terminal's modelled screen back? Only SCREEN(row, col) and
   // a PEEK/POKE of the C128 screen RAM can, and both are visible right here in the bytecode. When
@@ -16882,9 +17003,16 @@ begin
             (Int64(Instr.Immediate) and RECPTR_SLOT_MASK);
         end;
       // FreeBASIC raw byte heap (Allocate family).
-      20: Ctx.IntRegs[Instr.Dest] := RawAlloc(Ctx.IntRegs[Instr.Src1]);                              // bcRawAlloc
-      21: RawFree(Ctx.IntRegs[Instr.Src1]);                                                          // bcRawFree
-      22: Ctx.IntRegs[Instr.Dest] := RawRealloc(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]);   // bcRawRealloc
+      // ⭐ ...from LIBC in the fb memory mode (phase 1 of the pointer model): see NativeAlloc.
+      // ⛔ ...only a PROGRAM allocation (RAWALLOC_PROGRAM in the Immediate): the compiler's own slots - an address-taken
+      // local, a fixed ZString buffer - share this opcode and stay in the raw heap. Sending them to libc gave calloc
+      // a size carrying RAW_PTRCELL_REQ (bit 62), NULL came back, and every "@v" in a procedure read address 0.
+      20: if FNativeMemory and ((Instr.Immediate and RAWALLOC_PROGRAM) <> 0) then Ctx.IntRegs[Instr.Dest] := NativeAlloc(Ctx.IntRegs[Instr.Src1])
+          else Ctx.IntRegs[Instr.Dest] := RawAlloc(Ctx.IntRegs[Instr.Src1]);                         // bcRawAlloc
+      21: if FNativeMemory then NativeFree(Ctx.IntRegs[Instr.Src1])
+          else RawFree(Ctx.IntRegs[Instr.Src1]);                                                     // bcRawFree
+      22: if FNativeMemory then Ctx.IntRegs[Instr.Dest] := NativeRealloc(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2])
+          else Ctx.IntRegs[Instr.Dest] := RawRealloc(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2]); // bcRawRealloc
       // ⛔ A NEGATIVE ADDRESS IS NOT RAW MEMORY: it is a RECORD-FIELD pointer (RECPTR_TAG, bit 63), what
       // "@obj.field" yields for a managed record. bcRefLoadInt has told the three domains apart for a
       // while - its own comment says "the tag is IN the value, so the question is answered here, where

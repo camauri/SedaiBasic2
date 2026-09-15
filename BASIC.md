@@ -3574,8 +3574,10 @@ A program is compiled for one of two **memory modes**, and the mode decides what
 | `fb` (the default) | the machine address, as in FreeBASIC — what a C library expects when it keeps, returns or follows a pointer the program gave it | programs written for FreeBASIC, and every program that calls C |
 | `strict` | a name the VM checks and translates; a program cannot reach memory it does not own | programs that must stay isolated from the machine |
 
-⚠️ **Today the two modes behave the same.** The switch exists, it is carried and checked, and the `fb` mode is being
-built in steps: until they land, a program runs as it always did in either mode, and the limits listed under
+⚠️ **The `fb` mode is being built in steps.** Already in place: `Allocate`, `CAllocate`, `Reallocate`, `Deallocate`,
+`New` and crt's `malloc`/`calloc`/`realloc`/`free` answer memory from the C library, as in FreeBASIC — the pointer is the
+machine address, C can free a block the program allocated and the program can `Deallocate` a block C allocated.
+Records, arrays and variables whose address is taken still live where they always did, so the limits listed under
 "Calling C libraries" below still apply (a record whose address C keeps across calls, an address C hands back later).
 
 How the mode is chosen, most specific first:
