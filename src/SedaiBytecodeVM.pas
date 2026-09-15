@@ -13623,7 +13623,10 @@ end;
 
 function AotStrInstr(hayVal, needleVal: Pointer; start: PtrInt): PtrInt; cdecl;
 begin
-  if start < 1 then start := 1;
+  // ⛔ A START BELOW 1 ANSWERS 0 - the interpreter's bcStrInstr arm, and fbc's answer (DIVERGENZE 468). This primitive
+  // still CLAMPED it to 1, so "Instr(0, h, 'bc')" was 2 under --aot and 0 everywhere else: one rule written in one of
+  // its two places. aot_validate named it once the net stopped being blind.
+  if start < 1 then Exit(0);
   Result := Pos(AnsiString(needleVal), Copy(AnsiString(hayVal), start, MaxInt));
   if Result > 0 then Inc(Result, start - 1);
 end;

@@ -325,6 +325,11 @@ EventPollCounter := 0;
       // step. A compiled loop is entered from every worker, so this arm has the same exposure the
       // AOT arm below documents.
       ArrDescPtr := AcquireArrDescFast(JitArrDescCache, Ctx);
+      // ⛔ DIVERGENZE 469: the compiled PSET's surface is re-armed from the CURRENT graphics state at every entry. The
+      // cache is cleared by AotExecOne when the helper runs a statement, but a VIEW, WINDOW or SCREEN run HERE, by the
+      // interpreter, between two entries left it armed - so a loop entered after "View (40, 30)-(279, 169)" drew
+      // without the view's offset. One refresh per loop entry (the first PSET takes the cold path), not per pixel.
+      Ctx.GfxDesc[0] := 0;
       // AotSettle, not a bare assignment: since J14 a compiled loop can route one instruction through
       // the interpreter, and that helper reports a raised exception or a cleared Running as a NEGATIVE
       // sentinel in the same channel as the exit PC. Resolving it here is what makes ON ERROR / TRAP /
