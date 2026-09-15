@@ -11164,7 +11164,11 @@ begin
   if Context.Check(ttAsType) then
   begin
     Context.Advance;                                // AS
-    SkipTypeQualifiers;                     // FB: "As Const <type>"
+    // ⛔ THE REPORTING HELPER, AND THE MARK (DIVERGENZE 471): an ARRAY declared "As Const T" was the one
+    // declaration shape that dropped the qualifier - this site used the silent SkipTypeQualifiers - so the call
+    // site could not tell a const array argument from a plain one, and fbc OVERLOADS on that: "f( ca() )" against
+    // f( a() As Integer ) / f( a() As Const Integer ) is fbc's second, and was our first.
+    if SkipTypeQualifiersConst then Result.Attributes.Values['CONSTV'] := '1';
     // ⭐ "Dim arr(0 To 1) As Function(...) As T": an array whose ELEMENTS are procedure pointers. Every
     // other declaration shape has routed a FUNCTION/SUB type through TryParseProcPtrType for a long
     // time; the ARRAY one never did, so AtDottedTypeName met the FUNCTION keyword, refused it, and the
@@ -14548,6 +14552,9 @@ begin
     begin
       ArrayDecl := ParseArrayDeclaration;
       if not Assigned(ArrayDecl) then Break;
+      // ...and the leading-AS spelling knows the qualifier here, where the type was read (DIVERGENZE 471):
+      // "Dim As Const Integer ca(1 To 2)" marks the node ParseArrayDeclaration just built.
+      if NameIsConst then ArrayDecl.Attributes.Values['CONSTV'] := '1';
       // Inject the shared type unless the array already carries an explicit element-type child. The type
       // child (when present) is the antIdentifier at index 2; an ARRAYINIT initializer is an antArgumentList
       // that also lands at/after index 2, so a bare ChildCount check would wrongly skip type injection for

@@ -869,6 +869,7 @@ type
     function ArgConstSigFromArgs(ArgsNode: TASTNode): string;   // positional 'C'/'-' of const arguments
     function ProcRetFuncPtrSig(const NameU: string): string;   // a procedure whose RETURN is callable, either spelling
     function ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;  // pick an overload
+    function ResolveCallLabelRaw(const BaseLabel: string; ArgsNode: TASTNode): string;  // ...before the const-array rule
     function FindCtorWithDefaults(const TypeName: string; ArgCount: Integer): string;  // M4.4h: defaulted ctor
     procedure PreCollectFuncRetTypes(Node: TASTNode);  // FUNCTION name -> return type, before RegisterRecordVars
     function PreProcPtrSigOf(Node: TASTNode): string;   // "ProcPtr(f[,sig])"/"@f" -> f's "FPPARAMS|FPRET", '' if none
@@ -36359,6 +36360,82 @@ begin
 end;
 
 function TSSAGenerator.ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;
+// ⭐ DIVERGENZE 471 (residue): A CONST ARRAY ARGUMENT DOES NOT BIND A NON-CONST ARRAY PARAMETER. In fbc that is a
+// constraint, not a preference: fbc suite overload/const, "f4( ca(), i )" against f4( a() As Integer, x As Integer )
+// and f4( a() As Const Integer, x As Double ) answers the second, although the first converts nothing. Every pass of
+// the resolver below compares spellings and costs, and none of them knew the rule, so it is applied ONCE, here, on
+// the answer: a choice that breaks it is replaced by the cheapest candidate of the same arity that does not (the
+// first, when the ranking cannot order them). A call with no const array argument pays one scan of its arguments.
+// ⚠️ When no candidate respects the rule the resolver's answer stands: fbc refuses such a call, and refusing it here
+// would be a new rejection with its own ledger entry.
+var
+  i, k: Integer;
+  DeclN, ParamsN: TASTNode;
+  Nm, Best: string;
+  AnyConstArr: Boolean;
+  Cost, BestCost: Int64;
+
+  function ConstArrayArg(Idx: Integer): Boolean;
+  var N: TASTNode;
+  begin
+    Result := False;
+    N := ArgsNode.GetChild(Idx);
+    while Assigned(N) and (N.NodeType = antParentheses) and (N.ChildCount >= 1) do N := N.GetChild(0);
+    if N = nil then Exit;
+    // "ca()" - an array passed whole - can arrive as an index with no subscript OR as a CALL with no argument: the
+    // parser cannot tell the two apart before the name is resolved, so both spellings are asked.
+    if (N.NodeType = antArrayAccess) and (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antIdentifier) then
+      N := N.GetChild(0)
+    else if not (N.NodeType in [antIdentifier, antFunctionCall]) then Exit;
+    Result := (FConstVars.IndexOf(N.ValueUpper) >= 0) and (ArrayIndexOf(N.ValueUpper) >= 0);
+    if GetEnvironmentVariable('OVL_DIAG') = '1' then
+      WriteLn(ErrOutput, 'OVL: const-array arg ', Idx, ' node=', Ord(ArgsNode.GetChild(Idx).NodeType),
+              ' name=', N.ValueUpper, ' const=', FConstVars.IndexOf(N.ValueUpper) >= 0,
+              ' array=', ArrayIndexOf(N.ValueUpper) >= 0);
+  end;
+
+  function Violates(const Lbl: string): Boolean;
+  var j: Integer;
+      D, P: TASTNode;
+  begin
+    Result := False;
+    if not (FProcDecls.TryGetValue(Lbl, D) and Assigned(D) and (D.ChildCount >= 2)) then Exit;
+    P := D.GetChild(1);
+    if (P = nil) or (P.NodeType <> antParameterList) then Exit;
+    for j := 0 to ArgsNode.ChildCount - 1 do
+      if (j < P.ChildCount) and ConstArrayArg(j) and (P.GetChild(j).Attributes.Values['ARRAY'] = '1') and
+         (P.GetChild(j).Attributes.Values['CONSTP'] <> '1') then
+        Exit(True);
+  end;
+
+begin
+  Result := ResolveCallLabelRaw(BaseLabel, ArgsNode);
+  if (Result = '') or (ArgsNode = nil) or (ArgsNode.ChildCount = 0) then Exit;
+  AnyConstArr := False;
+  for i := 0 to ArgsNode.ChildCount - 1 do
+    if ConstArrayArg(i) then begin AnyConstArr := True; Break; end;
+  if (not AnyConstArr) or (not Violates(Result)) then Exit;
+  Best := ''; BestCost := -1;
+  for k := 0 to FProcedureNames.Count - 1 do
+  begin
+    Nm := FProcedureNames[k];
+    if Copy(Nm, 1, Length(BaseLabel) + 1) <> BaseLabel + '~' then Continue;
+    if not (FProcDecls.TryGetValue(Nm, DeclN) and Assigned(DeclN) and (DeclN.ChildCount >= 2)) then Continue;
+    ParamsN := DeclN.GetChild(1);
+    if (ParamsN = nil) or (ParamsN.NodeType <> antParameterList) or (ParamsN.ChildCount <> ArgsNode.ChildCount) then
+      Continue;
+    if Violates(Nm) then Continue;
+    if LabelRankCost(Nm, ArgsNode, Cost) then
+    begin
+      if (BestCost < 0) or (Cost < BestCost) then begin BestCost := Cost; Best := Nm; end;
+    end
+    else if (Best = '') and (BestCost < 0) then
+      Best := Nm;
+  end;
+  if Best <> '' then Result := Best;
+end;
+
+function TSSAGenerator.ResolveCallLabelRaw(const BaseLabel: string; ArgsNode: TASTNode): string;
 // Resolve a call to an OVERLOADED procedure. A name declared once keeps its bare label, so the first
 // test settles every non-overloaded program and this costs nothing. An overload set has no bare label
 // at all (the parser gave every member a "~<sig>" suffix), so:
@@ -37549,7 +37626,7 @@ begin
   // and the call site has to reproduce the callee's signature from its ARGUMENTS.
   if Node.NodeType in [antDim, antRedim] then
     for k := 0 to Node.ChildCount - 1 do
-      if (Node.GetChild(k).NodeType = antArrayDecl) and 
+      if (Node.GetChild(k).NodeType = antArrayDecl) and
          (Node.GetChild(k).Attributes.Values['CONSTV'] = '1') and
          (Node.GetChild(k).ChildCount >= 1) and
          (Node.GetChild(k).GetChild(0).NodeType = antIdentifier) and
