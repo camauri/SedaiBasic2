@@ -13720,6 +13720,16 @@ begin
         begin
           EnsureSharedBackingSized(UpperFast(ArrName));
           PublishScalarToHome(UpperFast(ArrName), RecHandleVal);
+        end
+        // ⭐ DIVERGENZE 447 (the limit, closed) - ...and a NARROW or FLOAT C scalar too, stored as it is into element 0
+        // of its integer home (EmitSharedScalarStoreVal coerces to the array's bank and nothing else). What truncated
+        // the address was PublishScalarToHome's RAWMODULE arm, which writes at the POINTEE's width: a scalar whose
+        // address the program takes ("@__ttytype", guards m956 · m961) keeps its slot address in that element, so it
+        // is left alone.
+        else if IsSharedScalar(UpperFast(ArrName)) and not IsRawModuleScalar(UpperFast(ArrName)) then
+        begin
+          EnsureSharedBackingSized(UpperFast(ArrName));
+          EmitSharedScalarStoreVal(UpperFast(ArrName), RecHandleVal);
         end;
       end;
       Continue;
@@ -27069,11 +27079,32 @@ function TSSAGenerator.RawUDTArithType(Node: TASTNode): string;
 // one - and of what record type? '' otherwise, and '' for "p - q", which is a COUNT and not a pointer.
 // DIVERGENZE 381: the scalar raw pointers had this question (RawPtrExprName); the record pointers, filed
 // in their own registry, did not.
+var
+  FldT, ObjT: string;
+  ObjU: Integer;
+  ObjOfs: TInt64Array;
+  ObjSz: Int64;
+  ObjB, ObjI, ObjC: TASTNode;
 begin
   Result := '';
   if Node = nil then Exit;
   while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
   if Node.NodeType = antIdentifier then Exit(RawUDTPtrType(Node.ValueUpper));
+  // ⭐ DIVERGENZE 442 - ...and a FIELD of raw memory declared "<record> Ptr": "g->SavedImages + 1" on giflib's array of
+  // SavedImage. Only a NAME was asked, so the sum stepped eight bytes, "= b" was false and "->ImageDesc.Width" read 0,
+  // while the same step through a local ("s0 + 1") was right. The object must resolve over raw memory: a record
+  // pointer field of the program's own record keeps its road.
+  if (Node.NodeType = antMemberAccess) and (Node.ChildCount >= 1) and
+     ResolveRawUDTBase(Node.GetChild(0), ObjT, ObjU, ObjOfs, ObjSz, ObjB, ObjI, ObjC) then
+  begin
+    FldT := UpperFast(DeclaredTypeNameOf(Node));
+    if (Length(FldT) > 4) and (Copy(FldT, Length(FldT) - 3, 4) = ' PTR') then
+    begin
+      FldT := UpperFast(CanonicalType(Trim(Copy(FldT, 1, Length(FldT) - 4))));
+      if FindUDT(FldT) >= 0 then Exit(FldT);
+    end;
+    Exit;
+  end;
   // "@p[k]": the address of an element, as raw as p and of the same type (EmitArrayElementAddress scales it).
   if (Node.NodeType = antProcAddress) and (Node.ChildCount >= 1) and (Node.GetChild(0) <> nil) and
      (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
@@ -45517,6 +45548,15 @@ var
          ((Rhs.NodeType = antArrayAccess) and (Rhs.Attributes.Values['BRACKET'] = '1') and
           (Rhs.ChildCount >= 1) and (Rhs.GetChild(0) <> nil) and
           (UpperFast(RawObjectPtrFieldMulti(Rhs.GetChild(0))) = UpperFast(PointerUDTType(TargetU)) + ' PTR')) or
+         // ⭐ DIVERGENZE 442 - "q = @s0[k]" and "q = @g->SavedImages[k]": the ADDRESS of an element of a record array
+         // that lives in raw memory is an address into those bytes. The number was right, but q was left a record
+         // handle of the program, and "q->ImageDesc.Width" died on "Invalid record handle" (giflib deck).
+         ((Rhs.NodeType = antProcAddress) and (Rhs.ChildCount >= 1) and (Rhs.GetChild(0) <> nil) and
+          (Rhs.GetChild(0).NodeType = antArrayAccess) and (Rhs.GetChild(0).Attributes.Values['BRACKET'] = '1') and
+          (Rhs.GetChild(0).ChildCount >= 1) and (Rhs.GetChild(0).GetChild(0) <> nil) and
+          (((Rhs.GetChild(0).GetChild(0).NodeType = antIdentifier) and
+            SameText(RawUDTPtrType(Rhs.GetChild(0).GetChild(0).ValueUpper), PointerUDTType(TargetU))) or
+           IsRawPtrFieldExpr(Rhs.GetChild(0).GetChild(0)))) or
          ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] <> '1') and
           TypeDeclaresAllocOperator(PointerUDTType(TargetU), 'OPERATORNEW') and
           (not TypeHasMemberProc(PointerUDTType(TargetU)))) or
@@ -46839,6 +46879,11 @@ var
   ElemSz: Int64;
   RawUDTOfs381: TInt64Array;   // DIVERGENZE 381: the C layout of a raw UDT pointer's record
   RawUDTSize381: Int64;
+  RawObjT442: string;          // DIVERGENZE 442: the object of "@o->f[k]", resolved over raw memory
+  RawObjU442: Integer;
+  RawObjOfs442: TInt64Array;
+  RawObjSz442: Int64;
+  RawB442, RawI442, RawC442: TASTNode;
 begin
   // ⭐ "@UDT.a(i)" / "@x.a(i)" where a is a STATIC ARRAY member: the element belongs to the backing
   // global array, so the whole ladder below works once the reference names it. Every rung here is
@@ -47121,6 +47166,15 @@ begin
       else if RawPtrExprName(Node.GetChild(0)) <> '' then
         // "p ± n" over a raw pointer VARIABLE: the same name-based question the p[i] path asks.
         ElemSz := RawElemSizeOf(RawPtrExprName(Node.GetChild(0)))
+      // ⭐ DIVERGENZE 442 - ...and a RECORD pointee over RAW memory steps by the record's C size. "@g->SavedImages[1]"
+      // (giflib's array of SavedImage, 56 bytes, which C allocated) took the scalar ladder, which answers 8 for a
+      // name it does not know: the address landed eight BYTES in, where fbc answers the second element. Only over
+      // raw memory: a record pointer of the program counts elements, and keeps the step it had.
+      else if (Length(BaseTypeName) > 4) and (Copy(BaseTypeName, Length(BaseTypeName) - 3, 4) = ' PTR') and
+              (Node.GetChild(0).NodeType = antMemberAccess) and (Node.GetChild(0).ChildCount >= 1) and
+              ResolveRawUDTBase(Node.GetChild(0).GetChild(0), RawObjT442, RawObjU442, RawObjOfs442, RawObjSz442,
+                                RawB442, RawI442, RawC442) then
+        ElemSz := RawChainElemBytes(Trim(Copy(BaseTypeName, 1, Length(BaseTypeName) - 4)))
       else if (Length(BaseTypeName) > 4) and (Copy(BaseTypeName, Length(BaseTypeName) - 3, 4) = ' PTR') then
         ElemSz := RawElemSizeOfPointee(Trim(Copy(BaseTypeName, 1, Length(BaseTypeName) - 4)))
       else

@@ -3651,9 +3651,10 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   `curl_easy_getinfo(h, CURLINFO_EFFECTIVE_URL, @url)` fills `url` with a string libcurl owns, and `*url` reads it;
   it used to stop with "Null or invalid pointer dereference". ⚠️ Only the address of a variable written in the call
   (`@url`); the address of a pointer field or array element in the variadic part is not yet brought back.
-- ⚠️ **The address of an element of a record array that C owns, taken with `@`, is wrong.**
-  `@img->SavedImages[1]` answers a different address, and `@p[1]` answers the right number that `->` cannot follow.
-  Write `p + 1` (or read `p[1].field` directly), which works as in FreeBASIC.
+- **The address of an element of a record array that C owns, taken with `@`, is that element.**
+  `@img->SavedImages[1]` used to answer an address eight bytes past the first element, and `q = @p[1]` the right
+  number that `q->field` could not follow; `img->SavedImages + 1` stepped eight bytes too. All three now work as in
+  FreeBASIC, like `p + 1` through a local pointer and `p[1].field` did.
 - **A procedure pointer stored in a record that belongs to C can be called.** libgd's dynamic context holds its own
   release function: `ctx->gd_free(ctx)` calls it, and so does a copy (`f = ctx->gd_free : f(ctx)`). The first used to
   stop with "Invalid record handle", the second ended the program silently with exit code 1.
@@ -3664,8 +3665,7 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
 - **C data declared with `Extern` can be used inside procedures.** `xmlFree(s)` in a SUB or FUNCTION of the program —
   an XPath extension function, a callback, a helper — and `*gdbm_version` read in a SUB used to stop the program,
   while the same lines worked at module level. Only a C variable of record type was reachable from a procedure.
-  ⚠️ A C variable of a narrow or floating-point type (`Extern x As Byte`, `As Short`, `As Long`, `As Double`) is
-  still not reachable inside a procedure; read it at module level and pass the value on.
+  C variables of narrow and floating-point types (`Extern x As Byte`, `As Short`, `As Double`) included.
 - ⚠️ **A record with a `Union` member cannot be passed to C by value, and a pointer member of such a union filled by
   C cannot be followed.** fontconfig's `FcValue` (a type tag and a union) is the common case: `FcValueEqual(a, b)` and
   `FcPatternAdd(p, object, value, append)` are refused when the program is compiled, naming the member, and after
