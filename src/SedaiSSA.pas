@@ -48490,15 +48490,23 @@ function TSSAGenerator.EmitTempCellFor(const Val: TSSAValue; const TypeName: str
 // site in this file passes RawTypeCodeOfPointee(<declared type>), and so does this one.
 var
   Bytes: TSSAValue;
-  Code: Integer;
+  Code, AllocFrom: Integer;
 begin
   Code := RawTypeCodeOfPointee(TypeName);
+  AllocFrom := -1;
+  if Assigned(FCurrentBlock) then AllocFrom := FCurrentBlock.Instructions.Count;
   Bytes := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaLoadConstInt, Bytes, MakeSSAConstInt(8), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  // Phase 2.1b: the temporary dies with the frame that made it (RAWALLOC_FRAME_CELL, DIVERGENZE 458). ⚠️ At module level
-  // there is no frame, and the VM does not stack it there: that half of the leak stays open.
+  // Phase 2.1b: the temporary dies with the frame that made it (RAWALLOC_FRAME_CELL, DIVERGENZE 458).
   EmitInstruction(ssaRawAlloc, Result, Bytes, MakeSSAValue(svkNone), MakeSSAConstInt(RAWALLOC_FRAME_CELL));
+  // ⭐ ...and at MODULE level, where there is no frame, ONE cell per call site, allocated once at the program's entry
+  // (HoistToEntry, as a raw module cell is). The module body is not re-entrant - threads run procedures, never it - so a
+  // call site's temporary cannot be live twice at once, and it only has to live as long as its statement. Before, every
+  // execution allocated a new cell: "For i = 1 To N : g(5) : Next" grew 79 MB at 4 M calls (458, second form). The value
+  // is still written here, every time.
+  if (not FInProcedure) and (AllocFrom >= 0) and (FEntryHoistPos >= 0) then
+    HoistToEntry(AllocFrom);
   if TypeNameToBank(TypeName, '') = srtFloat then
     EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), Result, EnsureFloatRegister(Val), MakeSSAConstInt(Code))
   else

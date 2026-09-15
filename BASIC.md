@@ -3781,10 +3781,13 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   per call; a procedure called millions of times now runs in constant memory. As in FreeBASIC, where such a variable
   lives on the stack, a pointer to it must not be used after the procedure returns. In the default (`fb`) memory
   mode a numeric local of a builtin type is real memory, so `@x` is its address.
-- ⚠️ **A `ByRef` temporary made at module level still keeps a few bytes per call.** When the argument of a `ByRef`
-  parameter is not a variable — `g(5)`, `g(a + b)`, `g(f())` — and the call is in the main program rather than
-  inside a procedure, its temporary is not released: millions of such calls grow by tens of megabytes. Passing a
-  variable does not leak.
+- ⚠️ **A `For` counter passed to a `ByRef` parameter does not receive the callee's write.** With
+  `Sub bump(ByRef v As Integer)`, `For i As Integer = 1 To 5 : bump(i) : Print i; : Next` prints `1 2 3 4 5`, where
+  FreeBASIC prints `2 4 6`: the loop keeps its own counting. An ordinary variable passed the same way is updated.
+- **A `ByRef` temporary made in the main program no longer grows memory.** When the argument of a `ByRef`
+  parameter is not a variable — `g(5)`, `g(a + b)`, `g(f())` — the call binds a temporary. In the main program each
+  such call site now reuses one temporary for as long as the program runs, instead of allocating a new one on every
+  execution. As in FreeBASIC, a reference to a temporary must not be used after the statement that made it.
 - ⚠️ **The byte of a true `Boolean` reads 255, not 1.** `Dim As Boolean b = True : Print *Cast(UByte Ptr, @b)`
   prints `255` where FreeBASIC prints `1`; the same byte reaches C through `memcpy` or a record. `Print b`, `If b`
   and comparisons are unaffected.
