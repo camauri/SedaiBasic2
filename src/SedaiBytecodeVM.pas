@@ -6373,8 +6373,10 @@ begin
     RTC_PTR64:
       begin
         Result := PInt64(RawAddr(RawPtr, 8))^;
-        if (Result <> 0) and ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) and
-           ((Result and FGNPTR_TAG) = 0) then
+        // ⭐ DIVERGENZE 451 - ...and only a value that IS a machine address: one the program stored in C's memory
+        // ("*cell = s", s from Allocate) is back in the VM's domain already, and marking it read the SCREEN.
+        if ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) and
+           ForeignIsMachineAddress(PtrUInt(Result)) then
         begin
           AvU := PtrUInt(VMPointerForMachineAddr(nil, PtrUInt(Result)));
           if AvU <> 0 then Exit(Int64(AvU));
@@ -7049,7 +7051,12 @@ begin
           // qui: la traduzione ha bisogno delle regioni passate a QUESTA chiamata, e qui siamo dentro
           // il chiamato, non nel marshaller.
           ACtx.XferInt[SlotI] := VMPointerForMachineAddr(ACtx, PtrUInt(PPointer(AArgs[i])^));
-          if ACtx.XferInt[SlotI] = 0 then
+          // ⭐ DIVERGENZE 451 - ...AND A VALUE THAT IS NOT A MACHINE ADDRESS ARRIVES AS THE PROGRAM LEFT IT. The program
+          // stored its own pointer in C's memory ("*cell = callocate(...)" in a local_infile init callback) and C hands
+          // it back to the next callback; marking it as C's put bit 61 over RAWPTR_TAG, and "s->tag" read the SCREEN.
+          if (ACtx.XferInt[SlotI] = 0) and not ForeignIsMachineAddress(PtrUInt(PPointer(AArgs[i])^)) then
+            ACtx.XferInt[SlotI] := Int64(PtrUInt(PPointer(AArgs[i])^))
+          else if ACtx.XferInt[SlotI] = 0 then
           begin
             // Non e' memoria nostra: resta un indirizzo MACCHINA, marcato.
             ACtx.XferInt[SlotI] := Int64(PtrUInt(PPointer(AArgs[i])^));

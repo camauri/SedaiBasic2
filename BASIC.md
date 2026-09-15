@@ -3671,12 +3671,34 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   `FcPatternAdd(p, object, value, append)` are refused when the program is compiled, naming the member, and after
   `FcPatternGet(p, object, 0, @v)` the numeric members `v.u.i` and `v.u.d` read right but `v.u.s` does not. Use the
   typed functions (`FcPatternAddString`, `FcPatternGetString` and the rest), which work as in FreeBASIC.
+- **Headers for old library versions are not supported**: `png12.bi`, `png14.bi`, `png15.bi` and `gif_lib4.bi` describe
+  libpng 1.2/1.4/1.5 and giflib 4. The headers are accepted, but the libraries a current system installs (libpng 1.6,
+  giflib 5) refuse them or have a different ABI, under FreeBASIC too. Use `png16.bi` and `gif_lib5.bi`.
 - ⚠️ **A block from `calloc` in `crt.bi`, read before anything is written to it, stops the program** with "Raw pointer
   dereference out of bounds". Writing a field first and then reading it works.
 - ⚠️ **An address the program gives to C and C hands back LATER is not the same pointer again.** After
   `set_user_data(x, @v)`, the pointer C answers in a later call reads the right value but does not compare equal to
   `@v`, and a callback that receives `@v` as its user data cannot read through it. A pointer C returns in the same call
-  that received it (`memcpy(@n, @n, 0)`) is right for a numeric variable.
+  that received it (`memcpy(@n, @n, 0)`) is right for a numeric variable. The same holds for a record allocated with
+  `Callocate` that the program stores in C's memory and C hands to a later callback (MariaDB's `LOAD DATA LOCAL INFILE`
+  handler): the pointer arrives, but its fields do not read right. Keep such state in a numeric block
+  (`Dim s As Long Ptr = Callocate(3 * SizeOf(Long))`), which works as in FreeBASIC.
+- ⚠️ **A C library that keeps the address of a RECORD of the program and reads it in a later call does not see the
+  record.** MariaDB's prepared statements are the common case: a `MYSQL_BIND` whose `buffer` is `@t`, `t` a
+  `MYSQL_TIME`, is copied by `mysql_stmt_bind_param` and read by `mysql_stmt_execute`, which then fails (or reads
+  zeros). Buffers of numbers and strings work; bind a date and time as a string (`MYSQL_TYPE_STRING`,
+  `"2021-02-03 04:05:06"`).
+- **A pointer C writes into a cell passed to a parameter declared `Any Ptr` can be dereferenced.**
+  `mysql_get_optionv(db, MYSQL_SET_CHARSET_NAME, @name)` and `mariadb_get_infov(db, value, @text)` then `*name` read
+  the text; it used to stop with "Null or invalid pointer dereference". A cell C only reads, or does not touch, keeps
+  its value.
+- **A pointer of the program that C hands back arrives as the program stored it**: in a callback (a MariaDB
+  `LOAD DATA LOCAL INFILE` handler, `g_list_foreach`), as a function's result (`g_list_nth_data`), copied into a cell
+  (`memcpy(@p, @q, SizeOf(Any Ptr))`), or read back out of C's memory. It used to stop with "SCREENPTR dereference: no
+  graphics screen".
+- **An element of an array declared with a C alias of an unsigned 64-bit type is unsigned.** `Dim lengths(0 To 5) As
+  CULong` (from `crt/long.bi`) prints `14` with no sign space, and compares, divides and takes `Mod` unsigned, as an
+  array declared `As ULongInt` always did; it used to print ` 14`.
 - ⚠️ **A callback that a C library calls from its own thread must not run while the program runs BASIC code.** An
   audio callback installed with `Pa_OpenDefaultStream` works when the program waits inside a C function (`Pa_Sleep`),
   but if the program runs a loop of its own at the same time, the program can end with an error or see its

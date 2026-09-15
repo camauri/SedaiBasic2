@@ -741,6 +741,7 @@ type
     // is not a BASIC call - it leaves the process. TryForeignCall answers False for every other name,
     // so it can be asked wherever a name has failed to resolve.
     function VarArgIsAddress(Node: TASTNode): Boolean;   // il valore e' un INDIRIZZO?
+    function ForeignPtrCellArg(Node: TASTNode): Boolean;   // "@p" of a POINTER variable: a cell C may fill (443, 450)
     function VariadicCallSiteDecl(const Decl: TForeignDecl; ArgListNode: TASTNode;
                                   NArgs: Integer; const RetOverride: string = ''): Integer;   // la coda variadica di UN sito
     function TryForeignCall(const NameU: string; ArgListNode: TASTNode;
@@ -14509,7 +14510,10 @@ begin
       // Unsigned 64-bit element type (UInteger/ULongInt): remember so an element read a(i) selects the
       // unsigned compare/div/mod/print forms (IsUnsigned64Expr). Width code is 0 for these (full 64-bit),
       // so the block above records nothing — this is a separate set.
-      if (ArrElemTypeName = 'UINTEGER') or (ArrElemTypeName = 'ULONGINT') then
+      // ⭐ DIVERGENZE 452 - ...THROUGH ITS ALIAS: "Dim olen(0 To 5) As CULong" (crt/long.bi: "Type culong As ULongInt")
+      // printed "]: 14" where fbc prints "]:14". The scalar registration already asked PrintKindOfTypeName.
+      if (UpperFast(CanonicalType(ArrElemTypeName)) = 'UINTEGER') or
+         (UpperFast(CanonicalType(ArrElemTypeName)) = 'ULONGINT') then
       begin
         if FUnsigned64Arrays.IndexOf(DeclArrName) < 0 then
           FUnsigned64Arrays.Add(DeclArrName);
@@ -52654,7 +52658,6 @@ function TSSAGenerator.VariadicCallSiteDecl(const Decl: TForeignDecl; ArgListNod
 var
   i, k: Integer;
   Params, T, Line, NarrowT, RetT: string;
-  AddrOp: TASTNode;
 begin
   Params := '';
   for i := 0 to High(Decl.ParamTypeNames) do
@@ -52685,6 +52688,11 @@ begin
         k := ForeignNarrowArg(ArgListNode.GetChild(i), NarrowT);
         if k > 0 then T := 'W' + IntToStr(k) + ':' + Decl.ParamTypeNames[i];
       end;
+      // ⭐ DIVERGENZE 450 - ...and a parameter DECLARED "Any Ptr" handed "@p" of a pointer is a cell C may fill, as the
+      // tail's is (443): "mysql_get_optionv(db, MYSQL_SET_CHARSET_NAME, @csn)" wrote C's address there, nothing brought
+      // it home, and "*csn" read it as the VM's ("Null or invalid pointer dereference").
+      if (T = '') and SameText(Decl.ParamTypeNames[i], 'ANY PTR') and ForeignPtrCellArg(ArgListNode.GetChild(i)) then
+        T := 'ANY PTR PTR';
     end;
     if T <> '' then Params := Params + T
     else Params := Params + Decl.ParamTypeNames[i];
@@ -52712,18 +52720,7 @@ begin
       // ⭐ DIVERGENZE 443 - ...and the ADDRESS OF A POINTER VARIABLE is a cell C may fill with one of ITS pointers:
       // "curl_easy_getinfo(h, CURLINFO_EFFECTIVE_URL, @eff)". A declared "T Ptr Ptr" parameter says so and the
       // runtime brings the cell home (219, 436); in the tail nothing did, and "*eff" read C's address as the VM's.
-      AddrOp := ArgListNode.GetChild(i);
-      if (AddrOp.NodeType = antProcAddress) and (AddrOp.ChildCount = 0) and (AddrOp.ValueUpper <> '') and
-         (FProcedureNames.IndexOf(AddrOp.ValueUpper) < 0) then
-      begin
-        AddrOp := TASTNode.CreateWithValue(antIdentifier, VarToStr(ArgListNode.GetChild(i).Value),
-                                           ArgListNode.GetChild(i).Token);
-        try
-          if ExprIsPointerTyped(AddrOp) then T := 'ANY PTR PTR';
-        finally
-          AddrOp.Free;
-        end;
-      end;
+      if ForeignPtrCellArg(ArgListNode.GetChild(i)) then T := 'ANY PTR PTR';
     end
     else
       case InferExprBank(ArgListNode.GetChild(i)) of
@@ -52751,6 +52748,26 @@ begin
     if FProgram.GetForeignDecl(k) = Line then Exit(k);
   FProgram.AddForeignDecl(Line);
   Result := FProgram.ForeignDeclCount - 1;
+end;
+
+function TSSAGenerator.ForeignPtrCellArg(Node: TASTNode): Boolean;
+// "@p" where p is a POINTER variable: the address of a cell that holds a pointer. Handed to C it is a cell C may FILL
+// with one of its own addresses - "curl_easy_getinfo(h, CURLINFO_EFFECTIVE_URL, @eff)" in a variadic tail (DIVERGENZE
+// 443), "mysql_get_optionv(db, MYSQL_SET_CHARSET_NAME, @csn)" in a parameter DECLARED "Any Ptr" (DIVERGENZE 450) - and
+// the call's own entry spells it "ANY PTR PTR", which is what makes the runtime bring the cell home.
+// ⚠️ "@x" of a scalar is an antProcAddress with NO children and the name in its Value; "@proc" is a callback, not a cell.
+var
+  Ident: TASTNode;
+begin
+  Result := False;
+  if (Node = nil) or (Node.NodeType <> antProcAddress) or (Node.ChildCount <> 0) or (Node.ValueUpper = '') or
+     (FProcedureNames.IndexOf(Node.ValueUpper) >= 0) then Exit;
+  Ident := TASTNode.CreateWithValue(antIdentifier, VarToStr(Node.Value), Node.Token);
+  try
+    Result := ExprIsPointerTyped(Ident);
+  finally
+    Ident.Free;
+  end;
 end;
 
 function TSSAGenerator.SideEffectFreeObject(Node: TASTNode): Boolean;
@@ -53398,7 +53415,8 @@ begin
       if (ForeignKindOf(Decl.ParamTypeNames[i]) = fkPointer) and
          ((BasicProcCallbackSig(ArgListNode.GetChild(i)) <> '') or
           ForeignRecordArg(ArgListNode.GetChild(i)) or
-          (ForeignNarrowArg(ArgListNode.GetChild(i), NarrowT) > 0)) then
+          (ForeignNarrowArg(ArgListNode.GetChild(i), NarrowT) > 0) or
+          (SameText(Decl.ParamTypeNames[i], 'ANY PTR') and ForeignPtrCellArg(ArgListNode.GetChild(i)))) then
       begin
         Idx := VariadicCallSiteDecl(DeclV, ArgListNode, NArgs, SRetSpec);
         Break;
@@ -54063,7 +54081,8 @@ begin
             FArrayFuncPtrSig.Values[MangledName] := FuncPtrTypeSig(TypeName);
           // An UNSIGNED 64-bit element: the print form has no leading sign space, and compare/divide/mod
           // take the unsigned opcodes. Width code is 0 for these, so the block above records nothing.
-          if ((TypeName = 'UINTEGER') or (TypeName = 'ULONGINT')) and
+          // ...through its ALIAS too (DIVERGENZE 452).
+          if ((UpperFast(CanonicalType(TypeName)) = 'UINTEGER') or (UpperFast(CanonicalType(TypeName)) = 'ULONGINT')) and
              (FUnsigned64Arrays.IndexOf(MangledName) < 0) then
             FUnsigned64Arrays.Add(MangledName);
           // ⭐ ...and the element's BYTE SIZE, which is the EIGHTH face of this family and the one the

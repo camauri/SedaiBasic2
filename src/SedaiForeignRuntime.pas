@@ -185,6 +185,8 @@ function ForeignMappedExtent(A: PtrUInt): PtrUInt;
   heap extended by realloc) got the OLD end. The refusing path of a bounds check asks this one. }
 function ForeignMappedExtentFresh(A: PtrUInt): PtrUInt;
 
+function ForeignIsMachineAddress(A: PtrUInt): Boolean;   // may C's mark go on this value? (DIVERGENZE 451)
+
 implementation
 
 { ⭐ THE CALLS THAT SAY HOW BIG THE MEMORY THEY RETURN IS, and the ones that take it back (DIVERGENZE
@@ -224,6 +226,19 @@ const
     (Sym: 'LocalFree';     PtrA: 0),
     (Sym: 'GlobalFree';    PtrA: 0),
     (Sym: 'VirtualFree';   PtrA: 0));
+
+function ForeignIsMachineAddress(A: PtrUInt): Boolean;
+// ⭐ DIVERGENZE 451 - IS THIS VALUE A USER-SPACE MACHINE ADDRESS? The one question every site asks before it gives a value
+// C handed over the mark of C's memory (FGNPTR_TAG): a returned pointer, a cell or a record field C wrote, a pointer
+// field of a struct returned by value, a callback's argument. A user-space address lies in [64 KiB, 2^47) on x86-64
+// Linux (nothing maps below mmap_min_addr) and on Win64. A raw-heap pointer of the VM (RAWPTR_TAG, bit 62), a record
+// pointer (RECPTR_TAG, bit 63), a small record handle and a sentinel such as (void*)-1 do not: each is a value the
+// PROGRAM put in C's memory, and it comes back as the program left it. Marked as C's, a raw-heap pointer got bit 61 on
+// top - which is also RAWPTR_REGION_FB - and "s->tag" read the SCREEN.
+// ⚠️ QWord, not PtrUInt: on a 32-bit target the upper bound does not fit, and every address is below it anyway.
+begin
+  Result := (QWord(A) >= $10000) and (QWord(A) < QWord($800000000000));
+end;
 
 function FgnArg(Vals: PPointer; NArgs, K: Integer): PtrUInt;
 // The marshalled value of argument K - the buffer is zero-filled, so a narrower one reads right.
@@ -863,6 +878,7 @@ var
   RegVM: array[0..63] of Int64;
   RegW: array[0..63] of Integer;
   OutLoc: array[0..63] of Pointer;     // dove un parametro "T PTR PTR" tiene il suo puntatore
+  OutOrig, OutSeen: array[0..63] of Int64;   // ...cio' che il programma ci teneva, e cio' che C ci ha trovato (450)
   NOut: Integer;
   // ⭐ The records this call handed over (DIVERGENZE 245): the image's machine address and the VM value
   // it came from. A returned pointer EQUAL to one comes home as that value - D3DXVec3Normalize answers
@@ -1323,13 +1339,16 @@ begin
                ((XferInt[SlotI] and FGNPTR_TAG) = 0) and
                (Pos(' PTR PTR', UpperCase(B^.Decl.ParamTypeNames[i])) > 0) then
             begin
-              OutLoc[NOut] := P; Inc(NOut);
+              OutLoc[NOut] := P;
+              OutOrig[NOut] := PInt64(P)^;
               // ⭐ DIVERGENZE 436 - ...and the cell is IN-OUT as often as it is out: "XrmPutStringResource(@db, ...)"
               // reads the database pointer the program holds there before writing the new one. It held C's
               // address WITH the program's mark, and C dereferenced the mark (access violation). For the call the
               // cell holds the machine address; the loop below AbiCall brings it home or marks it again.
               if (PInt64(P)^ and FGNPTR_TAG) <> 0 then
                 PInt64(P)^ := PInt64(P)^ and not FGNPTR_TAG;
+              OutSeen[NOut] := PInt64(P)^;
+              Inc(NOut);
             end;
             if (P <> nil) and (NReg <= High(RegBase)) and Assigned(FPtrRegion) and
                ((XferInt[SlotI] and FGNPTR_TAG) = 0) and FPtrRegion(ACtx, XferInt[SlotI], Avail, ElemW) then
@@ -1382,7 +1401,7 @@ begin
   for RPk := 0 to NRP - 1 do
     if RPAddr[RPk]^ = RPTr[RPk] then
       RPAddr[RPk]^ := RPOrig[RPk]
-    else if RPAddr[RPk]^ <> 0 then
+    else if ForeignIsMachineAddress(PtrUInt(RPAddr[RPk]^)) then   // a value that is not one stays as C wrote it (451)
     begin
       HomeV := 0;
       if Assigned(FPtrHome) then HomeV := FPtrHome(ACtx, PtrUInt(RPAddr[RPk]^));
@@ -1501,7 +1520,15 @@ begin
       if OutLoc[i] <> nil then
       begin
         RetAddr := PPtrUInt(OutLoc[i])^;
-        if RetAddr <> 0 then
+        // ⭐ DIVERGENZE 450 - ...A CELL C DID NOT TOUCH KEEPS WHAT THE PROGRAM HELD. Since a declared "Any Ptr"
+        // handed "@p" is a cell too ("mysql_get_optionv(db, opt, @csn)"), the cell may hold a VM pointer or a
+        // record handle C only READ ("fwrite(@p, 8, 1, f)"): taken for a machine address, it came back marked as
+        // one of C's. Unchanged means unchanged, whatever the bits say.
+        // ⛔ ...AND A VALUE C COPIED THERE THAT IS NOT A MACHINE ADDRESS STAYS AS C WROTE IT (451): "memcpy(@p, @q, 8)"
+        // with q from crt's malloc copies a pointer of the VM's OWN raw heap, and "*p" read the SCREEN.
+        if Int64(RetAddr) = OutSeen[i] then
+          PInt64(OutLoc[i])^ := OutOrig[i]
+        else if ForeignIsMachineAddress(RetAddr) then
         begin
           Avail := 0;
           ResInt := FPtrHome(ACtx, RetAddr);
@@ -1525,7 +1552,7 @@ begin
          (PtrUInt(SrFields[SrK].Offset) + 8 <= SretAvail) then
       begin
         SrV := PInt64(PByte(SretBuf) + SrFields[SrK].Offset)^;
-        if (SrV = 0) or ((SrV and FGNPTR_TAG) <> 0) then Continue;
+        if not ForeignIsMachineAddress(PtrUInt(SrV)) then Continue;   // 0, already C's, or the program's own (451)
         ResInt := FPtrHome(ACtx, PtrUInt(SrV));
         if ResInt <> 0 then
           PInt64(PByte(SretBuf) + SrFields[SrK].Offset)^ := ResInt
@@ -1635,6 +1662,13 @@ begin
           // ⭐ E' lo stesso gancio che i PARAMETRI D'USCITA usano trenta righe piu' sotto (voce 219) e
           // che il caricamento di un puntatore dalla memoria di C usa nel VM: una sola risposta alla
           // domanda "questo indirizzo e' casa nostra?". DIVERGENZE 332.
+          // ⭐ DIVERGENZE 451 - ...and a value that is not a machine address is the program's own, handed back as it was
+          // given ("get_user_data" of a block from Allocate): it returns unmarked.
+          if not ForeignIsMachineAddress(RetAddr) then
+          begin
+            ResInt := Int64(RetAddr);
+            Exit;
+          end;
           if Assigned(FPtrHome) then
           begin
             ResInt := FPtrHome(ACtx, RetAddr);
