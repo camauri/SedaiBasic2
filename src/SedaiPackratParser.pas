@@ -13905,11 +13905,22 @@ begin
       end;
       // "extern stdout as FILE ptr": a C library's POINTER variable (DIVERGENZE 253). Counted here so the
       // end-of-line test below sees the line read to its end; the SHAPE is still not registered for it.
+      // ⛔ ...AND A POINTER-LEVEL "CONST" IS PART OF THE SAME SUFFIX. "extern aerror_other as const AspellErrorInfo const
+      // ptr" - the form of every one of aspell's error descriptors - stopped this loop at the CONST, the line was left
+      // unread, and the name became an ordinary zero-initialised global: 0 where fbc reads the library's pointer, in
+      // silence (aspell deck, a03; DIVERGENZE 463). Consumed like the leading CONST above: a qualifier, not a type.
       while Assigned(Context.CurrentToken) and
             (SameText(VarToStr(Context.CurrentToken.Value), 'PTR') or
-             SameText(VarToStr(Context.CurrentToken.Value), 'POINTER')) do
+             SameText(VarToStr(Context.CurrentToken.Value), 'POINTER') or
+             ((Context.CurrentToken.TokenType = ttConstant) and
+              SameText(VarToStr(Context.CurrentToken.Value), 'CONST') and Assigned(Context.PeekNext) and
+              (SameText(VarToStr(Context.PeekNext.Value), 'PTR') or
+               SameText(VarToStr(Context.PeekNext.Value), 'POINTER')))) do
       begin
-        Inc(PtrDepth);
+        if (Context.CurrentToken.TokenType = ttConstant) and SameText(VarToStr(Context.CurrentToken.Value), 'CONST') then
+          HadConstQual := True
+        else
+          Inc(PtrDepth);
         Context.Advance;
       end;
     end;

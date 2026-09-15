@@ -3797,6 +3797,10 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   g(5) : End Sub` called as `grow(g())`, the `Print` shows `2 0` where FreeBASIC shows `5 55` (the same with
   `ReDim Preserve`). After the call returns, `g` has the new size and contents, and writing an element through the
   parameter is seen at once, as in FreeBASIC.
+- **A C library variable declared with a pointer-level `const` is the library's data.** `extern aerror_other as const
+  AspellErrorInfo const ptr` (the spelling of every error descriptor in `aspell.bi`, and of declarations in `bfd.bi`,
+  `glib.bi`, `gmp.bi`, `grx/grx20.bi` and `flite/`) now reads the library's pointer, as in FreeBASIC. It used to read 0
+  with no error, because the declaration was not recognised as external data.
 - **A `ByRef` temporary made in the main program no longer grows memory.** When the argument of a `ByRef`
   parameter is not a variable — `g(5)`, `g(a + b)`, `g(f())` — the call binds a temporary. In the main program each
   such call site now reuses one temporary for as long as the program runs, instead of allocating a new one on every
