@@ -211,6 +211,10 @@ const
   // cell). In the fb memory mode only the first kind comes from libc (pointer model, phase 1); the second stays in
   // the VM's raw heap, where the rest of the compiler expects it (RAW_PTRCELL_REQ rides on ITS size).
   RAWALLOC_PROGRAM = 1;
+  // ⭐ ...and a compiler slot that is NATIVE in the fb memory mode (pointer model, phase 2): the cell of an @-taken
+  // module scalar of a builtin numeric type. From libc, so "@x" is the machine address and the bcRaw* arms of the
+  // three engines read and write it as one move. Never a pointer cell (RAW_PTRCELL_REQ) nor a ZString buffer.
+  RAWALLOC_NATIVE_SLOT = 2;
 
   { ⭐ A POINTER THAT CAME FROM OUTSIDE (DIVERGENZE 183). Everything above is a VM-internal offset - no
     machine address is ever handed to a BASIC program - but a C function RETURNS one, and the program

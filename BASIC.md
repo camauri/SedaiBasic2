@@ -3763,13 +3763,28 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
 - ⚠️ **A byte view of an array of wider elements does not read bytes.** `Cast(UByte Ptr, @s(0))[k]` over a `Short`
   array reads the low byte of element `k`, not byte `k`, and past the last element it stops with "Null or invalid
   pointer dereference". The same happens when C hands a callback the program's own `Short` buffer and the callback
-  reads it byte by byte. Over `UByte` and `ZString` data the two readings coincide. A numeric **variable** read
-  through a byte pointer behaves the same way: `Dim pb As UByte Ptr = @x : Print pb[1]` over a `Long` stops with
-  "Null or invalid pointer dereference", while `*pb` reads the low byte correctly.
-- ⚠️ **A `ByRef` argument can lose the callee's write** when the program also takes the variable's address with a
-  pointer of the other numeric family — `Dim pd As Double Ptr = @x` over a `Long x`, or a `Single Ptr` over an
-  integer. `bump(x)` then leaves `x` unchanged, with no error. With a pointer of the same family (`UByte Ptr`,
-  `Long Ptr`, …) the write arrives.
+  reads it byte by byte. Over `UByte` and `ZString` data the two readings coincide.
+- **A numeric variable can be read byte by byte through its address.** In the default (`fb`) memory mode a
+  module-level variable whose address is taken lives in real memory, so `Dim pb As UByte Ptr = @x : Print pb[1]`
+  over a `Long` reads its second byte, as in FreeBASIC. ⚠️ In the `strict` memory mode a module-level variable
+  whose address only a pointer of the same numeric family takes still stops there with "Null or invalid pointer
+  dereference" (a variable declared inside a procedure reads its bytes in both modes).
+- **A `ByRef` argument receives the callee's write wherever the variable lives.** A `Byte`, `Short` or `Long`
+  `ByRef` parameter used to lose it in two shapes: when the program also took the variable's address (with a
+  pointer of the other numeric family, or — in the `fb` mode — with any pointer), and when the argument was a
+  dereference, `bump(*p)` or `bump(p[i])`. Both now write back, in both memory modes.
+- **A variable declared inside a loop of the main program starts at 0 on every pass**, also in a program that defines
+  a module `Constructor` (every `fbcunit` test does). It used to keep the previous pass's value there. A declaration
+  at the outermost level of the module is static, as in FreeBASIC, so a value a constructor writes into it survives.
+- ⚠️ **A procedure that takes the address of one of its local variables keeps a few bytes per call.** A local
+  whose address is taken (`@x`, `VarPtr`) gets its own cell on every call, and the cell is not released when the
+  procedure returns: about 13 bytes per call, so a program calling such a procedure millions of times grows by
+  tens of megabytes. Module-level variables are not affected. The same happens to the temporary a `ByRef`
+  parameter receives when the argument is not a variable — `g(5)`, `g(a + b)`, `g(f())` — on every call, at module
+  level too; passing a variable does not leak.
+- ⚠️ **The byte of a true `Boolean` reads 255, not 1.** `Dim As Boolean b = True : Print *Cast(UByte Ptr, @b)`
+  prints `255` where FreeBASIC prints `1`; the same byte reaches C through `memcpy` or a record. `Print b`, `If b`
+  and comparisons are unaffected.
 - ⚠️ **A pointer that C hands back does not compare equal to the address of a `String` it was given.**
   `rs = memcpy(@s, @s, 0)` then `rs = @s` is false, although `Hex(rs)` and `Hex(@s)` print the same number; with the
   address of a numeric variable or of a record the comparison is right.

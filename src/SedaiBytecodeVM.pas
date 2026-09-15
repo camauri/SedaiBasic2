@@ -17010,7 +17010,8 @@ begin
       // ⛔ ...only a PROGRAM allocation (RAWALLOC_PROGRAM in the Immediate): the compiler's own slots - an address-taken
       // local, a fixed ZString buffer - share this opcode and stay in the raw heap. Sending them to libc gave calloc
       // a size carrying RAW_PTRCELL_REQ (bit 62), NULL came back, and every "@v" in a procedure read address 0.
-      20: if FNativeMemory and ((Instr.Immediate and RAWALLOC_PROGRAM) <> 0) then Ctx.IntRegs[Instr.Dest] := NativeAlloc(Ctx.IntRegs[Instr.Src1])
+      // ⭐ ...and a compiler slot the SSA marked RAWALLOC_NATIVE_SLOT (phase 2: the cell of an @-taken module scalar).
+      20: if FNativeMemory and ((Instr.Immediate and (RAWALLOC_PROGRAM or RAWALLOC_NATIVE_SLOT)) <> 0) then Ctx.IntRegs[Instr.Dest] := NativeAlloc(Ctx.IntRegs[Instr.Src1])
           else Ctx.IntRegs[Instr.Dest] := RawAlloc(Ctx.IntRegs[Instr.Src1]);                         // bcRawAlloc
       21: if FNativeMemory then NativeFree(Ctx.IntRegs[Instr.Src1])
           else RawFree(Ctx.IntRegs[Instr.Src1]);                                                     // bcRawFree

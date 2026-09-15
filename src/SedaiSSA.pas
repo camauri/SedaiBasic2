@@ -535,6 +535,11 @@ type
                                           //   (module or proc). A GOTO to one of them exits every open block scope.
     FModernMode: Boolean;                // FB scope: True = MODERN (lexical scope); False = CLASSIC (global-by-name)
     FNativeMemory: Boolean;              // memory mode fb (True) or strict (False) - SedaiMemoryMode; phase 0: carried, not yet read
+    // Phase 2.1a: the program's entry block, and where in it a raw module cell's allocation is hoisted (HoistToEntry) -
+    // after the SHARED backings are sized and BEFORE static members, hoisted STATIC initialisers and module constructors.
+    FEntryBlock: TSSABasicBlock;
+    FEntryHoistPos: Integer;
+    FRawHoistFrom: Integer;              // the instruction index a RAWMODULE Dim's allocation starts at
     FScopeStack: array of TScopeFrame;   // FB scope: proc-root + block frames (innermost = High); module = FVarMap
     FNextScopeSerial: Integer;           // hands each pushed frame its identity (see BlockArrayMangle)
     // ...and the same key for every UDT a block declared, with the TYPE as its value. The pair is what
@@ -1089,6 +1094,7 @@ type
     function ZStringBufElemBytes(const Name: string): Int64;   // one CELL of such a buffer, in bytes
     function RawZStringBufBytes(const Name: string): Integer;                   // @-taken "ZSTRING * n" buffer -> n bytes, else 0
     procedure EmitRawAddrScalarAlloc(const Name: string);                       // allocate its per-frame 8-byte raw slot into the hidden handle
+    procedure HoistToEntry(FromIdx: Integer);                                   // move the instructions just emitted to the program's entry
     function IsRawModuleScalar(const Name: string): Boolean;                    // MODULE-level @-taken non-string scalar (raw byte slot, address in a shared int array)
     function RawModuleScalarType(const Name: string): string;                   // its declared type
     function RawModuleAddrArrayId(const Name: string): Integer;                 // shared int array "<name>$RA" holding the raw block address (declares on first use)
@@ -1728,6 +1734,8 @@ type
   end;
 
 implementation
+
+function NativeCellScalarType(const CanonTypeU: string): Boolean; forward;   // phase 2 of the pointer model
 
 function CRuntimeHint(const Name: string): string;
 // An extra sentence for an UNDECLARED name that is a well-known C standard-library function. The
@@ -3888,10 +3896,6 @@ begin
         // and that IS the pointer. Reading/writing through it uses raw load/store at the pointer's declared
         // pointee width, so a Single's bytes can be read as an Integer (type-punning).
         Result := EnsureIntRegister(AddrLocalHandle(VarToStr(Node.Value)))
-      else if IsRawModuleScalar(VarToStr(Node.Value)) then
-        // @module-scalar: the raw slot's byte address lives in the shared "<name>$RA" array; load it -- that
-        // is the pointer, bit-punnable like the local case.
-        Result := RawModuleAddrReg(VarToStr(Node.Value))
       else if IsAddrLocal(VarToStr(Node.Value)) then
       begin
         // @local STRING: a record-field pointer into this frame's backing record (slot 0) — distinct per call.
@@ -3939,6 +3943,12 @@ begin
           ThisAddrNode.Free;
         end;
       end
+      // @module-scalar: the raw slot's byte address lives in the shared "<name>$RA" array; load it -- that is the
+      // pointer, bit-punnable like the local case. ⛔ AFTER the field of This, like the SHARED branch below: in the fb
+      // memory mode every @-taken module scalar has this home (phase 2), and asked first it answered the module
+      // "gi" for "@gi" inside a method of a type with a field "gi" (guard m707) - latent before for a punned one.
+      else if IsRawModuleScalar(VarToStr(Node.Value)) then
+        Result := RawModuleAddrReg(VarToStr(Node.Value))
       else if IsSharedScalar(VarToStr(Node.Value)) then
         Result := EmitVarAddress(VarToStr(Node.Value))
       else if (FProcedureNames.IndexOf(Node.ValueUpper) < 0) and
@@ -4750,21 +4760,6 @@ begin
           if AnyFixedLen then Result := MaybeFixedLenRead(Node, Result);
         end;
       end
-      // Module-level @-taken scalar: read the declared-width value from its raw slot (address in the shared
-      // "<name>$RA" array). Bit-exact, so a type-punning read through @x sees the same bytes.
-      else if IsRawModuleScalar(VarName) then
-      begin
-        FuncRetType := TypeNameToBank(RawModuleScalarType(VarName), VarName);
-        Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
-        if FuncRetType = srtString then
-          // A ZSTRING/WSTRING buffer: the C string living in it, read at its address (to the terminator).
-          EmitInstruction(ssaRawLoadZStr, Result, RawModuleAddrReg(VarName), MakeSSAValue(svkNone),
-                          MakeSSAConstInt(Ord(RawModuleScalarType(VarName) = 'WSTRING')))
-        else if FuncRetType = srtFloat then
-          EmitInstruction(ssaRawLoadFloat, Result, RawModuleAddrReg(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(VarName))))
-        else
-          EmitInstruction(ssaRawLoadInt, Result, RawModuleAddrReg(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(VarName))));
-      end
       // Refinement #2: a SHARED scalar is backed by a 1-element global array — read element 0 (a live,
       // cross-thread load), not a per-thread register.
       // A module CONST is not a variable: fold the read to its value. Guarded by the same shadowing
@@ -4782,6 +4777,24 @@ begin
       begin
         ProcessExpression(ArgListNode, Result);
         ArgListNode.Free;
+      end
+      // Module-level @-taken scalar: read the declared-width value from its raw slot (address in the shared
+      // "<name>$RA" array). Bit-exact, so a type-punning read through @x sees the same bytes.
+      // ⛔ AFTER the field of This, as the write (ProcessAssignment) and "@" ask it: in the fb memory mode every
+      // @-taken module scalar has this home, and read first it answered the module "gi" for a bare "gi" inside
+      // a method of a type with a field "gi" (guard m707).
+      else if IsRawModuleScalar(VarName) then
+      begin
+        FuncRetType := TypeNameToBank(RawModuleScalarType(VarName), VarName);
+        Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
+        if FuncRetType = srtString then
+          // A ZSTRING/WSTRING buffer: the C string living in it, read at its address (to the terminator).
+          EmitInstruction(ssaRawLoadZStr, Result, RawModuleAddrReg(VarName), MakeSSAValue(svkNone),
+                          MakeSSAConstInt(Ord(RawModuleScalarType(VarName) = 'WSTRING')))
+        else if FuncRetType = srtFloat then
+          EmitInstruction(ssaRawLoadFloat, Result, RawModuleAddrReg(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(VarName))))
+        else
+          EmitInstruction(ssaRawLoadInt, Result, RawModuleAddrReg(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(VarName))));
       end
       else if IsSharedScalar(VarName) then
       begin
@@ -13947,6 +13960,8 @@ begin
       // width) -- the type-punnable model, mirroring the local case but with a shared (cross-proc) address.
       if ArrayDeclNode.Attributes.Values['RAWMODULE'] = '1' then
       begin
+        FRawHoistFrom := -1;
+        if Assigned(FCurrentBlock) then FRawHoistFrom := FCurrentBlock.Instructions.Count;
         ArrayIdx := RawModuleAddrArrayId(UpperFast(ArrName));
         EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), MakeSSAArrayRef(ArrayIdx, srtInt),
                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -13967,13 +13982,47 @@ begin
         else
           EmitInstruction(ssaLoadConstInt, UbReg, MakeSSAConstInt(InitBytes), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         RecHandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-        EmitInstruction(ssaRawAlloc, RecHandleVal, UbReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        // ⭐ Phase 2: in the fb memory mode the cell of a builtin numeric scalar comes from libc (RAWALLOC_NATIVE_SLOT),
+        // so "@x" is a machine address and reads/writes take the native bcRaw* arms. A ZString buffer and a pointer
+        // cell stay in the raw heap: the first is bounded by its block on a store, the second is translated for C.
+        if FNativeMemory and (StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0) = 0) and
+           NativeCellScalarType(ArrayDeclNode.GetChild(1).ValueUpper) then   // the DECLARED spelling, as MarkAddressTaken asks it
+          EmitInstruction(ssaRawAlloc, RecHandleVal, UbReg, MakeSSAValue(svkNone), MakeSSAConstInt(RAWALLOC_NATIVE_SLOT))
+        else
+          EmitInstruction(ssaRawAlloc, RecHandleVal, UbReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         // ... stored into "<name>$RA"[0] (ssaArrayStore takes value first, then array ref, then index).
         UbReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaLoadConstInt, UbReg, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         EmitInstruction(ssaArrayStore, RecHandleVal, MakeSSAArrayRef(ArrayIdx, srtInt), UbReg, MakeSSAValue(svkNone));
-        // "DIM v AS T = expr": write the initializer through the raw slot (ProcessAssignment routes it there).
-        if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) then
+        // ⭐ Phase 2.1a: the cell is ALLOCATED at the program's entry, not here (HoistToEntry). A module constructor, a
+        // static member or a hoisted STATIC initialiser reading "@g" runs before this Dim, and found $RA[0] still 0:
+        // "Static As Integer Ptr p = @g" inside a Sub died on "address 0" (fbc suite dim/static, repro v4/v5/v6) the
+        // moment phase 2 sent every @-taken module scalar here in the fb mode - latent before for a punned one.
+        // ⚠️ A fixed ZString/WString buffer is left as it was: its store is bounded by its block, and nothing measured
+        // it. ⛔ And the Dim still ZEROES a declaration with no initialiser: allocated once, a module "Dim x As Long"
+        // re-run in a loop would otherwise keep the previous value, where fbc starts it at 0 every time.
+        if (FRawHoistFrom >= 0) and (StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0) = 0) then
+        begin
+          HoistToEntry(FRawHoistFrom);
+          // ⛔ ...only a declaration inside a BLOCK (a loop body, an If, a Scope) runs again and starts at 0 again. One at
+          // the module's outermost level is static in fbc: a constructor that wrote it must still see its value.
+          if (InnermostBlockFrameIdx >= 0) and
+             not ((ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList)) then
+          begin
+            if TypeNameToBank(RawModuleScalarType(UpperFast(ArrName)), UpperFast(ArrName)) = srtFloat then
+              EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), RawModuleAddrReg(UpperFast(ArrName)),
+                              EnsureFloatRegister(MakeSSAConstFloat(0)),
+                              MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(UpperFast(ArrName)))))
+            else
+              EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), RawModuleAddrReg(UpperFast(ArrName)),
+                              EnsureIntRegister(MakeSSAConstInt(0)),
+                              MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(UpperFast(ArrName)))));
+          end;
+        end;
+        // "DIM v AS T = expr": write the initializer through the raw slot (ProcessAssignment routes it there) - unless the
+        // entry already applied it before the module constructors (PREINITED, EmitSharedScalarConstInits).
+        if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) and
+           (ArrayDeclNode.Attributes.Values['PREINITED'] <> '1') then
         begin
           InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
           InitAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperFast(ArrName), ArrayDeclNode.GetChild(0).Token));
@@ -13999,7 +14048,26 @@ begin
         // if any, still applies).
         if (FModuleCtors = nil) or (FModuleCtors.Count = 0) then
           EmitInstruction(ssaArrayDim, MakeSSAValue(svkNone), ArrayRef,
-                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                          MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+        // ⛔ ...BUT THE SKIPPED RE-SIZE WAS ALSO WHAT ZEROED IT. A numeric scalar declared with no initialiser inside a
+        // BLOCK (a loop body) starts at 0 every time the block runs in fbc; with a module constructor in the program -
+        // which is EVERY fbcunit test - "For i = 1 To 3 : Dim As Long x : Dim p As Long Ptr = @x : Print x; : *p = i*10
+        // : Next" printed "0 10 20" for "0 0 0" (guard m987, pre-existing in both memory modes). Zeroed through the
+        // ordinary assignment. Only inside a block: at the outermost level the declaration is static, and a
+        // constructor's write must survive it.
+        else if (FindUDT(RecTypeName) < 0) and (RecTypeName <> 'STRING') and (InnermostBlockFrameIdx >= 0) and
+                (StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0) = 0) and
+                not ((ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList)) then
+        begin
+          InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
+          InitAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperFast(ArrName), ArrayDeclNode.GetChild(0).Token));
+          InitAssign.AddChild(TASTNode.CreateWithValue(antLiteral, 0, ArrayDeclNode.GetChild(0).Token));
+          try
+            ProcessAssignment(InitAssign);
+          finally
+            InitAssign.Free;
+          end;
+        end;
         RecUDTIdx := FindUDT(RecTypeName);
         if RecUDTIdx < 0 then
           RecordSharedScalarType(UpperFast(ArrName), RecTypeName);  // print form + narrow store width
@@ -40092,6 +40160,25 @@ begin
         EmitXferLoad(RT, Slot, GetOrAllocateVariable(TmpName));
         EmitSharedScalarStoreVal(ArgExpr.ValueUpper, GetOrAllocateVariable(TmpName));
       end
+      // ⭐ DIVERGENZE 455 - ...and neither does a RAW-backed scalar: an @-taken local (ADDRLOCAL) or module variable
+      // (RAWMODULE) lives in its raw slot, and a narrow BYREF parameter (Byte/Short/Long: not an address carrier)
+      // copied back into the REGISTER left the slot as it was - "Dim pd As Double Ptr = @x : bump(x)" printed 7
+      // where fbc prints 1007, in silence. Phase 2 of the pointer model sends every @-taken numeric module scalar
+      // there in the fb mode, so the same-bank case broke too. Stored through the ordinary assignment, which
+      // knows the home and the width - the same road the array-element branch below already takes.
+      else if IsRawModuleScalar(ArgExpr.ValueUpper) or IsRawAddrLocal(ArgExpr.ValueUpper) then
+      begin
+        case RT of
+          srtInt:    TmpName := '__BRWTMP%';
+          srtString: TmpName := '__BRWTMP$';
+        else         TmpName := '__BRWTMP!';
+        end;
+        EmitXferLoad(RT, Slot, GetOrAllocateVariable(TmpName));
+        StoreAssign := TASTNode.Create(antAssignment, ArgExpr.Token);
+        StoreAssign.AddChild(ArgExpr.Clone);
+        StoreAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName, ArgExpr.Token));
+        try ProcessAssignment(StoreAssign); finally StoreAssign.Free; end;
+      end
       else
         EmitXferLoad(RT, Slot, GetOrAllocateVariable(ArgExpr.ValueUpper));
     end
@@ -40115,6 +40202,28 @@ begin
       StoreAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName, ArgExpr.Token));
       try ProcessArrayStore(StoreAssign); finally StoreAssign.Free; end;
     end
+    // ⭐ DIVERGENZE 457 - ...and "p[i]" through a scalar POINTER, the other spelling of a deref lvalue ("bump(q[2])" left
+    // q[2] at 9 where fbc prints 1009). Recognised as TryEmitIndexedElementAddress recognises it - a name whose
+    // pointee is a scalar and ONE index - and never a procedure: antArrayAccess is also how "f(i)" is spelled.
+    else if (ArgExpr.NodeType = antArrayAccess) and (ArgExpr.ChildCount >= 2) and
+            (ArgExpr.GetChild(0).NodeType = antIdentifier) and
+            (ArgExpr.GetChild(1).NodeType = antExpressionList) and (ArgExpr.GetChild(1).ChildCount = 1) and
+            (FProcedureNames.IndexOf(ArgExpr.GetChild(0).ValueUpper) < 0) and
+            (UpperFast(PointeeTypeOf(VarToStr(ArgExpr.GetChild(0).Value))) <> '') and
+            (FindUDT(UpperFast(PointeeTypeOf(VarToStr(ArgExpr.GetChild(0).Value)))) < 0) and
+            (Pos(' PTR', UpperFast(PointeeTypeOf(VarToStr(ArgExpr.GetChild(0).Value)))) = 0) then
+    begin
+      case RT of
+        srtInt:    TmpName := '__BRWTMP%';
+        srtString: TmpName := '__BRWTMP$';
+      else         TmpName := '__BRWTMP!';
+      end;
+      EmitXferLoad(RT, Slot, GetOrAllocateVariable(TmpName));
+      StoreAssign := TASTNode.Create(antAssignment, ArgExpr.Token);
+      StoreAssign.AddChild(ArgExpr.Clone);
+      StoreAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName, ArgExpr.Token));
+      try ProcessAssignment(StoreAssign); finally StoreAssign.Free; end;
+    end
     else if ArgExpr.NodeType = antMemberAccess then
     begin
       // Member-field lvalue arg "obj.field" / "p->field": load the parameter's final value from the
@@ -40131,6 +40240,23 @@ begin
       EmitXferLoad(RT, Slot, GetOrAllocateVariable(TmpName));
       StoreAssign := TASTNode.CreateWithValue(antIdentifier, TmpName, ArgExpr.Token);
       try ProcessMemberStore(ArgExpr, StoreAssign); finally StoreAssign.Free; end;
+    end
+    // ⭐ DIVERGENZE 457 - "*p" is an lvalue too. A narrow BYREF parameter (Byte/Short/Long: copy-in/copy-out, not an
+    // address carrier) handed "bump(*pl)" copied its final value nowhere, and the pointee kept its old value -
+    // "Dim pl As Long Ptr = @x : bump(*pl)" printed 7 where fbc prints 1007, and the same through a block from
+    // Allocate. Written back through the ordinary assignment, which routes a deref target to its store.
+    else if (ArgExpr.NodeType = antDeref) and (ArgExpr.ChildCount >= 1) then
+    begin
+      case RT of
+        srtInt:    TmpName := '__BRWTMP%';
+        srtString: TmpName := '__BRWTMP$';
+      else         TmpName := '__BRWTMP!';
+      end;
+      EmitXferLoad(RT, Slot, GetOrAllocateVariable(TmpName));
+      StoreAssign := TASTNode.Create(antAssignment, ArgExpr.Token);
+      StoreAssign.AddChild(ArgExpr.Clone);
+      StoreAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName, ArgExpr.Token));
+      try ProcessAssignment(StoreAssign); finally StoreAssign.Free; end;
     end;
     // else: a literal/expression or non-writable arg — left untouched.
   end;
@@ -41793,6 +41919,25 @@ begin
       end
       else if InitNode.NodeType <> antLiteral then Continue;
       NameU := Decl.GetChild(0).ValueUpper;
+      // ⭐ Phase 2.1a: a raw-backed module scalar keeps the same promise. In the fb memory mode every @-taken module
+      // scalar lives in a raw cell, whose ALLOCATION is hoisted to the entry (HoistToEntry, placed before this pass);
+      // its constant initialiser is applied here too, or the module body's Dim overwrote what a constructor wrote -
+      // "Sub init Constructor : g = 5 : End Sub" then "Dim Shared g = 111" printed 111 where fbc prints 5. Asked
+      // before IsSharedScalar, which does not know this home yet. A fixed ZString buffer keeps its own road.
+      if (Decl.Attributes.Values['RAWMODULE'] = '1') and
+         (StrToIntDef(Decl.Attributes.Values['FIXEDLEN'], 0) = 0) and IsRawModuleScalar(NameU) then
+      begin
+        InitAssign := TASTNode.Create(antAssignment, Decl.GetChild(0).Token);
+        InitAssign.AddChild(TASTNode.CreateWithValue(antIdentifier, NameU, Decl.GetChild(0).Token));
+        InitAssign.AddChild(InitNode.Clone);
+        try
+          ProcessAssignment(InitAssign);
+        finally
+          InitAssign.Free;
+        end;
+        Decl.Attributes.Values['PREINITED'] := '1';
+        Continue;
+      end;
       if not IsSharedScalar(NameU) then Continue;
       if FindUDT(Decl.GetChild(1).ValueUpper) >= 0 then Continue;   // a record is built at its DIM
       // ⛔⛔ AND THIS IS THE THIRD ROAD INTO ONE VARIABLE THAT SKIPS ProcessAssignment - after the DIM
@@ -42380,6 +42525,19 @@ begin
       CollectByrefReturnedNames(N.GetChild(i), L);
 end;
 
+function NativeCellScalarType(const CanonTypeU: string): Boolean;
+// Phase 2 of the pointer model: the builtin numeric types whose @-taken module variable lives in a native cell in
+// the fb memory mode. A positive list on purpose - see the rule in MarkAddressTaken.
+begin
+  case CanonTypeU of
+    'BYTE', 'UBYTE', 'SHORT', 'USHORT', 'LONG', 'ULONG', 'INTEGER', 'UINTEGER',
+    'LONGINT', 'ULONGINT', 'SINGLE', 'DOUBLE', 'BOOLEAN':
+      Result := True;
+  else
+    Result := False;
+  end;
+end;
+
 procedure TSSAGenerator.MarkAddressTaken(Node: TASTNode; Dict: TStringList; InProc: Boolean;
                                          ProcOwn: TStringList);
 // Pass 2: route each typed-scalar DIM whose variable is @-taken. A MODULE-level var is marked SHARED
@@ -42455,8 +42613,21 @@ begin
             if FRawModuleScalars.IndexOfName(VNameU) < 0 then
               FRawModuleScalars.Add(VNameU + '=' + VTypeC);
           end
+          // ⭐ PHASE 2 OF THE POINTER MODEL, fb memory mode: EVERY module scalar of a builtin numeric type takes the
+          // raw slot, not only a type-punned one. The SHARED cell answers "@x" with a packed array pointer that
+          // counts ELEMENTS, so a byte view of the variable - "Dim pb As UByte Ptr = @x : pb[1]" over a Long, the
+          // same bank - stepped a whole element and died (DIVERGENZE 429, scalar case). The slot is a machine
+          // address from libc (RAWALLOC_NATIVE_SLOT), where a step is a byte, as in fbc.
+          // ⚠️ A POSITIVE list of types (NativeCellScalarType): a pointer variable keeps its SHARED cell (its
+          // content is a VM pointer C may be handed, DIVERGENZE 257 B), and so does anything else not named.
+          // ⛔ The list is asked of the DECLARED spelling, not of the canonical type: a procedure-pointer alias
+          // ("Dim As xmlFreeFunc f") canonicalises to an integer, and its cell is one C writes a function address
+          // into that has to come home as a closure (DIVERGENZE 425) - as a native cell "f = xmlFree" was false.
+          // ⛔ And never a REFERENCE ("Dim Shared ByRef r = v"): its whole value is the target's address, kept
+          // in the SHARED home (DIVERGENZE 270); as a raw slot it read address 0 inside a Sub (guard m907zm).
           else if (VTypeC <> 'STRING') and
-                  ScalarIsTypePunned(VNameU, TypeNameToBank(VTypeC, VNameU)) then
+                  ((FNativeMemory and NativeCellScalarType(VTypeU) and (Decl.Attributes.Values['BYREF'] <> '1')) or
+                   ScalarIsTypePunned(VNameU, TypeNameToBank(VTypeC, VNameU))) then
           begin
             // TYPE-PUNNED module-level @-taken scalar (a DIFFERENT-bank pointer takes its @): a RAW byte slot
             // whose address lives in a shared int array, so @/deref are bit-exact just like the local case
@@ -46587,6 +46758,33 @@ begin
   if AddrLocalType(Nm) = 'WSTRING' then Result := (Chars + 1) * WIDE_CELL_BYTES else Result := Chars + 1;
 end;
 
+procedure TSSAGenerator.HoistToEntry(FromIdx: Integer);
+// Move the instructions the current block received from FromIdx on to the program's entry block, at FEntryHoistPos,
+// in order: each is CLONED there and the original becomes a Nop (the revocation BlockScopeExit already uses).
+// ⭐ Phase 2.1a of the pointer model: a raw module cell must exist before the code that can reach it runs, and module
+// constructors, static members and hoisted STATIC initialisers all run before the module body's Dim. The SHARED home
+// never needed it - "@g" was a constant - which is why this order was invisible until the cell became an address.
+// ⚠️ Only for instructions that define fresh registers and touch memory (the cell allocation): nothing else may be
+// moved without asking what reads their registers. The originals are collected FIRST, because when the Dim is itself
+// in the entry block every insertion shifts the indexes still to visit.
+var
+  k, n: Integer;
+  Orig: array of TSSAInstruction;
+begin
+  if (FCurrentBlock = nil) or (FEntryBlock = nil) or (FEntryHoistPos < 0) then Exit;
+  n := FCurrentBlock.Instructions.Count - FromIdx;
+  if n <= 0 then Exit;
+  SetLength(Orig, n);
+  for k := 0 to n - 1 do Orig[k] := FCurrentBlock.Instructions[FromIdx + k];
+  for k := 0 to n - 1 do
+  begin
+    if Orig[k].OpCode = ssaNop then Continue;
+    FEntryBlock.Instructions.Insert(FEntryHoistPos, Orig[k].Clone);
+    Inc(FEntryHoistPos);
+    Orig[k].OpCode := ssaNop;
+  end;
+end;
+
 procedure TSSAGenerator.EmitRawAddrScalarAlloc(const Name: string);
 // Allocate this @-taken scalar's per-frame 8-byte raw byte-heap slot (enough for any builtin scalar) and
 // store the block's address in the hidden handle. A fresh block per DIM/prologue keeps recursion safe.
@@ -48147,6 +48345,11 @@ begin
   // A raw-backed local/param: the hidden handle already HOLDS the byte address, exactly as "@x" reads it.
   if IsRawAddrLocal(Name) then
     Exit(EnsureIntRegister(AddrLocalHandle(Name)));
+  // ⭐ DIVERGENZE 455 - ...and a raw-backed MODULE scalar: the address sits in "<name>$RA"[0], exactly what "@x" reads.
+  // Without this branch the answer was the 0 constant, EmitVarAddressIsReal said "no address", and a ByRef
+  // argument was handed a TEMPORARY cell: "Dim pd As Double Ptr = @x : bump(x)" left x as it was, in silence.
+  if IsRawModuleScalar(Name) then
+    Exit(RawModuleAddrReg(Name));
   // ...and a STRING one is a record cell: its address is a record-field pointer at slot 0, again the
   // same thing "@s" emits.
   if IsAddrLocal(Name) then
@@ -48254,7 +48457,7 @@ function TSSAGenerator.EmitVarAddressIsReal(const Name: string): Boolean;
 // ordinary "t(x)" whose x happens to live in a register. The caller has to know, so it can cell the
 // value instead - see the temporary branch in StageCallArgs.
 begin
-  Result := IsRawAddrLocal(Name) or IsAddrLocal(Name) or
+  Result := IsRawAddrLocal(Name) or IsAddrLocal(Name) or IsRawModuleScalar(Name) or   // 455: RAWMODULE too
             (FSharedScalarArr.IndexOf(UpperFast(Name)) >= 0);
 end;
 
@@ -56144,6 +56347,8 @@ begin
 
   // Create entry block
   FCurrentBlock := FProgram.CreateBlock('_entry');
+  FEntryBlock := FCurrentBlock;
+  FEntryHoistPos := -1;          // set once the SHARED backings are sized (see EmitSharedScalarAllocs below)
 
   // OOP: allocate static member variables' backing arrays at program start (no DIM to trigger it).
   EmitStaticMemberAllocs;
@@ -56191,6 +56396,10 @@ begin
   // after static-member allocation). No-op when the program defines none. Pre-size SHARED-scalar backings
   // first so a constructor can touch module globals before their DIM statement runs.
   EmitSharedScalarAllocs;
+  // ⭐ Phase 2.1a: the cell of a raw-backed module scalar is allocated HERE (HoistToEntry moves it from its Dim), so a
+  // module constructor, a static member or a hoisted STATIC initialiser that reads "@g" finds the cell - they all run
+  // before the Dim does. After the line above, which may re-size a backing array, and before everything below.
+  if Assigned(FEntryBlock) then FEntryHoistPos := FEntryBlock.Instructions.Count;
   // ...and only NOW can a UDT-typed static member get its instance: the line above would have zeroed a
   // handle stored earlier, and a constructor label did not exist before PreCollectProcedures.
   EmitStaticMemberRecords;
