@@ -271,6 +271,8 @@ EventPollCounter := 0;
   HotFlags := 0;
   if ModernConv and (not FBoundsCheck) then HotFlags := HotFlags or 1;   // HF_MODERN_ARRAYS
   if ModernConv then HotFlags := HotFlags or 2;                          // HF_MODERN_CONV
+  // HF_NATIVE_MEM: the bcRaw* arms may use a C-tagged value as an address - RawAddr's own fast exit.
+  if FNativeMemory and (not FBoundsCheck) then HotFlags := HotFlags or 4;
   // The budget is spent on BACK EDGES, so it bounds a stay in units of BASIC loop iterations rather
   // than of instructions - a test per instruction in that loop was measured at 3.5-11.8% and would
   // tax every headless program to help the windowed ones. With no event callback there is nobody to

@@ -12154,7 +12154,10 @@ begin
                          // C8 for the JIT: the byte offset of the five-Int64 draw-surface block.
                          // An OFFSET, like the banks above and for the same reason - the block is
                          // per-CONTEXT, so a worker running this same code reads its own.
-                         Integer(PtrUInt(@FCtx.GfxDesc) - PtrUInt(Pointer(FCtx))));
+                         Integer(PtrUInt(@FCtx.GfxDesc) - PtrUInt(Pointer(FCtx))),
+                         // Phase 2 of the pointer model: the raw accessors may use a C-tagged value as an
+                         // address, exactly when RawAddr does (fb mode, no --bounds-check).
+                         FNativeMemory and (not FBoundsCheck));
       if Mem <> nil then FNativeLoops[hdr] := Mem;
       if SysUtils.GetEnvironmentVariable('JIT_DIAG') <> '' then
       begin

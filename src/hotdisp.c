@@ -36,6 +36,7 @@ typedef struct { uint16_t op, dest, s1, s2; int64_t imm; } SbInstr;
 
 #define HF_MODERN_ARRAYS 1
 #define HF_MODERN_CONV   2
+#define HF_NATIVE_MEM    4   /* the fb memory mode with no --bounds-check: a C-tagged value IS an address */
 
 /* ⛔ THE ORDER OF THIS LIST COSTS REAL TIME, AND THERE IS NO RULE FOR IT - ONLY MEASUREMENT.
    The arms are indirect-jump targets, so where each one LANDS matters. Adding the four record
@@ -191,7 +192,11 @@ double tan(double);
   X(0x0068, RecordLoadInt         ) \
   X(0x0069, RecordLoadFloat       ) \
   X(0x006B, RecordStoreInt        ) \
-  X(0x006C, RecordStoreFloat      )
+  X(0x006C, RecordStoreFloat      ) \
+  X(0x0317, RawLoadInt            ) \
+  X(0x0318, RawLoadFloat          ) \
+  X(0x0319, RawStoreInt           ) \
+  X(0x031A, RawStoreFloat         )
 
 
 
@@ -349,6 +354,67 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
     RECBYTES(rec_, enc_, p_);
     if ((enc_ & 0xF) == 7) *(float *)p_ = (float)v_; else *(double *)p_ = v_;
     pc++; } NEXT;
+
+  /* RAW MEMORY THROUGH A MACHINE ADDRESS (pointer model, phase 2), transcribed from the bcRaw* arms of
+     ExecuteArrayOp and from RawLoadInt / RawLoadFloat / RawStoreInt / RawStoreFloat in SedaiBytecodeVM.pas.
+     In the fb memory mode a block from Allocate is libc memory and its pointer is "address | FGNPTR_TAG";
+     with no --bounds-check RawAddr hands that address back as it is, so the whole access is one move.
+     ⛔ THE GUARD IS THE INTERPRETER'S OWN CONDITION, not a new one: bits 63..61 = 0 0 1 is exactly
+     "positive, no RAWPTR_TAG, FGNPTR_TAG set". Anything else - NULL, the VM's raw heap (bit 62), a packed
+     array pointer, a record-field pointer (negative) - still means a decode, and hands the PC back.
+     ⛔ AND THE TAG IS TAKEN OFF before the move: without it the read lands 2^61 past the address.
+     The immediate is the raw type code (RTC_* in SedaiSSATypes.pas); two codes stay the interpreter's:
+       10 RTC_PTR64  a pointer read out of, or written into, C's memory is translated there (DIVERGENZE 250/451)
+       3/9 on Windows  a 32-bit cell inside a WSTRING block Windows handed back is a UTF-16 unit (239) */
+#define RAWADDR(v_, out_) do {                                                    \
+    uint64_t u_ = (uint64_t)(v_);                                                 \
+    if (!(flags & HF_NATIVE_MEM) || (u_ >> 61) != 1) return pc;                   \
+    (out_) = (char *)(intptr_t)(u_ & ~(1ULL << 61));                              \
+  } while (0)
+  L_RawLoadInt: {
+    char *p_;
+    RAWADDR(ireg[I->s1], p_);
+    switch (I->imm) {
+      case 1:  ireg[I->dest] = *(int8_t   *)p_; break;   /* RTC_I8  */
+      case 2:  ireg[I->dest] = *(int16_t  *)p_; break;   /* RTC_I16 */
+      case 7:  ireg[I->dest] = *(uint8_t  *)p_; break;   /* RTC_U8  */
+      case 8:  ireg[I->dest] = *(uint16_t *)p_; break;   /* RTC_U16 */
+#ifndef _WIN32
+      case 3:  ireg[I->dest] = *(int32_t  *)p_; break;   /* RTC_I32 */
+      case 9:  ireg[I->dest] = *(uint32_t *)p_; break;   /* RTC_U32 */
+#else
+      case 3: case 9: return pc;
+#endif
+      case 10: return pc;                                /* RTC_PTR64 */
+      default: ireg[I->dest] = *(int64_t  *)p_; break;
+    }
+    pc++; } NEXT;
+  L_RawLoadFloat: {
+    char *p_;
+    RAWADDR(ireg[I->s1], p_);
+    freg[I->dest] = (I->imm == 5) ? (double)*(float *)p_ : *(double *)p_;   /* 5 = RTC_SINGLE */
+    pc++; } NEXT;
+  L_RawStoreInt: {
+    char *p_; int64_t v_ = ireg[I->s2];
+    RAWADDR(ireg[I->s1], p_);
+    switch (I->imm) {
+      case 1: case 7: *(uint8_t  *)p_ = (uint8_t )v_; break;
+      case 2: case 8: *(uint16_t *)p_ = (uint16_t)v_; break;
+#ifndef _WIN32
+      case 3: case 9: *(uint32_t *)p_ = (uint32_t)v_; break;
+#else
+      case 3: case 9: return pc;
+#endif
+      case 10: return pc;
+      default:        *(int64_t  *)p_ = v_;           break;
+    }
+    pc++; } NEXT;
+  L_RawStoreFloat: {
+    char *p_; double v_ = freg[I->s2];
+    RAWADDR(ireg[I->s1], p_);
+    if (I->imm == 5) *(float *)p_ = (float)v_; else *(double *)p_ = v_;
+    pc++; } NEXT;
+#undef RAWADDR
 
   L_LoadConstInt: ireg[I->dest] = I->imm;                                        pc++; NEXT;
   L_CopyInt: ireg[I->dest] = ireg[I->s1];                                   pc++; NEXT;

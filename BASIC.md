@@ -3763,7 +3763,13 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
 - ⚠️ **A byte view of an array of wider elements does not read bytes.** `Cast(UByte Ptr, @s(0))[k]` over a `Short`
   array reads the low byte of element `k`, not byte `k`, and past the last element it stops with "Null or invalid
   pointer dereference". The same happens when C hands a callback the program's own `Short` buffer and the callback
-  reads it byte by byte. Over `UByte` and `ZString` data the two readings coincide.
+  reads it byte by byte. Over `UByte` and `ZString` data the two readings coincide. A numeric **variable** read
+  through a byte pointer behaves the same way: `Dim pb As UByte Ptr = @x : Print pb[1]` over a `Long` stops with
+  "Null or invalid pointer dereference", while `*pb` reads the low byte correctly.
+- ⚠️ **A `ByRef` argument can lose the callee's write** when the program also takes the variable's address with a
+  pointer of the other numeric family — `Dim pd As Double Ptr = @x` over a `Long x`, or a `Single Ptr` over an
+  integer. `bump(x)` then leaves `x` unchanged, with no error. With a pointer of the same family (`UByte Ptr`,
+  `Long Ptr`, …) the write arrives.
 - ⚠️ **A pointer that C hands back does not compare equal to the address of a `String` it was given.**
   `rs = memcpy(@s, @s, 0)` then `rs = @s` is false, although `Hex(rs)` and `Hex(@s)` print the same number; with the
   address of a numeric variable or of a record the comparison is right.

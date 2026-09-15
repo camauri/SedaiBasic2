@@ -524,6 +524,10 @@ function AotSkipMainDefault(CombinedMode: Boolean): Boolean;
 // into a string header the other has decided it may not touch.
 function AotAscMidInline: Boolean;
 
+// Phase 2 of the pointer model: may a raw accessor of this type code be lowered to a move? Exported for the
+// same reason as AotAscMidInline - the loop JIT lowers the same four opcodes and must draw the same line.
+function AotRawCodeNative(Code: Int64; IsFloat: Boolean): Boolean;
+
 procedure AotSetRecordLayout(RecordsOff, RecSize, RecIntOff, RecFloatOff, SharedRecOff: Integer);
 
 // Magic number for a SIGNED 64-bit division by a constant (Hacker's Delight figure 10-4), so that
@@ -560,6 +564,11 @@ var
   GNoThreads: Boolean = False;     // program creates no thread: the shared region cannot grow under us
   GSharedRecLockFree: Boolean = True;  // the INTERPRETER resolves a shared handle without the lock
   GAotRecNative: Boolean = True;   // AOT_RECDEOPT=1 restores the old deopt-to-interpreter path
+  // ⭐ Phase 2 of the pointer model: the raw accessors lower to one move (AotRawAccess). True only in the
+  // fb memory mode with no forced bounds check - the one arrangement in which the interpreter's RawAddr
+  // uses a C-tagged value as an address - and AOT_RAWNAT=0 puts them back on the helper (the A/B).
+  // Set with the other classification globals, so the survey and the compile cannot disagree.
+  GAotRawMem: Boolean = False;
                                    // for shared-record fields (A/B knob, see AotRecAccess)
                                        // (TBytecodeVM.FSharedRecLockFree, SHAREDREC_LOCK=1 turns it
                                        // off). Mirrored here so compiled code takes the native path
@@ -647,6 +656,19 @@ begin
     else GRecNativeState := 1;
   end;
   Result := (GRecNativeState = 1) and (GRecSize > 0);
+end;
+
+function AotRawCodeNative(Code: Int64; IsFloat: Boolean): Boolean;
+begin
+  if IsFloat then Exit(True);            // RTC_SINGLE is four bytes, every other code eight
+  case Code of
+    RTC_PTR64: Result := False;          // a pointer read from / written into C's memory is translated (250 · 451)
+    {$IFDEF WINDOWS}
+    RTC_I32, RTC_U32: Result := False;   // a cell of a WSTRING block Windows handed back is a UTF-16 unit (239)
+    {$ENDIF}
+  else
+    Result := True;
+  end;
 end;
 
 // C7: replace a division by a CONSTANT with a multiply-high and shifts, gated for the A/B.
@@ -1245,6 +1267,9 @@ begin
     // C6: record ALLOCATION as a leaf call to the VM's own AllocRecord/FreeSharedRecord
     // (AotIsNative checks the gate and the operand shape).
     ssaRecordNew, ssaRecordFree,
+    // Phase 2 of the pointer model: raw memory through a machine address. A CONDITIONAL native form -
+    // anything that is not an fb-mode address falls back to the helper - so it needs a PC.
+    ssaRawLoadInt, ssaRawLoadFloat, ssaRawStoreInt, ssaRawStoreFloat,
     // B2: 1-D int/float array element access + dim-0 bound queries (string-element
     // arrays are rejected by the classifier/prescan; multi-dim access goes through
     // ssaArrayIdxPush/Resolve, which are not in the set, so those regions bail).
@@ -1509,6 +1534,22 @@ begin
                 (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtFloat) and
                 (Ins.Src2.Kind = svkRegister) and (Ins.Src2.RegType = srtFloat) and
                 (Ins.Dest.Kind = svkRegister) and (Ins.Dest.RegType = srtFloat);
+    // The width is a compile-time constant and every operand a register of its own bank; any other shape,
+    // or a width the interpreter translates (AotRawCodeNative), takes the helper road whole.
+    ssaRawLoadInt, ssaRawLoadFloat:
+      Result := GAotRawMem and (Ins.Src3.Kind = svkConstInt) and
+                AotRawCodeNative(Ins.Src3.ConstInt, Ins.OpCode = ssaRawLoadFloat) and
+                (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt) and
+                (Ins.Dest.Kind = svkRegister) and
+                ((Ins.Dest.RegType = srtFloat) = (Ins.OpCode = ssaRawLoadFloat)) and
+                (Ins.Dest.RegType <> srtString);
+    ssaRawStoreInt, ssaRawStoreFloat:
+      Result := GAotRawMem and (Ins.Src3.Kind = svkConstInt) and
+                AotRawCodeNative(Ins.Src3.ConstInt, Ins.OpCode = ssaRawStoreFloat) and
+                (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt) and
+                (Ins.Src2.Kind = svkRegister) and
+                ((Ins.Src2.RegType = srtFloat) = (Ins.OpCode = ssaRawStoreFloat)) and
+                (Ins.Src2.RegType <> srtString);
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordStoreInt, ssaRecordStoreFloat:
       // Needs the record layout AND a constant slot: the slot is baked into the displacement.
       Result := AotRecNative and (Ins.Src3.Kind = svkConstInt);
@@ -1742,7 +1783,7 @@ begin
   Result := Regions;
 end;
 
-procedure AotPrepareClassification(SSAProg: TSSAProgram; AllowUnsafe: Boolean);
+procedure AotPrepareClassification(SSAProg: TSSAProgram; Prog: TBytecodeProgram; AllowUnsafe: Boolean);
 // ⛔⛔ THE FOUR GLOBALS THE CLASSIFIER READS, SET IN ONE PLACE. They were written out inline in
 // AotCompileProgram, with a comment saying GArrStrNative "must be set BEFORE AotSliceAndClassify ...
 // if the two saw different values a region would be accepted and then fail at emit time". The
@@ -1773,6 +1814,8 @@ begin
       if not GNoThreads then Break;
     end;
   GArrStrNative := AllowUnsafe;
+  GAotRawMem := AllowUnsafe and (Prog <> nil) and Prog.NativeMemory and
+                (GetEnvironmentVariable('AOT_RAWNAT') <> '0');
 end;
 
 function AotEligiblePCMask(SSAProg: TSSAProgram; Prog: TBytecodeProgram): TBoolArray;
@@ -1794,7 +1837,7 @@ begin
   // AOT refuses at emit time what its own survey accepted. So both values are asked and a PC counts
   // as the AOT's if EITHER says so - conservative in the only direction that is safe, at the cost of
   // a handful of fusions in regions that were never going to be compiled anyway.
-  AotPrepareClassification(SSAProg, True);
+  AotPrepareClassification(SSAProg, Prog, True);
   Regions := AotSliceAndClassify(SSAProg, Prog);
   if Length(Regions) = 0 then Exit;
   SetLength(Starts, 0); SetLength(Elig, 0);
@@ -1805,7 +1848,7 @@ begin
       SetLength(Starts, t + 1); SetLength(Elig, t + 1);
       Starts[t] := Regions[i].EntryPC; Elig[t] := Regions[i].Eligible;
     end;
-  AotPrepareClassification(SSAProg, False);
+  AotPrepareClassification(SSAProg, Prog, False);
   Regions := AotSliceAndClassify(SSAProg, Prog);
   for i := 0 to High(Regions) do
     if Regions[i].EntryPC >= 0 then
@@ -1864,6 +1907,8 @@ begin
   // otherwise AOT_DIAG reports an eligibility nobody actually gets. A diagnostic that disagrees with
   // reality is worse than none - it cost an afternoon earlier today.
   GArrStrNative := AllowUnsafe;
+  GAotRawMem := AllowUnsafe and (Prog <> nil) and Prog.NativeMemory and
+                (GetEnvironmentVariable('AOT_RAWNAT') <> '0');
   Regions := AotSliceAndClassify(SSAProg, Prog);
   NElig := 0; NB3 := 0;
   for r := 0 to High(Regions) do
@@ -3917,6 +3962,88 @@ var
       if IsFloat then FStore(ValReg, XMM0) else IStore(ValReg, RAX);
     end;
   end;
+  // ⭐ RAW MEMORY THROUGH A MACHINE ADDRESS (pointer model, phase 2): ssaRaw{Load,Store}{Int,Float} as one
+  // move, where they used to be a helper call each - which made the AOT 1.6x SLOWER than the interpreter on
+  // an Allocate'd block (job/tests/bench/alloc_rw.bas, AOT-PRESTAZIONI.md §8), a defect by the owner's rule.
+  // In the fb memory mode such a block is libc memory and its pointer is "address | FGNPTR_TAG"; with no
+  // forced bounds check the interpreter's RawAddr hands the address back as it is.
+  // ⛔ The guard is the interpreter's own condition, bits 63..61 = 0 0 1. Anything else - NULL, the VM's raw
+  // heap, a packed array pointer, a record-field pointer - calls the helper for THIS instruction and native
+  // code carries on after it. ⛔ Never ExitTo: that abandons the whole region (see AotRecAccess).
+  // ⛔ And the tag comes off before the move, or the access lands 2^61 past the address.
+  // The width is Src3 (a raw type code, constant - AotIsNative checked it). The value is loaded first.
+  procedure AotRawAccess(apc: Integer; IsFloat, IsStore: Boolean);
+  var pr, vr, W, pCold, pDone: Integer;
+  begin
+    W := Integer(Cur.Src3.ConstInt);
+    pr := IReg(Cur.Src1);
+    if IsStore then
+    begin
+      if IsFloat then vr := FReg(Cur.Src2) else vr := IReg(Cur.Src2);
+    end
+    else
+    begin
+      if IsFloat then vr := FReg(Cur.Dest) else vr := IReg(Cur.Dest);
+    end;
+    if not OK then Exit;
+    if IsStore then
+    begin
+      if IsFloat then FLoad(XMM0, vr) else ILoad(RCX, vr);
+    end;
+    ILoad(RAX, pr);                                        // rax = the pointer value
+    E.EmitBytes([$48, $89, $C2]);                          // mov rdx, rax
+    E.EmitBytes([$48, $C1, $EA, 61]);                      // shr rdx, 61
+    E.EmitBytes([$83, $FA, $01]);                          // cmp edx, 1
+    E.EmitBytes([$0F, $85]); pCold := E.Len; E.Emit32(0);  // jne cold
+    E.EmitBytes([$48, $0F, $BA, $F0, 61]);                 // btr rax, 61
+    if IsStore then
+    begin
+      if IsFloat then
+      begin
+        if W = RTC_SINGLE then
+        begin
+          E.EmitBytes([$F2, $0F, $5A, $C0]);               // cvtsd2ss xmm0, xmm0
+          E.EmitBytes([$F3, $0F, $11, $00]);               // movss [rax], xmm0
+        end
+        else
+          E.EmitBytes([$F2, $0F, $11, $00]);               // movsd [rax], xmm0
+      end
+      else
+        case W of
+          RTC_I8,  RTC_U8:  E.EmitBytes([$88, $08]);       // mov [rax], cl
+          RTC_I16, RTC_U16: E.EmitBytes([$66, $89, $08]);  // mov [rax], cx
+          RTC_I32, RTC_U32: E.EmitBytes([$89, $08]);       // mov [rax], ecx
+        else                E.EmitBytes([$48, $89, $08]);  // mov [rax], rcx
+        end;
+    end
+    else
+    begin
+      if IsFloat then
+      begin
+        if W = RTC_SINGLE then E.EmitBytes([$F3, $0F, $5A, $00])   // cvtss2sd xmm0, [rax]
+        else E.EmitBytes([$F2, $0F, $10, $00]);                    // movsd xmm0, [rax]
+        FStore(vr, XMM0);
+      end
+      else
+      begin
+        case W of
+          RTC_I8:  E.EmitBytes([$48, $0F, $BE, $00]);      // movsx rax, byte [rax]
+          RTC_U8:  E.EmitBytes([$0F, $B6, $00]);           // movzx eax, byte [rax]
+          RTC_I16: E.EmitBytes([$48, $0F, $BF, $00]);      // movsx rax, word [rax]
+          RTC_U16: E.EmitBytes([$0F, $B7, $00]);           // movzx eax, word [rax]
+          RTC_I32: E.EmitBytes([$48, $63, $00]);           // movsxd rax, dword [rax]
+          RTC_U32: E.EmitBytes([$8B, $00]);                // mov eax, [rax] (zero-extends)
+        else       E.EmitBytes([$48, $8B, $00]);           // mov rax, [rax]
+        end;
+        IStore(vr, RAX);
+      end;
+    end;
+    E.EmitBytes([$E9]); pDone := E.Len; E.Emit32(0);       // jmp done
+    E.Patch32(pCold, LongWord(E.Len - (pCold + 4)));       // @cold
+    EmitHelperCall(apc);
+    E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));       // @done
+  end;
+
   // Record field access, ported from the JIT's J13 (SedaiJit.RecAccess) - same shape, same guard,
   // AOT deopt instead of the JIT's.
   //
@@ -5422,6 +5549,22 @@ var
               if Ins.OpCode = ssaMathAtan2 then CountVal(Ins.Src2);
             end;
           end;
+          // Phase 2 of the pointer model: the raw accessors. The same shape as PSET below - a native
+          // form whose cold path IS the helper call - so a call-ready frame, a deopt hazard and a PC.
+          ssaRawLoadInt, ssaRawLoadFloat, ssaRawStoreInt, ssaRawStoreFloat:
+          begin
+            if not AotIsNative(SSAProg, Ins) then NoteHelperOp
+            else
+            begin
+              HasHelperCall := True;
+              HasDeopt := True;
+              if not AotHelperRoutable(Prog, o) then Fail('raw-not-routable');
+              if Prog.GetSsaPc(o) < 0 then Fail('no-pc-raw');
+              CountVal(Ins.Src1);
+              if (Ins.OpCode = ssaRawLoadInt) or (Ins.OpCode = ssaRawLoadFloat) then CountVal(Ins.Dest)
+              else CountVal(Ins.Src2);
+            end;
+          end;
           // C8: PSET. Same shape as the print item above - a native form that can still fall back -
           // so it needs the same three things: a call-ready frame, a deopt hazard, and a PC.
           ssaGfxPset:
@@ -6093,7 +6236,8 @@ var
           ssaCmpEqFloat, ssaCmpNeFloat, ssaCmpLtFloat, ssaCmpGtFloat, ssaCmpLeFloat, ssaCmpGeFloat,
           ssaArrayLoad, ssaArrayStore,
           ssaArrayLoadIndInt, ssaArrayLoadIndFloat,
-          ssaArrayStoreIndInt, ssaArrayStoreIndFloat:
+          ssaArrayStoreIndInt, ssaArrayStoreIndFloat,
+          ssaRawLoadInt, ssaRawLoadFloat, ssaRawStoreInt, ssaRawStoreFloat:
             Inc(nArith);
         end;
       end;
@@ -7269,6 +7413,13 @@ var
         else
           AotRecAccess(apc, IReg(Cur.Src1), Cur.Src3.ConstInt, IReg(Cur.Src2), False, True);
       end;
+      // Phase 2 of the pointer model. A PC because the cold path is the helper call.
+      ssaRawLoadInt, ssaRawLoadFloat, ssaRawStoreInt, ssaRawStoreFloat:
+      begin
+        apc := NeedPC; if not OK then Exit;
+        AotRawAccess(apc, (Cur.OpCode = ssaRawLoadFloat) or (Cur.OpCode = ssaRawStoreFloat),
+                     (Cur.OpCode = ssaRawStoreInt) or (Cur.OpCode = ssaRawStoreFloat));
+      end;
       ssaArrayLBound:
       begin
         d := ArrId; if not OK then Exit;
@@ -7842,7 +7993,7 @@ begin
   //
   // ⛔ And the lesson under the lesson: a cost verdict has a DATE on it. This one was honest when
   // written and false eight weeks later, because a defect somewhere else was inside the measurement.
-  AotPrepareClassification(SSAProg, AllowUnsafe);
+  AotPrepareClassification(SSAProg, Prog, AllowUnsafe);
   if AotDumpDir <> '' then
     WriteLn(ErrOutput, '[AOT] AOT_DUMP: region dumps go to ', AotDumpDir,
             ' (disassemble with job/tests/tools/aot_disasm.ps1)');

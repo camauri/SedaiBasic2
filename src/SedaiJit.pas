@@ -38,6 +38,7 @@ interface
 
 uses
   SysUtils, SedaiBytecodeTypes, SedaiX86Emitter,
+  SedaiSSATypes,   // the RTC_* raw type codes the bcRaw* arms carry in their Immediate
   // SedaiAot for the AOTCTX_* offsets ONLY: the string/record leaf primitives live in one table that
   // the VM fills once and both backends read, which is what keeps them from drifting apart. The
   // dependency is one-way - SedaiAot does not use this unit.
@@ -87,7 +88,8 @@ function CompileLoop(Ins: Pointer; HeaderPC, EndPC, ProgLen: Integer; TrueVal: I
                      AllowUnsafe, Modern: Boolean; XferIntOff, XferFloatOff: Integer;
                      RecordsOff: Integer; RecSize, RecIntOff, RecFloatOff: Integer;
                      HelperFn, VMSelf: Pointer;
-                     PrimCtx: Pointer; StringRegsOff, GfxDescOff: Integer): TExecMem;
+                     PrimCtx: Pointer; StringRegsOff, GfxDescOff: Integer;
+                     NativeMem: Boolean): TExecMem;
 
 // J2 self-test: emit  a+b  and call it, proving the emit->exec->call pipeline.
 function JitSelfTest(out Msg: string): Boolean;
@@ -275,7 +277,11 @@ begin
       // and reserves the call scratch - but it never actually takes this route: the case arm below
       // emits it inline, and only its cold path calls out. A helper call is ~55 ns and the whole
       // per-point budget on that demo is 57.
-      bcGfxScreenLock, bcGfxScreenUnlock, bcGfxPset:
+      bcGfxScreenLock, bcGfxScreenUnlock, bcGfxPset,
+      // ⭐ The four RAW accessors (pointer model, phase 2): read, they name no FArrays storage and assign no
+      // Ctx.PC (ExecuteArrayOp lists them among the arms that cannot reshape). Admitted so a loop that
+      // walks an Allocate'd block ROUTES - the inline form below needs this road for its cold path.
+      bcRawLoadInt, bcRawLoadFloat, bcRawStoreInt, bcRawStoreFloat:
         Result := True;
     else
       Result := False;
@@ -287,7 +293,8 @@ function CompileLoop(Ins: Pointer; HeaderPC, EndPC, ProgLen: Integer; TrueVal: I
                      AllowUnsafe, Modern: Boolean; XferIntOff, XferFloatOff: Integer;
                      RecordsOff: Integer; RecSize, RecIntOff, RecFloatOff: Integer;
                      HelperFn, VMSelf: Pointer;
-                     PrimCtx: Pointer; StringRegsOff, GfxDescOff: Integer): TExecMem;
+                     PrimCtx: Pointer; StringRegsOff, GfxDescOff: Integer;
+                     NativeMem: Boolean): TExecMem;
 var
   E: TX86Emitter;
   NativeOff: array of Integer;      // absolute bytecode PC -> native offset (sized ProgLen)
@@ -1403,6 +1410,8 @@ var
         bcXferLoadFloat:   T(J^.Dest);               // Dest = value moved from the transfer slot
         bcRecordLoadFloat: T(J^.Dest);               // Dest = loaded record field (float)
         bcRecordStoreFloat: T(J^.Src2);              // Src2 = stored VALUE (float); Src1 = handle (int)
+        bcRawLoadFloat:  T(J^.Dest);                 // Dest = loaded value; Src1 = the address (int)
+        bcRawStoreFloat: T(J^.Src2);                 // Src2 = stored VALUE (float)
         bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat, bcCmpEqFloat, bcCmpNeFloat:
           begin T(J^.Src1); T(J^.Src2); end;         // float operands (Dest is an int reg -> ScanI)
         bcFloatToInt: T(J^.Src1);                    // float input (Dest is an int reg -> ScanI)
@@ -1460,6 +1469,9 @@ var
         bcRecordLoadInt:    begin T(J^.Dest); T(J^.Src1); end;   // Dest=field value, Src1=handle
         bcRecordStoreInt:   begin T(J^.Src1); T(J^.Src2); end;   // Src1=handle, Src2=stored value
         bcRecordLoadFloat, bcRecordStoreFloat: T(J^.Src1);       // Src1=handle (int); value is a float reg
+        bcRawLoadInt:  begin T(J^.Dest); T(J^.Src1); end;        // Dest=value, Src1=address
+        bcRawStoreInt: begin T(J^.Src1); T(J^.Src2); end;        // Src1=address, Src2=stored value
+        bcRawLoadFloat, bcRawStoreFloat: T(J^.Src1);             // Src1=address (int); value is a float reg
         bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat, bcCmpEqFloat, bcCmpNeFloat:
           T(J^.Dest);                                // float compare writes an int result reg
         bcFloatToInt, bcFloatRound: T(J^.Dest);      // float->int writes an int result reg
@@ -2012,6 +2024,79 @@ var
     MovRR(ABI_ARG1, RAX);                                                    // arg1 = the ctx itself
     LeafCall(Prim(AOTCTX_GFXREFRESH));
     LeafRestore;
+    E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));                         // @done
+  end;
+
+  { ⭐ RAW MEMORY THROUGH A MACHINE ADDRESS (pointer model, phase 2) - the bcRaw* accessors inline, the same
+    four the C hot loop and the AOT lower. In the fb memory mode a block from Allocate is libc memory and its
+    pointer is "address | FGNPTR_TAG"; with no --bounds-check the interpreter's RawAddr hands the address
+    back as it is, so the access is ONE move. Before this they were not routable at all, so a loop that
+    walked such a block BAILED whole and stayed interpreted.
+    ⛔ The guard is the interpreter's own condition - bits 63..61 = 0 0 1 - and anything else (NULL, the VM's
+    raw heap, a packed array pointer, a record-field pointer) takes the helper road for THIS instruction and
+    native execution carries on after it; never DeoptTo, which gives up the loop.
+    ⛔ And the tag comes off before the move, or the read lands 2^61 past the address.
+    The width is the raw type code in the Immediate, read at compile time (AotRawCodeNative decides which
+    codes are native, for both backends). The value is loaded FIRST, while rax is still free. }
+  procedure EmitRawJ(apc: Integer; IsFloat, IsStore: Boolean);
+  var pCold, pDone, W: Integer;
+  begin
+    W := Integer(I^.Immediate and $FFFFFFFF);
+    if IsStore then
+    begin
+      if IsFloat then FLoad(XMM0, I^.Src2) else ILoad(RCX, I^.Src2);
+    end;
+    ILoad(RAX, I^.Src1);                                                     // rax = the pointer value
+    E.EmitBytes([$48, $89, $C2]);                                            // mov rdx, rax
+    E.EmitBytes([$48, $C1, $EA, 61]);                                        // shr rdx, 61
+    E.EmitBytes([$83, $FA, $01]);                                            // cmp edx, 1
+    E.EmitBytes([$0F, $85]); pCold := E.Len; E.Emit32(0);                    // jne cold
+    E.EmitBytes([$48, $0F, $BA, $F0, 61]);                                   // btr rax, 61
+    if IsStore then
+    begin
+      if IsFloat then
+      begin
+        if W = RTC_SINGLE then
+        begin
+          E.EmitBytes([$F2, $0F, $5A, $C0]);                                 // cvtsd2ss xmm0, xmm0
+          E.EmitBytes([$F3, $0F, $11, $00]);                                 // movss [rax], xmm0
+        end
+        else
+          E.EmitBytes([$F2, $0F, $11, $00]);                                 // movsd [rax], xmm0
+      end
+      else
+        case W of
+          RTC_I8,  RTC_U8:  E.EmitBytes([$88, $08]);                         // mov [rax], cl
+          RTC_I16, RTC_U16: E.EmitBytes([$66, $89, $08]);                    // mov [rax], cx
+          RTC_I32, RTC_U32: E.EmitBytes([$89, $08]);                         // mov [rax], ecx
+        else                E.EmitBytes([$48, $89, $08]);                    // mov [rax], rcx
+        end;
+    end
+    else
+    begin
+      if IsFloat then
+      begin
+        if W = RTC_SINGLE then E.EmitBytes([$F3, $0F, $5A, $00])             // cvtss2sd xmm0, [rax]
+        else E.EmitBytes([$F2, $0F, $10, $00]);                              // movsd xmm0, [rax]
+        FStore(I^.Dest, XMM0);
+      end
+      else
+      begin
+        case W of
+          RTC_I8:  E.EmitBytes([$48, $0F, $BE, $00]);                        // movsx rax, byte [rax]
+          RTC_U8:  E.EmitBytes([$0F, $B6, $00]);                             // movzx eax, byte [rax]
+          RTC_I16: E.EmitBytes([$48, $0F, $BF, $00]);                        // movsx rax, word [rax]
+          RTC_U16: E.EmitBytes([$0F, $B7, $00]);                             // movzx eax, word [rax]
+          RTC_I32: E.EmitBytes([$48, $63, $00]);                             // movsxd rax, dword [rax]
+          RTC_U32: E.EmitBytes([$8B, $00]);                                  // mov eax, [rax] (zero-extends)
+        else       E.EmitBytes([$48, $8B, $00]);                             // mov rax, [rax]
+        end;
+        IStore(I^.Dest, RAX);
+      end;
+    end;
+    E.EmitBytes([$E9]); pDone := E.Len; E.Emit32(0);                         // jmp done
+    E.Patch32(pCold, LongWord(E.Len - (pCold + 4)));                         // @cold
+    EmitHelperCall(apc);
     E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));                         // @done
   end;
 
@@ -2944,6 +3029,13 @@ var
         // the whole per-point budget on bubble_universe is 57. The inline form is what makes the
         // difference between compiling this loop and being no better than interpreting it.
         if UseHelper and (GfxDescOff >= 0) and not (InCallee or InGosub) then EmitGfxPsetJ(apc)
+        else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
+      bcRawLoadInt, bcRawLoadFloat, bcRawStoreInt, bcRawStoreFloat:
+        if UseHelper and NativeMem and not (InCallee or InGosub) and
+           AotRawCodeNative(I^.Immediate and $FFFFFFFF,
+                            (I^.OpCode = bcRawLoadFloat) or (I^.OpCode = bcRawStoreFloat)) then
+          EmitRawJ(apc, (I^.OpCode = bcRawLoadFloat) or (I^.OpCode = bcRawStoreFloat),
+                   (I^.OpCode = bcRawStoreInt) or (I^.OpCode = bcRawStoreFloat))
         else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
     else
       // The helper route (J14): an instruction with no native form is run by the INTERPRETER and
