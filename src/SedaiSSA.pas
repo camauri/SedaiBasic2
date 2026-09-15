@@ -8730,6 +8730,14 @@ begin
           // call indirectly with the field's recorded signature (like a funcptr variable, but the PC comes
           // from a record slot rather than a variable register).
           TempStr := UDTFuncPtrFieldSig(FindUDT(MethodOwnerType), VarToStr(Node.GetChild(0).Value), RecSlotK);
+          // ⭐ DIVERGENZE 444 - ...and when the object is a record laid over RAW memory - C's, as "dyn->gd_free(dyn)"
+          // on the gdIOCtx libgd allocates - the field is read at its C offset, not from the record table, which
+          // took C's address for a record handle ("Invalid record handle").
+          if (TempStr <> '') and TryEmitRawUDTField(MethodObjNode, VarToStr(Node.GetChild(0).Value), TempVal) then
+          begin
+            Result := EmitIndirectCall(EnsureIntRegister(TempVal), TempStr, Node.GetChild(1));
+            Exit;
+          end;
           if (TempStr <> '') and ResolveRecordObject(MethodObjNode, Left, MethodOwnerType) then
           begin
             TempVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -13693,7 +13701,22 @@ begin
                                             DimsNode.ValueUpper);
         EmitInstruction(ssaCopyInt, GetOrAllocateVariable(UpperFast(ArrName)), RecHandleVal,
                         MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-        if FindUDT(DimsNode.ValueUpper) >= 0 then
+        // ⭐ DIVERGENZE 447 - THE HOME IS PUBLISHED WHEREVER IT CAN HOLD AN ADDRESS, not only for a record. A procedure
+        // reads a shared reference from its home (RefVarAddrValue), and only a record's was written: "xmlFree(s)"
+        // inside a SUB of the program died on "Null or invalid pointer dereference (address 0)", "*gdbm_version" on
+        // an access violation, while the same lines at module level were right.
+        // ⛔⛔ ...BUT NOT A NARROW OR FLOAT HOME. The first cure published for EVERY type, and the home of a shared
+        // "Byte" is a cell of its declared width: "extern __ttytype alias "ttytype" as byte" (guards m956 · m961) had
+        // its address truncated and died at MODULE level too. Records, pointers, procedure types and the 64-bit
+        // integers have a full-width integer home; a narrow or float C scalar keeps what it had (declared limit).
+        if (FindUDT(DimsNode.ValueUpper) >= 0) or
+           ((Length(DimsNode.ValueUpper) > 4) and
+            (Copy(DimsNode.ValueUpper, Length(DimsNode.ValueUpper) - 3, 4) = ' PTR')) or
+           (FuncPtrTypeSig(DimsNode.ValueUpper) <> '') or
+           (UpperFast(CanonicalType(DimsNode.ValueUpper)) = 'INTEGER') or
+           (UpperFast(CanonicalType(DimsNode.ValueUpper)) = 'LONGINT') or
+           (UpperFast(CanonicalType(DimsNode.ValueUpper)) = 'UINTEGER') or
+           (UpperFast(CanonicalType(DimsNode.ValueUpper)) = 'ULONGINT') then
         begin
           EnsureSharedBackingSized(UpperFast(ArrName));
           PublishScalarToHome(UpperFast(ArrName), RecHandleVal);
@@ -26613,14 +26636,19 @@ function TSSAGenerator.ForeignStructRetSpec(UDTIdx: Integer; out Why: string): s
 // aggregate, an array member, a string or a bit field would have to be flattened first, and guessing
 // there does not raise - it puts the value in the wrong register file and the caller reads a number
 // nobody returned. That is the one failure this whole path exists to avoid.
+// ⛔ DIVERGENZE 446 - THE FIELDS ACCUMULATE APART, and Result is written only at the end. They used to accumulate in
+// Result itself, so a refusal half-way ("field U is itself a record") left "6@0" behind: the call site saw a
+// non-empty layout, the compile-time refusal never fired, and C was handed an empty "SVAL:" that failed at run time
+// with no reason (fontconfig's FcValue, a tag and a UNION).
 var
   i, n, Al, Sz: Integer;
   Offsets: TInt64Array;
   TotalSize: Int64;
   K: TForeignKind;
   F: ^TUDTField;
+  FieldsS: string;
 begin
-  Result := ''; Why := '';
+  Result := ''; Why := ''; FieldsS := '';
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then begin Why := 'it is not a declared type'; Exit; end;
   if FUDTs[UDTIdx].IsUnion then begin Why := 'it is a UNION'; Exit; end;
   if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then
@@ -26665,11 +26693,11 @@ begin
     if i > High(Offsets) then begin Why := 'its layout has fewer fields than it declares'; Exit; end;
     Sz := ForeignKindSize(K);
     if Sz > Al then Al := Sz;
-    if Result <> '' then Result := Result + '/';
-    Result := Result + IntToStr(Ord(K)) + '@' + IntToStr(Offsets[i]);
+    if FieldsS <> '' then FieldsS := FieldsS + '/';
+    FieldsS := FieldsS + IntToStr(Ord(K)) + '@' + IntToStr(Offsets[i]);
   end;
   if Al > 8 then Al := 8;
-  Result := 'SRET:' + IntToStr(TotalSize) + ':' + IntToStr(Al) + ':' + Result;
+  Result := 'SRET:' + IntToStr(TotalSize) + ':' + IntToStr(Al) + ':' + FieldsS;
 end;
 
 function TSSAGenerator.AddRawUDTPtr(const ScopeU, NameU, TypeU: string): Boolean;
@@ -27860,7 +27888,10 @@ begin
       // ⛔ ...and a "<UDT> Ptr Ptr" field is a pointer as surely as the other two: its pointee is filed in
       // MultiPtrPointee, so "face->charmaps" (FreeType's "FT_CharMap Ptr") came out UNTAGGED and every read
       // through it took a machine address for one of the VM's own (freetype2 deck, DIVERGENZE 374).
-      if (F.PtrPointee <> '') or (F.RawPtrPointee <> '') or (F.MultiPtrPointee <> '') then
+      // ⭐ DIVERGENZE 444 - ...and so does a PROCEDURE field: in C's memory it holds a C function's ADDRESS
+      // (libgd's gdIOCtx.gd_free), and read as a bare integer the indirect call took it for a BASIC entry PC and
+      // the program ended in silence. The PTR64 arm tags only when the container carries C's mark.
+      if (F.PtrPointee <> '') or (F.RawPtrPointee <> '') or (F.MultiPtrPointee <> '') or (F.FuncPtrSig <> '') then
         EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_PTR64))
       else
         EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64));
@@ -53266,6 +53297,9 @@ begin
       SValUDT := FindUDT(UpperFast(CanonicalType(Decl.ParamTypeNames[i])));
       if SValUDT < 0 then Continue;          // not a record: the refusal below names it
       SValSpec := ForeignStructRetSpec(SValUDT, SValWhy);
+      if GetEnvironmentVariable('FGNDIAG') = '1' then
+        WriteLn(ErrOutput, 'FGN[sval] ', Decl.Name, ' parametro ', i + 1, ' tipo ', Decl.ParamTypeNames[i],
+                ' udt ', SValUDT, ' layout "', SValSpec, '" motivo "', SValWhy, '"');
       if SValSpec = '' then
         raise Exception.CreateFmt('Foreign function %s: parameter %d is "%s" by value, which this path ' +
                                   'cannot classify for the calling convention: %s',

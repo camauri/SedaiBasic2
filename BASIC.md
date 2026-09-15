@@ -3654,6 +3654,23 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
 - ⚠️ **The address of an element of a record array that C owns, taken with `@`, is wrong.**
   `@img->SavedImages[1]` answers a different address, and `@p[1]` answers the right number that `->` cannot follow.
   Write `p + 1` (or read `p[1].field` directly), which works as in FreeBASIC.
+- **A procedure pointer stored in a record that belongs to C can be called.** libgd's dynamic context holds its own
+  release function: `ctx->gd_free(ctx)` calls it, and so does a copy (`f = ctx->gd_free : f(ctx)`). The first used to
+  stop with "Invalid record handle", the second ended the program silently with exit code 1.
+- ⚠️ **Writing bytes with `Cast(UByte Ptr, buf)[i] = value` into a buffer a C library passes to a callback can
+  crash the process** ("stack smashing detected") when that buffer lives on C's stack — libpng reading through a
+  `gdIOCtx` does this. Declare a typed pointer first (`Dim q As UByte Ptr = buf : q[i] = value`) or copy with
+  `memcpy`; both work as in FreeBASIC.
+- **C data declared with `Extern` can be used inside procedures.** `xmlFree(s)` in a SUB or FUNCTION of the program —
+  an XPath extension function, a callback, a helper — and `*gdbm_version` read in a SUB used to stop the program,
+  while the same lines worked at module level. Only a C variable of record type was reachable from a procedure.
+  ⚠️ A C variable of a narrow or floating-point type (`Extern x As Byte`, `As Short`, `As Long`, `As Double`) is
+  still not reachable inside a procedure; read it at module level and pass the value on.
+- ⚠️ **A record with a `Union` member cannot be passed to C by value, and a pointer member of such a union filled by
+  C cannot be followed.** fontconfig's `FcValue` (a type tag and a union) is the common case: `FcValueEqual(a, b)` and
+  `FcPatternAdd(p, object, value, append)` are refused when the program is compiled, naming the member, and after
+  `FcPatternGet(p, object, 0, @v)` the numeric members `v.u.i` and `v.u.d` read right but `v.u.s` does not. Use the
+  typed functions (`FcPatternAddString`, `FcPatternGetString` and the rest), which work as in FreeBASIC.
 - ⚠️ **A block from `calloc` in `crt.bi`, read before anything is written to it, stops the program** with "Raw pointer
   dereference out of bounds". Writing a field first and then reading it works.
 - ⚠️ **An address the program gives to C and C hands back LATER is not the same pointer again.** After
