@@ -215,6 +215,10 @@ const
   // module scalar of a builtin numeric type. From libc, so "@x" is the machine address and the bcRaw* arms of the
   // three engines read and write it as one move. Never a pointer cell (RAW_PTRCELL_REQ) nor a ZString buffer.
   RAWALLOC_NATIVE_SLOT = 2;
+  // ⭐ ...and a cell that belongs to the running FRAME (phase 2.1b): an @-taken local, an @-taken parameter's slot, the
+  // temporary a ByRef argument receives. The VM stacks it on the context and FramePop releases it - before this every
+  // such cell was allocated per call and never given back (DIVERGENZE 458). Outside any frame it is not stacked.
+  RAWALLOC_FRAME_CELL = 4;
 
   { ⭐ A POINTER THAT CAME FROM OUTSIDE (DIVERGENZE 183). Everything above is a VM-internal offset - no
     machine address is ever handed to a BASIC program - but a C function RETURNS one, and the program

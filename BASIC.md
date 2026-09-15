@@ -3776,12 +3776,15 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
 - **A variable declared inside a loop of the main program starts at 0 on every pass**, also in a program that defines
   a module `Constructor` (every `fbcunit` test does). It used to keep the previous pass's value there. A declaration
   at the outermost level of the module is static, as in FreeBASIC, so a value a constructor writes into it survives.
-- ⚠️ **A procedure that takes the address of one of its local variables keeps a few bytes per call.** A local
-  whose address is taken (`@x`, `VarPtr`) gets its own cell on every call, and the cell is not released when the
-  procedure returns: about 13 bytes per call, so a program calling such a procedure millions of times grows by
-  tens of megabytes. Module-level variables are not affected. The same happens to the temporary a `ByRef`
-  parameter receives when the argument is not a variable — `g(5)`, `g(a + b)`, `g(f())` — on every call, at module
-  level too; passing a variable does not leak.
+- **A local variable whose address is taken is released when its procedure returns.** A local reached through
+  `@x` or `VarPtr`, and the temporary a `ByRef` parameter receives inside a procedure, used to keep about 13 bytes
+  per call; a procedure called millions of times now runs in constant memory. As in FreeBASIC, where such a variable
+  lives on the stack, a pointer to it must not be used after the procedure returns. In the default (`fb`) memory
+  mode a numeric local of a builtin type is real memory, so `@x` is its address.
+- ⚠️ **A `ByRef` temporary made at module level still keeps a few bytes per call.** When the argument of a `ByRef`
+  parameter is not a variable — `g(5)`, `g(a + b)`, `g(f())` — and the call is in the main program rather than
+  inside a procedure, its temporary is not released: millions of such calls grow by tens of megabytes. Passing a
+  variable does not leak.
 - ⚠️ **The byte of a true `Boolean` reads 255, not 1.** `Dim As Boolean b = True : Print *Cast(UByte Ptr, @b)`
   prints `255` where FreeBASIC prints `1`; the same byte reaches C through `memcpy` or a record. `Print b`, `If b`
   and comparisons are unaffected.

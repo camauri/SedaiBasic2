@@ -884,6 +884,8 @@ type
     function NativeAlloc(ByteCount: PtrUInt): Int64;              // fb mode: calloc, C's mark, region noted
     procedure NativeFree(P: Int64);                               // fb mode: free (a VM raw block goes to RawFree)
     function NativeRealloc(P: Int64; ByteCount: PtrUInt): Int64;  // fb mode: realloc
+    procedure PushFrameCell(Ctx: TExecutionContext; Cell: Int64);   // phase 2.1b: a cell the running frame owns
+    procedure FreeFrameCells(Ctx: TExecutionContext; Mark: Integer); // phase 2.1b: release the frame's cells down to Mark
     function StrSAdd(const S: string): Int64;   // SADD(s) -> raw pointer to a NUL-terminated byte copy
     function FormatNumber(Value: Double; const Mask: string): string;  // FORMAT(num, mask) -> formatted string (numeric masks)
     function FormatDateMask(Value: Double; const Mask: string): string;  // FORMAT(serial, mask) -> date/time formatted string
@@ -1849,6 +1851,7 @@ begin
   FCtx.FrameSaveFloatCount := -1;
   FCtx.FrameSaveStrCount := -1;
   FCtx.FrameMarkTop := 0;
+  FCtx.FrameCellTop := 0;       // phase 2.1b: frame cells of a run that was abandoned are not reclaimed, only forgotten
   FCtx.FrameWidthTop := 0;      // FRAMEMARK=0 layout
   FCtx.FrameRecBaseTop := 0;
   FCtx.BlockRecMarkTop := 0;
@@ -4341,6 +4344,7 @@ begin
         begin
           SetLength(Ctx.FrameMarks, Ctx.FrameMarkTop + 256);
           SetLength(Ctx.FrameMarkArrSave, Ctx.FrameMarkTop + 256);   // cresce IN PASSO: nessun controllo in piu'
+          SetLength(Ctx.FrameMarkCellSave, Ctx.FrameMarkTop + 256);  // ...e cosi' la marca delle celle (fase 2.1b)
         end;
         with Ctx.FrameMarks[Ctx.FrameMarkTop] do
         begin
@@ -4351,6 +4355,7 @@ begin
           BlockMark := Ctx.BlockRecMarkTop;
         end;
         Ctx.FrameMarkArrSave[Ctx.FrameMarkTop] := Ctx.ArrPrivSaveTop;
+        Ctx.FrameMarkCellSave[Ctx.FrameMarkTop] := Ctx.FrameCellTop;   // phase 2.1b: this frame's cells start here
         Inc(Ctx.FrameMarkTop);
         Ctx.RegDeltaI := Ctx.RegHwI - FBLo;
         Inc(Ctx.RegHwI, FBHi);
@@ -4394,6 +4399,7 @@ begin
         begin
           SetLength(Ctx.FrameMarks, Ctx.FrameMarkTop + 256);
           SetLength(Ctx.FrameMarkArrSave, Ctx.FrameMarkTop + 256);   // cresce IN PASSO: nessun controllo in piu'
+          SetLength(Ctx.FrameMarkCellSave, Ctx.FrameMarkTop + 256);  // ...e cosi' la marca delle celle (fase 2.1b)
         end;
         with Ctx.FrameMarks[Ctx.FrameMarkTop] do
         begin
@@ -4404,6 +4410,7 @@ begin
           BlockMark := Ctx.BlockRecMarkTop;
         end;
         Ctx.FrameMarkArrSave[Ctx.FrameMarkTop] := Ctx.ArrPrivSaveTop;
+        Ctx.FrameMarkCellSave[Ctx.FrameMarkTop] := Ctx.FrameCellTop;   // phase 2.1b: this frame's cells start here
         Inc(Ctx.FrameMarkTop);
         Ctx.RegDeltaI := NewDelta;
         Ctx.RegHwI := NewHw;
@@ -4513,6 +4520,7 @@ begin
     begin
       SetLength(Ctx.FrameMarks, Ctx.FrameMarkTop + 256);
       SetLength(Ctx.FrameMarkArrSave, Ctx.FrameMarkTop + 256);   // cresce IN PASSO: nessun controllo in piu'
+      SetLength(Ctx.FrameMarkCellSave, Ctx.FrameMarkTop + 256);  // ...e cosi' la marca delle celle (fase 2.1b)
     end;
     with Ctx.FrameMarks[Ctx.FrameMarkTop] do
     begin
@@ -4525,6 +4533,7 @@ begin
       SaveHwI := SaveHw;
     end;
     Ctx.FrameMarkArrSave[Ctx.FrameMarkTop] := Ctx.ArrPrivSaveTop;
+    Ctx.FrameMarkCellSave[Ctx.FrameMarkTop] := Ctx.FrameCellTop;   // phase 2.1b: this frame's cells start here
     Inc(Ctx.FrameMarkTop);
     // Slide the integer view only now: the copies above had to read the CALLER's float and string
     // banks, and FramePop undoes this from the mark just written.
@@ -4554,6 +4563,9 @@ begin
       SetLength(Ctx.FrameBlockMarkTop, Ctx.FrameRecBaseTop + 256);
     if Ctx.FrameRecBaseTop >= Length(Ctx.FrameArrSaveBase) then
       SetLength(Ctx.FrameArrSaveBase, Ctx.FrameRecBaseTop + 256);
+    if Ctx.FrameRecBaseTop >= Length(Ctx.FrameCellBase) then
+      SetLength(Ctx.FrameCellBase, Ctx.FrameRecBaseTop + 256);
+    Ctx.FrameCellBase[Ctx.FrameRecBaseTop] := Ctx.FrameCellTop;   // phase 2.1b, FRAMEMARK=0 layout
     Ctx.FrameRecBase[Ctx.FrameRecBaseTop] := Ctx.RecordCount;
     Ctx.FrameBlockMarkTop[Ctx.FrameRecBaseTop] := Ctx.BlockRecMarkTop;
     Ctx.FrameArrSaveBase[Ctx.FrameRecBaseTop] := Ctx.ArrPrivSaveTop;
@@ -4643,6 +4655,9 @@ begin
       if Mark^.RecBase < Ctx.RecordCount then
         Ctx.RecordCount := Mark^.RecBase;
       Ctx.BlockRecMarkTop := Mark^.BlockMark;
+      // phase 2.1b: a relocatable callee can own frame cells too, so the fast path releases them like the general one
+      if Ctx.FrameCellTop > Ctx.FrameMarkCellSave[Ctx.FrameMarkTop] then
+        FreeFrameCells(Ctx, Ctx.FrameMarkCellSave[Ctx.FrameMarkTop]);
       Exit;
     end;
     // A RELOCATED frame restored nothing and copied nothing: slide the view back to the caller's
@@ -4700,6 +4715,8 @@ begin
       Ctx.RecordCount := Mark^.RecBase;
     // M8: discard any block marks this frame left dangling (e.g. EXIT SUB from inside a loop).
     Ctx.BlockRecMarkTop := Mark^.BlockMark;
+    if Ctx.FrameCellTop > Ctx.FrameMarkCellSave[Ctx.FrameMarkTop] then   // phase 2.1b: this frame's cells
+      FreeFrameCells(Ctx, Ctx.FrameMarkCellSave[Ctx.FrameMarkTop]);
     if Ctx.ArrPrivSaveTop > Ctx.FrameMarkArrSave[Ctx.FrameMarkTop] then
       ArrPrivRestoreSlow(Ctx, Ctx.FrameMarkArrSave[Ctx.FrameMarkTop]);
   end
@@ -4709,6 +4726,9 @@ begin
     if Ctx.FrameRecBase[Ctx.FrameRecBaseTop] < Ctx.RecordCount then
       Ctx.RecordCount := Ctx.FrameRecBase[Ctx.FrameRecBaseTop];
     Ctx.BlockRecMarkTop := Ctx.FrameBlockMarkTop[Ctx.FrameRecBaseTop];
+    if (Ctx.FrameRecBaseTop < Length(Ctx.FrameCellBase)) and
+       (Ctx.FrameCellTop > Ctx.FrameCellBase[Ctx.FrameRecBaseTop]) then   // phase 2.1b, FRAMEMARK=0 layout
+      FreeFrameCells(Ctx, Ctx.FrameCellBase[Ctx.FrameRecBaseTop]);
     if (Ctx.FrameRecBaseTop < Length(Ctx.FrameArrSaveBase))
        and (Ctx.ArrPrivSaveTop > Ctx.FrameArrSaveBase[Ctx.FrameRecBaseTop]) then
       ArrPrivRestoreSlow(Ctx, Ctx.FrameArrSaveBase[Ctx.FrameRecBaseTop]);
@@ -5858,6 +5878,33 @@ begin
   if Mem = nil then Exit(0);
   ForeignNoteRegion(nil, PtrUInt(Mem), ByteCount, True, False);
   Result := Int64(PtrUInt(Mem)) or FGNPTR_TAG;
+end;
+
+procedure TBytecodeVM.PushFrameCell(Ctx: TExecutionContext; Cell: Int64);
+// ⭐ Phase 2.1b of the pointer model (DIVERGENZE 458): a raw cell bcRawAlloc made for the running frame - an @-taken local,
+// an @-taken parameter's slot, a ByRef temporary. It used to be allocated on every call and never given back: ~13 bytes
+// per call, measured. Stacked here, released by FramePop down to the mark FramePush saved.
+// ⚠️ Only INSIDE a frame: at module level nobody pops, and a stack that only grows would leak worse than the cell did.
+begin
+  if (Cell = 0) or ((Ctx.FrameMarkTop <= 0) and (Ctx.FrameRecBaseTop <= 0)) then Exit;
+  if Ctx.FrameCellTop >= Length(Ctx.FrameCells) then
+    SetLength(Ctx.FrameCells, Ctx.FrameCellTop + 256);
+  Ctx.FrameCells[Ctx.FrameCellTop] := Cell;
+  Inc(Ctx.FrameCellTop);
+end;
+
+procedure TBytecodeVM.FreeFrameCells(Ctx: TExecutionContext; Mark: Integer);
+// Release, newest first, every frame cell above Mark. NativeFree knows both kinds - a libc cell (C's mark) and one of the
+// VM's raw heap - so the fb mode asks it; the strict mode only ever made raw-heap cells.
+// ⚠️ A cell is the frame's, as a stack slot is under fbc: a pointer to it that outlives the procedure dangles there too.
+begin
+  if Mark < 0 then Mark := 0;
+  while Ctx.FrameCellTop > Mark do
+  begin
+    Dec(Ctx.FrameCellTop);
+    if FNativeMemory then NativeFree(Ctx.FrameCells[Ctx.FrameCellTop])
+    else RawFree(Ctx.FrameCells[Ctx.FrameCellTop]);
+  end;
 end;
 
 procedure TBytecodeVM.NativeFree(P: Int64);
@@ -7994,6 +8041,7 @@ begin
   WCtx.FrameSaveFloatCount := FCtx.FrameSaveFloatCount;
   WCtx.FrameSaveStrCount := FCtx.FrameSaveStrCount;
   WCtx.FrameMarkTop := 0;    // the worker's own frame-mark stack starts empty
+  WCtx.FrameCellTop := 0;    // ...and so does its frame-cell stack (phase 2.1b)
   WCtx.FrameWidthTop := 0;   // FRAMEMARK=0 layout
   WCtx.FrameRecBaseTop := 0;
   SizeIntBank(WCtx, WCtx.IntRegCount);
@@ -9940,6 +9988,7 @@ begin
   FCtx.FrameSaveFloatCount := -1;
   FCtx.FrameSaveStrCount := -1;
   FCtx.FrameMarkTop := 0;
+  FCtx.FrameCellTop := 0;       // phase 2.1b: frame cells of a run that was abandoned are not reclaimed, only forgotten
   FCtx.FrameWidthTop := 0;      // FRAMEMARK=0 layout
   FCtx.FrameRecBaseTop := 0;
   FCtx.BlockRecMarkTop := 0;
@@ -12667,6 +12716,7 @@ begin
     begin
       SetLength(C.FrameMarks, C.FrameMarkTop + 256);
       SetLength(C.FrameMarkArrSave, C.FrameMarkTop + 256);   // cresce IN PASSO: nessun controllo in piu'
+      SetLength(C.FrameMarkCellSave, C.FrameMarkTop + 256);  // ...e cosi' la marca delle celle (fase 2.1b)
     end;
     VM.GrowCallStackIfNeeded(C);
   except
@@ -12685,6 +12735,7 @@ begin
     BlockMark := C.BlockRecMarkTop;
   end;
   C.FrameMarkArrSave[C.FrameMarkTop] := C.ArrPrivSaveTop;
+  C.FrameMarkCellSave[C.FrameMarkTop] := C.FrameCellTop;   // phase 2.1b: this frame's cells start here
   Inc(C.FrameMarkTop);
   C.RegDeltaI := SaveHw - FBLo;
   C.RegHwI := SaveHw + FBHi;
@@ -12710,6 +12761,8 @@ begin
       if RecBase < C.RecordCount then C.RecordCount := RecBase;
       C.BlockRecMarkTop := BlockMark;
     end;
+    if C.FrameCellTop > C.FrameMarkCellSave[C.FrameMarkTop] then      // phase 2.1b: the callee's frame cells
+      VM.FreeFrameCells(C, C.FrameMarkCellSave[C.FrameMarkTop]);
     Exit(AOT_CALL_OK);
   end;
   Result := RetPC;                    // deopt inside the callee: frame + return address stay
@@ -17011,8 +17064,12 @@ begin
       // local, a fixed ZString buffer - share this opcode and stay in the raw heap. Sending them to libc gave calloc
       // a size carrying RAW_PTRCELL_REQ (bit 62), NULL came back, and every "@v" in a procedure read address 0.
       // ⭐ ...and a compiler slot the SSA marked RAWALLOC_NATIVE_SLOT (phase 2: the cell of an @-taken module scalar).
-      20: if FNativeMemory and ((Instr.Immediate and (RAWALLOC_PROGRAM or RAWALLOC_NATIVE_SLOT)) <> 0) then Ctx.IntRegs[Instr.Dest] := NativeAlloc(Ctx.IntRegs[Instr.Src1])
-          else Ctx.IntRegs[Instr.Dest] := RawAlloc(Ctx.IntRegs[Instr.Src1]);                         // bcRawAlloc
+      20: begin                                                                                      // bcRawAlloc
+            if FNativeMemory and ((Instr.Immediate and (RAWALLOC_PROGRAM or RAWALLOC_NATIVE_SLOT)) <> 0) then Ctx.IntRegs[Instr.Dest] := NativeAlloc(Ctx.IntRegs[Instr.Src1])
+            else Ctx.IntRegs[Instr.Dest] := RawAlloc(Ctx.IntRegs[Instr.Src1]);
+            // ⭐ phase 2.1b: a cell of the running frame is stacked, and FramePop gives it back (DIVERGENZE 458)
+            if (Instr.Immediate and RAWALLOC_FRAME_CELL) <> 0 then PushFrameCell(Ctx, Ctx.IntRegs[Instr.Dest]);
+          end;
       21: if FNativeMemory then NativeFree(Ctx.IntRegs[Instr.Src1])
           else RawFree(Ctx.IntRegs[Instr.Src1]);                                                     // bcRawFree
       22: if FNativeMemory then Ctx.IntRegs[Instr.Dest] := NativeRealloc(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2])

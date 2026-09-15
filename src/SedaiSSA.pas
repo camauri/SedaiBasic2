@@ -540,6 +540,7 @@ type
     FEntryBlock: TSSABasicBlock;
     FEntryHoistPos: Integer;
     FRawHoistFrom: Integer;              // the instruction index a RAWMODULE Dim's allocation starts at
+    FRawAllocNativeOK: Boolean;          // phase 2.1b: ProcessDim says the local's DECLARED type is a builtin numeric one
     FScopeStack: array of TScopeFrame;   // FB scope: proc-root + block frames (innermost = High); module = FVarMap
     FNextScopeSerial: Integer;           // hands each pushed frame its identity (see BlockArrayMangle)
     // ...and the same key for every UDT a block declared, with the TYPE as its value. The pair is what
@@ -13942,7 +13943,13 @@ begin
           EmitInstruction(ssaCopyInt, AddrLocalHandle(UpperFast(ArrName)), RecHandleVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end
         else
+        begin
+          // Phase 2.1b: the DECLARED spelling decides whether the cell may be native memory - a procedure-pointer alias is
+          // an integer once canonical, and its cell must come home as a closure (the m965 lesson, module side).
+          FRawAllocNativeOK := NativeCellScalarType(ArrayDeclNode.GetChild(1).ValueUpper);
           EmitRawAddrScalarAlloc(UpperFast(ArrName));
+          FRawAllocNativeOK := False;
+        end;
         // "DIM v AS T = expr": store the initializer through the record (slot 0), reusing ProcessAssignment.
         if (ArrayDeclNode.ChildCount >= 3) and (ArrayDeclNode.GetChild(2).NodeType <> antArgumentList) then
         begin
@@ -46803,7 +46810,16 @@ begin
     EmitInstruction(ssaLoadConstInt, CountReg, MakeSSAConstInt(RAW_PTRCELL_REQ or 8), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
   else
     EmitInstruction(ssaLoadConstInt, CountReg, MakeSSAConstInt(NBytes), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-  EmitInstruction(ssaRawAlloc, AddrLocalHandle(UpperFast(Name)), CountReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  // ⭐ Phase 2.1b: the slot belongs to this frame (RAWALLOC_FRAME_CELL: FramePop releases it - DIVERGENZE 458), and in the fb
+  // memory mode a builtin numeric local of eight bytes or less is native memory (RAWALLOC_NATIVE_SLOT), so "@x" is its
+  // machine address. A buffer and a pointer cell stay in the raw heap; only ProcessDim knows the declared spelling.
+  if FNativeMemory and FRawAllocNativeOK and (RawZStringBufBytes(Name) <= 0) and
+     not DeclTypeIsPointer(AddrLocalType(UpperFast(Name))) then
+    EmitInstruction(ssaRawAlloc, AddrLocalHandle(UpperFast(Name)), CountReg, MakeSSAValue(svkNone),
+                    MakeSSAConstInt(RAWALLOC_FRAME_CELL or RAWALLOC_NATIVE_SLOT))
+  else
+    EmitInstruction(ssaRawAlloc, AddrLocalHandle(UpperFast(Name)), CountReg, MakeSSAValue(svkNone),
+                    MakeSSAConstInt(RAWALLOC_FRAME_CELL));
 end;
 
 function TSSAGenerator.IsRawModuleScalar(const Name: string): Boolean;
@@ -48480,7 +48496,9 @@ begin
   Bytes := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaLoadConstInt, Bytes, MakeSSAConstInt(8), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaRawAlloc, Result, Bytes, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  // Phase 2.1b: the temporary dies with the frame that made it (RAWALLOC_FRAME_CELL, DIVERGENZE 458). ⚠️ At module level
+  // there is no frame, and the VM does not stack it there: that half of the leak stays open.
+  EmitInstruction(ssaRawAlloc, Result, Bytes, MakeSSAValue(svkNone), MakeSSAConstInt(RAWALLOC_FRAME_CELL));
   if TypeNameToBank(TypeName, '') = srtFloat then
     EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), Result, EnsureFloatRegister(Val), MakeSSAConstInt(Code))
   else

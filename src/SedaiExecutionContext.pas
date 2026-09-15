@@ -297,6 +297,14 @@ type
     FrameMarkArrSave: array of Integer;   // ...and for the FrameMarks path, indexed by FrameMarkTop
     FrameBlockMarkTop: array of Integer;
     FrameRecBaseTop: Integer;
+    // ⭐ Phase 2.1b of the pointer model (DIVERGENZE 458): the raw cells the running frames own - an @-taken local, an
+    // @-taken parameter's slot, a ByRef temporary - stacked as they are allocated (bcRawAlloc with RAWALLOC_FRAME_CELL)
+    // and released by FramePop down to the mark its FramePush saved. ⛔ The mark lives beside FrameMarkArrSave, NOT in
+    // TFrameMark (32 bytes on purpose), and grows at the SAME sites, so FramePushIsAllocFree's length test covers it.
+    FrameCells: array of Int64;
+    FrameCellTop: Integer;
+    FrameMarkCellSave: array of Integer;  // FrameCellTop on entry, for the FrameMarks path (indexed by FrameMarkTop)
+    FrameCellBase: array of Integer;      // ...and for the FRAMEMARK=0 path (indexed by FrameRecBaseTop)
 
     // --- Record reclamation marks (RAII, M8 block) ---
     // The FRAME-level marks moved into TFrameMark above; these are the per-BLOCK ones, which are

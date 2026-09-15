@@ -37,6 +37,8 @@
     - no error flow (ssaOnError / ssaResume* / ssaTrap);
     - no ssaRecordNew*: without a frame, callee-allocated records would not
       be reclaimed at the "return" - unbounded growth inside caller loops;
+    - no ssaRawAlloc of a FRAME CELL (RAWALLOC_FRAME_CELL: an @-taken local or
+      parameter, a ByRef temporary), for the same reason - FramePop frees it;
     - no ssaArrayDim: a local array's dimension REGISTERS are recorded in
       the shared array METADATA by register index; renaming the body would
       strand that metadata on the un-renamed registers;
@@ -224,6 +226,16 @@ begin
                              ssaRecordNewBlock, ssaRecordReallocBlock, ssaArrayDim,
                              ssaArrayBind, ssaArrayBindInd, ssaArrayBindApply,
                              ssaArrayUnbind]) then begin Inc(ID_Call); RecordBlocker(Ins.OpCode); Exit; end;
+        // ⛔ PHASE 2.1b OF THE POINTER MODEL: A CELL OF THE FRAME IS THE SAME CASE AS A RECORD. An @-taken local, an
+        // @-taken parameter's slot and a ByRef temporary are allocated with RAWALLOC_FRAME_CELL and released by FramePop
+        // (DIVERGENZE 458) - and an inlined body has no frame. Measured before this line: "Sub f : Dim w : pw = @w" in a
+        // loop was inlined and grew 48 -> 131 MB at 2 M calls in the fb mode (a libc cell per call, never freed), while
+        // INLINE_MAX=0 stayed flat at 25 MB in both modes.
+        if (Ins.OpCode = ssaRawAlloc) and (Ins.Src3.Kind = svkConstInt) and
+           ((Ins.Src3.ConstInt and RAWALLOC_FRAME_CELL) <> 0) then
+        begin
+          Inc(ID_Call); RecordBlocker(Ins.OpCode); Exit;
+        end;
         // V1 refused anything whose OPCODE NAME contained "Record" or "Ind", because UDT operator
         // functions inlined naively loop forever (m403/m433) and the record handle/RAII model needs
         // its own analysis before it can be flattened. That reasoning is sound for the machinery -
