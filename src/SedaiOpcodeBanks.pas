@@ -128,6 +128,7 @@ implementation
 function Src1IsArrayId(OpCode: TBytecodeOp): Boolean;
 begin
   case OpCode of
+    bcArrayLoadNarrow, bcArrayStoreNarrow,   // phase 2.5: packed elements, same operands as the Int pair
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     // The fused element accesses, read off their own arms in RunTemplate.inc the same way: each one
@@ -410,6 +411,7 @@ begin
     // === GROUP 2: Date/time: DATESERIAL/TIMESERIAL Src2 = month/minute (int); DATEADD Src2 = number ===
     bcDateSerial, bcTimeSerial, bcDateAdd,
     // === GROUP 3: Typed array operations: Src2 is always int (linear index) ===
+    bcArrayLoadNarrow, bcArrayStoreNarrow,   // phase 2.5
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     bcStrMidAssignArr,   // MID$ into an element: Src2 = the linear index, same as the stores above
@@ -610,6 +612,7 @@ begin
     bcDateDiff, bcDatePart,  // DATEDIFF/DATEPART -> int
     // === GROUP 3: Array operations ===
     bcArrayLoadInt,  // Typed array load (int) - Dest is WRITTEN
+    bcArrayLoadNarrow,  // phase 2.5: packed element load (int) - Dest is WRITTEN
     bcArrayLBound, bcArrayUBound,  // B1.4: LBOUND/UBOUND - Dest = int bound
     bcArrayDescPtr, bcArrayDescPtrInd,  // FBC.ArrayDescriptorPtr - Dest = a pointer into the descriptor region (int)
     bcArrayElemAddr,  // phase 2.3: "@a(i)" - Dest = the element's tagged machine address (int)
@@ -781,6 +784,7 @@ begin
     // compactor treats the register as dead on entry and may hand it to something else.
     bcBigFromInt, bcBigCopy, bcBigAdd, bcBigSub, bcBigMul, bcBigFromStr, bcBigMulSmall, bcBigDiv, bcBigMod,
     bcArrayStoreInt,  // Dest = value register (int) - READ, not written
+    bcArrayStoreNarrow,  // phase 2.5: Dest = value register (int) - READ, not written
     bcArrayStoreIndInt,  // UDT array member store (int): Dest = value register - READ, not written
     // === GROUP 10: Graphics ===
     bcGraphicBox,     // Dest = y1 register (int) - READ, not written

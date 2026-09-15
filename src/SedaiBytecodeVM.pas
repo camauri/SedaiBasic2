@@ -3271,7 +3271,7 @@ begin
     // Array element and bound reads. The array itself lives in FArrays, a bank of its own that is
     // never relocated, so an array opcode is transparent to the sliding view: only its register
     // operands matter here. Src1 is the array ID (an immediate), Src2 the index register.
-    bcArrayLoadInt, bcArrayLBound, bcArrayUBound, bcArrayElemAddr,
+    bcArrayLoadInt, bcArrayLBound, bcArrayUBound, bcArrayElemAddr, bcArrayLoadNarrow,
     // ⭐ THE FUSED LOOP COUNTER writes its counter into Dest and nothing else in the bank.
     // Auditing this family is not a micro-narrowing: an UNAUDITED opcode disqualifies its whole
     // procedure from call-site liveness (see BuildCallSiteLiveness), and every superinstruction was
@@ -3297,7 +3297,7 @@ begin
     bcRecordLoadFloat, bcRecordLoadString,
     bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString, bcRecordFree,
     bcArrayLoadFloat, bcArrayLoadString,
-    bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
+    bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString, bcArrayStoreNarrow,
     // Binding an array BYREF parameter moves entries between FArrays slots and a save stack of its
     // own. bcArrayBind/Unbind/BindApply name their arrays by immediate and touch no register at all;
     // bcArrayBindInd takes the member's runtime handle from Src2.
@@ -3400,7 +3400,7 @@ begin
     bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString, bcRecordFree,
     bcArrayLoadInt, bcArrayLoadString, bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     bcArrayLBound, bcArrayUBound, bcArrayBind, bcArrayUnbind, bcArrayBindApply,
-    bcArrayBindInd, bcArrayErase, bcArrayElemAddr,
+    bcArrayBindInd, bcArrayErase, bcArrayElemAddr, bcArrayLoadNarrow, bcArrayStoreNarrow,
     // ⭐ THE FUSED BRANCH FAMILY WRITES NO REGISTER AT ALL, in any bank - it consumes a comparison
     // and moves the PC - and the loop-counter forms write only the integer counter. Leaving them
     // unaudited is what made the superinstruction pass LOSE on call-heavy programs: BW_UNKNOWN
@@ -3453,7 +3453,7 @@ begin
     bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString, bcRecordFree,
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     bcArrayLBound, bcArrayUBound, bcArrayBind, bcArrayUnbind, bcArrayBindApply,
-    bcArrayBindInd, bcArrayErase, bcArrayElemAddr,
+    bcArrayBindInd, bcArrayErase, bcArrayElemAddr, bcArrayLoadNarrow, bcArrayStoreNarrow,
     // The fused branch family again - and THIS is the bank where leaving it unaudited was expensive,
     // because every entry here is a refcounted assignment. See the note in BcFloatWriteShape.
     bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
@@ -3557,12 +3557,12 @@ begin
       Result := US_SRC1;
     // Src2 is the element index (or the member handle for BindInd); Src1 is an immediate array id.
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
-    bcArrayLBound, bcArrayUBound, bcArrayBindInd, bcArrayElemAddr,
+    bcArrayLBound, bcArrayUBound, bcArrayBindInd, bcArrayElemAddr, bcArrayLoadNarrow,
     // A float or string element store reads its index from Src2 and its VALUE from the other bank.
     bcArrayStoreFloat, bcArrayStoreString:
       Result := US_SRC2;
     // ... but an INTEGER element store reads the value from Dest, in our bank.
-    bcArrayStoreInt:
+    bcArrayStoreInt, bcArrayStoreNarrow:
       Result := US_SRC2 or US_DEST;
     bcAddInt, bcSubInt, bcMulInt, bcDivInt, bcModInt,
     bcCmpEqInt, bcCmpNeInt, bcCmpLtInt, bcCmpGtInt, bcCmpLeInt, bcCmpGeInt,
@@ -8720,9 +8720,71 @@ var
     end;
   end;
 
+  procedure RewritePackedArrayOps;
+  // ⭐⭐ PHASE 2.5 OF THE POINTER MODEL: A PACKED ARRAY IS REACHED ONLY BY THE NARROW OPCODES, and this is where that is
+  // made true for every program the VM runs, a .basc compiled before phase 2.5 included.
+  // The descriptor of a packed array publishes its element base in field 1 and a NULL in field 0 (RebuildJitArrDesc),
+  // so an 8-byte arm - bcArrayLoadInt/StoreInt in the C loop, the JIT, or a fused superinstruction - that reached one
+  // would dereference NULL. Three rules, decided from the program's own array facts:
+  //   - bcArrayLoadInt / bcArrayStoreInt on a packed array become the narrow opcode, width and sign in the Immediate
+  //     (an older compiler emitted them; the interpreter arm answered from the physical width);
+  //   - a narrow opcode must name a packed array of that width, or the compiler and the facts disagree;
+  //   - any OTHER opcode that names a packed array through Src1 (or Dest, for the element copy/move) is refused by
+  //     name: it is a fused form an older compiler built, and recompiling the source emits the narrow ones.
+  var
+    k, W: Integer;
+    Ins: PBytecodeInstruction;
+    Op: Word;
+    Sgn: Boolean;
+    function PackedWidth(Id: Integer; out S: Boolean): Integer;
+    var AI: TSSAArrayInfo;
+    begin
+      Result := 0; S := False;
+      if (Id < 0) or (Id >= FProgram.GetArrayCount) then Exit;
+      AI := FProgram.GetArray(Id);
+      if AI.ElementType <> srtInt then Exit;
+      Result := AI.ElemWidth; S := AI.ElemSigned;
+    end;
+    function Stamp(Imm: Int64; Width: Integer; S: Boolean): Int64;
+    begin
+      Result := (Imm and BC_BOUNDS_SAFE_FLAG) or (Int64(Width) shl BC_NARROW_WIDTH_SHIFT) or (Ord(S) * BC_NARROW_SIGNED);
+    end;
+  begin
+    if (FProgram = nil) or (FProgram.GetInstructionCount = 0) then Exit;
+    Ins := PBytecodeInstruction(FProgram.GetInstructionsPtr);
+    if Ins = nil then Exit;
+    for k := 0 to FProgram.GetInstructionCount - 1 do
+    begin
+      Op := Ins[k].OpCode;
+      if (Op = bcArrayLoadInt) or (Op = bcArrayStoreInt) then
+      begin
+        W := PackedWidth(Ins[k].Src1, Sgn);
+        if W > 0 then
+        begin
+          if Op = bcArrayLoadInt then Ins[k].OpCode := bcArrayLoadNarrow else Ins[k].OpCode := bcArrayStoreNarrow;
+          Ins[k].Immediate := Stamp(Ins[k].Immediate, W, Sgn);
+        end;
+      end
+      else if (Op = bcArrayLoadNarrow) or (Op = bcArrayStoreNarrow) then
+      begin
+        W := PackedWidth(Ins[k].Src1, Sgn);
+        if (W = 0) or (((Ins[k].Immediate shr BC_NARROW_WIDTH_SHIFT) and BC_NARROW_WIDTH_MASK) <> W) then
+          raise Exception.CreateFmt('Instruction %d (%s) reads array %d at %d byte(s) per element, but the program ' +
+            'declares that array with %d: the bytecode and its array facts disagree',
+            [k, OpcodeToString(Op), Ins[k].Src1, (Ins[k].Immediate shr BC_NARROW_WIDTH_SHIFT) and BC_NARROW_WIDTH_MASK, W]);
+      end
+      else if (Src1IsArrayId(Op) and (PackedWidth(Ins[k].Src1, Sgn) > 0)) or
+              (((Op = bcArrayCopyElement) or (Op = bcArrayMoveElement)) and (PackedWidth(Ins[k].Dest, Sgn) > 0)) then
+        raise Exception.CreateFmt('Instruction %d (%s) reads a packed array (Byte, Short or Long elements) as ' +
+          'eight-byte cells. This bytecode was built by an older compiler: compile the source again',
+          [k, OpcodeToString(Op)]);
+    end;
+  end;
+
 begin
   FProgram := Program_;
   FNativeMemory := Assigned(Program_) and Program_.NativeMemory;   // decided when it was compiled
+  RewritePackedArrayOps;   // phase 2.5: before EnsureDenseOps builds the per-PC index and the JIT reads the bytecode
 
   // Does anything in this program read the terminal's modelled screen back? Only SCREEN(row, col) and
   // a PEEK/POKE of the C128 screen RAM can, and both are visible right here in the bytecode. When
@@ -9047,7 +9109,7 @@ begin
         end;
 
         // ArrayLoadInt: int Dest (result), int Src2 (index)
-        bcArrayLoadInt:
+        bcArrayLoadInt, bcArrayLoadNarrow:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;  // index is int
@@ -9346,7 +9408,7 @@ begin
         end;
 
         // ArrayStore: Dest is value register, Src2 is index (int)
-        bcArrayStoreInt:
+        bcArrayStoreInt, bcArrayStoreNarrow:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;  // value
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;  // index
@@ -14336,8 +14398,13 @@ function TBytecodeVM.ArrDescCount(const A: TArrayStorage): Int64;
 // were already written to check the pointer, the reader half of the change was in place, and the
 // WRITER still said 16. "Decorare un'etichetta e spostare i suoi lettori sono una modifica in due
 // meta'" - this is the other half. Guard m884.
+// ⭐⭐ PHASE 2.5 (15 Sep 2026): now it IS the number of elements, for a packed array too. What made TotalSize an
+// access violation was an 8-byte arm reaching a packed array; since phase 2.5 a packed array is reached only by
+// bcArrayLoadNarrow/StoreNarrow (the compiler emits them, LoadProgram rewrites an old .basc and refuses anything
+// else), which take the element base from field 1. Field 0 stays NULL for it, so an 8-byte arm that ever got there
+// would fault loudly instead of reading the wrong width. And a native UBOUND reads the right count.
 begin
-  if A.ElemWidth > 0 then Result := 0 else Result := A.TotalSize;
+  Result := A.TotalSize;
 end;
 
 function TBytecodeVM.ActiveCtx: TExecutionContext; inline;
@@ -14538,6 +14605,11 @@ begin
     else FJitArrDesc[a * 4 + 0] := 0;
     if Length(FArrays[a].FloatData) > 0 then
       FJitArrDesc[a * 4 + 1] := Int64(PtrUInt(@FArrays[a].FloatData[0]))
+    // ⭐ PHASE 2.5: a PACKED array publishes its element base in field 1, which an int-bank array never used (only
+    // float ops read it). bcArrayLoadNarrow/StoreNarrow read it at the width in their Immediate; an 8-byte int array
+    // bound to a narrow parameter answers NULL here, and the narrow arm hands that instruction to the interpreter.
+    else if (FArrays[a].ElemWidth > 0) and (Length(FArrays[a].ByteData) > 0) then
+      FJitArrDesc[a * 4 + 1] := Int64(PtrUInt(@FArrays[a].ByteData[0]))
     else FJitArrDesc[a * 4 + 1] := 0;
     FJitArrDesc[a * 4 + 2] := ArrDescCount(FArrays[a]);
     if Length(FArrays[a].LowerBounds) > 0 then
@@ -16877,7 +16949,8 @@ function ArrayOpMayReshape(SubOp: Word): Boolean; inline;
 begin
   case SubOp of
     9, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    29, 30, 31, 32, 33, 43, 45, 46, 50, 51, 52, 53, 54: Result := False;
+    29, 30, 31, 32, 33, 43, 45, 46, 50, 51, 52, 53, 54,
+    55, 56: Result := False;   // phase 2.5: a packed element read/write moves nothing (ArrayHotOps.inc)
   else
     Result := True;
   end;
@@ -17512,6 +17585,23 @@ begin
               // ONE array - fbc's FBARRAY* (DIVERGENZE 462). Nothing in FArrays moves.
               // ⚠️ The descriptor mark names the ARGUMENT's slot: a per-context copy refreshes a private
               // entry whose CURRENT physical slot falls in the rebuilt range, and the parameter's now does.
+              // ⛔ PHASE 2.5: the parameter's DECLARED element width decided its opcodes at compile time. An argument
+              // PACKED at another width would reach an 8-byte arm (or a narrow one of the wrong width) in the compiled
+              // engines - their descriptor gives it a NULL in field 0 - so the bind refuses it by name. An argument
+              // that is NOT packed is fine under a narrow parameter: the narrow arms find no packed base and hand that
+              // instruction to the interpreter, which reads the physical width.
+              if (Ctx.ArrayBindStack[I].ArgId >= 0) and (Ctx.ArrayBindStack[I].ArgId <= High(FArrays)) and
+                 (FArrays[Ctx.ArrayBindStack[I].ArgId].ElemWidth > 0) and
+                 (Ctx.ArrayBindStack[I].ParamId < FProgram.GetArrayCount) and
+                 (FProgram.GetArray(Ctx.ArrayBindStack[I].ParamId).ElemWidth <>
+                  FArrays[Ctx.ArrayBindStack[I].ArgId].ElemWidth) then
+                raise Exception.CreateFmt('Array parameter %s is declared with %d-byte elements but receives an array ' +
+                  'whose elements are %d byte(s) wide: declare the parameter with the argument''s element type',
+                  [FProgram.GetArray(Ctx.ArrayBindStack[I].ParamId).Name,
+                   Max(8, FProgram.GetArray(Ctx.ArrayBindStack[I].ParamId).ElemWidth) *
+                     Ord(FProgram.GetArray(Ctx.ArrayBindStack[I].ParamId).ElemWidth = 0) +
+                   FProgram.GetArray(Ctx.ArrayBindStack[I].ParamId).ElemWidth,
+                   FArrays[Ctx.ArrayBindStack[I].ArgId].ElemWidth]);
               Ctx.ArrayBindStack[I].OldMap := Ctx.ArrMap[Ctx.ArrayBindStack[I].ParamId];
               Ctx.ArrMap[Ctx.ArrayBindStack[I].ParamId] := Ctx.ArrayBindStack[I].ArgId;
               Ctx.ArrayBindStack[I].Applied := True;

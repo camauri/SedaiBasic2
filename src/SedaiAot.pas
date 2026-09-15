@@ -4610,6 +4610,59 @@ var
     EmitHelperCall(apc);
     E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));                 // @done
   end;
+  procedure AotNarrowAccess(IsStore: Boolean; ArrayId, IdxReg, ValReg, apc: Integer; Safe: Boolean;
+                            W: Integer; Signed: Boolean);
+  // ⭐ PHASE 2.5 OF THE POINTER MODEL: an element of a PACKED array, native. The base is descriptor field 1 (field 0
+  // is NULL for a packed array) and field 2 is the element count; the width and sign are the array's declared ones.
+  // One move at SIB scale 1/2/4 with the value in rax, the index in rcx and the base in rdx.
+  // ⛔ A NULL base, or an index out of range, runs THIS instruction through the helper: the interpreter settles the
+  // MODERN default, the dropped store, the CLASSIC error, and an 8-byte array reached through a narrow parameter.
+  // No dialect branch here - one cold path, and out of range is rare.
+  var pOOB, pCold, pDone: Integer;
+      sib: Byte;
+  begin
+    case W of
+      1: sib := $0A;          // scale 1, index rcx, base rdx
+      2: sib := $4A;          // scale 2
+    else sib := $8A;          // scale 4
+    end;
+    if IsStore then ILoad(RAX, ValReg);
+    ILoad(RCX, IdxReg);
+    if not OK then Exit;
+    E.MemOp([$49, $8B], RDX, R8, 16);                                  // rdx = ctx.ArrDesc
+    pOOB := -1;
+    if not Safe then
+    begin
+      E.MemOp([$48, $3B], RCX, RDX, LongWord(ArrayId) * 32 + 16);      // cmp rcx, [rdx + Count]
+      E.EmitBytes([$0F, $83]); pOOB := E.Len; E.Emit32(0);             // jae cold (unsigned: a negative index too)
+    end;
+    E.MemOp([$48, $8B], RDX, RDX, LongWord(ArrayId) * 32 + 8);         // rdx = packed element base (field 1)
+    E.EmitBytes([$48, $85, $D2]);                                      // test rdx, rdx
+    E.EmitBytes([$0F, $84]); pCold := E.Len; E.Emit32(0);              // jz cold
+    if IsStore then
+      case W of
+        1: E.EmitBytes([$88, $04, sib]);                               // mov [rdx+rcx], al
+        2: E.EmitBytes([$66, $89, $04, sib]);                          // mov [rdx+rcx*2], ax
+      else E.EmitBytes([$89, $04, sib]);                               // mov [rdx+rcx*4], eax
+      end
+    else
+    begin
+      case W of
+        1: if Signed then E.EmitBytes([$48, $0F, $BE, $04, sib])       // movsx rax, byte [rdx+rcx]
+           else E.EmitBytes([$0F, $B6, $04, sib]);                     // movzx eax, byte [rdx+rcx]
+        2: if Signed then E.EmitBytes([$48, $0F, $BF, $04, sib])       // movsx rax, word [rdx+rcx*2]
+           else E.EmitBytes([$0F, $B7, $04, sib]);                     // movzx eax, word [rdx+rcx*2]
+      else if Signed then E.EmitBytes([$48, $63, $04, sib])            // movsxd rax, dword [rdx+rcx*4]
+           else E.EmitBytes([$8B, $04, sib]);                          // mov eax, dword [rdx+rcx*4] (zero-extends)
+      end;
+      IStore(ValReg, RAX);
+    end;
+    E.EmitBytes([$E9]); pDone := E.Len; E.Emit32(0);                   // jmp done
+    if pOOB >= 0 then E.Patch32(pOOB, LongWord(E.Len - (pOOB + 4)));   // @cold
+    E.Patch32(pCold, LongWord(E.Len - (pCold + 4)));
+    EmitHelperCall(apc);
+    E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));                   // @done
+  end;
   procedure AotArrBound(apc, ArrayId: Integer; WantUpper: Boolean);
   var p1: Integer;
   begin
@@ -7500,7 +7553,15 @@ var
         apc := -1;
         // B4: a proven-safe access needs no deopt PC even under CLASSIC (the guard is elided).
         if ArrClassic and not Cur.BoundsSafe then begin apc := NeedPC; if not OK then Exit; end;
-        if SSAProg.GetArray(d).ElementType = srtString then
+        // ⭐ PHASE 2.5: a PACKED array is read at its true width - never through the 8-byte access below, whose base
+        // (descriptor field 0) is NULL for it. That NULL under a proven-safe index is what faulted (DIVERGENZE 406).
+        if (SSAProg.GetArray(d).ElementType = srtInt) and (SSAProg.GetArray(d).ElemWidth > 0) then
+        begin
+          apc := NeedPC; if not OK then Exit;
+          AotNarrowAccess(False, d, IReg(Cur.Src2), IReg(Cur.Dest), apc, Cur.BoundsSafe,
+                          SSAProg.GetArray(d).ElemWidth, SSAProg.GetArray(d).ElemSigned);
+        end
+        else if SSAProg.GetArray(d).ElementType = srtString then
           EmitArrLoadStr(d, IReg(Cur.Src2), SReg(Cur.Dest))
         else if SSAProg.GetArray(d).ElementType = srtFloat then
           AotArrAccess(True, False, d, IReg(Cur.Src2), FReg(Cur.Dest), apc, Cur.BoundsSafe)
@@ -7512,7 +7573,13 @@ var
         d := ArrId; if not OK then Exit;
         apc := -1;
         if ArrClassic and not Cur.BoundsSafe then begin apc := NeedPC; if not OK then Exit; end;
-        if SSAProg.GetArray(d).ElementType = srtString then
+        if (SSAProg.GetArray(d).ElementType = srtInt) and (SSAProg.GetArray(d).ElemWidth > 0) then   // phase 2.5
+        begin
+          apc := NeedPC; if not OK then Exit;
+          AotNarrowAccess(True, d, IReg(Cur.Src2), IReg(Cur.Dest), apc, Cur.BoundsSafe,
+                          SSAProg.GetArray(d).ElemWidth, SSAProg.GetArray(d).ElemSigned);
+        end
+        else if SSAProg.GetArray(d).ElementType = srtString then
           EmitArrStoreStr(d, IReg(Cur.Src2), SReg(Cur.Dest))
         else if SSAProg.GetArray(d).ElementType = srtFloat then
           AotArrAccess(True, True, d, IReg(Cur.Src2), FReg(Cur.Dest), apc, Cur.BoundsSafe)

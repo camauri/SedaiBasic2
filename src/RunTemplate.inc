@@ -947,7 +947,8 @@ EventPollCounter := 0;
         begin Ctx.PC := CurPC; ExecuteMathOp(Ctx, Instr^); CurPC := Ctx.PC + 1; end;
       // Group 3 (arrays). The ELEMENT-ACCESS opcodes (sub 3..8) run INLINE here, from the same source
       // text the handler uses (ArrayHotOps.inc). Everything else in group 3 is rare and still delegates.
-      DENSE_ARRAY_BASE + 3 .. DENSE_ARRAY_BASE + 8:
+      DENSE_ARRAY_BASE + 3 .. DENSE_ARRAY_BASE + 8,
+      DENSE_ARRAY_BASE + 55 .. DENSE_ARRAY_BASE + 56:   // phase 2.5: bcArrayLoadNarrow / bcArrayStoreNarrow
         begin
           // The shared branches never touch the PC, so this path advances it itself.
           // InstrHot is what the shared text below dereferences: this include is compiled into two
@@ -960,7 +961,8 @@ EventPollCounter := 0;
           end;
           Inc(CurPC);
         end;
-      DENSE_ARRAY_BASE + 0 .. DENSE_ARRAY_BASE + 2, DENSE_ARRAY_BASE + 9 .. DENSE_ARRAY_BASE + DENSE_ARRAY_SIZE - 1:
+      // ⛔ 9..54, not "9 .. SIZE - 1": 55 and 56 run inline above. A group-3 op added past 56 extends this range.
+      DENSE_ARRAY_BASE + 0 .. DENSE_ARRAY_BASE + 2, DENSE_ARRAY_BASE + 9 .. DENSE_ARRAY_BASE + 54:
         // Cold array ops (DIM/REDIM/ERASE/BIND/...) may resize or move an array's backing store; the
         // descriptor rebuild is triggered inside ExecuteArrayOp itself (it has two callers now - here
         // and the AOT helper - so the flag lives with the op, not the call site).

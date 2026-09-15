@@ -590,6 +590,17 @@ const
   // beside two wrong ones is not shippable. Now the storage says the same thing LBOUND/UBOUND say.
   bcArrayDescPtrInd    = bcGroupArray + 53;
   bcArrayElemAddr      = bcGroupArray + 54;  // "@a(i)" in the fb mode: Src1 = array id (immediate), Src2 = linear index (int), Dest = tagged machine address
+  // ⭐ PHASE 2.5 OF THE POINTER MODEL: an element of a PACKED array (Byte/UByte/Short/UShort/Long/ULong stored at its
+  // true width in ByteData). Same operands as bcArrayLoadInt / bcArrayStoreInt (Dest = value, Src1 = array id,
+  // Src2 = linear index); the Immediate carries BC_BOUNDS_SAFE_FLAG plus the element's width and sign, so the C hot
+  // loop, the AOT and the JIT pick the machine instruction without asking the VM.
+  // ⛔ A packed array must NEVER reach bcArrayLoadInt/StoreInt: its descriptor publishes the element base in field 1
+  // and a NULL in field 0, and an 8-byte arm would dereference that NULL. LoadProgram enforces it (RewritePackedArrayOps).
+  bcArrayLoadNarrow    = bcGroupArray + 55;
+  bcArrayStoreNarrow   = bcGroupArray + 56;
+  BC_NARROW_WIDTH_SHIFT = 1;    // Immediate bits 1..3 = element width in bytes (1, 2 or 4)
+  BC_NARROW_WIDTH_MASK  = 7;
+  BC_NARROW_SIGNED      = 16;   // Immediate bit 4 = the element type is signed (sign-extends on read)
 
   // === GROUP 4: I/O OPERATIONS (0x04xx) ===
   // Print values
@@ -2337,6 +2348,8 @@ begin
         52: Result := 'ArrayDescPtr';
         53: Result := 'ArrayDescPtrInd';
         54: Result := 'ArrayElemAddr';
+        55: Result := 'ArrayLoadNarrow';
+        56: Result := 'ArrayStoreNarrow';
         27: Result := 'ArrayRedimPush';
         28: Result := 'ArrayRedimN';
         29: Result := 'ArrayIdxPush';

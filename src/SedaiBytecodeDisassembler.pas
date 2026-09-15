@@ -418,6 +418,14 @@ begin
       Line := Format('%4d: %-20s R%d, ARR[%d], R%d%s', [Index, 'ArrayLoadString', Instr.Dest, Instr.Src1, Instr.Src2, BoundsSafeSuffix(Instr)]);
     bcArrayStoreInt:
       Line := Format('%4d: %-20s ARR[%d], R%d, R%d%s', [Index, 'ArrayStoreInt', Instr.Src1, Instr.Src2, Instr.Dest, BoundsSafeSuffix(Instr)]);
+    // Phase 2.5: a packed element, with its width and sign from the Immediate.
+    bcArrayLoadNarrow:
+      Line := Format('%4d: %-20s R%d, ARR[%d], R%d w%d%s%s', [Index, 'ArrayLoadNarrow', Instr.Dest, Instr.Src1, Instr.Src2,
+        (Instr.Immediate shr BC_NARROW_WIDTH_SHIFT) and BC_NARROW_WIDTH_MASK,
+        Copy('us', 1 + Ord((Instr.Immediate and BC_NARROW_SIGNED) <> 0), 1), BoundsSafeSuffix(Instr)]);
+    bcArrayStoreNarrow:
+      Line := Format('%4d: %-20s ARR[%d], R%d, R%d w%d%s', [Index, 'ArrayStoreNarrow', Instr.Src1, Instr.Src2, Instr.Dest,
+        (Instr.Immediate shr BC_NARROW_WIDTH_SHIFT) and BC_NARROW_WIDTH_MASK, BoundsSafeSuffix(Instr)]);
     bcArrayStoreFloat:
       Line := Format('%4d: %-20s ARR[%d], R%d, R%d%s', [Index, 'ArrayStoreFloat', Instr.Src1, Instr.Src2, Instr.Dest, BoundsSafeSuffix(Instr)]);
     bcArrayStoreString:

@@ -673,6 +673,8 @@ begin
   if (ArrayIndex >= 0) and (ArrayIndex < FSSAProgram.GetArrayCount) then
   begin
     ArrInfo := FSSAProgram.GetArray(ArrayIndex);
+    // ⭐ Phase 2.5: a PACKED array (Byte..ULong at its true width) never gets the 8-byte opcode - see bcArrayLoadNarrow.
+    if (ArrInfo.ElementType = srtInt) and (ArrInfo.ElemWidth > 0) then Exit(bcArrayLoadNarrow);
     case ArrInfo.ElementType of
       srtInt: Result := bcArrayLoadInt;
       srtFloat: Result := bcArrayLoadFloat;
@@ -693,6 +695,7 @@ begin
   if (ArrayIndex >= 0) and (ArrayIndex < FSSAProgram.GetArrayCount) then
   begin
     ArrInfo := FSSAProgram.GetArray(ArrayIndex);
+    if (ArrInfo.ElementType = srtInt) and (ArrInfo.ElemWidth > 0) then Exit(bcArrayStoreNarrow);   // phase 2.5
     case ArrInfo.ElementType of
       srtInt: Result := bcArrayStoreInt;
       srtFloat: Result := bcArrayStoreFloat;
@@ -2209,6 +2212,14 @@ begin
   // the interpreter ignores Immediate on these opcodes and keeps checking.
   if OpIn(Instr.OpCode, [ssaArrayLoad, ssaArrayStore]) and Instr.BoundsSafe then
     BCInstr.Immediate := BC_BOUNDS_SAFE_FLAG;
+  // ⭐ Phase 2.5: a packed element carries its width and sign beside the bounds flag, so the C hot loop and the JIT
+  // choose the machine instruction without asking the VM (bcArrayLoadNarrow / bcArrayStoreNarrow).
+  if ((BCInstr.OpCode = bcArrayLoadNarrow) or (BCInstr.OpCode = bcArrayStoreNarrow)) and
+     (Instr.Src1.Kind = svkArrayRef) and (Instr.Src1.ArrayIndex >= 0) and
+     (Instr.Src1.ArrayIndex < FSSAProgram.GetArrayCount) then
+    BCInstr.Immediate := (BCInstr.Immediate and BC_BOUNDS_SAFE_FLAG) or
+      (Int64(FSSAProgram.GetArray(Instr.Src1.ArrayIndex).ElemWidth) shl BC_NARROW_WIDTH_SHIFT) or
+      (Ord(FSSAProgram.GetArray(Instr.Src1.ArrayIndex).ElemSigned) * BC_NARROW_SIGNED);
   // FreeBASIC function form of the filesystem commands (ChDir/MkDir/RmDir/Kill=Scratch/
   // FileCopy/Shell): the SAME opcode as the statement form, discriminated by Immediate = -1,
   // with Dest = the int register receiving the error/exit code (the VM stores the code

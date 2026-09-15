@@ -284,7 +284,9 @@ begin
       bcRawLoadInt, bcRawLoadFloat, bcRawStoreInt, bcRawStoreFloat,
       // Phase 2.3: the Ref accessors (the same arms on a machine address) and "@a(i)", which reads the
       // descriptor and names no storage it could move.
-      bcRefLoadInt, bcRefLoadFloat, bcRefStoreInt, bcRefStoreFloat, bcArrayElemAddr:
+      bcRefLoadInt, bcRefLoadFloat, bcRefStoreInt, bcRefStoreFloat, bcArrayElemAddr,
+      // Phase 2.5: a packed element - it reads or writes element bytes and moves no storage (ArrayOpMayReshape).
+      bcArrayLoadNarrow, bcArrayStoreNarrow:
         Result := True;
     else
       Result := False;
@@ -1476,6 +1478,7 @@ var
         bcRawStoreInt, bcRefStoreInt: begin T(J^.Src1); T(J^.Src2); end;   // Src1=address, Src2=stored value
         bcRawLoadFloat, bcRawStoreFloat, bcRefLoadFloat, bcRefStoreFloat: T(J^.Src1);  // Src1=address (int)
         bcArrayElemAddr: begin T(J^.Dest); T(J^.Src2); end;   // Dest=address, Src2=index; Src1 is the array id
+        bcArrayLoadNarrow, bcArrayStoreNarrow: begin T(J^.Dest); T(J^.Src2); end;   // phase 2.5: Dest=value, Src2=index
         bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat, bcCmpEqFloat, bcCmpNeFloat:
           T(J^.Dest);                                // float compare writes an int result reg
         bcFloatToInt, bcFloatRound: T(J^.Dest);      // float->int writes an int result reg
@@ -2057,6 +2060,56 @@ var
     IStore(I^.Dest, RAX);
     E.EmitBytes([$E9]); pDone := E.Len; E.Emit32(0);                         // jmp done
     E.Patch32(pCold, LongWord(E.Len - (pCold + 4)));                         // @cold
+    EmitHelperCall(apc);
+    E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));                         // @done
+  end;
+  procedure EmitNarrowJ(apc: Integer; IsStore: Boolean);
+  // ⭐ PHASE 2.5: bcArrayLoadNarrow / bcArrayStoreNarrow, as the AOT's AotNarrowAccess. Width and sign from the
+  // Immediate, base from descriptor field 1, count from field 2; a NULL base or an index out of range runs this
+  // instruction through the helper, which settles every case the fast path does not.
+  var pOOB, pCold, pDone, W: Integer;
+      Sgn: Boolean;
+      sib: Byte;
+  begin
+    W := Integer((I^.Immediate shr BC_NARROW_WIDTH_SHIFT) and BC_NARROW_WIDTH_MASK);
+    Sgn := (I^.Immediate and BC_NARROW_SIGNED) <> 0;
+    case W of
+      1: sib := $0A;
+      2: sib := $4A;
+      4: sib := $8A;
+    else
+      begin EmitHelperCall(apc); Exit; end;                                  // not a width this arm knows
+    end;
+    if IsStore then ILoad(RAX, I^.Dest);                                     // the value is in Dest
+    ILoad(RCX, I^.Src2);                                                     // rcx = linear index
+    pOOB := -1;
+    if (I^.Immediate and BC_BOUNDS_SAFE_FLAG) = 0 then
+    begin
+      R8Load(RDX, LongWord(I^.Src1) * 32 + 16);                              // rdx = Count
+      E.EmitBytes([$48, $39, $D1]);                                          // cmp rcx, rdx
+      E.EmitBytes([$0F, $83]); pOOB := E.Len; E.Emit32(0);                   // jae cold
+    end;
+    R8Load(RDX, LongWord(I^.Src1) * 32 + 8);                                 // rdx = packed element base (field 1)
+    E.EmitBytes([$48, $85, $D2]);                                            // test rdx, rdx
+    E.EmitBytes([$0F, $84]); pCold := E.Len; E.Emit32(0);                    // jz cold
+    if IsStore then
+      case W of
+        1: E.EmitBytes([$88, $04, sib]);                                     // mov [rdx+rcx], al
+        2: E.EmitBytes([$66, $89, $04, sib]);                                // mov [rdx+rcx*2], ax
+      else E.EmitBytes([$89, $04, sib]);                                     // mov [rdx+rcx*4], eax
+      end
+    else
+    begin
+      case W of
+        1: if Sgn then E.EmitBytes([$48, $0F, $BE, $04, sib]) else E.EmitBytes([$0F, $B6, $04, sib]);
+        2: if Sgn then E.EmitBytes([$48, $0F, $BF, $04, sib]) else E.EmitBytes([$0F, $B7, $04, sib]);
+      else if Sgn then E.EmitBytes([$48, $63, $04, sib]) else E.EmitBytes([$8B, $04, sib]);
+      end;
+      IStore(I^.Dest, RAX);
+    end;
+    E.EmitBytes([$E9]); pDone := E.Len; E.Emit32(0);                         // jmp done
+    if pOOB >= 0 then E.Patch32(pOOB, LongWord(E.Len - (pOOB + 4)));         // @cold
+    E.Patch32(pCold, LongWord(E.Len - (pCold + 4)));
     EmitHelperCall(apc);
     E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));                         // @done
   end;
@@ -3054,6 +3107,8 @@ var
         else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
       bcArrayElemAddr:
         if UseHelper and not (InCallee or InGosub) then EmitArrElemAddrJ(apc) else Exit;
+      bcArrayLoadNarrow, bcArrayStoreNarrow:   // phase 2.5
+        if UseHelper and not (InCallee or InGosub) then EmitNarrowJ(apc, I^.OpCode = bcArrayStoreNarrow) else Exit;
       bcRawLoadInt, bcRawLoadFloat, bcRawStoreInt, bcRawStoreFloat,
       bcRefLoadInt, bcRefLoadFloat, bcRefStoreInt, bcRefStoreFloat:
         // ⛔ NEVER "I^.OpCode in [bcRaw..., ...]": a Pascal set holds 0..255 and these opcodes are two-byte words

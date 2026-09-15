@@ -92,6 +92,22 @@
           {$ENDIF}
         end;
       end;
+    55: // bcArrayLoadNarrow - phase 2.5: an element of a PACKED array. ArrGetInt reads the PHYSICAL width, so an
+      begin  // 8-byte array reached through a narrow parameter still answers right here.
+        ArrayIdx := ArrMapP[InstrHot^.Src1];
+        LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
+        if ArrayBoundsOK(ArrayIdx, LinearIdx) then
+          Ctx.IntRegs[InstrHot^.Dest] := ArrGetInt(FArrays[ArrayIdx], LinearIdx)
+        else
+          Ctx.IntRegs[InstrHot^.Dest] := 0;   // MODERN out-of-bounds read -> default (FreeBASIC)
+      end;
+    56: // bcArrayStoreNarrow - the value in Dest, written at the physical width (the wrap happens here)
+      begin
+        ArrayIdx := ArrMapP[InstrHot^.Src1];
+        LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
+        if ArrayBoundsOK(ArrayIdx, LinearIdx) then
+          ArrSetIntAt(ArrayIdx, LinearIdx, Ctx.IntRegs[InstrHot^.Dest]);
+      end;
     8: // bcArrayStoreString
       begin
         ArrayIdx := ArrMapP[InstrHot^.Src1];   // logical -> this context's physical slot

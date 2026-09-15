@@ -201,7 +201,10 @@ double tan(double);
   X(0x030E, RefLoadFloat          ) \
   X(0x0310, RefStoreInt           ) \
   X(0x0311, RefStoreFloat         ) \
-  X(0x0336, ArrayElemAddr         )
+  X(0x0336, ArrayElemAddr         ) \
+  X(0x0337, ArrayLoadNarrow       ) \
+  X(0x0338, ArrayStoreNarrow      ) \
+  X(0x0081, NarrowInt             )
 
 
 
@@ -632,6 +635,56 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
         if ((uint64_t)li < (uint64_t)d[2]) ((int64_t *)(intptr_t)d[0])[li] = ireg[I->dest];
         else if (!(flags & HF_MODERN_ARRAYS) || !d[0]) return pc; }
+      pc++; NEXT;
+  /* ⭐ PHASE 2.5 OF THE POINTER MODEL: an element of a PACKED array (Byte..ULong at its true width). The base is
+     descriptor field 1 - field 0 is NULL for such an array, so no 8-byte arm can read it - and the count field 2 is
+     the element count. imm >> 1: bits 0..2 = width in bytes, bit 3 = signed (BC_NARROW_* in SedaiBytecodeTypes).
+     A NULL base (an 8-byte array reached through a narrow parameter, or nothing allocated) hands the PC back, and so
+     does anything the out-of-bounds rule cannot settle - the same two-arm shape as the 8-byte accessors above.
+     __builtin_memcpy, not a cast: the element need not sit on its own alignment, and gcc lowers it to one move. */
+  L_ArrayLoadNarrow:
+      { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
+        const uint8_t *b_ = (const uint8_t *)(intptr_t)d[1];
+        if (b_ && (uint64_t)li < (uint64_t)d[2]) {
+          switch ((unsigned)(I->imm >> 1) & 0xFu) {
+            case 1:  ireg[I->dest] = b_[li]; break;
+            case 9:  ireg[I->dest] = (int8_t)b_[li]; break;
+            case 2:  { uint16_t v_; __builtin_memcpy(&v_, b_ + li * 2, 2); ireg[I->dest] = v_; } break;
+            case 10: { int16_t v_;  __builtin_memcpy(&v_, b_ + li * 2, 2); ireg[I->dest] = v_; } break;
+            case 4:  { uint32_t v_; __builtin_memcpy(&v_, b_ + li * 4, 4); ireg[I->dest] = v_; } break;
+            case 12: { int32_t v_;  __builtin_memcpy(&v_, b_ + li * 4, 4); ireg[I->dest] = v_; } break;
+            default: return pc;
+          } }
+        else if ((flags & HF_MODERN_ARRAYS) && b_) ireg[I->dest] = 0;
+        else return pc; }
+      pc++; NEXT;
+  L_ArrayStoreNarrow:   /* the VALUE is in Dest, truncated to the element's width - the wrap happens here */
+      { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
+        uint8_t *b_ = (uint8_t *)(intptr_t)d[1];
+        if (b_ && (uint64_t)li < (uint64_t)d[2]) {
+          switch (((unsigned)(I->imm >> 1)) & 7u) {
+            case 1:  b_[li] = (uint8_t)ireg[I->dest]; break;
+            case 2:  { uint16_t v_ = (uint16_t)ireg[I->dest]; __builtin_memcpy(b_ + li * 2, &v_, 2); } break;
+            case 4:  { uint32_t v_ = (uint32_t)ireg[I->dest]; __builtin_memcpy(b_ + li * 4, &v_, 4); } break;
+            default: return pc;
+          } }
+        else if (!(flags & HF_MODERN_ARRAYS) || !b_) return pc; }
+      pc++; NEXT;
+  /* bcNarrowInt - the WRAP of a value into a narrow type before it is stored (NarrowInt64 in SedaiBytecodeVM.pas: the
+     same six codes). It was the one exit HOTC_DIAG named on a loop over packed arrays once phase 2.5 made their
+     accesses native: 60 000 000 exits, one per store into a Short or a UByte, in a loop otherwise fully covered. */
+  L_NarrowInt:
+      { int64_t v_ = ireg[I->s1];
+        switch (I->imm) {
+          case 1: v_ = (int8_t)v_; break;
+          case 2: v_ = (uint8_t)v_; break;
+          case 3: v_ = (int16_t)v_; break;
+          case 4: v_ = (uint16_t)v_; break;
+          case 5: v_ = (int32_t)v_; break;
+          case 6: v_ = (uint32_t)v_; break;
+          default: break;
+        }
+        ireg[I->dest] = v_; }
       pc++; NEXT;
   L_ArrayStoreFloat:
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];

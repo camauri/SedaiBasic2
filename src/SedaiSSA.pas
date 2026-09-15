@@ -30413,6 +30413,35 @@ begin
   // A record FIELD: its declared type is on the field, which is why it carries an IdentCode of its own.
   if (Node.NodeType = antMemberAccess) and (Node.ChildCount >= 1) then
     Exit(UDTFieldIdentCode(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value)));
+  // ⭐ AN ARRAY - passed whole, "f(a())", or one element of it - names its DECLARED element type. Without it an array
+  // of Integer and one of LongInt both signed '-' and "f(ali())" against f(x() As Integer) / f(x() As LongInt)
+  // took the first declaration, where fbc answers "longint" (fbc suite overload/const). A Long array did resolve,
+  // through Declared32Code, which knows the narrow widths and not the four 64-bit identities.
+  // ⛔ Only a name that IS an array: a call written "g_()" arrives with the same node shape.
+  if (Node.NodeType in [antArrayAccess, antIdentifier]) then
+  begin
+    if Node.NodeType = antArrayAccess then
+    begin
+      if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+        T := VarToStr(Node.GetChild(0).Value)
+      else
+        T := '';
+    end
+    else
+      T := VarToStr(Node.Value);
+    if (T <> '') and (ArrayIndexOf(UpperFast(T)) >= 0) then
+    begin
+      T := FArrayScalarType.Values[ArrayFactKey(T)];
+      if T = '' then T := FArrayScalarType.Values[UpperFast(VarToStr(Node.Value))];
+      T := UpperFast(Trim(T));
+      if Copy(T, 1, 6) = 'CONST ' then T := Trim(Copy(T, 7, MaxInt));
+      if T <> '' then
+      begin
+        idx := TypeNameIdentCode(T);
+        if idx <> 0 then Exit(idx);
+      end;
+    end;
+  end;
   if Node.NodeType in [antIdentifier, antFunctionCall] then
   begin
     if FInProcedure and (FCurrentProcName <> '') then
@@ -36353,6 +36382,9 @@ var
 
   // The four spellings of one width tail, most specific first: the declared label that matches, or ''.
   function WidthTailLabel(const WT: string): string;
+  var
+    kc, jc, NC, BestC: Integer;
+    Lbl, BestLbl: string;
   begin
     if ConstSig <> '' then
     begin
@@ -36371,6 +36403,30 @@ var
     end;
     Result := BaseLabel + '~' + Sig + '%' + WT;
     if FProcDecls.ContainsKey(Result) then Exit;
+    // ⭐ A NON-CONST ARGUMENT BINDS A CONST PARAMETER, as in fbc - but only after every exact spelling above has
+    // failed, so a const/non-const pair still gives the non-const argument its own overload (m849). A set whose
+    // members are ALL const ("fc(x() As Const Long)" / "As Const Integer" ...) matched nothing here and fell to
+    // the arity fallback, which took the first declaration: fbc suite overload/const answered "integer" for a
+    // Long array. Among the const spellings of the same banks and widths, the fewest 'C' wins.
+    if (ConstSig = '') and (UdtSig = '') then
+    begin
+      BestC := MaxInt; BestLbl := '';
+      for kc := 0 to FProcedureNames.Count - 1 do
+      begin
+        Lbl := FProcedureNames[kc];
+        if (Copy(Lbl, 1, Length(BaseLabel) + Length(Sig) + 2) = BaseLabel + '~' + Sig + '!') and
+           (Length(Lbl) = Length(BaseLabel) + Length(Sig) + 2 + Length(Sig) + 1 + Length(WT)) and
+           (Copy(Lbl, Length(Lbl) - Length(WT), MaxInt) = '%' + WT) then
+        begin
+          NC := 0;
+          for jc := Length(BaseLabel) + Length(Sig) + 3 to Length(BaseLabel) + 2 * Length(Sig) + 2 do
+            if Lbl[jc] = 'C' then Inc(NC)
+            else if Lbl[jc] <> '-' then NC := MaxInt div 2;
+          if (NC < BestC) and FProcDecls.ContainsKey(Lbl) then begin BestC := NC; BestLbl := Lbl; end;
+        end;
+      end;
+      if BestLbl <> '' then Exit(BestLbl);
+    end;
     Result := '';
   end;
 
@@ -54662,6 +54718,11 @@ begin
       // Record the slot so array accesses on it subtract the lower bound at RUNTIME (the bound array's
       // lower bound varies per call and cannot be a compile-time constant like a normal array's).
       Slot := FProgram.FindArray(MangledName);
+      // ⭐ PHASE 2.5: the parameter's element WIDTH as storage, like every DIM (NoteArrayElemStorage's two callers
+      // there). Without it "Sub f(a() As Long)" read its packed argument through an 8-byte opcode, which exited to
+      // the interpreter only because the descriptor published NULL; with the element base published it would read
+      // the wrong width. The width of the ARGUMENT is checked against this one at the bind (bcArrayBindApply).
+      if FindUDT(TypeName) < 0 then NoteArrayElemStorage(Slot, ET, TypeName);
       NoteArrayAddrNative(Slot, ET, TypeName);   // phase 2.3: "@a(i)" of the parameter, by its declared type
       if (Slot >= 0) and not IsArrayParamSlot(Slot) then
       begin
