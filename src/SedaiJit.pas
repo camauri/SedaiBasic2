@@ -3056,11 +3056,18 @@ var
         if UseHelper and not (InCallee or InGosub) then EmitArrElemAddrJ(apc) else Exit;
       bcRawLoadInt, bcRawLoadFloat, bcRawStoreInt, bcRawStoreFloat,
       bcRefLoadInt, bcRefLoadFloat, bcRefStoreInt, bcRefStoreFloat:
+        // ⛔ NEVER "I^.OpCode in [bcRaw..., ...]": a Pascal set holds 0..255 and these opcodes are two-byte words
+        // ($0319...). FPC only WARNS ("range check error while evaluating constants") and the test is always False -
+        // which is how phase 2.3 turned every native raw STORE into a LOAD and every Float access into an Int one
+        // (m984 died under --jit with "address 1"). Explicit comparisons, as before.
         if UseHelper and NativeMem and not (InCallee or InGosub) and
            AotRawCodeNative(I^.Immediate and $FFFFFFFF,
-                            I^.OpCode in [bcRawLoadFloat, bcRawStoreFloat, bcRefLoadFloat, bcRefStoreFloat]) then
-          EmitRawJ(apc, I^.OpCode in [bcRawLoadFloat, bcRawStoreFloat, bcRefLoadFloat, bcRefStoreFloat],
-                   I^.OpCode in [bcRawStoreInt, bcRawStoreFloat, bcRefStoreInt, bcRefStoreFloat])
+                            (I^.OpCode = bcRawLoadFloat) or (I^.OpCode = bcRawStoreFloat) or
+                            (I^.OpCode = bcRefLoadFloat) or (I^.OpCode = bcRefStoreFloat)) then
+          EmitRawJ(apc, (I^.OpCode = bcRawLoadFloat) or (I^.OpCode = bcRawStoreFloat) or
+                        (I^.OpCode = bcRefLoadFloat) or (I^.OpCode = bcRefStoreFloat),
+                   (I^.OpCode = bcRawStoreInt) or (I^.OpCode = bcRawStoreFloat) or
+                   (I^.OpCode = bcRefStoreInt) or (I^.OpCode = bcRefStoreFloat))
         else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
     else
       // The helper route (J14): an instruction with no native form is run by the INTERPRETER and

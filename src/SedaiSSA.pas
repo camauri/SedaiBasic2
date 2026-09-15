@@ -44011,8 +44011,17 @@ begin
     if (Result = '') and (Node.Token.TokenType = ttOpAdd) then Result := RawPtrExprName(Node.GetChild(1));
   end
   // A pointer CAST is a value passthrough, so "CPtr(UByte Ptr, @z)" is as raw as what it wraps.
+  // ⛔ ...and ONLY a pointer cast (DIVERGENZE 348). "Cast(Integer, @lw[4]) - Cast(Integer, lw)" is a subtraction of two
+  // NUMBERS, where fbc answers 16; passing through the integer cast made it a pointer DIFFERENCE, divided by
+  // SizeOf(Long): 4. A target not yet resolved ("Cast(TypeOf(x), v)", answered at lowering) keeps the passthrough.
   else if (Node.NodeType = antCast) and (Node.ChildCount >= 1) then
-    Result := RawPtrExprName(Node.GetChild(0))
+  begin
+    if (Node.ValueUpper = '') or (Copy(Node.ValueUpper, 1, 6) = 'TYPEOF') or
+       ((Length(Node.ValueUpper) >= 4) and (Copy(Node.ValueUpper, Length(Node.ValueUpper) - 3, 4) = ' PTR')) or
+       ((Length(UpperFast(CanonicalType(Node.ValueUpper))) >= 4) and
+        (Copy(UpperFast(CanonicalType(Node.ValueUpper)), Length(UpperFast(CanonicalType(Node.ValueUpper))) - 3, 4) = ' PTR')) then
+      Result := RawPtrExprName(Node.GetChild(0));
+  end
   // "@x" where x is a RAW-BACKED scalar or buffer: its address is a real byte pointer, so a deref or a
   // cast through it is a raw access. Without this, "*CPtr(UByte Ptr, @z)" fell to the managed pointer
   // path and the tagged address was decoded as an array handle.
@@ -50404,6 +50413,16 @@ begin
   while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
   if ExprIsPointerValue(Node) then Exit(True);
   if (Node.NodeType = antCast) and EndsPtr(VarToStr(Node.Value)) then Exit(True);
+  // ⭐ ...and a STEP of a pointer, "p + n" / "n + p" / "p - n": still a pointer, still tagged. "Cast(Integer, pa + 3)"
+  // with pa = @la(0) kept FGNPTR_TAG in the fb mode once @a(i) became a machine address (phase 2.3): 2^61 + 12 where
+  // fbc says the address. "p - q" is NOT one: two pointers subtract to a count.
+  if (Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) and Assigned(Node.Token) then
+  begin
+    if (Node.Token.TokenType = ttOpAdd) and
+       (ExprIsPointerTyped(Node.GetChild(0)) or ExprIsPointerTyped(Node.GetChild(1))) then Exit(True);
+    if (Node.Token.TokenType = ttOpSub) and ExprIsPointerTyped(Node.GetChild(0)) and
+       not ExprIsPointerTyped(Node.GetChild(1)) then Exit(True);
+  end;
   // ⭐ ...and an ELEMENT of a pointer-to-pointer, "p[i]" with p a "gpointer Ptr": the element is itself a
   // pointer, and it has no declared type of its own to ask. GLib's GPOINTER_TO_INT is exactly
   // "Cast(Integer, pa->pdata[i])", and it kept the foreign-address tag - 2^61 + 200 where fbc says 200
