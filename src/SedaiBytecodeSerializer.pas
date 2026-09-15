@@ -94,7 +94,10 @@ const
   // added to the READER in the same change, never one alone, and `basc_sweep` is the net that sees it.
   // v6 (15 Sep 2026): the MEMORY MODE flag. A v5 file has it clear, which reads as strict - the only model
   // any v5 file could have been compiled for.
-  BASC_VERSION = 6;
+  // v7 (15 Sep 2026): one more byte per array, bit 0 = TSSAArrayInfo.AddrNative (phase 2.3 of the pointer model).
+  // The v4 flags byte was full: bit 7 was its last free bit. A v6 file reads False - its bytecode has the packed
+  // "@a(i)" inside, so False is what it means.
+  BASC_VERSION = 7;
 
   // Flags
   BASC_FLAG_DEBUG_INFO = $0001;  // Contains source line mapping (always included)
@@ -347,6 +350,10 @@ begin
       // is what it meant - a program compiled before this existed had no descriptor to answer.
       if ArrInfo.RankStated then RegType := RegType or 128;
       Stream.WriteBuffer(RegType, SizeOf(RegType));
+      // v7: the second facts byte. Bit 0 = AddrNative; written HERE and read in the same change (DIVERGENZE 172).
+      RegType := 0;
+      if ArrInfo.AddrNative then RegType := RegType or 1;
+      Stream.WriteBuffer(RegType, SizeOf(RegType));
     except
       on E: Exception do
         raise EBytecodeSerializerError.CreateFmt('Error writing array %d: %s', [i, E.Message]);
@@ -536,6 +543,14 @@ begin
         end;
         ArrInfo.ElemSigned := (RegType and 32) <> 0;
         ArrInfo.ElemIsPtr := (RegType and 64) <> 0;          // written by the writer above, in the same change
+      end;
+      // v7: the second facts byte. ⛔ Set on EVERY array, older files included: ArrInfo is reused across the
+      // loop, and a True left from the previous array would be read as this one's.
+      ArrInfo.AddrNative := False;
+      if Header.Version >= 7 then
+      begin
+        Stream.ReadBuffer(RegType, SizeOf(RegType));
+        ArrInfo.AddrNative := (RegType and 1) <> 0;
       end;
       Result.AddArrayInfo(ArrInfo);
     end;

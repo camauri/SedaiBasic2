@@ -589,6 +589,7 @@ const
   // carry what fbc's descriptor reports until DIVERGENZE 309-312 were closed, and three right fields
   // beside two wrong ones is not shippable. Now the storage says the same thing LBOUND/UBOUND say.
   bcArrayDescPtrInd    = bcGroupArray + 53;
+  bcArrayElemAddr      = bcGroupArray + 54;  // "@a(i)" in the fb mode: Src1 = array id (immediate), Src2 = linear index (int), Dest = tagged machine address
 
   // === GROUP 4: I/O OPERATIONS (0x04xx) ===
   // Print values
@@ -2335,6 +2336,7 @@ begin
         51: Result := 'RawStoreZStr';
         52: Result := 'ArrayDescPtr';
         53: Result := 'ArrayDescPtrInd';
+        54: Result := 'ArrayElemAddr';
         27: Result := 'ArrayRedimPush';
         28: Result := 'ArrayRedimN';
         29: Result := 'ArrayIdxPush';

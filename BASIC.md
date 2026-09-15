@@ -300,13 +300,18 @@ the call states it (`malloc`, `calloc`, `realloc`, `CoTaskMemAlloc`, `HeapAlloc`
   the program's character cell stands for. A string expression passed to a `WString Ptr` parameter
   travels as a wide temporary, as in FreeBASIC.
 
-**Pointer arithmetic and the numeric value of a pointer.** A pointer obtained from `Allocate`,
-`SAdd`, `StrPtr` or `ScreenPtr` is a byte address and steps by `SizeOf(pointee)`, exactly as in
-FreeBASIC. A pointer obtained with `@` on a variable or an array element is a packed
-(array, element) pair instead, so its numeric value counts ELEMENTS: `CInt(p + 1) - CInt(p)` answers
-1 where FreeBASIC answers `SizeOf(pointee)`. Dereferencing, indexing and pointer subtraction are
-unaffected — `*p`, `p[i]`, `p2 - p1` and `For p = @a(0) To @a(n)` all answer what FreeBASIC answers,
-because both sides of those speak the same unit.
+**Pointer arithmetic and the numeric value of a pointer.** In the default memory mode (`--memory=fb`)
+a pointer obtained from `Allocate`, `SAdd`, `StrPtr` or `ScreenPtr`, from `@` on a variable of a builtin
+numeric type, or from `@` on an element of an array of integers (`Byte` to `ULongInt`) or `Double` is a
+machine address and steps by `SizeOf(pointee)`, exactly as in FreeBASIC: `CInt(p + 1) - CInt(p)`
+answers `SizeOf(pointee)`, a `UByte Ptr` over a `Short` array reads its bytes one by one, and C can
+keep the pointer and hand it back. A pointer obtained with `@` on an element of an array of `Single`,
+`Boolean`, an enum, strings, records or pointers is still a packed (array, element) pair, so its numeric
+value counts ELEMENTS: `CInt(p + 1) - CInt(p)` answers 1 where FreeBASIC answers `SizeOf(pointee)`. In
+the isolated mode (`--memory=strict`) every `@` pointer is such a pair. Dereferencing, indexing and
+pointer subtraction are unaffected in both cases — `*p`, `p[i]`, `p2 - p1` and
+`For p = @a(0) To @a(n)` all answer what FreeBASIC answers, because both sides of those speak the same
+unit.
 
 **C functions that exist only at link time cannot be called** (10 September 2026). SedaiBasic reaches
 a C library by LOADING it while the program runs, where FreeBASIC compiles and LINKS an executable. A
@@ -3577,8 +3582,12 @@ A program is compiled for one of two **memory modes**, and the mode decides what
 ⚠️ **The `fb` mode is being built in steps.** Already in place: `Allocate`, `CAllocate`, `Reallocate`, `Deallocate`,
 `New` and crt's `malloc`/`calloc`/`realloc`/`free` answer memory from the C library, as in FreeBASIC — the pointer is the
 machine address, C can free a block the program allocated and the program can `Deallocate` a block C allocated.
-Records, arrays and variables whose address is taken still live where they always did, so the limits listed under
-"Calling C libraries" below still apply (a record whose address C keeps across calls, an address C hands back later).
+A variable of a builtin numeric type whose address is taken lives in a cell of native memory, and `@` on an element of
+an array of integers (`Byte` to `ULongInt`) or `Double` is the element's machine address — so a `UByte Ptr` over such an
+array reads its bytes, pointer arithmetic counts bytes, and C can keep that address and hand it back.
+Records, arrays of `Single`, `Boolean`, enums, strings or pointers, and strings still live where they always did, so the
+limits listed under "Calling C libraries" below still apply to them (a record whose address C keeps across calls, an
+address C hands back later).
 
 How the mode is chosen, most specific first:
 
@@ -3589,8 +3598,9 @@ How the mode is chosen, most specific first:
 
 A value that is not `fb` or `strict` is refused, naming where it came from; nothing runs.
 
-**A compiled program keeps its mode.** `sbc` writes it into the `.basc` file (format version 6, shown by `sbd` as
-`Memory mode`), and `sb prog.basc` runs it in that mode. Asking for the other one with `--memory` is refused with the
+**A compiled program keeps its mode.** `sbc` writes it into the `.basc` file (since format version 6, shown by `sbd`
+as `Memory mode`; format 7 also records which arrays hand out machine addresses), and `sb prog.basc` runs it in that
+mode. Asking for the other one with `--memory` is refused with the
 command that recompiles it, because the pointer model is decided when a program is compiled. A `.basc` written before
 format 6 runs as `strict`.
 

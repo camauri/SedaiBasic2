@@ -281,7 +281,10 @@ begin
       // ⭐ The four RAW accessors (pointer model, phase 2): read, they name no FArrays storage and assign no
       // Ctx.PC (ExecuteArrayOp lists them among the arms that cannot reshape). Admitted so a loop that
       // walks an Allocate'd block ROUTES - the inline form below needs this road for its cold path.
-      bcRawLoadInt, bcRawLoadFloat, bcRawStoreInt, bcRawStoreFloat:
+      bcRawLoadInt, bcRawLoadFloat, bcRawStoreInt, bcRawStoreFloat,
+      // Phase 2.3: the Ref accessors (the same arms on a machine address) and "@a(i)", which reads the
+      // descriptor and names no storage it could move.
+      bcRefLoadInt, bcRefLoadFloat, bcRefStoreInt, bcRefStoreFloat, bcArrayElemAddr:
         Result := True;
     else
       Result := False;
@@ -1410,8 +1413,8 @@ var
         bcXferLoadFloat:   T(J^.Dest);               // Dest = value moved from the transfer slot
         bcRecordLoadFloat: T(J^.Dest);               // Dest = loaded record field (float)
         bcRecordStoreFloat: T(J^.Src2);              // Src2 = stored VALUE (float); Src1 = handle (int)
-        bcRawLoadFloat:  T(J^.Dest);                 // Dest = loaded value; Src1 = the address (int)
-        bcRawStoreFloat: T(J^.Src2);                 // Src2 = stored VALUE (float)
+        bcRawLoadFloat, bcRefLoadFloat:  T(J^.Dest); // Dest = loaded value; Src1 = the address (int)
+        bcRawStoreFloat, bcRefStoreFloat: T(J^.Src2); // Src2 = stored VALUE (float)
         bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat, bcCmpEqFloat, bcCmpNeFloat:
           begin T(J^.Src1); T(J^.Src2); end;         // float operands (Dest is an int reg -> ScanI)
         bcFloatToInt: T(J^.Src1);                    // float input (Dest is an int reg -> ScanI)
@@ -1469,9 +1472,10 @@ var
         bcRecordLoadInt:    begin T(J^.Dest); T(J^.Src1); end;   // Dest=field value, Src1=handle
         bcRecordStoreInt:   begin T(J^.Src1); T(J^.Src2); end;   // Src1=handle, Src2=stored value
         bcRecordLoadFloat, bcRecordStoreFloat: T(J^.Src1);       // Src1=handle (int); value is a float reg
-        bcRawLoadInt:  begin T(J^.Dest); T(J^.Src1); end;        // Dest=value, Src1=address
-        bcRawStoreInt: begin T(J^.Src1); T(J^.Src2); end;        // Src1=address, Src2=stored value
-        bcRawLoadFloat, bcRawStoreFloat: T(J^.Src1);             // Src1=address (int); value is a float reg
+        bcRawLoadInt, bcRefLoadInt:   begin T(J^.Dest); T(J^.Src1); end;   // Dest=value, Src1=address
+        bcRawStoreInt, bcRefStoreInt: begin T(J^.Src1); T(J^.Src2); end;   // Src1=address, Src2=stored value
+        bcRawLoadFloat, bcRawStoreFloat, bcRefLoadFloat, bcRefStoreFloat: T(J^.Src1);  // Src1=address (int)
+        bcArrayElemAddr: begin T(J^.Dest); T(J^.Src2); end;   // Dest=address, Src2=index; Src1 is the array id
         bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat, bcCmpEqFloat, bcCmpNeFloat:
           T(J^.Dest);                                // float compare writes an int result reg
         bcFloatToInt, bcFloatRound: T(J^.Dest);      // float->int writes an int result reg
@@ -2038,6 +2042,24 @@ var
     ⛔ And the tag comes off before the move, or the read lands 2^61 past the address.
     The width is the raw type code in the Immediate, read at compile time (AotRawCodeNative decides which
     codes are native, for both backends). The value is loaded FIRST, while rax is still free. }
+  procedure EmitArrElemAddrJ(apc: Integer);
+  // "@a(i)" in the fb mode (phase 2.3), as AotArrElemAddr: the descriptor base plus index * 8, tagged; a NULL
+  // base (empty or packed array) runs the instruction through the helper.
+  var pCold, pDone: Integer;
+  begin
+    ILoad(RCX, I^.Src2);                                                     // rcx = linear index
+    if (I^.Immediate and $FFFFFFFF) = 1 then R8Load(RAX, LongWord(I^.Src1) * 32 + 8)   // FloatData base
+    else R8Load(RAX, LongWord(I^.Src1) * 32);                                // IntData base
+    E.EmitBytes([$48, $85, $C0]);                                            // test rax, rax
+    E.EmitBytes([$0F, $84]); pCold := E.Len; E.Emit32(0);                    // jz cold
+    E.EmitBytes([$48, $8D, $04, $C8]);                                       // lea rax, [rax + rcx*8]
+    E.EmitBytes([$48, $0F, $BA, $E8, 61]);                                   // bts rax, 61
+    IStore(I^.Dest, RAX);
+    E.EmitBytes([$E9]); pDone := E.Len; E.Emit32(0);                         // jmp done
+    E.Patch32(pCold, LongWord(E.Len - (pCold + 4)));                         // @cold
+    EmitHelperCall(apc);
+    E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));                         // @done
+  end;
   procedure EmitRawJ(apc: Integer; IsFloat, IsStore: Boolean);
   var pCold, pDone, W: Integer;
   begin
@@ -3030,12 +3052,15 @@ var
         // difference between compiling this loop and being no better than interpreting it.
         if UseHelper and (GfxDescOff >= 0) and not (InCallee or InGosub) then EmitGfxPsetJ(apc)
         else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
-      bcRawLoadInt, bcRawLoadFloat, bcRawStoreInt, bcRawStoreFloat:
+      bcArrayElemAddr:
+        if UseHelper and not (InCallee or InGosub) then EmitArrElemAddrJ(apc) else Exit;
+      bcRawLoadInt, bcRawLoadFloat, bcRawStoreInt, bcRawStoreFloat,
+      bcRefLoadInt, bcRefLoadFloat, bcRefStoreInt, bcRefStoreFloat:
         if UseHelper and NativeMem and not (InCallee or InGosub) and
            AotRawCodeNative(I^.Immediate and $FFFFFFFF,
-                            (I^.OpCode = bcRawLoadFloat) or (I^.OpCode = bcRawStoreFloat)) then
-          EmitRawJ(apc, (I^.OpCode = bcRawLoadFloat) or (I^.OpCode = bcRawStoreFloat),
-                   (I^.OpCode = bcRawStoreInt) or (I^.OpCode = bcRawStoreFloat))
+                            I^.OpCode in [bcRawLoadFloat, bcRawStoreFloat, bcRefLoadFloat, bcRefStoreFloat]) then
+          EmitRawJ(apc, I^.OpCode in [bcRawLoadFloat, bcRawStoreFloat, bcRefLoadFloat, bcRefStoreFloat],
+                   I^.OpCode in [bcRawStoreInt, bcRawStoreFloat, bcRefStoreInt, bcRefStoreFloat])
         else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
     else
       // The helper route (J14): an instruction with no native form is run by the INTERPRETER and

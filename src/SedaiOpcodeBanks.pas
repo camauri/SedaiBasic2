@@ -420,6 +420,7 @@ begin
     bcArrayCopyContents, bcArrayCopyRecords,  // Src2 = source FArrays handle (int)
     bcArrayBindInd,  // Src2 = the arg member array's runtime FArrays handle (int); Src1 is an array id, NOT a register
     bcArrayLBound, bcArrayUBound,  // B1.4: Src2 = 0-based dim index (int)
+    bcArrayElemAddr,  // phase 2.3: Src2 = 0-based linear element index (int)
     bcArrayRedim,  // B1.4: REDIM - Src2 = new upper bound (int)
     bcRefStoreInt,  // FreeBASIC pointer store (int) - Src2 = value (int)
     bcConScreen,    // SCREEN(row,col[,flag]): Src2 = column (int)
@@ -611,6 +612,7 @@ begin
     bcArrayLoadInt,  // Typed array load (int) - Dest is WRITTEN
     bcArrayLBound, bcArrayUBound,  // B1.4: LBOUND/UBOUND - Dest = int bound
     bcArrayDescPtr, bcArrayDescPtrInd,  // FBC.ArrayDescriptorPtr - Dest = a pointer into the descriptor region (int)
+    bcArrayElemAddr,  // phase 2.3: "@a(i)" - Dest = the element's tagged machine address (int)
     bcRefLoadInt,    // FreeBASIC pointer deref (int) - Dest = value loaded
     bcRefAddrField,  // @obj.field - Dest = packed record-field pointer (int)
     bcRawAlloc, bcRawRealloc,  // raw heap: Dest = raw pointer (int)

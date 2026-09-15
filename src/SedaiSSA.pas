@@ -644,7 +644,8 @@ type
     FForeignDataScalars: TStringList;    // DIVERGENZE 405: an Extern of a C library whose type is a SCALAR (its address is C's)
     FForeignProcExterns: TStringList;    // DIVERGENZE 422: ...whose type is a named PROCEDURE type (libxml's xmlFree)
     FForeignDataArrays: TStringList;     // DIVERGENZE 441: "NAME=symbol|T|lb:ub,..." - a C library's data ARRAY
-    FArrayScalarType: TStringList;       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
+    FArrayScalarType: TStringList;
+    FAddrNativeArrays: array of Boolean;  // phase 2.3: array id -> "@a(i)" is a machine address in the fb mode       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
     FArrayFuncPtrSig: TStringList;       // array-of-funcptr (DIM As <named funcptr type> a(..)) -> "params|ret" signature, so "a(i)(args)" is an indirect call
     FArrayPtrPointee: TStringList;       // array of UDT POINTERS ("DIM As T PTR a(..)", "a() AS T PTR" param) -> T, so "a(i)->field" resolves (params under their mangled name)
     FArrayFixedStr: TStringList;         // array DECLARATION name (ArrayFactKey) -> "<STRING|ZSTRING|WSTRING>=<n>"
@@ -1217,6 +1218,10 @@ type
     function TypeNameToBank(const TypeName, FieldName: string): TSSARegisterType;
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
     function TypeNameWidthCode(const TypeName: string): Integer;
+    procedure NoteArrayAddrNative(ArrayIdx: Integer; ET: TSSARegisterType; const ElemTypeName: string);
+    function ArrayAddrIsNative(ArrayIdx: Integer): Boolean;
+    function NarrowRefArg(const Pointee: string): TSSAValue;
+    function EmitIsNativeAddr(const P: TSSAValue): TSSAValue;
     procedure NoteArrayElemStorage(ArrayIdx: Integer; ET: TSSARegisterType;
                                    const ArrElemTypeName: string);  // packed storage, guard m884
     function TypeNameIdentCode(const TypeName: string): Integer;   // ...its overload-IDENTITY twin (DIVERGENZE 8)
@@ -10119,7 +10124,8 @@ begin
             srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
             srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           else
-            EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone),
+                            NarrowRefArg(PointeeTypeOf(ArrName)));   // phase 2.3: an address has no array to ask the width
           end;
           // ⛔ "p[i]" IS "*(p + i)" and owes the pointee's width and sign exactly as much. Closing the
           // rule on "*p" alone would have left the subscript spelling of the same read still wrong -
@@ -11606,7 +11612,7 @@ begin
         end;
     else
       ExprValue := EnsureIntRegister(ExprValue);
-      EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+      EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, NarrowRefArg(ByrefRetPointeeType(VarName)));
     end;
     Exit;
   end;
@@ -11686,7 +11692,7 @@ begin
         srtFloat:  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, EnsureFloatRegister(ExprValue), MakeSSAValue(svkNone));
         srtString: EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, EnsureStringRegister(ExprValue), MakeSSAValue(svkNone));
       else
-        EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, EnsureIntRegister(ExprValue), MakeSSAValue(svkNone));
+        EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, EnsureIntRegister(ExprValue), NarrowRefArg(DstRecType));
       end;
     Exit;
   end;
@@ -14741,6 +14747,7 @@ begin
       // ⚠️ INT bank only: a SINGLE array (code 7) is float-banked and keeps its own storage, and an
       // unsigned 64-bit one (code 8) is already eight bytes wide.
       NoteArrayElemStorage(ArrayIdx, ElementType, ArrElemTypeName);
+    NoteArrayAddrNative(ArrayIdx, ElementType, ArrElemTypeName);   // phase 2.3
       NoteArrayShape(DeclArrName, True);                 // "Dim x()" / "Dim x(Any)": dynamic, by shape
       // ⭐ ...and here the two spellings PART. Both register one runtime-sized dimension, but
       // "Dim a(Any)" STATED that there is one of them and the bare "Dim a()" did not - which is what
@@ -14954,6 +14961,7 @@ begin
     // reading as inert: the SSA carried the read's width, the VM arm knew how to use it, and the array
     // it asked was never marked. Two call sites, one funnel - see NoteArrayElemStorage.
     NoteArrayElemStorage(ArrayIdx, ElementType, ArrElemTypeName);
+    NoteArrayAddrNative(ArrayIdx, ElementType, ArrElemTypeName);   // phase 2.3
     // Subscripts make it FIXED - unless this DIM is the one ProcessRedim synthesizes for a "ReDim" of a
     // name never declared, which is a dynamic array however it is written.
     // ⛔ ...OR ONE OF THE SUBSCRIPTS IS "Any", WHICH *IS* THE WORD FOR DYNAMIC. "Dim b(Any, Any)" reaches
@@ -26707,7 +26715,7 @@ begin
     // string and a WSTRING one is wide cells. A packed address ignores it.
     srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone),
                                MakeSSAConstInt(Ord(Pos('WSTRING', ByrefRetPointeeType(Lbl)) > 0)));
-  else         EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  else         EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), NarrowRefArg(ByrefRetPointeeType(Lbl)));
   end;
 end;
 
@@ -26731,7 +26739,7 @@ begin
     srtFloat:  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), AddrVal, EnsureFloatRegister(Val), MakeSSAValue(svkNone));
     srtString: EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), AddrVal, EnsureStringRegister(Val),
                                MakeSSAConstInt(Ord(Pos('WSTRING', ByrefRetPointeeType(Lbl)) > 0)));
-  else         EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), AddrVal, EnsureIntRegister(Val), MakeSSAValue(svkNone));
+  else         EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), AddrVal, EnsureIntRegister(Val), NarrowRefArg(ByrefRetPointeeType(Lbl)));
   end;
 end;
 
@@ -34008,11 +34016,17 @@ function TSSAGenerator.EmitManagedPtrStep(const PtrVal, Count: TSSAValue; Esz: I
 // every step left it (a pointer walk ran 32-36% slower, measured with SB_NO_PTR_STEP=1 on one binary),
 // and in CLASSIC SHR is LOGICAL - "p shr 63" is 1 there, not -1, and the mask was wrong. A compare, an AND
 // and the arithmetic are all in the C loop, in both dialects.
+// ⭐ PHASE 2.3 (fb memory mode): and a THIRD unit - a tagged machine address ("@a(i)", Allocate, C) counts BYTES,
+// n * SizeOf(pointee). The term G*(Esz-1) is added to the per-count factor, G = EmitIsNativeAddr(p); it is
+// emitted only in fb and only when the pointee is wider than a byte, so strict keeps its bytecode.
 var
-  P, F, S, S1: TSSAValue;
+  P, F, G, S, S1, S2: TSSAValue;
+  UseG: Boolean;
 begin
   P := EnsureIntRegister(PtrVal);
   F := EmitIsRecPtr(P);
+  UseG := FNativeMemory and (Esz > 1);
+  if UseG then G := EmitIsNativeAddr(P);
   if Count.Kind = svkConstInt then
   begin
     S := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -34020,12 +34034,29 @@ begin
                     MakeSSAValue(svkNone));
     Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaAddInt, Result, S, EnsureIntRegister(MakeSSAConstInt(Count.ConstInt)), MakeSSAValue(svkNone));
+    if UseG then
+    begin
+      S2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaMulInt, S2, G, EnsureIntRegister(MakeSSAConstInt(Count.ConstInt * (Esz - 1))),
+                      MakeSSAValue(svkNone));
+      S := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaAddInt, S, Result, S2, MakeSSAValue(svkNone));
+      Result := S;
+    end;
     Exit;
   end;
   S := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaMulInt, S, F, EnsureIntRegister(MakeSSAConstInt(Esz * 16 - 1)), MakeSSAValue(svkNone));
   S1 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaAddInt, S1, S, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+  if UseG then
+  begin
+    S2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, S2, G, EnsureIntRegister(MakeSSAConstInt(Esz - 1)), MakeSSAValue(svkNone));
+    S := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, S, S1, S2, MakeSSAValue(svkNone));
+    S1 := S;
+  end;
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaMulInt, Result, EnsureIntRegister(Count), S1, MakeSSAValue(svkNone));
 end;
@@ -34293,7 +34324,7 @@ var
   PL, PR, Pt: string;
   IsSub, LIsPtr: Boolean;
   Esz: Int64;
-  LV, RV, PV, IV, Step, M, A, B, E, D, X, T: TSSAValue;
+  LV, RV, PV, IV, Step, M, A, B, E, D, X, T, G, GS, GD: TSSAValue;
 begin
   Result := False;
   Res := MakeSSAValue(svkNone);
@@ -34342,6 +34373,18 @@ begin
     EmitInstruction(ssaBitwiseAnd, T, X, M, MakeSSAValue(svkNone));
     Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaBitwiseXor, Res, D, T, MakeSSAValue(svkNone));
+    // ⭐ PHASE 2.3 (fb): two tagged machine addresses subtract in BYTES - divided by SizeOf, elements again.
+    if FNativeMemory and (Esz > 1) then
+    begin
+      G := EmitIsNativeAddr(LV);
+      GS := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaMulInt, GS, G, EnsureIntRegister(MakeSSAConstInt(Esz - 1)), MakeSSAValue(svkNone));
+      GD := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaAddInt, GD, GS, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+      GS := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaDivInt, GS, Res, GD, MakeSSAValue(svkNone));
+      Res := GS;
+    end;
     Exit(True);
   end;
   if LIsPtr then begin PV := LV; IV := RV; end else begin PV := RV; IV := LV; end;
@@ -47672,6 +47715,17 @@ begin
     end;
   end;
 
+  // ⭐ PHASE 2.3 (fb memory mode): the element's MACHINE address, resolved at run time (a private array has a
+  // buffer per context, a parameter names the caller's slot, a REDIM moves the buffer). See NoteArrayAddrNative
+  // for which arrays, and bcArrayElemAddr for the value. Closes DIVERGENZE 429 (array) and 453 in fb.
+  if ArrayAddrIsNative(ArrayIdx) then
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    // Src3 = the element BANK (1 = float), so the compiled engines pick the descriptor's base without asking the VM.
+    EmitInstruction(ssaArrayElemAddr, Result, MakeSSAArrayRef(ArrayIdx, srtInt), EnsureIntRegister(LinearIndex),
+                    MakeSSAConstInt(Ord(ArrInfo.ElementType = srtFloat)));
+    Exit;
+  end;
   // packedAddr = baseConst + linearIndex, baseConst = (arrayId+1) shl POINTER_ARRAY_SHIFT.
   BaseVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaLoadConstInt, BaseVal,
@@ -48459,7 +48513,7 @@ begin
       srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     else
-      EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), NarrowRefArg(Pointee));
     end;
 end;
 
@@ -49297,7 +49351,7 @@ begin
     case RetRT of
       srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    else         EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    else         EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), NarrowRefArg(RetPart));
     end;
     Exit;
   end;
@@ -49378,7 +49432,7 @@ begin
       srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     else
-      EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), NarrowRefArg(ByrefRetPointeeType(Name)));
     end;
   end
   else
@@ -54068,6 +54122,75 @@ end;
 // the array has been handed out, and a path that forgets to call this silently keeps the wide layout.
 // ⚠️ INT bank only: a SINGLE array (code 7) is float-banked and keeps its own storage, and an
 // unsigned 64-bit one (code 8) is already eight bytes wide.
+procedure TSSAGenerator.NoteArrayAddrNative(ArrayIdx: Integer; ET: TSSARegisterType; const ElemTypeName: string);
+// ⭐ PHASE 2.3 OF THE POINTER MODEL (15 Sep 2026): in the fb memory mode "@a(i)" of THIS array is the element's
+// machine address (bcArrayElemAddr), not a packed VM name. Decided by the DECLARED element type, at the same
+// sites that decide the element's width, and for an array PARAMETER from its declared type.
+// ⛔ Only builtin integers and Double - the types whose storage already has the element's true width:
+//   - Single is float-banked in 8-byte cells, so a "Single Ptr" into it would step into the middle of a cell;
+//   - an array of POINTERS keeps its packed pointers, because C reaches its cells through the second-level
+//     translation (ForeignDeepCell) that only a packed pointer names;
+//   - Boolean, enums, String, records are other questions (fbc widths the storage does not have yet).
+var
+  C: string;
+  k, Old: Integer;
+begin
+  if (ArrayIdx < 0) or (ElemTypeName = '') or not (ET in [srtInt, srtFloat]) then Exit;
+  C := UpperFast(CanonicalType(Trim(ElemTypeName)));
+  if not ((C = 'BYTE') or (C = 'UBYTE') or (C = 'SHORT') or (C = 'USHORT') or (C = 'LONG') or
+          (C = 'ULONG') or (C = 'INTEGER') or (C = 'UINTEGER') or (C = 'LONGINT') or (C = 'ULONGINT') or
+          (C = 'DOUBLE')) then Exit;
+  if (C = 'DOUBLE') <> (ET = srtFloat) then Exit;
+  if ArrayIdx >= Length(FAddrNativeArrays) then
+  begin
+    Old := Length(FAddrNativeArrays);
+    SetLength(FAddrNativeArrays, ArrayIdx + 64);
+    for k := Old to High(FAddrNativeArrays) do FAddrNativeArrays[k] := False;
+  end;
+  FAddrNativeArrays[ArrayIdx] := True;
+  FProgram.SetArrayAddrNative(ArrayIdx);   // ...and for the VM: FBC.ArrayDescriptorPtr's base_ptr (and the .basc)
+end;
+
+function TSSAGenerator.ArrayAddrIsNative(ArrayIdx: Integer): Boolean;
+begin
+  Result := FNativeMemory and (ArrayIdx >= 0) and (ArrayIdx < Length(FAddrNativeArrays)) and
+            FAddrNativeArrays[ArrayIdx];
+end;
+
+function TSSAGenerator.NarrowRefArg(const Pointee: string): TSSAValue;
+// The width a Ref load/store owes a NARROW pointee in the fb mode (phase 2.3). A packed pointer found the
+// width in the array it names; a machine address has no array to ask, and read or written at 8 bytes it
+// takes the next element with it. Nothing for a wide pointee, and nothing in strict: the bytecode there
+// stays what it was.
+var
+  C: string;
+  W: Integer;
+begin
+  Result := MakeSSAValue(svkNone);
+  if not FNativeMemory then Exit;
+  C := UpperFast(CanonicalType(Trim(Pointee)));
+  W := TypeNameWidthCode(C);
+  if (W >= 1) and (W <= 6) then Result := MakeSSAConstInt(RawTypeCodeOfPointee(C));
+end;
+
+function TSSAGenerator.EmitIsNativeAddr(const P: TSSAValue): TSSAValue;
+// 1 when P is a tagged machine address (2^61 <= P < 2^62: FGNPTR_TAG set, RAWPTR_TAG clear), else 0.
+// Two compares and two ANDs - no SHR, for the reason EmitManagedPtrStep gives.
+var
+  A, B, T: TSSAValue;
+begin
+  A := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpGeInt, A, EnsureIntRegister(P), EnsureIntRegister(MakeSSAConstInt(Int64(1) shl 61)),
+                  MakeSSAValue(svkNone));
+  B := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpLtInt, B, EnsureIntRegister(P), EnsureIntRegister(MakeSSAConstInt(Int64(1) shl 62)),
+                  MakeSSAValue(svkNone));
+  T := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, T, A, B, MakeSSAValue(svkNone));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, Result, T, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+end;
+
 procedure TSSAGenerator.NoteArrayElemStorage(ArrayIdx: Integer; ET: TSSARegisterType;
                                              const ArrElemTypeName: string);
 begin
@@ -54520,6 +54643,7 @@ begin
       // Record the slot so array accesses on it subtract the lower bound at RUNTIME (the bound array's
       // lower bound varies per call and cannot be a compile-time constant like a normal array's).
       Slot := FProgram.FindArray(MangledName);
+      NoteArrayAddrNative(Slot, ET, TypeName);   // phase 2.3: "@a(i)" of the parameter, by its declared type
       if (Slot >= 0) and not IsArrayParamSlot(Slot) then
       begin
         SetLength(FArrayParamSlots, Length(FArrayParamSlots) + 1);

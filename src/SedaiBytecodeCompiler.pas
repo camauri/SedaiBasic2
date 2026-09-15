@@ -634,6 +634,7 @@ begin
     ssaRawStoreZStr: Result := bcRawStoreZStr;
     ssaArrayDescPtr: Result := bcArrayDescPtr;
     ssaArrayDescPtrInd: Result := bcArrayDescPtrInd;
+    ssaArrayElemAddr: Result := bcArrayElemAddr;
     ssaCopyFile: Result := bcCopyFile;
     ssaScratch: Result := bcScratch;
     ssaRenameFile: Result := bcRenameFile;

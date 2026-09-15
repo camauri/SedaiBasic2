@@ -148,6 +148,12 @@ type
                     never cleared by ERASE. }
     RankStated: Boolean;
     DescDims: Byte;
+    { ⭐ PHASE 2.3 OF THE POINTER MODEL (15 Sep 2026): bcArrayElemAddr has handed the program a MACHINE
+      address into this buffer ("@a(i)" in the fb mode). From then on an address inside it that comes back
+      from C stays an address (VMPointerForMachineAddr) and --bounds-check bounds it by the buffer
+      (ArrayBufferAvail). ⚠️ It fits the padding, so ARRAY_STORAGE_FIELD_BYTES did not move: AliasArrayStorage
+      and ClearArrayStorage were updated by hand, which is exactly what the tripwire exists to demand. }
+    AddrPublished: Boolean;
   end;
 
 

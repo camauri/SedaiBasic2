@@ -578,6 +578,8 @@ type
     // Spill slots given back and ready for reuse (see SpillSlotTake). VM-wide: every caller holds
     // LockArrays whenever workers exist.
     FSpillFree: array of Integer;
+    // Phase 2.3: logical array id -> TSSAArrayInfo.AddrNative, read once at load (GetArray copies a managed record).
+    FArrAddrNativeLog: array of Boolean;
     FSpillFreeTop: Integer;
     // The array BYREF bind save-stack moved to TExecutionContext (per-context since 21 Aug 2026).
     FRedimPendingUBs: array of Integer;   // REDIM multi-dim: upper bounds accumulated by bcArrayRedimPush, consumed by bcArrayRedimN
@@ -864,6 +866,8 @@ type
     function ForeignMakeClosure(ACtx: TObject; AEntryPC: Int64;
                                 const ASig: string): Pointer;       // una procedura BASIC che C puo' chiamare
     function VMPointerForMachineAddr(ACtx: TExecutionContext; A: PtrUInt): Int64;  // ...e la strada inversa
+    function ArrayBufferAvail(A, NeedBytes: PtrUInt; out AAvail: PtrUInt): Boolean;  // phase 2.3, --bounds-check
+    function ArraySlotOfAddr(A: PtrUInt; out Slot: Integer; out Elem: Int64): Boolean;   // phase 2.3
     function ForeignPtrHome(ACtx: TObject; A: PtrUInt): Int64;   // la stessa, per la FFI
     function ForeignRecBytes(ACtx: TObject; Value: Int64; out ALen: PtrUInt): Pointer;  // the C image of a record (DIVERGENZE 245)
     function ForeignRecRun(ACtx: TObject; Value: Int64; out ACount: Integer; out AStride: PtrUInt): Boolean;  // ...and how many follow it contiguously (336)
@@ -3267,7 +3271,7 @@ begin
     // Array element and bound reads. The array itself lives in FArrays, a bank of its own that is
     // never relocated, so an array opcode is transparent to the sliding view: only its register
     // operands matter here. Src1 is the array ID (an immediate), Src2 the index register.
-    bcArrayLoadInt, bcArrayLBound, bcArrayUBound,
+    bcArrayLoadInt, bcArrayLBound, bcArrayUBound, bcArrayElemAddr,
     // ⭐ THE FUSED LOOP COUNTER writes its counter into Dest and nothing else in the bank.
     // Auditing this family is not a micro-narrowing: an UNAUDITED opcode disqualifies its whole
     // procedure from call-site liveness (see BuildCallSiteLiveness), and every superinstruction was
@@ -3396,7 +3400,7 @@ begin
     bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString, bcRecordFree,
     bcArrayLoadInt, bcArrayLoadString, bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     bcArrayLBound, bcArrayUBound, bcArrayBind, bcArrayUnbind, bcArrayBindApply,
-    bcArrayBindInd, bcArrayErase,
+    bcArrayBindInd, bcArrayErase, bcArrayElemAddr,
     // ⭐ THE FUSED BRANCH FAMILY WRITES NO REGISTER AT ALL, in any bank - it consumes a comparison
     // and moves the PC - and the loop-counter forms write only the integer counter. Leaving them
     // unaudited is what made the superinstruction pass LOSE on call-heavy programs: BW_UNKNOWN
@@ -3449,7 +3453,7 @@ begin
     bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString, bcRecordFree,
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     bcArrayLBound, bcArrayUBound, bcArrayBind, bcArrayUnbind, bcArrayBindApply,
-    bcArrayBindInd, bcArrayErase,
+    bcArrayBindInd, bcArrayErase, bcArrayElemAddr,
     // The fused branch family again - and THIS is the bank where leaving it unaudited was expensive,
     // because every entry here is a refcounted assignment. See the note in BcFloatWriteShape.
     bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
@@ -3553,7 +3557,7 @@ begin
       Result := US_SRC1;
     // Src2 is the element index (or the member handle for BindInd); Src1 is an immediate array id.
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
-    bcArrayLBound, bcArrayUBound, bcArrayBindInd,
+    bcArrayLBound, bcArrayUBound, bcArrayBindInd, bcArrayElemAddr,
     // A float or string element store reads its index from Src2 and its VALUE from the other bank.
     bcArrayStoreFloat, bcArrayStoreString:
       Result := US_SRC2;
@@ -6213,6 +6217,19 @@ begin
   if Elems > 0 then
   begin
     PInt64(P + FBARRAY_OFS_BASE_PTR)^ := (Int64(LogicalId) + 1) shl POINTER_ARRAY_SHIFT;
+    // ⭐ PHASE 2.3 (fb): base_ptr is in the same domain as "@a(2)" - for an array whose element addresses are machine
+    // addresses, the address of its first element. The SSA decided which arrays (TSSAArrayInfo.AddrNative).
+    if FNativeMemory and (LogicalId >= 0) and (LogicalId < FProgram.GetArrayCount) and
+       FProgram.GetArray(LogicalId).AddrNative then
+    begin
+      if (FArrays[Slot].ElemWidth > 0) and (Length(FArrays[Slot].ByteData) > 0) then
+        PInt64(P + FBARRAY_OFS_BASE_PTR)^ := Int64(PtrUInt(@FArrays[Slot].ByteData[0])) or FGNPTR_TAG
+      else if (FArrays[Slot].ElementType = 1) and (Length(FArrays[Slot].FloatData) > 0) then
+        PInt64(P + FBARRAY_OFS_BASE_PTR)^ := Int64(PtrUInt(@FArrays[Slot].FloatData[0])) or FGNPTR_TAG
+      else if (FArrays[Slot].ElemWidth = 0) and (FArrays[Slot].ElementType = 0) and (Length(FArrays[Slot].IntData) > 0) then
+        PInt64(P + FBARRAY_OFS_BASE_PTR)^ := Int64(PtrUInt(@FArrays[Slot].IntData[0])) or FGNPTR_TAG;
+      FArrays[Slot].AddrPublished := True;   // an address into this buffer is in the program's hands now
+    end;
     if AllZeroLb then
       PInt64(P + FBARRAY_OFS_INDEX_PTR)^ := PInt64(P + FBARRAY_OFS_BASE_PTR)^;
   end;
@@ -7407,6 +7424,89 @@ begin
   end;
 end;
 
+function TBytecodeVM.ArraySlotOfAddr(A: PtrUInt; out Slot: Integer; out Elem: Int64): Boolean;
+// The array slot and element an address names, for a consumer that needs the ARRAY and not the bytes
+// (PALETTE USING stores through the element accessor). Phase 2.3: in the fb mode "@a(i)" is a machine address,
+// and these consumers used to read only the packed form. The address must sit on an element boundary.
+var
+  i: Integer;
+  Base, Len, W: PtrUInt;
+begin
+  Result := False;
+  Slot := -1;
+  Elem := 0;
+  for i := 0 to High(FArrays) do
+  begin
+    if FArrays[i].ElemWidth > 0 then
+    begin
+      if Length(FArrays[i].ByteData) = 0 then System.Continue;
+      Base := PtrUInt(@FArrays[i].ByteData[0]); W := FArrays[i].ElemWidth;
+      Len := PtrUInt(Length(FArrays[i].ByteData));
+    end
+    else if FArrays[i].ElementType = 1 then
+    begin
+      if Length(FArrays[i].FloatData) = 0 then System.Continue;
+      Base := PtrUInt(@FArrays[i].FloatData[0]); W := 8; Len := PtrUInt(Length(FArrays[i].FloatData)) * 8;
+    end
+    else
+    begin
+      if Length(FArrays[i].IntData) = 0 then System.Continue;
+      Base := PtrUInt(@FArrays[i].IntData[0]); W := 8; Len := PtrUInt(Length(FArrays[i].IntData)) * 8;
+    end;
+    if (A < Base) or (A - Base >= Len) or (((A - Base) mod W) <> 0) then System.Continue;
+    Slot := i;
+    Elem := Int64((A - Base) div W);
+    Exit(True);
+  end;
+end;
+
+function TBytecodeVM.ArrayBufferAvail(A, NeedBytes: PtrUInt; out AAvail: PtrUInt): Boolean;
+// Is A inside the element buffer of an array whose element addresses the program holds (phase 2.3)? Then the
+// buffer is the bound: raise when NeedBytes from A leave it, answer True and the bytes left otherwise.
+// ⛔ Only under --bounds-check in the fb mode (ForeignRegionAddr asks it): without the switch an address is used
+// as it is, and an array buffer is not a region anybody noted - so the check would refuse every "@a(i)".
+// ⚠️ It walks the table and reads other contexts' private buffers, which is the race DIVERGENZE 314 paid for:
+// FArrDescLock while workers exist.
+var
+  i: Integer;
+  Base, Len: PtrUInt;
+  Locked: Boolean;
+begin
+  Result := False;
+  AAvail := 0;
+  Locked := FHasWorkers;
+  if Locked then EnterCriticalSection(FArrDescLock);
+  try
+    for i := 0 to High(FArrays) do
+    begin
+      if not FArrays[i].AddrPublished then System.Continue;
+      if FArrays[i].ElemWidth > 0 then
+      begin
+        if Length(FArrays[i].ByteData) = 0 then System.Continue;
+        Base := PtrUInt(@FArrays[i].ByteData[0]); Len := PtrUInt(Length(FArrays[i].ByteData));
+      end
+      else if FArrays[i].ElementType = 1 then
+      begin
+        if Length(FArrays[i].FloatData) = 0 then System.Continue;
+        Base := PtrUInt(@FArrays[i].FloatData[0]); Len := PtrUInt(Length(FArrays[i].FloatData)) * 8;
+      end
+      else
+      begin
+        if Length(FArrays[i].IntData) = 0 then System.Continue;
+        Base := PtrUInt(@FArrays[i].IntData[0]); Len := PtrUInt(Length(FArrays[i].IntData)) * 8;
+      end;
+      if (A < Base) or (A - Base >= Len) then System.Continue;
+      if (A - Base) + NeedBytes > Len then
+        raise ERangeError.CreateFmt('Array pointer dereference out of bounds: offset %d + %d > %d bytes',
+                                    [Int64(A - Base), Int64(NeedBytes), Int64(Len)]);
+      AAvail := Len - (A - Base);
+      Exit(True);
+    end;
+  finally
+    if Locked then LeaveCriticalSection(FArrDescLock);
+  end;
+end;
+
 function TBytecodeVM.ForeignRegionAddr(A, NeedBytes: PtrUInt; out AAvail: PtrUInt): Pointer;
 // The machine address A, if NeedBytes from it lie in memory a foreign call handed back; raise otherwise.
 // ⛔ The region is the NEAREST one at or below A. With a known length that is a real bounds check; with
@@ -7416,6 +7516,8 @@ var
   lo, hi, mid, r: Integer;
   B, L, M: PtrUInt;
 begin
+  // Phase 2.3: "@a(i)" is a machine address in the fb mode, and its buffer is its bound.
+  if FNativeMemory and ArrayBufferAvail(A, NeedBytes, AAvail) then Exit(Pointer(A));
   r := -1; B := 0; L := 0; M := 0;
   EnterCriticalSection(FFgnLock);
   try
@@ -7571,6 +7673,9 @@ begin
     // E' scritto due volte altrove in questo file, e ci sono cascato lo stesso: `qsort` funzionava
     // (il primo array era quello giusto, si usciva prima), `bsearch` no - il suo primo argomento e' uno
     // SCALARE, quindi il ciclo saltava almeno un array e ci passava.
+    // ⭐ PHASE 2.3: an array whose element addresses the program already holds as MACHINE addresses keeps them
+    // as addresses - their arithmetic counts bytes. Turning one back into a packed pointer was DIVERGENZE 453.
+    if FArrays[i].AddrPublished then System.Continue;
     W := FArrays[i].ElemWidth;
     if (W > 0) and (Length(FArrays[i].ByteData) > 0) then
     begin
@@ -7614,6 +7719,7 @@ begin
   // block the allocator handed out, and an address INSIDE an array must win over the end of another.
   for i := 0 to High(FArrays) do
   begin
+    if FArrays[i].AddrPublished then System.Continue;   // phase 2.3, as in the first pass
     W := FArrays[i].ElemWidth;
     if (W > 0) and (Length(FArrays[i].ByteData) > 0) then
     begin
@@ -8948,7 +9054,7 @@ begin
         end;
 
         // LBOUND/UBOUND: Dest = int bound, Src2 = int dim index (Src1 = array id, not a register)
-        bcArrayLBound, bcArrayUBound:
+        bcArrayLBound, bcArrayUBound, bcArrayElemAddr:   // phase 2.3: Src2 = the linear element index
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
@@ -14017,6 +14123,8 @@ begin
   if FProgram = nil then Exit;
   n := FProgram.GetArrayCount;
   if n > FStaticArrCount then n := FStaticArrCount;
+  SetLength(FArrAddrNativeLog, n);
+  for i := 0 to n - 1 do FArrAddrNativeLog[i] := FProgram.GetArray(i).AddrNative;
   for i := 0 to n - 1 do
     if FProgram.GetArray(i).IsPrivate then
     begin
@@ -16494,6 +16602,7 @@ begin
   // the storage, and so does FBC.ArrayDescriptorPtr( param() ).
   Dst.RankStated  := Src.RankStated;
   Dst.DescDims    := Src.DescDims;
+  Dst.AddrPublished := Src.AddrPublished;   // phase 2.3: see TArrayStorage.AddrPublished
 end;
 
 procedure ReleaseArrayStorage(var A: TArrayStorage);
@@ -16584,6 +16693,7 @@ begin
   A.ElemSigned := False;
   A.RankStated := False;   // an EMPTY array states nothing: FBC.ArrayDescriptorPtr reads these two
   A.DescDims := 0;
+  A.AddrPublished := False;
 end;
 
 procedure TBytecodeVM.ExecuteArrayDim(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -16657,6 +16767,9 @@ begin
         // Fixed or dynamic, stamped on the STORAGE: ERASE through an array PARAMETER asks the storage,
         // because the answer is the CALLER's (see EraseArray and the Immediate-2 case).
         FArrays[ArrayIdx].IsDynamic := ArrInfo.IsDynamicShape;
+        // ⭐ PHASE 2.3: published from the DIM, not only from bcArrayElemAddr - the C hot loop, the AOT and the
+        // JIT compute "@a(i)" natively and cannot write this flag. The SSA decided (TSSAArrayInfo.AddrNative).
+        FArrays[ArrayIdx].AddrPublished := FNativeMemory and ArrInfo.AddrNative;
         // ⭐ ...and the two facts fbc's array DESCRIPTOR needs (see TArrayStorage.DescDims). A bare
         // "Dim a()" reports ZERO dimensions until a ReDim gives it some, which is why this is not
         // DimCount: both spellings register one runtime-sized dimension.
@@ -16756,13 +16869,15 @@ function ArrayOpMayReshape(SubOp: Word): Boolean; inline;
 //   index arithmetic      29, 30  ArrayIdxPush / Resolve  43  ...on a UDT member
 //   descriptor pointer    52, 53  FBC.ArrayDescriptorPtr - it only PACKS a slot number into a
 //                                 pointer; the 240 bytes are built later, at the dereference
+//   element address       54      bcArrayElemAddr - reads where an element IS; the only write is the
+//                                 AddrPublished flag, which moves nothing
 // ⚠️ A pointer store CAN write into an array's element data - that is why the lock is still taken
 // for these arms. Writing an element does not change where the element IS, which is all the
 // descriptor records.
 begin
   case SubOp of
     9, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    29, 30, 31, 32, 33, 43, 45, 46, 50, 51, 52, 53: Result := False;
+    29, 30, 31, 32, 33, 43, 45, 46, 50, 51, 52, 53, 54: Result := False;
   else
     Result := True;
   end;
@@ -17299,6 +17414,43 @@ begin
                                        (Int64(ArrayIdx) shl RAWPTR_ADESC_PHYS_SHIFT) or
                                        (Int64(LinearIdx) shl RAWPTR_ADESC_LOG_SHIFT);
         end;
+      54: // bcArrayElemAddr - "@a(i)" in the fb memory mode (phase 2.3 of the pointer model). Dest(int) = the
+        begin  // MACHINE ADDRESS of element Src2 (0-based linear index) of array Src1, tagged FGNPTR_TAG like
+               // every native address, so every arm that reads through a pointer already reads it.
+          // ⭐ The element buffer of a numeric array IS native memory at the element's true width - IntData and
+          // FloatData 8 bytes, ByteData ElemWidth bytes - and it moves only when a REDIM moves it, exactly as
+          // an fbc array does. So "@a(i)" needs no allocator of its own: it needs the buffer's address.
+          // ⛔ The slot is resolved HERE, at run time: a private array has one buffer per context, an array
+          // parameter names the caller's slot through ArrMap (DIVERGENZE 462), and a REDIM moves the buffer.
+          // The SSA emits this only for arrays of builtin integers and Double (TSSAGenerator.ArrayAddrIsNative):
+          // a Single array still keeps 8-byte cells, and an array of pointers keeps its packed pointers for
+          // the second-level translation towards C (ForeignDeepCell).
+          ArrayIdx := Ctx.ArrMap[Instr.Src1];
+          PtrAddr := Ctx.IntRegs[Instr.Src2];
+          Ctx.IntRegs[Instr.Dest] := 0;
+          if (ArrayIdx >= 0) and (ArrayIdx <= High(FArrays)) then
+          begin
+            if FArrays[ArrayIdx].ElemWidth > 0 then
+            begin
+              if Length(FArrays[ArrayIdx].ByteData) > 0 then
+                Ctx.IntRegs[Instr.Dest] := Int64(PtrUInt(@FArrays[ArrayIdx].ByteData[0]) +
+                                             PtrUInt(PtrAddr * FArrays[ArrayIdx].ElemWidth)) or FGNPTR_TAG;
+            end
+            else if FArrays[ArrayIdx].ElementType = 1 then
+            begin
+              if Length(FArrays[ArrayIdx].FloatData) > 0 then
+                Ctx.IntRegs[Instr.Dest] := Int64(PtrUInt(@FArrays[ArrayIdx].FloatData[0]) +
+                                             PtrUInt(PtrAddr * 8)) or FGNPTR_TAG;
+            end
+            else if Length(FArrays[ArrayIdx].IntData) > 0 then
+              Ctx.IntRegs[Instr.Dest] := Int64(PtrUInt(@FArrays[ArrayIdx].IntData[0]) +
+                                           PtrUInt(PtrAddr * 8)) or FGNPTR_TAG;
+            // ⭐ Remembered on the STORAGE: an address into this buffer that comes back from C, or out of C's
+            // memory, must stay an address and not be turned back into a packed pointer - the program's
+            // pointer arithmetic on it counts bytes now (VMPointerForMachineAddr, DIVERGENZE 453).
+            FArrays[ArrayIdx].AddrPublished := True;
+          end;
+        end;
       34: // bcArrayBind - array BYREF param (PHASE 1): capture the argument's PHYSICAL slot now; the parameter
         begin  // is pointed at it by bcArrayBindApply. Two-phase so a batch of binds that swaps arrays
                // (recursive "proc(a(),b())" -> "proc(b(),a())", where param and arg ids coincide) reads every
@@ -17333,6 +17485,9 @@ begin
             if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
             begin
               Ctx.ArrayBindStack[Ctx.ArrayBindTop].ArgId := PtrAddr;   // the member's own slot
+              // Phase 2.3: a member array is not DIMmed, so a native-address PARAMETER publishes it here.
+              if FNativeMemory and (Instr.Src1 < Length(FArrAddrNativeLog)) and FArrAddrNativeLog[Instr.Src1] then
+                FArrays[PtrAddr].AddrPublished := True;
               Ctx.ArrayBindStack[Ctx.ArrayBindTop].OwnsSpill := False;
             end
             else
@@ -18466,7 +18621,7 @@ var
   ScrSize: Integer;
   PalArr: ^TArrayStorage;   // PALETTE USING: the array the whole palette is read from / written to
   PalN, PalK, PalStart, PalIdx: Integer;
-  PalPtr: Int64;
+  PalPtr, PalAddrElem: Int64;
   ImgHandle: Integer;   // IMAGECREATE: the surface index, before it becomes a pointer
 begin
   // ⛔ THE TEST IS INLINE AND THE CALL IS NOT MADE WHILE LOCKED. Both of these run once per GRAPHICS
@@ -18864,10 +19019,20 @@ begin
         if (Instr.Immediate and 2) <> 0 then
         begin
           PalPtr := Ctx.IntRegs[Instr.Src1];
+          // ⭐ PHASE 2.3: in the fb mode "@p(0)" is a machine address - back to its array and element (m851).
+          if (PalPtr > 0) and ((PalPtr shr 61) = 1) then
+          begin
+            if not ArraySlotOfAddr(PtrUInt(PalPtr and not FGNPTR_TAG), PalIdx, PalAddrElem) then Exit;
+            PalArr := @FArrays[PalIdx];
+            PalStart := PalAddrElem;
+          end
+          else
+          begin
           PalIdx := MapArrDyn(Ctx, (PalPtr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
           if (PalIdx < 0) or (PalIdx > High(FArrays)) then Exit;
           PalArr := @FArrays[PalIdx];
           PalStart := PalPtr and POINTER_OFFSET_MASK;
+          end;
         end
         else
         begin

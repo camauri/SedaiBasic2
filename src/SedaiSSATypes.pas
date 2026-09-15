@@ -522,6 +522,7 @@ type
       ...Ind: the array is a UDT MEMBER, so Src1 is an int register holding its runtime FArrays
       handle - the same split bcArrayLBound / bcArrayLBoundInd already makes. }
     ssaArrayDescPtr, ssaArrayDescPtrInd,
+    ssaArrayElemAddr,               // "@a(i)" in the fb memory mode: Dest = machine address of element Src2 (linear) of array Src1
     ssaPrint, ssaPrintLn, ssaPrintString, ssaPrintStringLn,
     ssaPrintInt, ssaPrintIntLn,
     ssaPrintBool, ssaPrintUInt,   // B1.5 phase C: BOOLEAN true/false, unsigned-64 print
@@ -930,6 +931,12 @@ type
       It rides to the VM on the array's flags byte, like IsDynamicShape, because the descriptor is
       built at a DEREFERENCE, which has the storage and not the declaration. }
     RankStated: Boolean;
+    { ⭐ PHASE 2.3 OF THE POINTER MODEL (15 Sep 2026): in the fb memory mode "@a(i)" of this array is the
+      element's MACHINE address (bcArrayElemAddr), decided by the declared element type in the SSA
+      (TSSAGenerator.NoteArrayAddrNative). The VM cannot re-derive it - it does not tell Single from Double
+      or an enum from an Integer - and FBC.ArrayDescriptorPtr must answer base_ptr in the same domain as
+      "@a(i)". Rides in the .basc from v7; a v6 file reads False, which is what its bytecode contains. }
+    AddrNative: Boolean;
   end;
 
   TSSAProgram = class
@@ -1002,6 +1009,7 @@ type
     procedure SetArrayRankStated(ArrayIdx: Integer); // mark: the declaration STATED the rank
     procedure SetArrayElemWidth(ArrayIdx, Width: Integer; Signed: Boolean);  // packed storage for a narrow type
     procedure SetArrayElemIsPtr(ArrayIdx: Integer);                          // its elements are pointers (257 B)
+    procedure SetArrayAddrNative(ArrayIdx: Integer);                         // "@a(i)" is a machine address in fb (phase 2.3)
     procedure SetArrayPrivate(ArrayIdx: Integer);    // mark: proc-local, needs one storage PER THREAD
     procedure SetArrayDynamicShape(ArrayIdx: Integer; Dynamic: Boolean);  // mark: DYNAMIC slot (ERASE frees it)
     function GetArray(Index: Integer): TSSAArrayInfo;
@@ -2034,6 +2042,13 @@ procedure TSSAProgram.SetArrayElemIsPtr(ArrayIdx: Integer);
 begin
   if (ArrayIdx < 0) or (ArrayIdx >= FNextArrayIndex) then Exit;
   FArrays[ArrayIdx].ElemIsPtr := True;
+end;
+
+procedure TSSAProgram.SetArrayAddrNative(ArrayIdx: Integer);
+// "@a(i)" of this array is a machine address in the fb mode - see TSSAArrayInfo.AddrNative.
+begin
+  if (ArrayIdx < 0) or (ArrayIdx >= FNextArrayIndex) then Exit;
+  FArrays[ArrayIdx].AddrNative := True;
 end;
 
 procedure TSSAProgram.SetArrayMultiDim(ArrayIdx: Integer);

@@ -1292,6 +1292,8 @@ begin
     // Phase 2 of the pointer model: raw memory through a machine address. A CONDITIONAL native form -
     // anything that is not an fb-mode address falls back to the helper - so it needs a PC.
     ssaRawLoadInt, ssaRawLoadFloat, ssaRawStoreInt, ssaRawStoreFloat,
+    // Phase 2.3: the Ref accessors on a machine address (the same form, same cold path) and "@a(i)" itself.
+    ssaRefLoadInt, ssaRefLoadFloat, ssaRefStoreInt, ssaRefStoreFloat, ssaArrayElemAddr,
     // B2: 1-D int/float array element access + dim-0 bound queries (string-element
     // arrays are rejected by the classifier/prescan; multi-dim access goes through
     // ssaArrayIdxPush/Resolve, which are not in the set, so those regions bail).
@@ -1572,6 +1574,27 @@ begin
                 (Ins.Src2.Kind = svkRegister) and
                 ((Ins.Src2.RegType = srtFloat) = (Ins.OpCode = ssaRawStoreFloat)) and
                 (Ins.Src2.RegType <> srtString);
+    // Phase 2.3: a Ref accessor's width is optional (a float Ref and a wide int Ref carry none: 8 bytes).
+    ssaRefLoadInt, ssaRefLoadFloat:
+      Result := GAotRawMem and
+                ((Ins.Src3.Kind = svkNone) or ((Ins.Src3.Kind = svkConstInt) and
+                  AotRawCodeNative(Ins.Src3.ConstInt, Ins.OpCode = ssaRefLoadFloat))) and
+                (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt) and
+                (Ins.Dest.Kind = svkRegister) and
+                ((Ins.Dest.RegType = srtFloat) = (Ins.OpCode = ssaRefLoadFloat)) and
+                (Ins.Dest.RegType <> srtString);
+    ssaRefStoreInt, ssaRefStoreFloat:
+      Result := GAotRawMem and
+                ((Ins.Src3.Kind = svkNone) or ((Ins.Src3.Kind = svkConstInt) and
+                  AotRawCodeNative(Ins.Src3.ConstInt, Ins.OpCode = ssaRefStoreFloat))) and
+                (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt) and
+                (Ins.Src2.Kind = svkRegister) and
+                ((Ins.Src2.RegType = srtFloat) = (Ins.OpCode = ssaRefStoreFloat)) and
+                (Ins.Src2.RegType <> srtString);
+    // "@a(i)": the descriptor base plus index * 8. A NULL base takes the helper (empty or packed array).
+    ssaArrayElemAddr:
+      Result := (Ins.Src1.Kind = svkArrayRef) and (Ins.Src2.Kind = svkRegister) and
+                (Ins.Src2.RegType = srtInt) and (Ins.Dest.Kind = svkRegister) and (Ins.Dest.RegType = srtInt);
     ssaRecordLoadInt, ssaRecordLoadFloat, ssaRecordStoreInt, ssaRecordStoreFloat:
       // Needs the record layout AND a constant slot: the slot is baked into the displacement.
       Result := AotRecNative and (Ins.Src3.Kind = svkConstInt);
@@ -4023,7 +4046,8 @@ var
   procedure AotRawAccess(apc: Integer; IsFloat, IsStore: Boolean);
   var pr, vr, W, pCold, pDone: Integer;
   begin
-    W := Integer(Cur.Src3.ConstInt);
+    // A Ref accessor may carry no width (phase 2.3): 0, eight bytes / a Double.
+    if Cur.Src3.Kind = svkConstInt then W := Integer(Cur.Src3.ConstInt) else W := 0;
     pr := IReg(Cur.Src1);
     if IsStore then
     begin
@@ -4562,6 +4586,30 @@ var
     end;
   end;
 
+  procedure AotArrElemAddr(apc, ArrayId: Integer);
+  // "@a(i)" in the fb mode (phase 2.3): the element buffer's base out of the descriptor table, plus index * 8,
+  // tagged FGNPTR_TAG - bcArrayElemAddr's Pascal arm, native. A NULL base (an empty array, or a narrow one
+  // packed at 1/2/4 bytes) takes the helper for this instruction, which answers.
+  var pCold, pDone, ir, dr: Integer;
+  begin
+    ir := IReg(Cur.Src2); dr := IReg(Cur.Dest);
+    if not OK then Exit;
+    ILoad(RCX, ir);                                                  // rcx = linear index
+    E.MemOp([$49, $8B], RDX, R8, 16);                                // rdx = ctx.ArrDesc
+    if (Cur.Src3.Kind = svkConstInt) and (Cur.Src3.ConstInt = 1) then
+      E.MemOp([$48, $8B], RAX, RDX, LongWord(ArrayId) * 32 + 8)      // rax = FloatData base
+    else
+      E.MemOp([$48, $8B], RAX, RDX, LongWord(ArrayId) * 32);         // rax = IntData base
+    E.EmitBytes([$48, $85, $C0]);                                    // test rax, rax
+    E.EmitBytes([$0F, $84]); pCold := E.Len; E.Emit32(0);            // jz cold
+    E.EmitBytes([$48, $8D, $04, $C8]);                               // lea rax, [rax + rcx*8]
+    E.EmitBytes([$48, $0F, $BA, $E8, 61]);                           // bts rax, 61
+    IStore(dr, RAX);
+    E.EmitBytes([$E9]); pDone := E.Len; E.Emit32(0);                 // jmp done
+    E.Patch32(pCold, LongWord(E.Len - (pCold + 4)));                 // @cold
+    EmitHelperCall(apc);
+    E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));                 // @done
+  end;
   procedure AotArrBound(apc, ArrayId: Integer; WantUpper: Boolean);
   var p1: Integer;
   begin
@@ -5610,7 +5658,20 @@ var
           end;
           // Phase 2 of the pointer model: the raw accessors. The same shape as PSET below - a native
           // form whose cold path IS the helper call - so a call-ready frame, a deopt hazard and a PC.
-          ssaRawLoadInt, ssaRawLoadFloat, ssaRawStoreInt, ssaRawStoreFloat:
+          ssaArrayElemAddr:
+          begin
+            if not AotIsNative(SSAProg, Ins) then NoteHelperOp
+            else
+            begin
+              HasHelperCall := True;
+              HasDeopt := True;
+              if not AotHelperRoutable(Prog, o) then Fail('elemaddr-not-routable');
+              if Prog.GetSsaPc(o) < 0 then Fail('no-pc-elemaddr');
+              CountVal(Ins.Src2); CountVal(Ins.Dest);
+            end;
+          end;
+          ssaRawLoadInt, ssaRawLoadFloat, ssaRawStoreInt, ssaRawStoreFloat,
+          ssaRefLoadInt, ssaRefLoadFloat, ssaRefStoreInt, ssaRefStoreFloat:
           begin
             if not AotIsNative(SSAProg, Ins) then NoteHelperOp
             else
@@ -5620,7 +5681,7 @@ var
               if not AotHelperRoutable(Prog, o) then Fail('raw-not-routable');
               if Prog.GetSsaPc(o) < 0 then Fail('no-pc-raw');
               CountVal(Ins.Src1);
-              if (Ins.OpCode = ssaRawLoadInt) or (Ins.OpCode = ssaRawLoadFloat) then CountVal(Ins.Dest)
+              if Ins.OpCode in [ssaRawLoadInt, ssaRawLoadFloat, ssaRefLoadInt, ssaRefLoadFloat] then CountVal(Ins.Dest)
               else CountVal(Ins.Src2);
             end;
           end;
@@ -6296,7 +6357,8 @@ var
           ssaArrayLoad, ssaArrayStore,
           ssaArrayLoadIndInt, ssaArrayLoadIndFloat,
           ssaArrayStoreIndInt, ssaArrayStoreIndFloat,
-          ssaRawLoadInt, ssaRawLoadFloat, ssaRawStoreInt, ssaRawStoreFloat:
+          ssaRawLoadInt, ssaRawLoadFloat, ssaRawStoreInt, ssaRawStoreFloat,
+          ssaRefLoadInt, ssaRefLoadFloat, ssaRefStoreInt, ssaRefStoreFloat, ssaArrayElemAddr:
             Inc(nArith);
         end;
       end;
@@ -7474,11 +7536,18 @@ var
           AotRecAccess(apc, IReg(Cur.Src1), Cur.Src3.ConstInt, IReg(Cur.Src2), False, True);
       end;
       // Phase 2 of the pointer model. A PC because the cold path is the helper call.
-      ssaRawLoadInt, ssaRawLoadFloat, ssaRawStoreInt, ssaRawStoreFloat:
+      ssaRawLoadInt, ssaRawLoadFloat, ssaRawStoreInt, ssaRawStoreFloat,
+      ssaRefLoadInt, ssaRefLoadFloat, ssaRefStoreInt, ssaRefStoreFloat:
       begin
         apc := NeedPC; if not OK then Exit;
-        AotRawAccess(apc, (Cur.OpCode = ssaRawLoadFloat) or (Cur.OpCode = ssaRawStoreFloat),
-                     (Cur.OpCode = ssaRawStoreInt) or (Cur.OpCode = ssaRawStoreFloat));
+        AotRawAccess(apc, Cur.OpCode in [ssaRawLoadFloat, ssaRawStoreFloat, ssaRefLoadFloat, ssaRefStoreFloat],
+                     Cur.OpCode in [ssaRawStoreInt, ssaRawStoreFloat, ssaRefStoreInt, ssaRefStoreFloat]);
+      end;
+      ssaArrayElemAddr:
+      begin
+        d := ArrId; if not OK then Exit;
+        apc := NeedPC; if not OK then Exit;
+        AotArrElemAddr(apc, d);
       end;
       ssaArrayLBound:
       begin

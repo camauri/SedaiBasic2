@@ -196,7 +196,12 @@ double tan(double);
   X(0x0317, RawLoadInt            ) \
   X(0x0318, RawLoadFloat          ) \
   X(0x0319, RawStoreInt           ) \
-  X(0x031A, RawStoreFloat         )
+  X(0x031A, RawStoreFloat         ) \
+  X(0x030D, RefLoadInt            ) \
+  X(0x030E, RefLoadFloat          ) \
+  X(0x0310, RefStoreInt           ) \
+  X(0x0311, RefStoreFloat         ) \
+  X(0x0336, ArrayElemAddr         )
 
 
 
@@ -371,6 +376,16 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
     if (!(flags & HF_NATIVE_MEM) || (u_ >> 61) != 1) return pc;                   \
     (out_) = (char *)(intptr_t)(u_ & ~(1ULL << 61));                              \
   } while (0)
+  /* ⭐ THE REF ACCESSORS ON A MACHINE ADDRESS (pointer model, phase 2.3). bcRef{Load,Store}{Int,Float} have the
+     same operands as the bcRaw* four (Src1 the pointer, Src2 the stored value, the width in the immediate) and,
+     on a value whose bits 63..61 are 0 0 1, the same Pascal arm: RawLoadInt / RawStoreInt with that width
+     (a float Ref carries no width: the immediate is 0, a Double). Every other kind - a record-field pointer, a
+     packed array pointer, the raw heap - fails RAWADDR's guard and hands the PC back. In the fb mode "@a(i)" is
+     such an address, and without these the pointer walk left the loop on every element. */
+  L_RefLoadInt:    goto L_RawLoadInt;
+  L_RefLoadFloat:  goto L_RawLoadFloat;
+  L_RefStoreInt:   goto L_RawStoreInt;
+  L_RefStoreFloat: goto L_RawStoreFloat;
   L_RawLoadInt: {
     char *p_;
     RAWADDR(ireg[I->s1], p_);
@@ -603,6 +618,15 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
         if ((uint64_t)li < (uint64_t)d[2]) freg[I->dest] = ((const double *)(intptr_t)d[1])[li];
         else if ((flags & HF_MODERN_ARRAYS) && d[1]) freg[I->dest] = 0.0;
         else return pc; }
+      pc++; NEXT;
+  L_ArrayElemAddr:   /* bcArrayElemAddr (phase 2.3): "@a(i)" in the fb mode - imm 1 = the FLOAT bank */
+      /* The element buffer's base from the descriptor, plus index * 8, tagged FGNPTR_TAG like the Pascal arm.
+         A NULL base - an empty array, or a narrow one packed at 1/2/4 bytes, whose IntData pointer is NULL -
+         hands the PC back and the interpreter answers. No bounds test: fbc takes "@a(ub + 1)" too. */
+      { const int64_t *d = arrdesc + 4*(int)I->s1;
+        uint64_t b_ = (uint64_t)((I->imm == 1) ? d[1] : d[0]);
+        if (!b_) return pc;
+        ireg[I->dest] = (int64_t)((b_ + (uint64_t)ireg[I->s2] * 8u) | (1ULL << 61)); }
       pc++; NEXT;
   L_ArrayStoreInt:   /* bcArrayStoreInt - the VALUE is in Dest, read not written */
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
