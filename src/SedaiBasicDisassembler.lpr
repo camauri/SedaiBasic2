@@ -229,6 +229,11 @@ begin
           Output(Format('Variables:         %d', [BytecodeProgram.GetVariableCount]));
           Output(Format('String Constants:  %d', [BytecodeProgram.StringConstants.Count]));
           Output(Format('Arrays:            %d', [BytecodeProgram.GetArrayCount]));
+          // The pointer model the program was compiled for (SedaiMemoryMode, .basc v6).
+          if BytecodeProgram.NativeMemory then
+            Output('Memory mode:       fb')
+          else
+            Output('Memory mode:       strict');
           if Options.Verbose then
             Output(Format('Entry Point:       %d', [BytecodeProgram.EntryPoint]));
           Output('');

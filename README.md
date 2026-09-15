@@ -407,6 +407,7 @@ Options:
   --no-exec           Compile only, do not execute (useful with --disasm)
   --stats             Show execution statistics
   --no-opt            Skip the SSA/bytecode optimization passes (differential testing)
+  --memory=fb|strict  Memory mode: fb = FreeBASIC pointers (default), strict = isolated from the VM
   --jit               Compile eligible hot loops to native code
   --aot               Compile eligible whole functions to native code before running
   --bounds-check      Hard-error on out-of-bounds array access (like FreeBASIC's -exx)

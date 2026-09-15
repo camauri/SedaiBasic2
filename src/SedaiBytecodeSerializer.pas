@@ -92,12 +92,15 @@ const
   // which is right: it cannot contain a bcForeignCall, because the opcode did not exist.
   // ⛔ The lesson of 172, written where the next person will need it: a field added to the WRITER is
   // added to the READER in the same change, never one alone, and `basc_sweep` is the net that sees it.
-  BASC_VERSION = 5;
+  // v6 (15 Sep 2026): the MEMORY MODE flag. A v5 file has it clear, which reads as strict - the only model
+  // any v5 file could have been compiled for.
+  BASC_VERSION = 6;
 
   // Flags
   BASC_FLAG_DEBUG_INFO = $0001;  // Contains source line mapping (always included)
   BASC_FLAG_MODERN     = $0002;  // Program compiled from a Modern/FreeBASIC source (no line numbers)
   BASC_FLAG_QBLANG     = $0004;  // Source declared -lang qb: QB PRINT number spacing (trailing space)
+  BASC_FLAG_NATIVE_MEMORY = $0008;  // Compiled for memory mode fb (SedaiMemoryMode); clear = strict
 
 type
   { TBascHeader - File header structure }
@@ -241,6 +244,8 @@ begin
     Header.Flags := Header.Flags or BASC_FLAG_MODERN;
   if Program_.QBLang then
     Header.Flags := Header.Flags or BASC_FLAG_QBLANG;
+  if Program_.NativeMemory then
+    Header.Flags := Header.Flags or BASC_FLAG_NATIVE_MEMORY;
 
   Header.InstructionCount := Program_.GetInstructionCount;
   if Assigned(Program_.StringConstants) then
@@ -446,6 +451,7 @@ begin
     Result.ModernMode := (Header.Flags and BASC_FLAG_MODERN) <> 0;
     Result.OptionDigits := Integer(Header.Reserved1);   // see the note where it is written
     Result.QBLang := (Header.Flags and BASC_FLAG_QBLANG) <> 0;
+    Result.NativeMemory := (Header.Flags and BASC_FLAG_NATIVE_MEMORY) <> 0;   // v5 and older: strict
 
     // Read string constants
     for i := 0 to Header.StringConstCount - 1 do

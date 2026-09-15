@@ -1178,6 +1178,10 @@ type
     // Name of the source file this program was compiled from (ERMN). Set by the host.
     FModuleName: string;
     FQBLang: Boolean;      // source declared -lang qb ('#lang "qb"' / '$lang: "qb"): QB PRINT spacing
+    // The MEMORY MODE it was compiled for (SedaiMemoryMode): True = fb (a pointer is a machine address),
+    // False = strict (a pointer is a name of the VM). False by default, so a front end that never sets it
+    // (sbv, TSedaiRunner) builds STRICT programs. Travels in the .basc header (v6).
+    FNativeMemory: Boolean;
     { "OPTION DIGITS n": how many significant digits a float shows in PRINT.
       0 = the directive was absent, so the dialect default stands (16 for a
       Double, 7 for a Single). It rides on the PROGRAM for the same reason
@@ -1223,6 +1227,7 @@ type
     property ModernMode: Boolean read FModernMode write FModernMode;
     property ModuleName: string read FModuleName write FModuleName;
     property QBLang: Boolean read FQBLang write FQBLang;
+    property NativeMemory: Boolean read FNativeMemory write FNativeMemory;
     property OptionDigits: Integer read FOptionDigits write FOptionDigits;
     constructor Create;
     destructor Destroy; override;

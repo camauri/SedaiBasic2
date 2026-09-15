@@ -36,6 +36,7 @@ uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
   {$IFDEF WINDOWS}Windows,{$ENDIF}
   SedaiConsoleState,
+  SedaiMemoryMode,   // --memory=fb|strict (sbw reads no sedai.conf: the flag or the default)
   SedaiOpcodeTable,
   Classes, SysUtils, Variants, TypInfo, Math,
   // HTTP Server
@@ -257,10 +258,19 @@ begin
         Verbose := True
       else if ParamLower = '--cache' then
         UseCache := True
+      else if Pos(MEMORY_MODE_FLAG, ParamLower) = 1 then
+        GMemoryModeFlag := Copy(ParamLower, Length(MEMORY_MODE_FLAG) + 1, MaxInt)
       else if ParamLower = '--no-dir-listing' then
         AllowDirListing := False;
 
       Inc(i);
+    end;
+
+    // The memory mode every page is compiled in (SedaiMemoryMode), resolved once at startup.
+    if not ResolveSourceMemoryMode then
+    begin
+      ExitCode := 1;
+      Exit;
     end;
 
     // Validate required parameters

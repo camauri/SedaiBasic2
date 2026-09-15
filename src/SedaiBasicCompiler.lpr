@@ -50,7 +50,7 @@ uses
   // Preprocessor (runs before lexing)
   SedaiPreprocessor,
   // Where headers and libraries live (sedai.conf / SEDAI_* / fbc on the PATH) - see LoadConfig below
-  SedaiConfig,
+  SedaiConfig, SedaiMemoryMode,
   // Installs GPPTypeSizeHook: see the note in SedaiTypeSizeProbe. Linked for its initialization.
   SedaiTypeSizeProbe,
   // Dialect auto-detection (line numbers => classic, otherwise Modern)
@@ -168,6 +168,7 @@ var
   i, removed: Integer;
   HasLineNums: Boolean;
   QBLangDetected: Boolean;
+  MemSrc, MemErr: string;
   {$IFNDEF DISABLE_REG_ALLOC}
   RegAlloc: TLinearScanAllocator;
   {$ENDIF}
@@ -220,6 +221,25 @@ begin
       // dropped in silence and every C call was "Array not declared: PRINTF" - while sb ran the same
       // file. A missing include was not refused either (guard m894e). basc_sweep: 4 SBCFAIL + 1 DIFF.
       LoadConfig(ExtractFilePath(ExpandFileName(SourceFile)));
+      // ⭐ THE MEMORY MODE, resolved where sb resolves it: after the configuration, before anything is generated
+      // (SedaiMemoryMode). A WASM module keeps the isolated model - its backend has one of its own and no FFI -
+      // so an explicit fb there is refused instead of ignored.
+      if not ResolveMemoryMode(GMemoryModeFlag, GMemoryMode, MemSrc, MemErr) then
+      begin
+        WriteLn('ERROR: ', MemErr);
+        Exit;
+      end;
+      if OptTargetWasm then
+      begin
+        if (GMemoryModeFlag <> '') and (GMemoryMode = mmFB) then
+        begin
+          WriteLn('ERROR: --memory=fb: the WASM target has only the strict memory mode');
+          Exit;
+        end;
+        GMemoryMode := mmStrict;
+        MemSrc := 'wasm target';
+      end;
+      NoteMemoryMode(GMemoryMode, MemSrc);
       Source.Text := PreprocessSource(Source.Text, ExtractFilePath(ExpandFileName(SourceFile)), SourceFile);
     except
       on E: EPreprocessorError do
@@ -296,6 +316,7 @@ begin
         // Dialect gate for FB lexical scope: MODERN when the source has no line numbers
         // (mirrors the lexer config above), CLASSIC otherwise.
         SSAGen.ModernMode := not HasLineNums;
+        SSAGen.NativeMemory := GMemoryMode = mmFB;
         try
           SSAProgram := SSAGen.Generate(ParserResult.AST);
 
@@ -506,6 +527,7 @@ begin
             // Record the source dialect so the VM can pick dialect-aware behaviour when
             // running the .basc (mirrors SSAGen.ModernMode above; persisted by the serializer).
             BytecodeProgram.ModernMode := not HasLineNums;
+            BytecodeProgram.NativeMemory := GMemoryMode = mmFB;   // the memory mode travels in the .basc header
             // "OPTION DIGITS n", same channel as the dialect above.
             // ⚠️ NOT persisted by the serializer yet: a .basc loses it.
             BytecodeProgram.OptionDigits := ParserResult.OptionDigits;
@@ -670,6 +692,8 @@ begin
         OptVerbose := True
       else if (Param = '--quiet') or (Param = '-q') then
         OptQuiet := True
+      else if Pos(MEMORY_MODE_FLAG, LowerCase(Param)) = 1 then
+        GMemoryModeFlag := Copy(Param, Length(MEMORY_MODE_FLAG) + 1, MaxInt)   // fb | strict (SedaiMemoryMode)
       else if (Param = '--target=wasm') or (Param = '--target-wasm') then
         OptTargetWasm := True
       else if (Param = '--target') and (i < ParamCount) then

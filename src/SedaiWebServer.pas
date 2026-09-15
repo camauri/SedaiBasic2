@@ -98,7 +98,7 @@ type
 implementation
 
 uses
-  StrUtils, DateUtils;
+  StrUtils, DateUtils, SedaiMemoryMode;
 
 { TSedaiWebServer }
 
@@ -481,6 +481,7 @@ begin
       // Dialect gate for FB lexical scope: MODERN gives a Sub its own locals, CLASSIC keeps BASIC v7
       // global-by-name. Same line as sb's, from the same answer.
       SSAGen.ModernMode := ProgIsModern;
+      SSAGen.NativeMemory := GMemoryMode = mmFB;   // resolved at startup (SedaiMemoryMode)
       try
         SSAProgram := SSAGen.Generate(ParserResult.AST);
       except
@@ -575,6 +576,7 @@ begin
           // four sb sets (SedaiBasicVM.lpr) and sbc sets (SedaiBasicCompiler.lpr); a fifth added
           // there and not here is the next instance of this same defect.
           Result.ModernMode := ProgIsModern;
+          Result.NativeMemory := GMemoryMode = mmFB;   // the FIFTH fact: the memory mode, as sb and sbc set it
           Result.QBLang := QBLangDetected;
           // "OPTION DIGITS n" rides out on the PARSE RESULT and the VM applies it before running.
           // Without it `Option Digits Exact` printed 0.1 where sb prints all 55 digits.

@@ -28,6 +28,7 @@ TARGET="all"
 DEBUG=false
 CLEAN=false
 WINDOW=false
+STRICT_ONLY=false     # --strict-only: a binary locked to the STRICT memory mode (SEDAI_STRICT_ONLY)
 NO_BANNER=false
 SELECT_FPC=false
 FPC_OVERRIDE=""
@@ -73,6 +74,7 @@ show_help() {
     echo "  --debug                  Build with debug info"
     echo "  --clean                  Clean build artifacts before building"
     echo "  --window                 Build sb with the SDL2 window presenter (sb --window)"
+    echo "  --strict-only            Lock the binaries to the STRICT memory mode: --memory=fb is refused"
     echo "  --cpu <x86_64|i386|aarch64>   Target CPU (default: host)"
     echo "  --os <linux|darwin|win64|win32>  Target OS (default: host)"
     echo "  --with-sedai-audio <no|path>  Audio: disable, or use a specific path"
@@ -619,6 +621,7 @@ while [[ $# -gt 0 ]]; do
         --debug) DEBUG=true; shift ;;
         --clean) CLEAN=true; shift ;;
         --window) WINDOW=true; shift ;;
+        --strict-only) STRICT_ONLY=true; shift ;;
         --no-banner) NO_BANNER=true; shift ;;
         --select-fpc) SELECT_FPC=true; shift ;;
         --fpc) FPC_OVERRIDE="$2"; shift 2 ;;
@@ -783,6 +786,9 @@ fi
 
 # Debug flags -> defines
 DEBUG_DEFINES=()
+# ⛔ A define changes unit CONTENT, so it rides in DEBUG_DEFINES: unit_dir_for keys the lib directory on it, and a
+# locked build never reuses the units of an unlocked one (or the other way round).
+[[ "$STRICT_ONLY" == "true" ]] && DEBUG_DEFINES+=("SEDAI_STRICT_ONLY")
 if [[ -n "$DEBUG_FLAGS" ]]; then
     IFS=',' read -ra _flags <<< "$(echo "$DEBUG_FLAGS" | tr '[:lower:]' '[:upper:]')"
     for f in "${_flags[@]}"; do

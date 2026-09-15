@@ -46,6 +46,7 @@ uses
   // Bytecode VM
   // -i / -p: dove stanno gli header e le librerie (SedaiConfig e' la loro fonte)
   SedaiConfig, SedaiFFI,
+  SedaiMemoryMode,   // --memory=fb|strict: the pointer model a program is compiled for
   SedaiSSATypes, SedaiSSA,
   SedaiBytecodeTypes, SedaiBytecodeCompiler, SedaiBytecodeVM,
   SedaiBytecodeDisassembler, SedaiOpcodeTable, SedaiJit, SedaiAot,
@@ -541,6 +542,7 @@ begin
   WriteLn('  --disasm-pre        Show bytecode BEFORE superinstruction fusion');
   WriteLn('  --no-exec           Compile only, do not execute (useful with --disasm)');
   WriteLn('  --no-opt            Skip the SSA/bytecode optimization passes (differential testing)');
+  WriteLn('  --memory=fb|strict  Memory mode: fb = FreeBASIC pointers (default), strict = isolated from the VM');
   WriteLn('  --home              Run the program as if from its own directory (chdir before it starts).');
   WriteLn('                        Without it the current directory is the shell''s, as it is for fbc,');
   WriteLn('                        and only a READ-ONLY relative path falls back beside the program.');
@@ -966,6 +968,7 @@ begin
       // lexer config above), CLASSIC otherwise. CLASSIC keeps BASIC v7 global-by-name semantics.
       ProgIsModern := not TSedaiRunner.SourceHasLineNumbers(Source.Text);
       SSAGen.ModernMode := ProgIsModern;
+      SSAGen.NativeMemory := GMemoryMode = mmFB;   // resolved before this compile (SedaiMemoryMode)
       try
         Timer := CreateHiResTimer;
         SSAProgram := SSAGen.Generate(ParserResult.AST);
@@ -1751,6 +1754,7 @@ begin
         // Record the source dialect on the program so the VM can pick dialect-aware behaviour
         // (e.g. filesystem error codes: FreeBASIC vs Commodore). Mirrors SSAGen.ModernMode above.
         BytecodeProgram.ModernMode := not TSedaiRunner.SourceHasLineNumbers(Source.Text);
+        BytecodeProgram.NativeMemory := GMemoryMode = mmFB;   // ...and travels with the program
         // "OPTION DIGITS n" rides out on the PARSE RESULT (the parser itself is
         // long gone) and the VM applies it to the console behavior before running.
         BytecodeProgram.OptionDigits := ParserResult.OptionDigits;
@@ -2341,6 +2345,9 @@ begin
     Timer := CreateHiResTimer;
     try
       BytecodeProgram := Serializer.LoadFromFile(BytecodeFile);
+      // ⛔ A .basc was compiled for ONE memory mode and runs in it: a --memory asking for the other, or a
+      // build locked to STRICT meeting an fb file, is refused here through the error path below.
+      AdoptCompiledMemoryMode(BytecodeProgram.NativeMemory);
       // ⛔⛔ THE FUSION PASS RUNS HERE AND NOT IN `sbc`. Whether fusing pays depends on the ENGINE,
       // and only this side knows which one: RunSuperinstructions' own gate reads GJitWillRun, which
       // --jit has already set by the time we get here. `sbc` cannot know, always fused, and a
@@ -2720,6 +2727,8 @@ begin
         AddLibrarySearchPath(ParamStr(i + 1));
         GSkipNextArg := True;
       end
+      else if Pos(MEMORY_MODE_FLAG, Param) = 1 then
+        GMemoryModeFlag := Copy(Param, Length(MEMORY_MODE_FLAG) + 1, MaxInt)   // fb | strict (SedaiMemoryMode)
       else if (Param = '--no-opt') or (Param = '--no-optimize') then
         GSSAOptimizationsEnabled := False   // differential-test reference: skip the optimization passes
       else if (Param = '--home') then
@@ -2845,7 +2854,11 @@ begin
 
     case FileType of
       sftSource:
-        // Compile and run .bas source file
+        // Compile and run .bas source file - in the memory mode the command line, sedai.conf or the build
+        // says (SedaiMemoryMode), resolved BEFORE generating: the SSA chooses the pointer model.
+        if not ResolveSourceMemoryMode then
+          ExitCode := 1
+        else
         TestBytecodeCompilation(TestFile, OptVerbose, OptDumpAST, OptDisasm, OptDisasmPre, OptStats, OptNoExec
           {$IFDEF ENABLE_PROFILER}, OptProfile, ProfileMode, ProfileExport{$ENDIF});
 

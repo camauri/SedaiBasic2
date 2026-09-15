@@ -534,6 +534,7 @@ type
     FCurrentTopLevelLabels: TStringList;  // GOTO-unwind: names of labels at block-depth 0 in the current frame
                                           //   (module or proc). A GOTO to one of them exits every open block scope.
     FModernMode: Boolean;                // FB scope: True = MODERN (lexical scope); False = CLASSIC (global-by-name)
+    FNativeMemory: Boolean;              // memory mode fb (True) or strict (False) - SedaiMemoryMode; phase 0: carried, not yet read
     FScopeStack: array of TScopeFrame;   // FB scope: proc-root + block frames (innermost = High); module = FVarMap
     FNextScopeSerial: Integer;           // hands each pushed frame its identity (see BlockArrayMangle)
     // ...and the same key for every UDT a block declared, with the TYPE as its value. The pair is what
@@ -1721,6 +1722,9 @@ type
     // FB scope dialect gate: True = MODERN (FreeBASIC lexical scope), False = CLASSIC (BASIC v7
     // global-by-name). Set by the compile driver from the LOAD-time dialect (line numbers => CLASSIC).
     property ModernMode: Boolean read FModernMode write FModernMode;
+    // The pointer model this program is generated for (job/markdown/MODELLO-PUNTATORI.md). Set by the compile
+    // driver from SedaiMemoryMode; False (strict) unless a driver says otherwise.
+    property NativeMemory: Boolean read FNativeMemory write FNativeMemory;
   end;
 
 implementation

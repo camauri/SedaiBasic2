@@ -3565,6 +3565,40 @@ qualified — `Sub T.U.proc` — and `This` inside it is the *nested* type. A ne
 enclosing type's **private** members, as it does in FreeBASIC and in C++. The **anonymous** form is
 what it has always been: a layout block whose members are sequential inside the surrounding union.
 
+### Memory mode: FreeBASIC pointers, or a program isolated from the VM (15 September 2026)
+
+A program is compiled for one of two **memory modes**, and the mode decides what a pointer is:
+
+| mode | a pointer is | for |
+|---|---|---|
+| `fb` (the default) | the machine address, as in FreeBASIC — what a C library expects when it keeps, returns or follows a pointer the program gave it | programs written for FreeBASIC, and every program that calls C |
+| `strict` | a name the VM checks and translates; a program cannot reach memory it does not own | programs that must stay isolated from the machine |
+
+⚠️ **Today the two modes behave the same.** The switch exists, it is carried and checked, and the `fb` mode is being
+built in steps: until they land, a program runs as it always did in either mode, and the limits listed under
+"Calling C libraries" below still apply (a record whose address C keeps across calls, an address C hands back later).
+
+How the mode is chosen, most specific first:
+
+- **the command line**: `sb --memory=fb prog.bas`, `sb --memory=strict prog.bas`; `sbc` and `sbw` take the same switch;
+- **`sedai.conf`**: a line `memory = fb` or `memory = strict`, in any of the places `sedai.conf` is read from (`sbw`
+  does not read `sedai.conf`: there the switch or the default decides);
+- **the default**: `fb`.
+
+A value that is not `fb` or `strict` is refused, naming where it came from; nothing runs.
+
+**A compiled program keeps its mode.** `sbc` writes it into the `.basc` file (format version 6, shown by `sbd` as
+`Memory mode`), and `sb prog.basc` runs it in that mode. Asking for the other one with `--memory` is refused with the
+command that recompiles it, because the pointer model is decided when a program is compiled. A `.basc` written before
+format 6 runs as `strict`.
+
+**A build that can only be `strict`.** `./build.sh sb --strict-only` produces binaries locked to the isolated mode, for
+contexts where that must not be switched off: there `--memory=fb`, `memory = fb` in `sedai.conf` and a `.basc`
+compiled for `fb` are all refused, and the message names the lock. The WebAssembly target (`sbc --target wasm`) and
+the Commodore environment (`sbv`) are always `strict`; `sbc --target wasm --memory=fb` is refused.
+
+`MEMMODE_DIAG=1` prints on standard error which mode a run uses and where the choice came from.
+
 ### Calling C libraries: what the runtime does on the program's behalf (14 September 2026)
 
 Written down so that a program that behaves unexpectedly with a C library can be traced to a cause without
