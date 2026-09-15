@@ -54854,7 +54854,12 @@ begin
           end
           else
           begin
+          // ⭐ Phase 2 of the pointer model: in the fb memory mode a parameter of a builtin numeric type gets a NATIVE cell,
+          // as a local Dim does (ProcessDim), so "@x" is its machine address. The DECLARED spelling decides - a procedure-
+          // pointer alias is an integer once canonical, and its cell must come home as a closure (the m965 lesson).
+          FRawAllocNativeOK := NativeCellScalarType(ParamDeclaredTypeName(ParamNodeJ));
           EmitRawAddrScalarAlloc(ParamNodeJ.ValueUpper);
+          FRawAllocNativeOK := False;
           if RT = srtFloat then
             EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(ParamNodeJ.ValueUpper)), ParamReg, MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(ParamNodeJ.ValueUpper))))
           else

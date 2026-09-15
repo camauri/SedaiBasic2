@@ -3780,7 +3780,7 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   `@x` or `VarPtr`, and the temporary a `ByRef` parameter receives inside a procedure, used to keep about 13 bytes
   per call; a procedure called millions of times now runs in constant memory. As in FreeBASIC, where such a variable
   lives on the stack, a pointer to it must not be used after the procedure returns. In the default (`fb`) memory
-  mode a numeric local of a builtin type is real memory, so `@x` is its address.
+  mode a numeric local or parameter of a builtin type is real memory, so `@x` is its address.
 - **A `For` counter passed to a `ByRef` parameter receives the callee's write, and the loop continues from it.**
   With `Sub bump(ByRef v As Integer)`, `For i As Integer = 1 To 5 : bump(i) : Print i; : Next` prints `2 4 6`, as in
   FreeBASIC. It used to print `1 2 3 4 5`: the loop kept counting on its own copy. The same holds for a counter
