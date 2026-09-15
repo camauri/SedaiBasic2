@@ -3787,10 +3787,11 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   declared with `Dim`, of any numeric type, with any `Step`, and for a write through the counter's address
   (`Dim p As Integer Ptr = @i : *p += 2`). A counter declared in the `For` head (`For i As Integer`) is a variable of
   its own and no longer overwrites an outer variable of the same name when it is passed by reference.
-- ⚠️ **The difference of two pointers is wrong unless both point into an array.** `Dim hp As Double Ptr =
-  Allocate(80) : Print (hp + 7) - hp` prints a very large number where FreeBASIC prints `7`; the same happens for
-  pointers to a local variable, a parameter, and (in the default `fb` memory mode) a module-level variable.
-  `@a(4) - @a(1)` on an array is right. Dereferencing, indexing and adding an integer to a pointer are not affected.
+- **The difference of two pointers counts elements, whatever memory they point into.** `Dim hp As Double Ptr =
+  Allocate(80) : Print (hp + 7) - hp` prints `7`, as in FreeBASIC. It used to print a very large number for pointers
+  into `Allocate` memory, to a local variable or a parameter, between two pointer variables, and (in the default
+  `fb` memory mode) to a module-level variable; pointers into an array were already right. A nested step such as
+  `(@x + 1) + 1` now also advances by the size of `x`.
 - **A `ByRef` temporary made in the main program no longer grows memory.** When the argument of a `ByRef`
   parameter is not a variable — `g(5)`, `g(a + b)`, `g(f())` — the call binds a temporary. In the main program each
   such call site now reuses one temporary for as long as the program runs, instead of allocating a new one on every

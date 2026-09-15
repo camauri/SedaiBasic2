@@ -43860,6 +43860,7 @@ var
   PtrSide, IntSide, BareSide: TASTNode;
   PtrVal, IntVal, SzVal, Scaled: TSSAValue;
   sz: Int64;
+  IsDiff, Descended: Boolean;
 begin
   // Decide which child is the raw pointer (left for +/-, or right only for +). ⭐ A SADD/STRPTR call
   // is a raw pointer with no NAME, so the side test asks both questions - and the scale then has to
@@ -43869,9 +43870,31 @@ begin
   else
   begin PtrSide := Node.GetChild(1); IntSide := Node.GetChild(0); end;
   PtrName := RawPtrExprName(PtrSide);
+  // ⛔ "p - q" WITH TWO RAW POINTERS IS A DIFFERENCE, NOT A STEP BACK (DIVERGENZE 461). The right side was taken for the
+  // integer index, scaled by SizeOf and subtracted: "(hp + 7) - hp" over an Allocate block answered the tag minus seven
+  // times the address, where fbc answers 7. Two addresses of the same domain carry the same mark, so the plain
+  // subtraction cancels it, and one exact division gives elements. In the fb memory mode every @-taken module scalar
+  // became a raw pointer with phase 2.1a, which is how "(@md + 1) - @md" regressed from 1 to garbage.
+  IsDiff := (Node.Token.TokenType = ttOpSub) and (PtrSide = Node.GetChild(0)) and
+            ((RawPtrExprName(Node.GetChild(1)) <> '') or (StrDataPtrPointee(Node.GetChild(1)) <> ''));
+  // ...and the node that decides the STRIDE is the pointer itself, found through "+"/"-": for "(@d + 1)" the bare side
+  // was the sum, AddrOfScalarPointee had nothing to say about it, and the stride fell to the eight-byte default.
   BareSide := PtrSide;
-  while (BareSide <> nil) and (BareSide.NodeType = antParentheses) and (BareSide.ChildCount >= 1) do
-    BareSide := BareSide.GetChild(0);
+  repeat
+    Descended := False;
+    while (BareSide <> nil) and (BareSide.NodeType = antParentheses) and (BareSide.ChildCount >= 1) do
+      BareSide := BareSide.GetChild(0);
+    if (BareSide <> nil) and (BareSide.NodeType = antBinaryOp) and (BareSide.ChildCount >= 2) and
+       Assigned(BareSide.Token) and
+       ((BareSide.Token.TokenType = ttOpAdd) or (BareSide.Token.TokenType = ttOpSub)) then
+    begin
+      if (RawPtrExprName(BareSide.GetChild(0)) <> '') or (StrDataPtrPointee(BareSide.GetChild(0)) <> '') then
+        BareSide := BareSide.GetChild(0)
+      else
+        BareSide := BareSide.GetChild(1);
+      Descended := True;
+    end;
+  until not Descended;
   ProcessExpression(PtrSide, PtrVal); PtrVal := EnsureIntRegister(PtrVal);
   ProcessExpression(IntSide, IntVal); IntVal := EnsureIntRegister(IntVal);
   // ⛔⛔ A CHARACTER BUFFER STEPS ONE BYTE, AND THE POINTEE LOOKUP HAS NOTHING TO SAY ABOUT IT.
@@ -43897,6 +43920,20 @@ begin
   end
   else
     sz := RawElemSizeOfPointee(StrDataPtrPointee(PtrSide));
+  if IsDiff then
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaSubInt, Result, PtrVal, IntVal, MakeSSAValue(svkNone));
+    if sz > 1 then
+    begin
+      SzVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, SzVal, MakeSSAConstInt(sz), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Scaled := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaDivInt, Scaled, Result, SzVal, MakeSSAValue(svkNone));
+      Result := Scaled;
+    end;
+    Exit;
+  end;
   if sz > 1 then
   begin
     SzVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
