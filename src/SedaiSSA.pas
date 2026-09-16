@@ -539,6 +539,7 @@ type
     FRecNativeKnob: Boolean;             // phase 3.2: native records in the fb mode; SB_RECNATIVE=0 turns them off (A/B)
     FRecNativeMethods: Boolean;          // phase 3.6: a type with METHODS can be native too; SB_RECNATIVE_METHODS=0 is the A/B
     FRecNativeCtors: Boolean;            // phase 3.6b: ...and one with a CONSTRUCTOR or DESTRUCTOR (SB_RECNATIVE_CTORS)
+    FRecNativeHoist: Boolean;            // phase 3.7: a native local record's cell is allocated at the frame's entry
     FNativeRecAsking: TStringList;       // phase 3.2: the types NativeRecordType is answering right now (a list's own pointer)
     // Phase 2.1a: the program's entry block, and where in it a raw module cell's allocation is hoisted (HoistToEntry) -
     // after the SHARED backings are sized and BEFORE static members, hoisted STATIC initialisers and module constructors.
@@ -596,6 +597,7 @@ type
     FSingleMemoDepth: Integer;
     FBlockManagedTypes: TStringList;     // types whose "New T[n]" must be MANAGED records (ctor/dtor)
     FMemberOwnerTypes: TStringList;      // phase 3.2: types that DEFINE any member procedure ("T.x" anywhere)
+    FNonPtrNames: TStringList;           // DIVERGENZE 483: names SOME declaration gives a type that is not a pointer
     FConstDeclSeen: TStringList;         // CONST names already seen: a name declared TWICE must not fold
     FConstStrBytes: TStringList;         // STRING consts: name (UPPER) -> byte size fbc reports (length + 1)
     FTypeAliases: TStringList;           // FB "TYPE alias AS underlying": alias (UPPER) -> underlying (UPPER)
@@ -914,6 +916,11 @@ type
     procedure EmitRecordArrayInit(ArrayIdx, UDTIdx: Integer);  // per-element EmitRecordInit over a DIM'd array-of-UDT
     function SplitRecordVar(const S: string; out VName, TName: string; out IsArray: Boolean): Boolean;
     procedure EmitRecordVarDestruction(const VName, TName: string; IsArray: Boolean);
+    function EmitRecordArrayCount(ArrayIdx: Integer; RankHint: Integer = 0): TSSAValue;   // the flat element count, at run time
+    procedure EmitRecordArrayConstructFrom(ArrayIdx: Integer; const TypeName: string; const FromReg: TSSAValue;
+                                           RankHint: Integer = 0);
+    procedure EmitRecordArrayConstructCore(ArrayIdx: Integer; const TypeName: string; FromFlatIndex: Integer;
+                                           RunDtor: Boolean; const FromReg: TSSAValue; RankHint: Integer);
     procedure EmitRecordArrayConstruct(ArrayIdx: Integer; const TypeName: string;
                                        FromFlatIndex: Integer;
                                        RunDtor: Boolean = False);  // ...and the CONSTRUCTOR (or the DESTRUCTOR) on each element
@@ -1198,6 +1205,7 @@ type
     procedure CountIdentifierUses(Node: TASTNode);
     function NameUsedElsewhere(const NameU: string): Boolean;
     procedure DropUnreadConstArrays;
+    procedure HoistNativeLocalRecords;   // phase 3.7: a native local record's cell is the frame's, allocated once
     procedure NoteUDTName(AIndex: Integer);
     function UDTsNamed(const U: string): TIntegerDynArray;
     function FindUDT(const TypeName: string): Integer;        // -1 if not a UDT
@@ -1377,7 +1385,10 @@ type
     function TryEmitUDTCastToString(Node: TASTNode; out Val: TSSAValue): Boolean;
     function SolePtrCastLabel(const TypeName: string): string;        // the ONE pointer-returning cast, or ''
     function ExprIsPointerValue(Node: TASTNode): Boolean;   // un T Ptr NON e' un T
-    function ExprIsPointerTyped(Node: TASTNode): Boolean;   // a pointer VARIABLE, CAST or CALL result (235)
+    function ExprIsPointerTyped(Node: TASTNode): Boolean;
+    procedure RefusePointerArg(const FuncName: string; ArgListNode: TASTNode; const Why: string);   // DIVERGENZE 483
+    procedure CollectNonPtrNames(Node: TASTNode);
+    function PointerArgCertain(Node: TASTNode): Boolean;   // a pointer VARIABLE, CAST or CALL result (235)
     function EmitStripForeignTag(const V: TSSAValue): TSSAValue;   // a foreign address, as a NUMBER (235)
     function TryEmitUDTCastToPtr(Node: TASTNode; const WantedType: string; out Val: TSSAValue): Boolean;
     function TryEmitUDTCastToNumber(Node: TASTNode; out Val: TSSAValue): Boolean;  // "Operator Cast() As Integer/Double" in arithmetic
@@ -1903,6 +1914,7 @@ begin
   FRecNativeKnob := GetEnvironmentVariable('SB_RECNATIVE') <> '0';   // phase 3.2: on by default; =0 is the A/B
   FRecNativeMethods := GetEnvironmentVariable('SB_RECNATIVE_METHODS') <> '0';   // phase 3.6: same, for types with methods
   FRecNativeCtors := GetEnvironmentVariable('SB_RECNATIVE_CTORS') <> '0';         // phase 3.6b: on by default; =0 is the A/B
+  FRecNativeHoist := GetEnvironmentVariable('SB_RECNATIVE_HOIST') <> '0';         // phase 3.7: on by default; =0 is the A/B
   FProgram := nil;
   FCurrentBlock := nil;
   FLabelCounter := 0;
@@ -2065,6 +2077,9 @@ begin
   FRawPtrScoped.CaseSensitive := False;
   FBlockManagedTypes := TIndexedStringList.Create;
   FMemberOwnerTypes := TIndexedStringList.Create;
+  FNonPtrNames := TIndexedStringList.Create;
+  FNonPtrNames.Sorted := True;
+  FNonPtrNames.Duplicates := dupIgnore;
   FNativeRecAsking := TStringList.Create;
   FMemberOwnerTypes.Sorted := True;
   FMemberOwnerTypes.Duplicates := dupIgnore;
@@ -2241,6 +2256,7 @@ begin
   FRawPtrScoped.Free;
   FBlockManagedTypes.Free;
   FMemberOwnerTypes.Free;
+  FNonPtrNames.Free;
   FNativeRecAsking.Free;
   FConstDeclSeen.Free;
   FNulStrConsts.Free;
@@ -3375,14 +3391,19 @@ begin
   // ⚠️ ssaRecordReallocBlock is tested BESIDE the set, not in it: a Pascal set holds ordinals
   // 0..255 and this opcode sits at the END of the enum - where it has to be, because
   // inserting one in the middle shifts every ordinal after it.
-  if (OpCode = ssaRecordReallocBlock) or (OpCode in RECORD_ALLOCATING_OPS) or
-     ((GRecMarkCall = 1) and (OpCode in RECORD_ALLOCATING_CALL_OPS)) then Inc(FRecAllocSeq);
-
   // ⭐ Phase 3.2: every allocation of a record of a NATIVE type says so, in ONE place - fourteen sites emit these and
   // none of them has to know. The type id rides the packed immediate (bits 48..63 for the array and block forms,
   // 32..47 for New), and it is the index into FUDTs.
   if FRecNativeKnob and FNativeMemory then
     RecNativeStamp(OpCode, Src1, Src2, Src3);
+
+  // ⭐ Phase 3.7: a native LOCAL record is not the block's allocation - HoistNativeLocalRecords moves its cell to the frame's
+  // entry, so a block that allocates nothing else needs no record mark (the same shape that pass recognises).
+  if (OpCode = ssaRecordNew) and (Src3.Kind = svkConstInt) and ((Src3.ConstInt and RECNEW_NATIVE) <> 0) and
+     (((Src3.ConstInt shr 48) and 1) = 0) and (Src1.Kind = svkConstInt) and (Dest.Kind = svkRegister) and
+     FRecNativeHoist and FRecNativeKnob and FNativeMemory then
+  else if (OpCode = ssaRecordReallocBlock) or (OpCode in RECORD_ALLOCATING_OPS) or
+     ((GRecMarkCall = 1) and (OpCode in RECORD_ALLOCATING_CALL_OPS)) then Inc(FRecAllocSeq);
 
   Instr := TSSAInstruction.Create(OpCode);
   Instr.Dest := Dest;
@@ -7337,6 +7358,9 @@ begin
         end
         else if IsIntReturningConv(FuncName) then
         begin
+          if (FuncName = 'CLNG') or (FuncName = 'CULNG') or (FuncName = 'CSHORT') or (FuncName = 'CUSHORT') or
+             (FuncName = 'CBYTE') or (FuncName = 'CUBYTE') then
+            RefusePointerArg(FuncName, ArgListNode, 'Type mismatch');
           // CSIGN/CUNSG reinterpret the signedness AT THE OPERAND'S WIDTH (see the ConvW block below):
           // CUnsg(Short -1) is a UShort 65535, CSign(UShort 65535) is a Short -1. A 64-bit / unknown-width
           // operand keeps the wide form -- CSIGN a signed pass-through, CUNSG an unsigned-64 value whose
@@ -7486,6 +7510,7 @@ begin
         end
         else if (FuncName = 'CDBL') or (FuncName = 'CSNG') then
         begin
+          RefusePointerArg(FuncName, ArgListNode, 'Type mismatch');
           // FreeBASIC float conversion functions: produce a float value. CSNG rounds to true
           // single precision (held in the Double bank) via bcNarrowSingle (B1.5).
           // ⛔ ...AND THE OTHER HALF OF THE SAME RULE. A UDT with an "Operator Cast" is a number here
@@ -7572,6 +7597,7 @@ begin
         else
         begin
           // Standard math functions (single argument, float result)
+          RefusePointerArg(FuncName, ArgListNode, 'Invalid data types');
           if (ArgListNode <> nil) then
           begin
             // If it's an argument list node, get first child
@@ -15461,7 +15487,7 @@ var
   ArrName, MTypeName, ElemUdtName, SlotRankKey: string;
   PrevRank: Integer;
   ArrayDeclNode, DimsNode, DimChild, DimExpr, DimNode, MemberNode, StaticArr, ThisArrNode: TASTNode;
-  UbValue, UbReg, MHandle, LbVal, MArrHandle: TSSAValue;
+  UbValue, UbReg, MHandle, LbVal, MArrHandle, OldCountReg: TSSAValue;
   MElemBank: TSSARegisterType;
   PreserveFlag, LbImm, FoldedLb, RecPacked: Int64;
   AllExplicitLb: Boolean;
@@ -15726,6 +15752,20 @@ begin
       if PrevRank = 0 then FArrRankOfSlot.Values[SlotRankKey] := IntToStr(DimsNode.ChildCount);
     end;
 
+    // ⭐ DIVERGENZE 485: an array of OBJECTS. Without PRESERVE the old elements are destroyed - last to first, as fbc does -
+    // before anything is resized; with PRESERVE the count before the resize says which elements are new. Both are read
+    // here, BEFORE the bounds are pushed: a destructor is a call, and nothing may run between a push and its commit.
+    // 🕳️ A PRESERVE that SHRINKS the array does not destroy the elements it drops (fbc does).
+    OldCountReg := MakeSSAValue(svkNone);
+    ElemUdtName := ArrayRecordTypeOf(ArrName);
+    if (ElemUdtName <> '') and (FindUDT(ElemUdtName) >= 0) then
+    begin
+      if PreserveFlag = 0 then
+        EmitRecordArrayConstructCore(ArrayIdx, ElemUdtName, 0, True, MakeSSAValue(svkNone), DimsNode.ChildCount)
+      else if (ResolveConstructorLabel(ElemUdtName, '') <> '') or (FindCtorWithDefaults(ElemUdtName, 0) <> '') then
+        OldCountReg := EmitRecordArrayCount(ArrayIdx, DimsNode.ChildCount);
+    end;
+
     if DimsNode.ChildCount = 1 then
     begin
       // 1-D REDIM: bare upper bound, or antDimRange(lb, ub). An explicit "lb TO ub" ALSO sets the lower
@@ -15822,7 +15862,10 @@ begin
         // worse than leaving the new ones unbuilt. Telling one from the other needs a per-record
         // "constructed" mark, which this model does not have (the same wall EmitRecordArrayInit's
         // zero-probe works around, and a probe cannot work here - a constructed record may hold zeros).
-        if PreserveFlag = 0 then EmitRecordArrayConstruct(ArrayIdx, ElemUdtName, 0);
+        if PreserveFlag = 0 then
+          EmitRecordArrayConstructCore(ArrayIdx, ElemUdtName, 0, False, MakeSSAValue(svkNone), DimsNode.ChildCount)
+        else if OldCountReg.Kind <> svkNone then
+          EmitRecordArrayConstructFrom(ArrayIdx, ElemUdtName, OldCountReg, DimsNode.ChildCount);
       end;
     end;
   end;
@@ -16826,6 +16869,7 @@ begin
   end
   else if FuncName = kCBOOL then
   begin
+    RefusePointerArg(FuncName, ArgsNode, 'Type mismatch');   // DIVERGENZE 483
     // ⭐ CBOOL OF A STRING READS THE WORD. fbc answers true for "true" in any case and false for
     // "false", and falls back to the numeric value for anything else - measured on fbc 1.10.1:
     // "true"/"TrUe" -> true, "false"/"abc" -> false, "2"/"-1"/"0.5" -> true, and " true " -> FALSE,
@@ -32182,6 +32226,128 @@ begin
   Result := Cur <> '1';         // '1' means the declaration and nothing else, '2' means more
 end;
 
+procedure TSSAGenerator.HoistNativeLocalRecords;
+// ⭐ Phase 3.7 of the pointer model: a NATIVE record that is local - a Dim, a temporary, a by-value result - lives where fbc
+// keeps it, in the FRAME: its cell is allocated ONCE when the procedure (or the module) is entered, and the place where
+// the program created it only clears the image. A Dim inside a loop is then the same address on every pass, exactly as a
+// stack slot is under fbc, and the loop no longer allocates: bcRecordNew was the op that made the C hot loop, the AOT and
+// the JIT leave the loop (4 M exits on job/tests/bench/oop_vec3.bas).
+// Each creation SITE gets its own cell, so two records alive together never share one; a site runs again only through a
+// loop or a GOTO, where its previous value is dead - the same rule the stack gives. Recursion has a frame per call.
+// ⚠️ The cell is stacked at entry, below every block mark, so a block exit never gives it back: the frame's exit does.
+// SB_RECNATIVE_HOIST=0 keeps the per-site allocation (A/B).
+var
+  b, j, k, RegionEntry, InsPos: Integer;
+  Blk: TSSABasicBlock;
+  Ins, NewIns: TSSAInstruction;
+  Cell: TSSAValue;
+  Bytes, P, W: Int64;
+  Code: Integer;
+  Adds: array of TSSAInstruction;
+
+  procedure Add(I: TSSAInstruction);
+  begin
+    SetLength(Adds, Length(Adds) + 1);
+    Adds[High(Adds)] := I;
+  end;
+
+  function NewReg: TSSAValue;
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  end;
+
+  procedure ClearChunk(Width: Int64; ACode: Integer; const Base, Zero: TSSAValue);
+  var
+    Addr: TSSAValue;
+    I: TSSAInstruction;
+  begin
+    if P = 0 then Addr := Base
+    else
+    begin
+      Addr := NewReg;
+      I := TSSAInstruction.Create(ssaLoadConstInt);
+      I.Dest := NewReg; I.Src1 := MakeSSAConstInt(P);
+      Add(I);
+      NewIns := TSSAInstruction.Create(ssaAddInt);
+      NewIns.Dest := Addr; NewIns.Src1 := Base; NewIns.Src2 := I.Dest;
+      Add(NewIns);
+    end;
+    I := TSSAInstruction.Create(ssaRawStoreInt);
+    I.Dest := MakeSSAValue(svkNone); I.Src1 := Addr; I.Src2 := Zero; I.Src3 := MakeSSAConstInt(ACode);
+    Add(I);
+    P := P + Width;
+  end;
+
+var
+  ZeroI, LenI, ClearI: TSSAInstruction;
+begin
+  if not (FNativeMemory and FRecNativeKnob and FRecNativeHoist) then Exit;
+  RegionEntry := 0;
+  InsPos := 0;
+  for b := 0 to FProgram.Blocks.Count - 1 do
+  begin
+    Blk := FProgram.Blocks[b];
+    if (b > 0) and (Copy(Blk.LabelName, 1, 5) = 'PROC_') then
+    begin
+      RegionEntry := b;
+      InsPos := 0;
+    end;
+    j := 0;
+    while j < Blk.Instructions.Count do
+    begin
+      Ins := Blk.Instructions[j];
+      if (Ins.OpCode <> ssaRecordNew) or (Ins.Src3.Kind <> svkConstInt) or
+         ((Ins.Src3.ConstInt and RECNEW_NATIVE) = 0) or (((Ins.Src3.ConstInt shr 48) and 1) <> 0) or
+         (Ins.Src1.Kind <> svkConstInt) or (Ins.Dest.Kind <> svkRegister) then
+      begin
+        Inc(j);
+        Continue;
+      end;
+      Bytes := Ins.Src1.ConstInt;
+      // the allocation, at the region's entry
+      Cell := NewReg;
+      NewIns := Ins.Clone;
+      NewIns.Dest := Cell;
+      FProgram.Blocks[RegionEntry].Instructions.Insert(InsPos, NewIns);
+      Inc(InsPos);
+      if b = RegionEntry then Inc(j);   // the insertion shifted this block
+      // ...and in its place: the name takes the cell, and the image is cleared
+      SetLength(Adds, 0);
+      Ins.OpCode := ssaCopyInt;
+      Ins.Src1 := Cell;
+      Ins.Src2 := MakeSSAValue(svkNone);
+      Ins.Src3 := MakeSSAValue(svkNone);
+      ZeroI := TSSAInstruction.Create(ssaLoadConstInt);
+      ZeroI.Dest := NewReg; ZeroI.Src1 := MakeSSAConstInt(0);
+      Add(ZeroI);
+      if Bytes > 256 then
+      begin
+        LenI := TSSAInstruction.Create(ssaLoadConstInt);
+        LenI.Dest := NewReg; LenI.Src1 := MakeSSAConstInt(Bytes);
+        Add(LenI);
+        ClearI := TSSAInstruction.Create(ssaRawClear);
+        ClearI.Dest := MakeSSAValue(svkNone); ClearI.Src1 := Ins.Dest; ClearI.Src2 := ZeroI.Dest; ClearI.Src3 := LenI.Dest;
+        Add(ClearI);
+      end
+      else
+      begin
+        P := 0;
+        while Bytes - P >= 8 do ClearChunk(8, RTC_I64, Ins.Dest, ZeroI.Dest);
+        W := Bytes - P;
+        if W >= 4 then begin Code := RTC_U32; ClearChunk(4, Code, Ins.Dest, ZeroI.Dest); end;
+        if Bytes - P >= 2 then ClearChunk(2, RTC_U16, Ins.Dest, ZeroI.Dest);
+        if Bytes - P >= 1 then ClearChunk(1, RTC_U8, Ins.Dest, ZeroI.Dest);
+      end;
+      for k := 0 to High(Adds) do
+      begin
+        Adds[k].SourceLine := Ins.SourceLine;
+        Blk.Instructions.Insert(j + 1 + k, Adds[k]);
+      end;
+      Inc(j, 1 + Length(Adds));
+    end;
+  end;
+end;
+
 procedure TSSAGenerator.DropUnreadConstArrays;
 // ⛔⛔⛔ THE BACKING OF A FOLDED CONST THAT NOBODY READS. A module CONST is stored in a one-element
 // global array, dimensioned and written at run time, AND folded to an immediate at every read that
@@ -40133,8 +40299,52 @@ begin
   CondBlock.AddSuccessor(EndBlock); EndBlock.AddPredecessor(CondBlock);
 end;
 
+function TSSAGenerator.EmitRecordArrayCount(ArrayIdx: Integer; RankHint: Integer = 0): TSSAValue;
+// The number of elements the array holds right now, over every dimension (0 before it is allocated). RankHint: the rank a
+// REDIM states, for an array declared "Dim m()" whose slot does not record one.
+var
+  ArrayRef, One, DimReg, Ub, Lb, Diff, Cnt, NewAcc: TSSAValue;
+  d, DimCount: Integer;
+begin
+  ArrayRef := MakeSSAArrayRef(ArrayIdx, srtInt);
+  DimCount := FProgram.GetArray(ArrayIdx).DimCount;
+  if RankHint > DimCount then DimCount := RankHint;
+  if DimCount < 1 then DimCount := 1;
+  One := EnsureIntRegister(MakeSSAConstInt(1));
+  Result := EnsureIntRegister(MakeSSAConstInt(1));
+  for d := 0 to DimCount - 1 do
+  begin
+    DimReg := EnsureIntRegister(MakeSSAConstInt(d));
+    Ub := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    Lb := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaArrayUBound, Ub, ArrayRef, DimReg, ArrayRank1Flag(ArrayIdx));
+    EmitInstruction(ssaArrayLBound, Lb, ArrayRef, DimReg, MakeSSAValue(svkNone));
+    Diff := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaSubInt, Diff, Ub, Lb, MakeSSAValue(svkNone));
+    Cnt := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, Cnt, Diff, One, MakeSSAValue(svkNone));
+    NewAcc := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, NewAcc, Result, Cnt, MakeSSAValue(svkNone));
+    Result := NewAcc;
+  end;
+end;
+
 procedure TSSAGenerator.EmitRecordArrayConstruct(ArrayIdx: Integer; const TypeName: string;
   FromFlatIndex: Integer; RunDtor: Boolean = False);
+begin
+  EmitRecordArrayConstructCore(ArrayIdx, TypeName, FromFlatIndex, RunDtor, MakeSSAValue(svkNone), 0);
+end;
+
+procedure TSSAGenerator.EmitRecordArrayConstructFrom(ArrayIdx: Integer; const TypeName: string; const FromReg: TSSAValue;
+  RankHint: Integer = 0);
+// DIVERGENZE 485: construct the elements from a flat index known only at run time - the count before a REDIM PRESERVE grew
+// the array, so the kept elements are not constructed twice and the new ones are constructed once.
+begin
+  EmitRecordArrayConstructCore(ArrayIdx, TypeName, 0, False, FromReg, RankHint);
+end;
+
+procedure TSSAGenerator.EmitRecordArrayConstructCore(ArrayIdx: Integer; const TypeName: string;
+  FromFlatIndex: Integer; RunDtor: Boolean; const FromReg: TSSAValue; RankHint: Integer);
 // Run the DEFAULT constructor on every element of a DIM'd array-of-UDT, from flat index FromFlatIndex on.
 // "Dim a(1 To 3) As T" declares THREE objects, and FreeBASIC constructs each one: only the scalar case
 // was ever constructed here, so every element of an array came up with its fields at 0 -- a member
@@ -40163,32 +40373,16 @@ begin
   end
   else if (ResolveConstructorLabel(TypeName, '') = '') and (FindCtorWithDefaults(TypeName, 0) = '') then Exit;
   ArrayRef := MakeSSAArrayRef(ArrayIdx, srtInt);
-  DimCount := FProgram.GetArray(ArrayIdx).DimCount;
-  if DimCount < 1 then DimCount := 1;
-
-  One := EnsureIntRegister(MakeSSAConstInt(1));
-  Acc := EnsureIntRegister(MakeSSAConstInt(1));
-  for d := 0 to DimCount - 1 do
-  begin
-    DimReg := EnsureIntRegister(MakeSSAConstInt(d));
-    Ub := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    Lb := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaArrayUBound, Ub, ArrayRef, DimReg, ArrayRank1Flag(ArrayIdx));
-    EmitInstruction(ssaArrayLBound, Lb, ArrayRef, DimReg, MakeSSAValue(svkNone));
-    Diff := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaSubInt, Diff, Ub, Lb, MakeSSAValue(svkNone));
-    Cnt := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaAddInt, Cnt, Diff, One, MakeSSAValue(svkNone));
-    NewAcc := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaMulInt, NewAcc, Acc, Cnt, MakeSSAValue(svkNone));
-    Acc := NewAcc;
-  end;
+  Acc := EmitRecordArrayCount(ArrayIdx, RankHint);
 
   CounterName := '__RECARRCTOR%' + IntToStr(FScopeSerial);
   Inc(FScopeSerial);
   CounterVar := DeclareVariableTyped(CounterName, srtInt);
-  EmitInstruction(ssaLoadConstInt, CounterVar, MakeSSAConstInt(FromFlatIndex),
-                  MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  if FromReg.Kind <> svkNone then
+    EmitInstruction(ssaCopyInt, CounterVar, EnsureIntRegister(FromReg), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+  else
+    EmitInstruction(ssaLoadConstInt, CounterVar, MakeSSAConstInt(FromFlatIndex),
+                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   CondLabel := GenerateUniqueLabel('recarrctor_cond');
   BodyLabel := GenerateUniqueLabel('recarrctor_body');
   IncrLabel := GenerateUniqueLabel('recarrctor_incr');
@@ -51530,6 +51724,98 @@ begin
     Result := FPointerVars.IndexOfName(Node.ValueUpper) >= 0;
 end;
 
+procedure TSSAGenerator.CollectNonPtrNames(Node: TASTNode);
+// Every name that SOME declaration - a Dim, a parameter, a field, a function result, a FOR counter - gives a type that is
+// not a pointer, or no written type at all. The pointer registry answers by bare name (FPointerVars), so a refusal built
+// on it alone refused "Sqr(p)" with p a local Double beside a global "p As Long Ptr" - a program fbc compiles. Wider on
+// purpose: a name found here is never refused, which can only leave a wrong program accepted, as before.
+var
+  i: Integer;
+  T: string;
+
+  procedure Note(const NameU, TypeU: string);
+  begin
+    if NameU = '' then Exit;
+    if (Pos(' PTR', TypeU) = 0) and (Pos(' POINTER', TypeU) = 0) then FNonPtrNames.Add(NameU);
+  end;
+
+begin
+  if Node = nil then Exit;
+  case Node.NodeType of
+    antArrayDecl:
+      if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+      begin
+        T := '';
+        if (Node.ChildCount >= 2) and (Node.GetChild(1).NodeType = antIdentifier) then T := Node.GetChild(1).ValueUpper;
+        Note(Node.GetChild(0).ValueUpper, T);
+      end;
+    antIdentifier:
+      if (Node.ChildCount >= 1) and (Node.GetChild(0) <> nil) and (Node.GetChild(0).NodeType = antIdentifier) then
+        Note(Node.ValueUpper, Node.GetChild(0).ValueUpper);
+    antForLoop:
+      if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+        Note(Node.GetChild(0).ValueUpper, '');
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    CollectNonPtrNames(Node.GetChild(i));
+end;
+
+function TSSAGenerator.PointerArgCertain(Node: TASTNode): Boolean;
+// Is this argument a pointer beyond any doubt? An address-of, a cast to a pointer type, a pointer field, a pointer name
+// no declaration spells otherwise, and a step of one of those. Anything else answers False (DIVERGENZE 483).
+var
+  T: string;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  case Node.NodeType of
+    antProcAddress: Result := True;
+    antCast:
+      begin
+        T := UpperFast(CanonicalType(Node.ValueUpper));
+        Result := (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR');
+      end;
+    antIdentifier:
+      Result := (Node.ChildCount = 0) and (FNonPtrNames.IndexOf(Node.ValueUpper) < 0) and
+                NameIsPointerHere(Node.ValueUpper) and not
+                ((FCurrentThisType <> '') and (UDTFieldIndex(FindUDT(FCurrentThisType), Node.ValueUpper) >= 0));
+    antMemberAccess:
+      Result := ExprIsPointerTyped(Node);
+    antBinaryOp:
+      if (Node.ChildCount >= 2) and Assigned(Node.Token) then
+      begin
+        if Node.Token.TokenType = ttOpAdd then
+          Result := PointerArgCertain(Node.GetChild(0)) or PointerArgCertain(Node.GetChild(1))
+        else if Node.Token.TokenType = ttOpSub then
+          // "p - q" of two pointers is a COUNT: the right side is a pointer if EITHER predicate says so ("q - @x").
+          Result := PointerArgCertain(Node.GetChild(0)) and not
+                    (ExprIsPointerTyped(Node.GetChild(1)) or PointerArgCertain(Node.GetChild(1)) or
+                     (Node.GetChild(1).NodeType = antIdentifier) and (FPointerVars.IndexOfName(Node.GetChild(1).ValueUpper) >= 0));
+      end;
+  end;
+end;
+
+procedure TSSAGenerator.RefusePointerArg(const FuncName: string; ArgListNode: TASTNode; const Why: string);
+// DIVERGENZE 483: a POINTER is not an argument of a conversion to anything narrower than a pointer, nor of a math function.
+// Measured against fbc one function at a time: CLng, CULng, CShort, CUShort, CByte, CUByte, CDbl, CSng and CBool answer
+// "error 20: Type mismatch", Int, Fix, Abs, Sgn, Sqr, Sin, Cos, Tan, Atn, Exp, Log and Frac "error 24: Invalid data
+// types"; CInt, CUInt, CLngInt, CULngInt, CSign, CUnsg, Hex, Oct, Bin and Str take one. All were accepted here.
+var
+  A: TASTNode;
+begin
+  if not FModernMode then Exit;
+  A := ArgListNode;
+  if (A <> nil) and (A.NodeType in [antArgumentList, antExpressionList]) then   // CBool parses as an array access
+  begin
+    if A.ChildCount < 1 then Exit;
+    A := A.GetChild(0);
+  end;
+  if (A <> nil) and PointerArgCertain(A) then
+    raise Exception.CreateFmt('%s, a pointer is not an argument of %s: convert it with Cast(Integer, p) first',
+                              [Why, FuncName]);
+end;
+
 function TSSAGenerator.ExprIsPointerTyped(Node: TASTNode): Boolean;
 // Is this expression's TYPE a pointer - a pointer variable, a CAST to a pointer type, or a CALL that
 // returns one (a foreign function included, through CalleeRetTypeName)? Wider than ExprIsPointerValue,
@@ -57748,6 +58034,7 @@ begin
   FRawPtrRetFuncs.Clear;
   FBlockManagedTypes.Clear;
   FMemberOwnerTypes.Clear;
+  FNonPtrNames.Clear;
   FConstDeclSeen.Clear;
   FConstStrBytes.Clear;
   FArrayElemWidth.Clear;
@@ -57759,6 +58046,7 @@ begin
   // bail AnyFixedLen keeps costing one integer test for every program that has none.
   FHasNulStrLiteral := False;
   PreMarkStart; ScanForNulStrLiteral(AST); PreMarkEnd('ScanForNulStrLiteral');
+  PreMarkStart; CollectNonPtrNames(AST); PreMarkEnd('CollectNonPtrNames');
   PreMarkStart; CollectBlockManagedTypes(AST); PreMarkEnd('CollectBlockManagedTypes');   // before the raw-pointer fixpoint: it asks whether New T[n] is managed
   PreMarkStart; CollectAddressTakenVars(AST); PreMarkEnd('CollectAddressTakenVars');
   NoteDeclaredProcNames(AST);
@@ -58029,6 +58317,8 @@ begin
   for LastArr := 0 to FProgram.GetArrayCount - 1 do
     if FMultiDimArrays.IndexOf(ArrayBareName(UpperFast(FProgram.GetArray(LastArr).Name))) >= 0 then
       FProgram.SetArrayMultiDim(LastArr);
+
+  HoistNativeLocalRecords;
 
   // ...and LAST of all, because it is a question about the FINISHED code: the storage of a folded
   // CONST that no instruction ever reads.

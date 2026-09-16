@@ -4700,6 +4700,14 @@ begin
      not (Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpDot)) then
     Context.CurrentToken.TokenType := ttKeyword;
 
+  // ⭐ ...and the OWNER of a member definition may be any type the program declared, keyword or not (DIVERGENZE 484):
+  // "Type Out" is legal in fbc, so "Constructor Out()" and "Sub Out.show()" are too. Only a name FTypeNamesSeen holds.
+  if FModernMode and (not Context.Check(ttIdentifier)) and (Context.CurrentToken <> nil) and
+     (FTypeNamesSeen.IndexOf(UpperFast(VarToStr(Context.CurrentToken.Value))) >= 0) and
+     ((Kind = kCONSTRUCTOR) or (Kind = kDESTRUCTOR) or
+      (Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpDot))) then
+    Context.CurrentToken.TokenType := ttIdentifier;
+
   if not Context.Check(ttIdentifier) then
   begin
     HandleError(Format('Expected a name after %s, but found the reserved word "%s"',

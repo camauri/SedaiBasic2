@@ -1121,7 +1121,7 @@ library for the whole program, which is the way to check whether a difference is
 | Function | Status | Description |
 |----------|--------|-------------|
 | `CINT` | ✓ | Convert to Integer, rounding to nearest (banker's rounding) |
-| `CLNG` | ✓ | Convert to Long, rounding to nearest. ⚠️ **Known difference**: `CLng(<pointer>)` is accepted, while FreeBASIC refuses it (`Type mismatch`); write `Cast(Integer, p)`, which both accept. |
+| `CLNG` | ✓ | Convert to Long, rounding to nearest. As in FreeBASIC, a POINTER is refused here and by every conversion narrower than a pointer (`CULng`, `CShort`, `CUShort`, `CByte`, `CUByte`), by `CDbl`, `CSng`, `CBool` and by the math functions (`Int`, `Fix`, `Abs`, `Sgn`, `Sqr`, `Sin`, …); `CInt`, `CUInt`, `CLngInt`, `CULngInt`, `CSign`, `CUnsg` and `Cast(Integer, p)` take one (16 Sep 2026). |
 | `CLNGINT` | ✓ | Convert to LongInt (64-bit), rounding to nearest |
 | `CSHORT` | ✓ | Convert to Short, rounding to nearest |
 | `CBYTE` | ✓ | Convert to Byte, rounding to nearest |
@@ -2848,7 +2848,7 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 | `INP` | ◐ | Name recognised, **behaviour not implemented**: always answers `-8` (*no port access*), never reads a port. |
 | `LPRINT` | ✓ | Line-printer output — no printer, so routed to stdout (reuses the PRINT machinery). |
 | `LPOS` | ✓ | Printer head column — always 1 (no printer). |
-| `OUT` | ◐ | Name recognised, **behaviour not implemented**: evaluates its operands and writes nothing. ⚠️ **Known difference**: a TYPE named `Out` is refused (`Constructor Out()` reads the name as the keyword); FreeBASIC accepts it. |
+| `OUT` | ◐ | Name recognised, **behaviour not implemented**: evaluates its operands and writes nothing. A TYPE may still be named `Out`, and its members defined as `Constructor Out()` / `Sub Out.m()`, as in FreeBASIC (16 Sep 2026). |
 | `WAIT` | ◐ | Name recognised, **behaviour not implemented**: returns at once. Built on `INP`, so it cannot do more than `INP` does. |
 
 ##### Operating System
@@ -2908,14 +2908,14 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 | `OPTION STATIC` | ⚠️ | Refused in the FreeBASIC dialect, exactly as `OPTION DYNAMIC` above. |
 | `'$STATIC` | ✓ | Advisory metacommand, accepted and ignored. |
 | `DIM` | ✓ | Defines any type of array. Supports `lo TO hi` bounds (incl. negative), positional initializers `= { ... }` / `=> { ... }`, an empty variable-length array `DIM x()` (`UBOUND = -1` until `REDIM`), and an ellipsis upper bound `DIM x(lb TO ...) = { ... }` / `DIM x(...) = { ... }` sized from the initializer. |
-| `REDIM` | ✓ | ⚠️ **Known difference** for an array of objects with a constructor or destructor: the elements a `REDIM PRESERVE` adds are not constructed (they read 0), and a `REDIM` without `PRESERVE` neither destroys the old elements nor constructs the new ones — FreeBASIC does both. Resizes an array: `REDIM [PRESERVE] arr(ub [, ub ...])` (B1.4) — single or multi-dimensional; each existing dimension's lower bound is kept. If the array was not DIM'd first, REDIM declares it as a fresh dynamic array (honouring the element type and any `lb TO ub` bounds). A multi-dim REDIM'd array computes its element strides at runtime. |
+| `REDIM` | ✓ | On an array of objects it runs constructors and destructors as FreeBASIC does: without `PRESERVE` the old elements are destroyed (last to first) and the new ones constructed; with `PRESERVE` only the elements the array gains are constructed (16 Sep 2026). ⚠️ **Known difference**: a `PRESERVE` that shrinks the array does not destroy the elements it drops. Resizes an array: `REDIM [PRESERVE] arr(ub [, ub ...])` (B1.4) — single or multi-dimensional; each existing dimension's lower bound is kept. If the array was not DIM'd first, REDIM declares it as a fresh dynamic array (honouring the element type and any `lb TO ub` bounds). A multi-dim REDIM'd array computes its element strides at runtime. |
 | `PRESERVE` | ✓ | Preserves the overlapping array contents when used with `REDIM` (B1.4). |
 
 #### Clearing Array Data
 
 | Keyword | Status | Description |
 |---|---|---|
-| `ERASE` | ✓ | ⚠️ On an array of objects it destroys the elements in reverse order, as FreeBASIC does, but it destroys the elements the array holds after a `REDIM` of such an array only as far as `REDIM` kept them (see `REDIM`). `ERASE arr [, arr ...]` resets every element to its default (0 / 0.0 / "") keeping the current size (B1.4). Also erases a UDT **array member**, written out (`Erase obj.arr`) or with the leading dot inside a `WITH` block (`Erase .arr`). |
+| `ERASE` | ✓ | On an array of objects it destroys the elements in reverse order, as FreeBASIC does. `ERASE arr [, arr ...]` resets every element to its default (0 / 0.0 / "") keeping the current size (B1.4). Also erases a UDT **array member**, written out (`Erase obj.arr`) or with the leading dot inside a `WITH` block (`Erase .arr`). |
 
 #### Retrieving Array Size
 
