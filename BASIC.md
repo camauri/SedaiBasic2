@@ -2174,7 +2174,7 @@ in a record, or in the numeric builtins. Keep one in a plain `Dim` until those c
 
 | Keyword | Status | Description |
 |---|---|---|
-| `BOOLEAN` | ✓ | Holds -1 (true) or 0 (false) in the VM; a `BOOLEAN` variable **prints as `true`/`false`** (B1.5). A `Boolean` field of a record is **one byte**, and in the default (fb) memory mode it holds C's `0`/`1` exactly as `fbc` lays it out — so is the byte written or read through a `Boolean Ptr` or a `ByRef` Boolean parameter (any nonzero byte reads as true). ⚠️ **Divergence (open):** an **array** of `Boolean` is still eight bytes per element, and its elements print as `-1`/`0` instead of `true`/`false`. |
+| `BOOLEAN` | ✓ | Holds -1 (true) or 0 (false) in the VM; a `BOOLEAN` variable **prints as `true`/`false`** (B1.5). A `Boolean` field of a record is **one byte**, and in the default (fb) memory mode it holds C's `0`/`1` exactly as `fbc` lays it out — so is the byte written or read through a `Boolean Ptr` or a `ByRef` Boolean parameter (any nonzero byte reads as true). An **array** of `Boolean` (standalone or a member of a record) is one byte per element with the same 0/1 image, and its elements print as `true`/`false`. ⚠️ In the `strict` memory mode a record keeps the VM's own image, where a true Boolean field or member element is the byte 255. |
 
 ##### Procedure Types
 

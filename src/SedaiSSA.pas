@@ -543,6 +543,7 @@ type
     FRecNativeHoist: Boolean;            // phase 3.7: a native local record's cell is allocated at the frame's entry
     FRecNativeProcFields: Boolean;       // phase 3.7: a type with PROCEDURE fields can be native
     FRecNativeBool: Boolean;             // phase 3 (exclusions): a type with BOOLEAN fields can be native
+    FBoolArrays: Boolean;                // DIVERGENZE 493: a Boolean array is packed at one byte holding C's 0/1
     FNativeRecAsking: TStringList;       // phase 3.2: the types NativeRecordType is answering right now (a list's own pointer)
     // Phase 2.1a: the program's entry block, and where in it a raw module cell's allocation is hoisted (HoistToEntry) -
     // after the SHARED backings are sized and BEFORE static members, hoisted STATIC initialisers and module constructors.
@@ -1258,6 +1259,8 @@ type
     function NarrowRefArg(const Pointee: string): TSSAValue;
     function FloatRefArg(const Pointee: string): TSSAValue;   // phase 2.6: a Single pointee's width
     function EmitIsNativeAddr(const P: TSSAValue): TSSAValue;
+    function IsBoolArrayName(const ArrName: string): Boolean;
+    function BoolToCByte(const V: TSSAValue): TSSAValue;
     procedure NoteArrayElemStorage(ArrayIdx: Integer; ET: TSSARegisterType;
                                    const ArrElemTypeName: string);  // packed storage, guard m884
     function TypeNameIdentCode(const TypeName: string): Integer;   // ...its overload-IDENTITY twin (DIVERGENZE 8)
@@ -1927,6 +1930,7 @@ begin
   FRecNativeHoist := GetEnvironmentVariable('SB_RECNATIVE_HOIST') <> '0';         // phase 3.7: on by default; =0 is the A/B
   FRecNativeProcFields := GetEnvironmentVariable('SB_RECNATIVE_PROCFIELDS') <> '0'; // phase 3.7: same
   FRecNativeBool := GetEnvironmentVariable('SB_RECNATIVE_BOOL') <> '0';                 // phase 3 exclusions: same
+  FBoolArrays := GetEnvironmentVariable('SB_BOOL_ARRAYS') <> '0';                        // DIVERGENZE 493: =0 is the A/B
   FProgram := nil;
   FCurrentBlock := nil;
   FLabelCounter := 0;
@@ -2747,6 +2751,9 @@ var
 begin
   T := UpperFast(Trim(ElemType));
   if (Length(T) >= 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then Exit(0);
+  // DIVERGENZE 493: a Boolean element is one byte - a SIGNED one on the managed wire, so the VM's -1/0 comes back as it
+  // went (a native record reads and writes it on the raw path, RTC_BOOL, as C's 0/1).
+  if (CanonicalType(T) = 'BOOLEAN') and FBoolArrays then Exit(1);
   Result := RecPtrWireWidth(T);
 end;
 
@@ -9141,6 +9148,16 @@ begin
             Result := MakeSSAConstInt(TypeSizeBytes(TempStr));   // a CONSTANT, not a loaded register
             Exit;
           end;
+          // ⭐ An ELEMENT of a declared array is sized by the array's own registry - the answer "SizeOf(a)" already gives.
+          // OperandWidthCode only knows the six integer widths, so a Boolean element (one byte) answered 8 (DIVERGENZE 493).
+          if (Node.GetChild(1).GetChild(0).NodeType = antArrayAccess) and
+             (Node.GetChild(1).GetChild(0).ChildCount >= 1) and
+             (Node.GetChild(1).GetChild(0).GetChild(0).NodeType = antIdentifier) and
+             IsBoolArrayName(Node.GetChild(1).GetChild(0).GetChild(0).ValueUpper) then
+          begin
+            Result := MakeSSAConstInt(1);
+            Exit;
+          end;
           FieldSzConst := BinaryElemBytesOfWidthCode(OperandWidthCode(Node.GetChild(1).GetChild(0)));
           if OperandWidthCode(Node.GetChild(1).GetChild(0)) = 0 then
           case InferExprBank(Node.GetChild(1).GetChild(0)) of
@@ -10431,6 +10448,13 @@ begin
         // Emit ssaArrayLoad instruction with pre-computed linear index
         // Dest, ArrayRef, LinearIndex, None
         EmitInstruction(ssaArrayLoad, Result, ArrayRef, LinearIndex, MakeSSAValue(svkNone));
+        // DIVERGENZE 493: a Boolean element holds C's 0/1; the VM's true is -1.
+        if (ArrInfo.ElementType = srtInt) and IsBoolArrayName(ArrName) then
+        begin
+          TempVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaCmpNeInt, TempVal, Result, EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
+          Result := TempVal;
+        end;
     end;
 
     {$IFDEF WEB_MODE}
@@ -13559,6 +13583,7 @@ begin
   j := FArrayElemWidth.IndexOf(ArrayFactKey(ArrName));
   if j >= 0 then
     ExprValue := ApplyNarrowCode(PtrInt(FArrayElemWidth.Objects[j]), ExprValue);
+  if IsBoolArrayName(ArrName) then ExprValue := BoolToCByte(ExprValue);   // DIVERGENZE 493: C's 0/1 in the byte
 
   // ⛔ ...AND A FIXED-LENGTH STRING ELEMENT TRUNCATES, which is the same rule the SCALAR spelling has
   // carried all along and this one never had: "Dim a(0 To 1) As ZString * 3 : a(0) = "abcde"" kept all
@@ -15242,6 +15267,8 @@ begin
               srtFloat:  InitElemReg := ApplyNarrowCode(TypeNameWidthCode(ArrElemTypeName),
                                                         EnsureFloatRegister(InitElemVal));
               srtString: InitElemReg := EnsureStringRegister(InitElemVal);
+            else if FBoolArrays and (TypeNameWidthCode(ArrElemTypeName) = 11) then
+              InitElemReg := BoolToCByte(InitElemVal)                  // DIVERGENZE 493
             else         InitElemReg := EnsureIntRegister(InitElemVal);
             end;
           end;
@@ -31255,7 +31282,8 @@ begin
         // ⛔ ...AND CODE 8, the 64-bit unsigned pair (UINTEGER/ULONGINT), which this list did not have.
         // It is print kind 2, not 3 - a full-width unsigned needs the wider form - and PrintKindOfType
         // has answered 2 for those two names all along: only the DERIVED path was missing them.
-        else if AwCode = 8 then Result := 2;
+        else if AwCode = 8 then Result := 2
+        else if AwCode = 11 then Result := 1;   // a Boolean pointee prints true/false (DIVERGENZE 493)
       end;
     end;
     antGraphicsFunction:
@@ -31289,7 +31317,8 @@ begin
         begin
           AwCode := TypeNameWidthCode(Trim(Copy(Txt, 1, Length(Txt) - 4)));
           if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
-          else if AwCode = 8 then Result := 2;
+          else if AwCode = 8 then Result := 2
+          else if AwCode = 11 then Result := 1;   // a Boolean pointee prints true/false (DIVERGENZE 493)
         end;
       end
       // ⭐ ...AND THE SAME READ WITH ARITHMETIC IN FRONT OF IT: "(Cast(UByte Ptr, x) + 9)[i]" is the
@@ -31300,7 +31329,8 @@ begin
       begin
         AwCode := TypeNameWidthCode(UpperFast(CanonicalType(PtrExprPointeeTypeName(Node.GetChild(0)))));
         if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
-        else if AwCode = 8 then Result := 2;
+        else if AwCode = 8 then Result := 2
+        else if AwCode = 11 then Result := 1;   // a Boolean pointee prints true/false (DIVERGENZE 493)
       end
       // ⭐ ...AND THE POINTER A C FUNCTION RETURNS, indexed in place: "gdk_pixbuf_get_pixels(pb)[k]" is a
       // guchar, and printed " 224" where fbc prints "224" - the value was right, the column was not. The
@@ -31311,7 +31341,8 @@ begin
       begin
         AwCode := TypeNameWidthCode(UpperFast(CanonicalType(DerefedType(Node.GetChild(0)))));
         if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
-        else if AwCode = 8 then Result := 2;
+        else if AwCode = 8 then Result := 2
+        else if AwCode = 11 then Result := 1;   // a Boolean pointee prints true/false (DIVERGENZE 493)
       end
       // ⭐ "obj.p[i]" and "obj.m(i)[j]": the base is a raw "<scalar> PTR" - a FIELD, or an ELEMENT of an
       // array member - so what prints is the POINTEE, and its type decides the sign space. The arms above
@@ -31335,7 +31366,8 @@ begin
         // (UByte/UShort/ULong member array -> no sign space). ObjectTypeName is the no-emit type query.
         MNode := Node.GetChild(0);
         AwCode := UDTFieldArrayElemWidthCode(FindUDT(ObjectTypeName(MNode.GetChild(0))), VarToStr(MNode.Value));
-        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
+        if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
+        else if (AwCode = 11) and FModernMode then Result := 1;   // DIVERGENZE 493
       end
       else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
       begin
@@ -31373,7 +31405,8 @@ begin
           if AwIdx >= 0 then
           begin
             AwCode := PtrInt(FArrayElemWidth.Objects[AwIdx]);
-            if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
+            if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
+            else if (AwCode = 11) and FModernMode then Result := 1;   // DIVERGENZE 493: a Boolean element prints true/false
           end;
         end;
         // "p[i]" through a POINTER to a narrow UNSIGNED type prints unsigned too: the pointee's type is
@@ -31382,7 +31415,8 @@ begin
         if (Result = 0) and FModernMode then
         begin
           AwCode := TypeNameWidthCode(UpperFast(PointeeTypeOf(VarToStr(Node.GetChild(0).Value))));
-          if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3;
+          if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
+          else if AwCode = 11 then Result := 1;   // "p[i]" through a Boolean Ptr prints true/false (DIVERGENZE 493)
           // "p[i]" through a ZSTRING/WSTRING pointer is a CHARACTER CODE - an unsigned byte - so it
           // prints with no leading sign space, like every other unsigned value.
           if (Result = 0) and (UpperFast(PointeeTypeOf(VarToStr(Node.GetChild(0).Value))) = 'ZSTRING') then
@@ -31429,7 +31463,8 @@ begin
         // narrow unsigned widths were recognised here, so "rec.u = 1e19" printed the right bits as a
         // NEGATIVE number - the conversion was already correct by then, which is what made it look
         // like a conversion bug rather than a print one.
-        else if AwCode = 8 then Result := 2;
+        else if AwCode = 8 then Result := 2
+        else if AwCode = 11 then Result := 1;   // a Boolean pointee prints true/false (DIVERGENZE 493)
       end;
     antParentheses:
       if Node.ChildCount >= 1 then Result := PrintKindOfExpr(Node.GetChild(0));
@@ -33983,7 +34018,7 @@ begin
      (FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemPtrPointee <> '') then Exit;
   if FWholeArrayFields.IndexOf(FUDTs[UDTIdx].Fields[FieldIdx].Name) >= 0 then Exit;
   T := UpperFast(Trim(FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemScalarType));
-  if (T = '') or (T = 'BOOLEAN') or (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') then Exit;
+  if (T = '') or ((T = 'BOOLEAN') and not FBoolArrays) or (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') then Exit;
   if InlineArrayElemWidthCode(T) < 0 then Exit;
   if not FixedArrayMemberCShape(UDTIdx, FieldIdx, Size, Align) then
   begin
@@ -55988,9 +56023,38 @@ begin
     4: FProgram.SetArrayElemWidth(ArrayIdx, 2, False);
     5: FProgram.SetArrayElemWidth(ArrayIdx, 4, True);
     6: FProgram.SetArrayElemWidth(ArrayIdx, 4, False);
+    // ⭐ DIVERGENZE 493: a BOOLEAN element is one byte holding C's 0/1, as fbc lays it out. Stores write (v <> 0) And 1 and
+    // loads compare with zero (BoolArrayNormalise), so the VM still sees -1/0; a byte view and C see fbc's image.
+    11: if FBoolArrays then FProgram.SetArrayElemWidth(ArrayIdx, 1, False)
+        else FProgram.SetArrayElemWidth(ArrayIdx, 0, False);
   else
     FProgram.SetArrayElemWidth(ArrayIdx, 0, False);
   end;
+end;
+
+function TSSAGenerator.IsBoolArrayName(const ArrName: string): Boolean;
+// Is this array (by the key the width registry uses) a packed Boolean array (DIVERGENZE 493)?
+var
+  j: Integer;
+begin
+  Result := False;
+  if not FBoolArrays then Exit;
+  j := FArrayElemWidth.IndexOf(ArrayFactKey(ArrName));
+  Result := (j >= 0) and (PtrInt(FArrayElemWidth.Objects[j]) = 11);
+end;
+
+function TSSAGenerator.BoolToCByte(const V: TSSAValue): TSSAValue;
+// The VM's Boolean (any nonzero is true) as C's byte: 1 or 0.
+var
+  T: TSSAValue;
+begin
+  T := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  if IsFloatOperand(V) then
+    EmitInstruction(ssaCmpNeFloat, T, EnsureFloatRegister(V), EnsureFloatRegister(MakeSSAConstFloat(0.0)), MakeSSAValue(svkNone))
+  else
+    EmitInstruction(ssaCmpNeInt, T, EnsureIntRegister(V), EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, Result, T, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
 end;
 
 function TSSAGenerator.DeclareArrayScoped(const AName: string; ET: TSSARegisterType;
