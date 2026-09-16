@@ -9567,6 +9567,12 @@ begin
             if (RecFieldIdx >= 0) and (FUDTs[RecUDTIdx].Fields[RecFieldIdx].BitWidth > 0) then
               raise Exception.CreateFmt('Invalid data types: OFFSETOF of the bit field "%s" in "%s" ' +
                                         '- a bit field has no address', [ArrName2, FUDTs[RecUDTIdx].Name]);
+            // ⛔ DIVERGENZE 502: ...and the bare member name is refused, as the note above says fbc refuses it. We answered the
+            // member's offset.
+            if (RecFieldIdx >= 0) and FUDTs[RecUDTIdx].Fields[RecFieldIdx].IsArray and (RecIdxNode = nil) and FModernMode then
+              raise Exception.CreateFmt('Array access, index expected: OFFSETOF of the array member "%s" in "%s" ' +
+                                        'needs an element - write %s(<index>)', [LowerCase(ArrName2), FUDTs[RecUDTIdx].Name,
+                                        LowerCase(ArrName2)]);
             if RecFieldIdx >= 0 then
             begin
               // ⛔ NOT every member of a union begins at byte 0: the members of an ANONYMOUS "Type ... End
