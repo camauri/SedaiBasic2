@@ -516,11 +516,14 @@ raw bytes.
   — `FILE*`, `printf`/`snprintf`, the string and formatting entry points — stays unsupported: this VM
   owns its own memory and its own file handles, and handing a BASIC program a real `FILE*` is the one
   thing the memory-safety design exists to prevent.
-- ⚠️ **`Load` is a reserved word here and not in fbc**, so `Sub Load()` is refused. Every other
-  Commodore word in that position was checked: `run`, `new`, `delete`, `poke`, `wait`, `close`,
-  `open`, `get`, `put`, `print` and `input` are refused by fbc too (in its own words, "Duplicated
-  definition"), and `list`, `save`, `verify`, `sys`, `cont` and `clr` are accepted by both. `Load` is
-  the only one that is ours alone.
+- **A keyword as a procedure name follows FreeBASIC** (measured word by word, 16 September 2026). At module
+  level `run`, `new`, `delete`, `poke`, `wait`, `close`, `open`, `get`, `put`, `print` and `input` are
+  refused, as in FreeBASIC, while `list`, `load`, `save`, `verify`, `sys`, `cont` and `clr` are accepted.
+  **Inside a `Namespace`** a procedure may take almost any statement keyword — `Sub run()`,
+  `Sub print()`, `Function open()` — and is called through the namespace (`n.run()`); what stays
+  refused there is what FreeBASIC refuses: declaration and control words, type names, operators, and
+  `Abs`, `Int`, `Fix`, `Sgn`, `Peek`, `Poke`. `Cast`, `TypeOf`, `Abstract` and `Virtual` never name a
+  procedure.
 - ⚠️ **`LSet` / `RSet` on a string-convertible UDT is accepted in one case fbc rejects.** fbc requires
   both an `Extends ZString`/`WString` chain *and* an `Operator Cast() ByRef As Z/WString` declared on
   the type itself; we require the chain and a cast that merely *resolves*, which an ancestor may

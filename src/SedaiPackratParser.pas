@@ -1265,6 +1265,27 @@ begin
   Result := (Nm = 'LET') or (Nm = '[]') or (Nm[Length(Nm)] = '=');
 end;
 
+function NsProcNameAllowed(const W: string): Boolean;
+// May this keyword spelling name a procedure inside a namespace? fbc's answer, measured word by word (DIVERGENZE 473).
+const
+  Refused = ' NEW DELETE END SUB FUNCTION DIM SWAP IF THEN ELSE ELSEIF FOR NEXT TO STEP DO LOOP WHILE WEND UNTIL ' +
+            'SELECT CASE EXIT CONTINUE RETURN GOTO TYPE UNION ENUM NAMESPACE USING DECLARE CONST STATIC SHARED ' +
+            'COMMON EXTERN AS BYVAL BYREF PTR POINTER AND OR NOT XOR MOD SHL SHR ANDALSO ORELSE IS LET OPERATOR ' +
+            'PROPERTY CONSTRUCTOR DESTRUCTOR BASE VAR CAST TYPEOF INTEGER LONG SINGLE DOUBLE STRING BYTE SHORT ' +
+            'UBYTE UINTEGER ULONG USHORT LONGINT ULONGINT ZSTRING WSTRING ANY BOOLEAN SCOPE WITH PRIVATE PUBLIC ' +
+            'PROTECTED ABSTRACT VIRTUAL CDECL STDCALL PASCAL ALIAS LIB EXPORT OVERLOAD ABS INT FIX SGN PROCPTR ' +
+            'PEEK POKE IMP EQV ';
+var
+  k: Integer;
+begin
+  Result := False;
+  if W = '' then Exit;
+  for k := 1 to Length(W) do
+    if not (W[k] in ['A'..'Z', '_', '0'..'9']) then Exit;
+  if not (W[1] in ['A'..'Z', '_']) then Exit;
+  Result := Pos(' ' + W + ' ', Refused) = 0;
+end;
+
 procedure TPackratParser.RegisterOverloadLabel(DeclNode, NameNode, ParamList: TASTNode; IsMethod: Boolean);
 // See the call site in ParseProcedureDecl. Only DEFINITIONS reach here -- a DECLARE (module level or in a
 // TYPE body) is skipped without producing a node -- so a repeated label really is an overload set, never a
@@ -2150,7 +2171,7 @@ begin
      // The flag STAYS open afterwards, so "Any Ptr Ptr" keeps both.
      else if FgnTypeOpen and (FgnTok = kPTR) then
      begin
-       if (FgnDepth = 1) and (not FgnFnPtrRet) and (FgnParams <> '') then FgnParams := FgnParams + ' PTR'
+       if (FgnDepth = 1) and (not FgnFnPtrRet) and (FgnRet = '') and (FgnParams <> '') then FgnParams := FgnParams + ' PTR'
        else if (FgnDepth = 0) and (FgnRet <> '') then FgnRet := FgnRet + ' PTR';
        // ...and the entry the declared-type check will read says so too: a pointer to an incomplete
        // type is a perfectly good pointer.
@@ -2181,7 +2202,8 @@ begin
        // MECCANISMO. ⭐ E il tipo giusto e' "ANY PTR": un puntatore a procedura si marshalla come un
        // indirizzo, non come la parola "FUNCTION" (che ForeignKindOf non conosce e che avrebbe fatto
        // rifiutare la dichiarazione per intero).
-       if FgnDepth = 1 then
+       // ⛔ ...and never once the RETURN is recorded: what follows it is the return's own signature (DIVERGENZE 474).
+       if (FgnDepth = 1) and (FgnRet = '') then
        begin
          if FgnParams <> '' then FgnParams := FgnParams + ',';
          // ⭐ "PROC ANY PTR", not plain "ANY PTR" (DIVERGENZE 420): still a pointer to everything that marshals it
@@ -2193,7 +2215,11 @@ begin
        end
        else if FgnDepth = 0 then
        begin
-         if FgnRet = '' then FgnRet := FgnTok;
+         // ⭐ A RETURN that is a procedure pointer is an address too (DIVERGENZE 474): "Declare Function
+         // gsl_set_error_handler(...) As Sub(...)" recorded the word SUB, which has no C type, and the whole
+         // declaration was refused. The callback's own parameter list that follows is swallowed, as for a
+         // parameter.
+         if FgnRet = '' then FgnRet := 'PROC ANY PTR';
        end;
        FgnAfterAs := False;
        FgnTypeOpen := True;
@@ -2213,7 +2239,7 @@ begin
      begin
        // ⛔ SOLO AL PRIMO LIVELLO: dentro "as function(...)" ci sono i parametri del CALLBACK, non
        // quelli di questa procedura (vedi la nota sul ramo ttProcedureStart).
-       if (FgnDepth = 1) and (not FgnFnPtrRet) then
+       if (FgnDepth = 1) and (not FgnFnPtrRet) and (FgnRet = '') then
        begin
          if FgnParams <> '' then FgnParams := FgnParams + ',';
          FgnParams := FgnParams + FgnTok;
@@ -4659,6 +4685,20 @@ begin
   if FModernMode and (not Context.Check(ttIdentifier)) and
      IsShadowableExtensionName(UpperFast(Context.CurrentToken.Value)) then
     Context.CurrentToken.TokenType := ttIdentifier;
+  // ⭐ ...AND INSIDE A NAMESPACE fbc LETS A PROCEDURE TAKE ALMOST ANY STATEMENT KEYWORD (DIVERGENZE 473): "Sub run()",
+  // "Sub print()", "Sub open()" compile there and are called "n.run()". Measured one word at a time against the oracle
+  // (130 words): what it still refuses is the declaration and control words, the types, the operators and six
+  // functions it treats as operators - that list is NsProcNameRefused, and everything else a keyword token spells is a
+  // name here. At module level the old rule stands (fbc refuses "Sub run()" there too).
+  if FModernMode and (FNsPrefix <> '') and (not Context.Check(ttIdentifier)) and
+     NsProcNameAllowed(UpperFast(VarToStr(Context.CurrentToken.Value))) then
+    Context.CurrentToken.TokenType := ttIdentifier;
+  // ⛔ ...and four words our lexer hands over as plain identifiers although fbc reserves them, at module level and in a
+  // namespace alike (measured with DIVERGENZE 473): they were accepted as procedure names.
+  if FModernMode and Context.Check(ttIdentifier) and
+     (Pos(' ' + UpperFast(VarToStr(Context.CurrentToken.Value)) + ' ', ' CAST TYPEOF ABSTRACT VIRTUAL ') > 0) and
+     not (Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttOpDot)) then
+    Context.CurrentToken.TokenType := ttKeyword;
 
   if not Context.Check(ttIdentifier) then
   begin
