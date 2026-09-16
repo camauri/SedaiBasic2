@@ -399,6 +399,16 @@ type
     FRetiredArrDesc: array of TInt64Array;
     FArrDescLock: TRTLCriticalSection;
     FArraysDirty: Boolean;
+    // ⭐ Phase 3.2: the [lo, hi] span of every array buffer VMPointerForMachineAddr can bring an address home to, and the
+    // raw heap's reserved range [RawLo, RawHi). A pointer read out of native memory outside both needs no walk over the
+    // arrays (9% of binary-trees) and, in compiled code, no call at all. FHomeValid is cleared wherever FArraysDirty is
+    // set and wherever the raw heap is (re)placed; RebuildHomeSpan sets it last. Int64 each: the AOT reads them.
+    FHomeValid, FHomeLo, FHomeHi, FRawLo, FRawHi: Int64;
+    // ...and the EXACT candidate buffers, [lo, hi] with hi one past the end: the span is a filter for compiled code, but
+    // with a worker's libc arena mapped between two array buffers almost every address falls inside it (binary-trees
+    // under --aot: VMPointerForMachineAddr 44% of the run).
+    FHomeIv: array of Int64;   // pairs
+    FHomeIvN: Integer;
     { ⭐⭐ WHICH SLOTS the outstanding change touched, so the rebuild can be proportional to it
       instead of to the length of the table.
       📊 3 Sep 2026, job/tests/bench/arraybind_many.bas, 2 M calls to a Sub with an array parameter:
@@ -726,6 +736,10 @@ type
     procedure NoteDescSlot(Slot: Integer);
     procedure NoteDescNoChange;
     procedure MarkArraysDirtyAll(Src: Integer);
+    procedure RebuildHomeSpan;   // phase 3.2: the span VMPointerForMachineAddr can answer in
+    function PtrLoadHome(V: Int64): Int64;     // phase 3.2: RTC_PTR64 read, one copy
+    function HomeMayContain(A: PtrUInt): Boolean;   // phase 3.2: the exact candidate test
+    function PtrStoreValue(V: Int64): Int64;   // phase 3.2: RTC_PTR64 write, one copy
     procedure BuildJitLoops;
     // JIT (J3): refresh the array descriptor table from FArrays (base pointers + counts).
     procedure SetAotPrimitives(var C: TAotCtx);
@@ -903,6 +917,13 @@ type
     function NativeRealloc(P: Int64; ByteCount: PtrUInt): Int64;  // fb mode: realloc
     function ExecRawAlloc(Ctx: TExecutionContext; ByteCount, Imm: Int64): Int64;  // bcRawAlloc, shared by the arm and the AOT leaf
     procedure PushFrameCell(Ctx: TExecutionContext; Cell: Int64);   // phase 2.1b: a cell the running frame owns
+    function NativeRecCell(Ctx: TExecutionContext; ByteSize: Int64): Int64;         // phase 3.2: a native record local
+    function ManagedMemberAddr(Ctx: TExecutionContext; H, Ofs: Int64): Int64;       // phase 3.2: a member's machine address
+    function ExecRecordNew(Ctx: TExecutionContext; ByteSize, Imm: Int64): Int64;   // bcRecordNew, all engines
+    function ExecRecordNewBlock(N, Imm: Int64): Int64;                           // bcRecordNewBlock, both dispatchers
+    function ExecRecordReallocBlock(H, N, Imm: Int64): Int64;                    // bcRecordReallocBlock, both dispatchers
+    procedure ExecRecMarkPush(Ctx: TExecutionContext);                            // bcRecMarkPush, all engines
+    procedure ExecRecMarkPop(Ctx: TExecutionContext);                             // bcRecMarkPop, all engines
     procedure FreeFrameCells(Ctx: TExecutionContext; Mark: Integer); // phase 2.1b: release the frame's cells down to Mark
     function StrSAdd(const S: string): Int64;   // SADD(s) -> raw pointer to a NUL-terminated byte copy
     function FormatNumber(Value: Double; const Mask: string): string;  // FORMAT(num, mask) -> formatted string (numeric masks)
@@ -962,6 +983,7 @@ type
     procedure RecCacheAdopt(C: PRecCache);    // bind this thread's free-index cache to this VM
     procedure RecCacheFlush(C: PRecCache);    // give a batch of free indices back to the region
     procedure RecCacheRefill(C: PRecCache);   // restock a dry cache from the region
+    procedure RecordNewArrayNative(ArrayId: Integer; ByteSize: Int64);   // phase 3.2
     procedure RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);  // M3.1: fill UDT array
     procedure StampRecordRuns(ArrayId: Integer);  // which of its elements lie at CONSECUTIVE region indices (336)
     procedure DeepCopyArrayRecords(Ctx: TExecutionContext; DestArr, SrcArr: Int64; PackedCounts: Int64);  // value-copy array-of-UDT member
@@ -3280,6 +3302,11 @@ begin
     // never relocated, so an array opcode is transparent to the sliding view: only its register
     // operands matter here. Src1 is the array ID (an immediate), Src2 the index register.
     bcArrayLoadInt, bcArrayLBound, bcArrayUBound, bcArrayElemAddr, bcArrayLoadNarrow,
+    // ⭐ Phase 3.2: the ADDRESS accessors (bcRaw*/bcRef* and bcRefAddrField). Src1 is the pointer and, for a store, Src2
+    // the value, in the bank the opcode names; the memory they reach is never a register (verified against the arms of
+    // ExecuteArrayOp, the PtrDomain helpers included). Unaudited, every procedure reading a native record field lost its
+    // relocatable frame: binary-trees paid 2.4x.
+    bcRawLoadInt, bcRefLoadInt, bcRefAddrField,
     // ⭐ THE FUSED LOOP COUNTER writes its counter into Dest and nothing else in the bank.
     // Auditing this family is not a micro-narrowing: an UNAUDITED opcode disqualifies its whole
     // procedure from call-site liveness (see BuildCallSiteLiveness), and every superinstruction was
@@ -3307,6 +3334,7 @@ begin
     bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString, bcArrayStoreNarrow,
     bcArrayLoadSingle, bcArrayStoreSingle,   // phase 2.6: float value, int index
+    bcRawLoadFloat, bcRefLoadFloat, bcRawStoreInt, bcRawStoreFloat, bcRefStoreInt, bcRefStoreFloat,   // phase 3.2
     // Binding an array BYREF parameter moves entries between FArrays slots and a save stack of its
     // own. bcArrayBind/Unbind/BindApply name their arrays by immediate and touch no register at all;
     // bcArrayBindInd takes the member's runtime handle from Src2.
@@ -3388,8 +3416,11 @@ begin
     // Dest is a float register.
     bcLoadConstFloat, bcCopyFloat, bcNarrowSingle,
     bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcNegFloat,
-    bcIntToFloat, bcXferLoadFloat, bcRecordLoadFloat, bcArrayLoadFloat, bcArrayLoadSingle:
+    bcIntToFloat, bcXferLoadFloat, bcRecordLoadFloat, bcArrayLoadFloat, bcArrayLoadSingle,
+    bcRawLoadFloat, bcRefLoadFloat:   // phase 3.2
       Result := BW_DEST;
+    bcRawLoadInt, bcRefLoadInt, bcRefAddrField, bcRawStoreInt, bcRawStoreFloat, bcRefStoreInt, bcRefStoreFloat:
+      Result := BW_NONE;              // phase 3.2: see BcIntWriteShapeRaw
     // Integer-only work, plus the opcodes that READ a float and write elsewhere: a comparison
     // writes the integer bank, a transfer store writes the transfer bank, an array or record store
     // writes that array or record. None of them leaves a float register changed.
@@ -3465,6 +3496,8 @@ begin
     bcArrayLBound, bcArrayUBound, bcArrayBind, bcArrayUnbind, bcArrayBindApply,
     bcArrayBindInd, bcArrayErase, bcArrayElemAddr, bcArrayLoadNarrow, bcArrayStoreNarrow,
     bcArrayLoadSingle, bcArrayStoreSingle,   // phase 2.6
+    bcRawLoadInt, bcRawLoadFloat, bcRefLoadInt, bcRefLoadFloat, bcRefAddrField,   // phase 3.2
+    bcRawStoreInt, bcRawStoreFloat, bcRefStoreInt, bcRefStoreFloat,
     // The fused branch family again - and THIS is the bank where leaving it unaudited was expensive,
     // because every entry here is a refcounted assignment. See the note in BcFloatWriteShape.
     bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
@@ -3564,7 +3597,9 @@ begin
     bcBranchEqZeroInt, bcBranchNeZeroInt,
     // Thread primitives taking one HANDLE from the integer bank and writing nothing back to it.
     bcMutexLock, bcMutexUnlock, bcMutexDestroy,
-    bcCondSignal, bcCondBroadcast, bcCondDestroy:
+    bcCondSignal, bcCondBroadcast, bcCondDestroy,
+    // Phase 3.2: the pointer in Src1; a float store's value is in the float bank.
+    bcRawLoadInt, bcRawLoadFloat, bcRefLoadInt, bcRefLoadFloat, bcRefAddrField, bcRawStoreFloat, bcRefStoreFloat:
       Result := US_SRC1;
     // Src2 is the element index (or the member handle for BindInd); Src1 is an immediate array id.
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
@@ -3581,6 +3616,7 @@ begin
     bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcShl, bcShr,
     bcBitRotl, bcBitRotr,   // Src1 = value, Src2 = rotate count (the width is an immediate)
     bcRecordStoreInt,   // Src1 = handle, Src2 = the integer value being stored
+    bcRawStoreInt, bcRefStoreInt,   // phase 3.2: Src1 = the pointer, Src2 = the integer value
     // The fused compare-and-branch reads the two operands the CmpInt used to read.
     bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
     // Unsigned reads the same two INT registers; only the comparison differs.
@@ -4896,6 +4932,41 @@ begin
   end;
 end;
 
+function IsNativeRec(H: Int64): Boolean; inline;
+// ⭐ Phase 3.2: a native record is named by its image's machine address with FGNPTR_TAG - bits 63..61 = 001. A handle has
+// bit 61 clear, a shared one bit 62 set, a record-field pointer or a view bit 63 set: none of them answers True.
+begin
+  Result := (UInt64(H) shr 61) = 1;
+end;
+
+function NativeRecAt(H, Enc: Int64): PByte; inline;
+begin
+  Result := PByte(PtrUInt(H and not FGNPTR_TAG) + PtrUInt(Enc shr 4));
+end;
+
+function FieldIntAt(p: PByte; Code: Int64): Int64; inline;
+begin
+  case Code of
+    1: Result := PShortInt(p)^;
+    2: Result := PByte(p)^;
+    3: Result := PSmallInt(p)^;
+    4: Result := PWord(p)^;
+    5: Result := PLongInt(p)^;
+    6: Result := PLongWord(p)^;
+  else Result := PInt64(p)^;
+  end;
+end;
+
+procedure SetFieldIntAt(p: PByte; Code, Val: Int64); inline;
+begin
+  case Code of
+    1, 2: PByte(p)^ := Byte(Val);
+    3, 4: PWord(p)^ := Word(Val);
+    5, 6: PLongWord(p)^ := LongWord(Val);
+  else PInt64(p)^ := Val;
+  end;
+end;
+
 function RecFieldInt(R: PRecordStorage; Enc: Int64): Int64; inline;
 var
   p: PByte;
@@ -5109,6 +5180,7 @@ var
   R: PRecordStorage;
   C: PRecCache;
 begin
+  if IsNativeRec(Handle) then begin NativeFree(Handle, FBoundsCheck); Exit; end;   // phase 3.2: libc's, noted only for --bounds-check
   if (Handle and SHARED_REC_FLAG) = 0 then Exit;
   Idx := Handle and SHARED_REC_MASK;
   if (Idx < 0) or (Idx >= FSharedRecordCount) then Exit;
@@ -5221,6 +5293,9 @@ begin
   // ⛔ A VIEW IS NOT A HANDLE (DIVERGENZE 226). It is negative, and a view of a SHARED record also carries
   // bit 62 - so without this test it would index the shared table with a value that is not an index, and
   // answer ANOTHER record in silence. The field ops go through RecLoadI & co.; anything else is refused.
+  if IsNativeRec(Handle) then
+    raise ERangeError.CreateFmt('A native record (address %d) has no record storage: phase 3.2 of the pointer ' +
+      'model reached an operation it does not cover yet', [Handle]);
   if Handle < 0 then
     raise ERangeError.CreateFmt('Negative record handle %d where a whole record is needed: a VIEW of a ' +
       'nested member (DIVERGENZE 226) or an invalid handle', [Handle]);
@@ -5322,6 +5397,7 @@ var
   R: PRecordStorage;
   E: Int64;
 begin
+  if IsNativeRec(H) then Exit(FieldIntAt(NativeRecAt(H, Enc), Enc and $F));
   if H >= 0 then Exit(RecFieldInt(ResolveRec(Ctx, H), Enc));
   E := Enc;
   R := RecViewTarget(Ctx, H, E);
@@ -5333,6 +5409,11 @@ var
   R: PRecordStorage;
   E: Int64;
 begin
+  if IsNativeRec(H) then
+  begin
+    if (Enc and $F) = 7 then Exit(PSingle(NativeRecAt(H, Enc))^);
+    Exit(PDouble(NativeRecAt(H, Enc))^);
+  end;
   if H >= 0 then Exit(RecFieldFloat(ResolveRec(Ctx, H), Enc));
   E := Enc;
   R := RecViewTarget(Ctx, H, E);
@@ -5344,6 +5425,7 @@ var
   R: PRecordStorage;
   E: Int64;
 begin
+  if IsNativeRec(H) then begin SetFieldIntAt(NativeRecAt(H, Enc), Enc and $F, Val); Exit; end;
   if H >= 0 then begin RecSetFieldInt(ResolveRec(Ctx, H), Enc, Val); Exit; end;
   E := Enc;
   R := RecViewTarget(Ctx, H, E);
@@ -5355,6 +5437,12 @@ var
   R: PRecordStorage;
   E: Int64;
 begin
+  if IsNativeRec(H) then
+  begin
+    if (Enc and $F) = 7 then PSingle(NativeRecAt(H, Enc))^ := Val
+    else PDouble(NativeRecAt(H, Enc))^ := Val;
+    Exit;
+  end;
   if H >= 0 then begin RecSetFieldFloat(ResolveRec(Ctx, H), Enc, Val); Exit; end;
   E := Enc;
   R := RecViewTarget(Ctx, H, E);
@@ -5449,6 +5537,7 @@ begin
           if mem = nil then
             raise Exception.Create('Out of memory: the raw heap could not reserve its address space');
           FRawHeap := PByte(mem);
+          FHomeValid := 0;   // phase 3.2: the raw heap now has a range
         end;
         if newCap > FRawHeapReserve then newCap := FRawHeapReserve;
         if need > newCap then
@@ -5463,6 +5552,7 @@ begin
         {$ELSE}
         // No reserve/commit here (a web build): a moving block, as before - and no threads.
         ReallocMem(FRawHeap, newCap);
+        FHomeValid := 0;   // phase 3.2: the raw heap may have moved
         FillChar(FRawHeap[FRawHeapCap], newCap - FRawHeapCap, 0);
         {$ENDIF}
         FRawHeapCap := newCap;
@@ -5965,6 +6055,138 @@ begin
   Inc(Ctx.FrameCellTop);
 end;
 
+function TBytecodeVM.ManagedMemberAddr(Ctx: TExecutionContext; H, Ofs: Int64): Int64;
+// The machine address of the bytes Ofs past a MANAGED record (or a view of one), with FGNPTR_TAG: how a native-typed
+// member held by value inside a managed container is named (phase 3.2).
+var
+  R: PRecordStorage;
+  S: Integer;
+begin
+  if H < 0 then
+  begin
+    R := RecPtrTarget(Ctx, H, S);
+    Ofs := Ofs + (Int64(S) shr 4);
+  end
+  else
+    R := ResolveRec(Ctx, H);
+  if (R = nil) or (Ofs < 0) or (Ofs >= Length(R^.Bytes)) then
+    raise ERangeError.CreateFmt('Record member address out of range: byte %d of a %d-byte record',
+                                [Ofs, Length(R^.Bytes)]);
+  Result := Int64(PtrUInt(@R^.Bytes[0]) + PtrUInt(Ofs)) or FGNPTR_TAG;
+end;
+
+function TBytecodeVM.NativeRecCell(Ctx: TExecutionContext; ByteSize: Int64): Int64;
+// A native record local: a pooled cell of this size if one is free (zeroed), else a new libc block with the size in the 8
+// bytes before the image. The image starts 8 bytes in, so its address is still 8-aligned and bit 0 is free for the
+// FrameCells mark.
+var
+  k, Lim: Integer;
+  Img: PtrUInt;
+  Mem: Pointer;
+begin
+  k := Ctx.RecPoolTop - 1;
+  Lim := k - 64;
+  if Lim < 0 then Lim := 0;
+  while k >= Lim do
+  begin
+    Img := PtrUInt(Ctx.RecPool[k] and not FGNPTR_TAG);
+    if PInt64(Img - 8)^ = ByteSize then
+    begin
+      Result := Ctx.RecPool[k];
+      Dec(Ctx.RecPoolTop);
+      Ctx.RecPool[k] := Ctx.RecPool[Ctx.RecPoolTop];
+      FillChar(Pointer(Img)^, ByteSize, 0);
+      Exit;
+    end;
+    Dec(k);
+  end;
+  Mem := libc_calloc(1, PtrUInt(ByteSize) + 8);
+  if Mem = nil then raise EOutOfMemory.Create('Out of memory allocating a record');
+  PInt64(Mem)^ := ByteSize;
+  Img := PtrUInt(Mem) + 8;
+  if FBoundsCheck then
+    ForeignNoteRegion(nil, Img, PtrUInt(ByteSize), True, False);
+  Result := Int64(Img) or FGNPTR_TAG;
+end;
+
+function TBytecodeVM.ExecRecordNew(Ctx: TExecutionContext; ByteSize, Imm: Int64): Int64;
+// bcRecordNew, ONCE for the interpreter's two dispatchers and the AOT's leaf. Immediate: string slots in bits 0..15, type id
+// in 32..47, "shared region" in 48, and (phase 3.2) RECNEW_NATIVE in 49.
+// ⭐ A NATIVE record is C bytes from libc and its value is the address. A shared one (Dim Shared, New) lives until Delete; a
+// local one is a cell of the running FRAME - or of the running BLOCK, which ExecRecMarkPop gives back - exactly the life a
+// per-thread record had through RecordCount.
+begin
+  if (Imm and RECNEW_NATIVE) <> 0 then
+  begin
+    if ByteSize < 1 then ByteSize := 1;
+    // ⚠️ The region map is noted only for --bounds-check, as for a frame cell: its readers are that check and the
+    // Windows WSTRING blocks, and the note (a lock, a binary search, a Move) made binary-trees 3.5x slower.
+    if ((Imm shr 48) and 1) <> 0 then
+      Result := NativeAlloc(PtrUInt(ByteSize), FBoundsCheck)
+    else
+    begin
+      Result := NativeRecCell(Ctx, ByteSize);
+      if (Ctx.FrameMarkTop > 0) or (Ctx.FrameRecBaseTop > 0) or (Ctx.BlockRecMarkTop > 0) then
+      begin
+        Ctx.RecCellOwner := Pointer(Self);
+        if Ctx.FrameCellTop >= Length(Ctx.FrameCells) then
+          SetLength(Ctx.FrameCells, Ctx.FrameCellTop + 256);
+        Ctx.FrameCells[Ctx.FrameCellTop] := Result or 1;   // bit 0: a record cell, pooled on release
+        Inc(Ctx.FrameCellTop);
+      end;
+    end;
+    Exit;
+  end;
+  if ((Imm shr 48) and 1) <> 0 then
+    Result := AllocSharedRecord(Integer(ByteSize), Imm and $FFFF, (Imm shr 32) and $FFFF)
+  else
+    Result := AllocRecord(Ctx, Integer(ByteSize), Imm and $FFFF, (Imm shr 32) and $FFFF);
+end;
+
+function TBytecodeVM.ExecRecordNewBlock(N, Imm: Int64): Int64;
+// "CAllocate(n, SizeOf(T))" into a "T Ptr": N consecutive records. Native (bit 63, phase 3.2): ONE libc block of N images, so
+// "p[i]" and "p + i" are the addresses fbc gives.
+begin
+  if N < 1 then N := 1;
+  if (Imm and RECBLOCK_NATIVE) <> 0 then
+    Exit(NativeAlloc(PtrUInt(N * (Imm and $FFFFFFFF)), FBoundsCheck));
+  Result := AllocSharedRecordBlock(N, Imm and $FFFFFFFF, (Imm shr 32) and $FFFF, (Imm shr 48) and $FFFF);
+end;
+
+function TBytecodeVM.ExecRecordReallocBlock(H, N, Imm: Int64): Int64;
+begin
+  if N < 1 then N := 1;
+  if (Imm and RECBLOCK_NATIVE) <> 0 then
+    Exit(NativeRealloc(H, PtrUInt(N * (Imm and $FFFFFFFF))));
+  Result := ReallocSharedRecordBlock(H, Integer(N), Imm and $FFFFFFFF, (Imm shr 32) and $FFFF, (Imm shr 48) and $FFFF);
+end;
+
+procedure TBytecodeVM.ExecRecMarkPush(Ctx: TExecutionContext);
+begin
+  if Ctx.BlockRecMarkTop >= Length(Ctx.BlockRecMark) then
+    SetLength(Ctx.BlockRecMark, Ctx.BlockRecMarkTop + 256);
+  if Ctx.BlockRecMarkTop >= Length(Ctx.BlockCellMark) then
+    SetLength(Ctx.BlockCellMark, Length(Ctx.BlockRecMark));
+  Ctx.BlockRecMark[Ctx.BlockRecMarkTop] := Ctx.RecordCount;
+  Ctx.BlockCellMark[Ctx.BlockRecMarkTop] := Ctx.FrameCellTop;
+  Inc(Ctx.BlockRecMarkTop);
+end;
+
+procedure TBytecodeVM.ExecRecMarkPop(Ctx: TExecutionContext);
+// ⭐ Phase 3.2: the block's frame cells go back too - a native record declared in a loop body is one cell per iteration,
+// and without this a module-level loop never gave any back. The cells a block owns are those stacked since its push.
+begin
+  if Ctx.BlockRecMarkTop > 0 then
+  begin
+    Dec(Ctx.BlockRecMarkTop);
+    if Ctx.BlockRecMark[Ctx.BlockRecMarkTop] < Ctx.RecordCount then
+      Ctx.RecordCount := Ctx.BlockRecMark[Ctx.BlockRecMarkTop];
+    if (Ctx.RecCellOwner <> nil) and (Ctx.BlockRecMarkTop < Length(Ctx.BlockCellMark)) and
+       (Ctx.BlockCellMark[Ctx.BlockRecMarkTop] < Ctx.FrameCellTop) then
+      FreeFrameCells(Ctx, Ctx.BlockCellMark[Ctx.BlockRecMarkTop]);
+  end;
+end;
+
 procedure TBytecodeVM.FreeFrameCells(Ctx: TExecutionContext; Mark: Integer);
 // Release, newest first, every frame cell above Mark. NativeFree knows both kinds - a libc cell (C's mark) and one of the
 // VM's raw heap - so the fb mode asks it; the strict mode only ever made raw-heap cells.
@@ -5974,6 +6196,16 @@ begin
   while Ctx.FrameCellTop > Mark do
   begin
     Dec(Ctx.FrameCellTop);
+    // ⭐ Phase 3.2: a native record cell is pooled, not freed (see TExecutionContext.RecPool).
+    // ⛔ No "Continue" here: inside a TBytecodeVM method it is the BASIC CONT command, not the loop's.
+    if (Ctx.FrameCells[Ctx.FrameCellTop] and 1) <> 0 then
+    begin
+      if Ctx.RecPoolTop >= Length(Ctx.RecPool) then
+        SetLength(Ctx.RecPool, Ctx.RecPoolTop + 256);
+      Ctx.RecPool[Ctx.RecPoolTop] := Ctx.FrameCells[Ctx.FrameCellTop] and not Int64(1);
+      Inc(Ctx.RecPoolTop);
+    end
+    else
     if FNativeMemory then NativeFree(Ctx.FrameCells[Ctx.FrameCellTop], FBoundsCheck)   // noted only under --bounds-check
     else RawFree(Ctx.FrameCells[Ctx.FrameCellTop]);
   end;
@@ -6397,7 +6629,7 @@ begin
     RTC_I8, RTC_U8:   W := 1;
     RTC_I16, RTC_U16: W := 2;
     RTC_I32, RTC_U32: W := 4;
-    RTC_I64, RTC_PTR64: W := 8;         // a pointer is eight bytes wherever it is read (DIVERGENZE 250)
+    RTC_I64, RTC_PTR64, RTC_NPTR: W := 8;   // a pointer is eight bytes wherever it is read (DIVERGENZE 250)
   else
     W := A.ElemWidth;                 // 0 = "one element, at its own width"
   end;
@@ -6411,7 +6643,7 @@ begin
     RTC_U16: Result := PWord(@A.ByteData[ByteOfs])^;
     RTC_I32: Result := PLongInt(@A.ByteData[ByteOfs])^;
     RTC_U32: Result := PLongWord(@A.ByteData[ByteOfs])^;
-    RTC_I64, RTC_PTR64: Result := PInt64(@A.ByteData[ByteOfs])^;
+    RTC_I64, RTC_PTR64, RTC_NPTR: Result := PInt64(@A.ByteData[ByteOfs])^;
   else
     // No type on the read: one element, at the array's own width and sign.
     case A.ElemWidth of
@@ -6437,7 +6669,7 @@ begin
     RTC_I8, RTC_U8:   W := 1;
     RTC_I16, RTC_U16: W := 2;
     RTC_I32, RTC_U32: W := 4;
-    RTC_I64, RTC_PTR64: W := 8;         // a pointer is eight bytes wherever it is read (DIVERGENZE 250)
+    RTC_I64, RTC_PTR64, RTC_NPTR: W := 8;   // a pointer is eight bytes wherever it is read (DIVERGENZE 250)
   else
     W := FArrays[ArrIdx].ElemWidth;
   end;
@@ -6615,6 +6847,74 @@ begin
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
 end;
 
+function TBytecodeVM.HomeMayContain(A: PtrUInt): Boolean;
+// May VMPointerForMachineAddr answer anything for A? Inside the raw heap, or inside (or one past) a candidate buffer.
+var
+  k: Integer;
+begin
+  if (Int64(A) >= FRawLo) and (Int64(A) < FRawHi) then Exit(True);
+  if (Int64(A) < FHomeLo) or (Int64(A) > FHomeHi) then Exit(False);
+  for k := 0 to FHomeIvN - 1 do
+    if (Int64(A) >= FHomeIv[2 * k]) and (Int64(A) <= FHomeIv[2 * k + 1]) then Exit(True);
+  Result := False;
+end;
+
+function TBytecodeVM.PtrLoadHome(V: Int64): Int64;
+// A pointer read out of C's (or native) memory - RTC_PTR64 in a C-marked container, ONCE for the interpreter, the C hot loop's
+// Pascal side and the AOT's leaf (AotPtrHome). A user-space address comes home if it names memory the VM owns, and gets C's
+// mark otherwise; any other value is the program's, as it left it.
+var
+  AvU: PtrUInt;
+begin
+  Result := V;
+  if not ForeignIsMachineAddress(PtrUInt(V)) then Exit;
+  // The span and the candidate list are built here too, and read - under FArrDescLock with workers, as the C loop's entry
+  // builds them: a worker may be rebuilding them. Outside every candidate buffer and the raw heap there is nothing to
+  // come home to, and the walk over every array is skipped.
+  AvU := 0;
+  if FHasWorkers then EnterCriticalSection(FArrDescLock);
+  try
+    if FHomeValid = 0 then RebuildHomeSpan;
+    if HomeMayContain(PtrUInt(V)) then
+      AvU := PtrUInt(VMPointerForMachineAddr(nil, PtrUInt(V)));
+  finally
+    if FHasWorkers then LeaveCriticalSection(FArrDescLock);
+  end;
+  if AvU <> 0 then Exit(Int64(AvU));
+  // ⚠️ The region note is read only by --bounds-check and by the strict mode (RawAddr): in fb it was a lock, a binary
+  // search and an INSERT per pointer read - and a map growing with every distinct node of a tree, which made binary-trees
+  // 3x slower once its records were native (phase 3.2).
+  if FBoundsCheck or not FNativeMemory then
+    ForeignNoteRegion(nil, PtrUInt(V), 0, True, False);
+  Result := V or FGNPTR_TAG;
+end;
+
+function TBytecodeVM.PtrStoreValue(V: Int64): Int64;
+// ...and its write twin: what a pointer becomes in C's (or native) memory. A C-marked address loses the mark; in the fb mode a
+// PACKED array pointer becomes the address of its element (phase 1, guard m799); anything else is written as it is.
+// ⚠️ Not while worker-private arrays exist: there the id is per context, and this store has none.
+begin
+  Result := V;
+  if (V shr 61) and 7 = 1 then Exit(V and not FGNPTR_TAG);
+  if FNativeMemory and (V >= (Int64(1) shl POINTER_ARRAY_SHIFT)) and ((V and (RAWPTR_TAG or FGNPTR_TAG)) = 0) and
+     (FPrivArrCount = 0) then
+  try
+    Result := Int64(PtrUInt(BlockAddr(nil, V, 1)));
+  except
+    on ERangeError do Result := V;   // not an array pointer after all: as it was
+  end;
+end;
+
+function AotPtrHome(VMSelf: Pointer; V: PtrInt): PtrInt; cdecl;
+begin
+  Result := PtrInt(TBytecodeVM(VMSelf).PtrLoadHome(V));
+end;
+
+function AotPtrStore(VMSelf: Pointer; V: PtrInt): PtrInt; cdecl;
+begin
+  Result := PtrInt(TBytecodeVM(VMSelf).PtrStoreValue(V));
+end;
+
 function TBytecodeVM.RawLoadInt(RawPtr: Int64; TypeCode: Integer): Int64;
 var
   PU: PWord;
@@ -6641,14 +6941,13 @@ begin
         Result := PInt64(RawAddr(RawPtr, 8))^;
         // ⭐ DIVERGENZE 451 - ...and only a value that IS a machine address: one the program stored in C's memory
         // ("*cell = s", s from Allocate) is back in the VM's domain already, and marking it read the SCREEN.
-        if ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) and
-           ForeignIsMachineAddress(PtrUInt(Result)) then
-        begin
-          AvU := PtrUInt(VMPointerForMachineAddr(nil, PtrUInt(Result)));
-          if AvU <> 0 then Exit(Int64(AvU));
-          ForeignNoteRegion(nil, PtrUInt(Result), 0, True, False);
-          Result := Result or FGNPTR_TAG;
-        end;
+        if ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) then
+          Result := PtrLoadHome(Result);
+      end;
+    RTC_NPTR:   // phase 3.2: a native record's pointer field - an address, marked
+      begin
+        Result := PInt64(RawAddr(RawPtr, 8))^;
+        if ForeignIsMachineAddress(PtrUInt(Result)) then Result := Result or FGNPTR_TAG;
       end;
   else
     Result := PInt64(RawAddr(RawPtr, 8))^;
@@ -7026,16 +7325,13 @@ begin
       // ⚠️ Only a packed pointer: a raw-heap pointer (bit 62) already comes back as it was (DIVERGENZE 451), and resolving
       // one as raw memory is the trap of DIVERGENZE 379 - a CAllocate'd UDT block is a shared RECORD on that same bit.
       // ⚠️ Not while worker-private arrays exist: there the id is per context, and this store has none.
-      else if ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) and FNativeMemory and
-              (Value >= (Int64(1) shl POINTER_ARRAY_SHIFT)) and ((Value and (RAWPTR_TAG or FGNPTR_TAG)) = 0) and
-              (FPrivArrCount = 0) then
-      begin
-        try
-          PInt64(RawAddr(RawPtr, 8, True))^ := Int64(PtrUInt(BlockAddr(nil, Value, 1)));
-        except
-          on ERangeError do PInt64(RawAddr(RawPtr, 8, True))^ := Value;   // not an array pointer after all: as it was
-        end;
-      end
+      else if ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) then
+        PInt64(RawAddr(RawPtr, 8, True))^ := PtrStoreValue(Value)
+      else
+        PInt64(RawAddr(RawPtr, 8, True))^ := Value;
+    RTC_NPTR:   // phase 3.2: the mark comes off, nothing else changes
+      if (Value shr 61) and 7 = 1 then
+        PInt64(RawAddr(RawPtr, 8, True))^ := Value and not FGNPTR_TAG
       else
         PInt64(RawAddr(RawPtr, 8, True))^ := Value;
   else
@@ -7141,6 +7437,30 @@ begin
   FillChar(BlockAddr(Ctx, DstPtr, ByteCount, True)^, ByteCount, Value);
 end;
 
+procedure TBytecodeVM.RecordNewArrayNative(ArrayId: Integer; ByteSize: Int64);
+var
+  k, n: Integer;
+  Missing: Boolean;
+  Base, Old: Int64;
+begin
+  n := FArrays[ArrayId].TotalSize;
+  if n <= 0 then Exit;
+  Missing := False;
+  for k := 0 to n - 1 do
+    if ArrGetInt(FArrays[ArrayId], k) = 0 then begin Missing := True; Break; end;
+  if not Missing then Exit;
+  if ByteSize < 1 then ByteSize := 1;
+  Base := NativeAlloc(PtrUInt(n * ByteSize), True);
+  if Base = 0 then raise EOutOfMemory.Create('Out of memory allocating an array of records');
+  for k := 0 to n - 1 do
+  begin
+    Old := ArrGetInt(FArrays[ArrayId], k);
+    if IsNativeRec(Old) then
+      Move(Pointer(PtrUInt(Old and not FGNPTR_TAG))^, Pointer(PtrUInt((Base and not FGNPTR_TAG) + k * ByteSize))^, ByteSize);
+    ArrSetIntAt(ArrayId, k, Base + k * ByteSize);
+  end;
+end;
+
 procedure TBytecodeVM.RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);
 // Eager-allocate one record instance per element of the (int handle) array and store the handles.
 // PackedCounts = byteSize | 0<<16 | strCount<<32 | typeId<<48. A3-i: bits 16..31 used to hold the
@@ -7153,6 +7473,16 @@ begin
   ByteSize := PackedCounts and $FFFFFFFF;   // 32 bits: a record past 64 KiB (DIVERGENZE 226)
   StrC := (PackedCounts shr 32) and $FFFF;
   TypeId := (PackedCounts shr 48) and $FFFF;
+  // ⭐ Phase 3.2: the elements of an array of a NATIVE type are ONE contiguous libc block, as in fbc, and each element's value
+  // is its address - so "@a(i)", "@a(i + 1) - @a(i)" and a C function walking "@a(0)" see what fbc gives. A REDIM that
+  // grows the array gets a new block with the kept elements copied in.
+  // ⚠️ The superseded block is not freed (a live pointer may still name it, and nothing here knows the block's start),
+  // the same leak ReallocSharedRecordBlock declares; nor is a block freed by Erase or at the end of a procedure.
+  if (PackedCounts and RECARR_NATIVE) <> 0 then
+  begin
+    RecordNewArrayNative(ArrayId, ByteSize);
+    Exit;
+  end;
   // Allocate a record only for elements that do not already have one. A valid array-of-UDT element
   // handle is a shared-region record (SHARED_REC_FLAG set), so it is never 0 — a 0 handle marks an
   // uninitialized slot. After a plain DIM every slot is 0, so all are filled; after REDIM [PRESERVE]
@@ -7688,6 +8018,48 @@ begin
   Result := VMPointerForMachineAddr(TExecutionContext(ACtx), A);
 end;
 
+procedure TBytecodeVM.RebuildHomeSpan;
+var
+  i: Integer;
+  procedure Take(Lo, Len: PtrUInt);
+  begin
+    if Int64(Lo) < FHomeLo then FHomeLo := Int64(Lo);
+    if Int64(Lo + Len) > FHomeHi then FHomeHi := Int64(Lo + Len);   // one past the end is a candidate too
+    if 2 * FHomeIvN + 2 > Length(FHomeIv) then SetLength(FHomeIv, 2 * FHomeIvN + 64);
+    FHomeIv[2 * FHomeIvN] := Int64(Lo);
+    FHomeIv[2 * FHomeIvN + 1] := Int64(Lo + Len);
+    Inc(FHomeIvN);
+  end;
+begin
+  FHomeValid := 0;
+  FHomeLo := High(Int64); FHomeHi := 0;
+  FHomeIvN := 0;
+  for i := 0 to High(FArrays) do
+  begin
+    if FArrays[i].AddrPublished then System.Continue;
+    if (FArrays[i].ElemWidth > 0) and (Length(FArrays[i].ByteData) > 0) then
+      Take(PtrUInt(@FArrays[i].ByteData[0]), PtrUInt(Length(FArrays[i].ByteData)))
+    else
+    begin
+      if Length(FArrays[i].IntData) > 0 then
+        Take(PtrUInt(@FArrays[i].IntData[0]), PtrUInt(Length(FArrays[i].IntData)) * SizeOf(Int64));
+      if Length(FArrays[i].FloatData) > 0 then
+        Take(PtrUInt(@FArrays[i].FloatData[0]), PtrUInt(Length(FArrays[i].FloatData)) * SizeOf(Double));
+    end;
+  end;
+  if FHomeLo > FHomeHi then begin FHomeLo := 1; FHomeHi := 0; end;   // nothing to bring home: every address is outside
+  if FRawHeap <> nil then
+  begin
+    FRawLo := Int64(PtrUInt(FRawHeap));
+    FRawHi := FRawLo + Int64(FRawHeapReserve);
+  end
+  else
+  begin
+    FRawLo := 1; FRawHi := 0;
+  end;
+  FHomeValid := 1;   // last: a reader never sees a half-built span as valid
+end;
+
 function TBytecodeVM.VMPointerForMachineAddr(ACtx: TExecutionContext; A: PtrUInt): Int64;
 // L'indirizzo macchina A, riportato a un puntatore del DOMINIO VM se cade in memoria che la VM
 // possiede. 0 se non ci cade.
@@ -7715,6 +8087,13 @@ begin
     Base := PtrUInt(@FRawHeap[0]);
     if (A >= Base) and (A - Base < PtrUInt(FRawHeapCap)) then
       Exit(Int64(A - Base) or RAWPTR_TAG);
+  end;
+  // ⭐ Phase 3.2: outside the span of every candidate buffer nothing below can answer. Single-threaded only: a worker
+  // may reshape an array between the generation test and the walk.
+  if not FHasWorkers then
+  begin
+    if FHomeValid = 0 then RebuildHomeSpan;
+    if (Int64(A) < FHomeLo) or (Int64(A) > FHomeHi) then Exit;
   end;
   for i := 0 to High(FArrays) do
   begin
@@ -7950,6 +8329,13 @@ var
   R: PRecordStorage;
 begin
   Result := nil; ALen := 0;
+  // ⭐ Phase 3.2: a native record IS its image. Its length is the declared type's, which the call site already checked
+  // against the C struct (ForeignStructRetSpec), as fbc trusts it.
+  if IsNativeRec(Value) then
+  begin
+    ALen := PtrUInt(High(Int32));
+    Exit(Pointer(PtrUInt(Value and not FGNPTR_TAG)));
+  end;
   Ctx := TExecutionContext(ACtx);
   if Ctx = nil then Exit;
   if Value < 0 then
@@ -8135,6 +8521,7 @@ var
   Idx: Integer;
 begin
   Result := 1;
+  if IsNativeRec(Handle) then Exit;   // phase 3.2: a native type has nothing to run per element
   if (Handle and SHARED_REC_FLAG) = 0 then Exit;
   Idx := Integer(Handle and not SHARED_REC_FLAG);
   if (Idx < 0) or (Idx >= FSharedRecordCount) then Exit;
@@ -10800,20 +11187,8 @@ begin
       end;
     // Block-scoped record reclamation (M8): push the current high-water mark at a loop-body entry,
     // and reclaim to the last mark at the body exit (after the destructors ran).
-    bcRecMarkPush:
-      begin
-        if Ctx.BlockRecMarkTop >= Length(Ctx.BlockRecMark) then
-          SetLength(Ctx.BlockRecMark, Ctx.BlockRecMarkTop + 256);
-        Ctx.BlockRecMark[Ctx.BlockRecMarkTop] := Ctx.RecordCount;
-        Inc(Ctx.BlockRecMarkTop);
-      end;
-    bcRecMarkPop:
-      if Ctx.BlockRecMarkTop > 0 then
-      begin
-        Dec(Ctx.BlockRecMarkTop);
-        if Ctx.BlockRecMark[Ctx.BlockRecMarkTop] < Ctx.RecordCount then
-          Ctx.RecordCount := Ctx.BlockRecMark[Ctx.BlockRecMarkTop];
-      end;
+    bcRecMarkPush: ExecRecMarkPush(Ctx);
+    bcRecMarkPop:  ExecRecMarkPop(Ctx);
     // Transfer registers (M2): move a value to/from the non-saved transfer banks.
     bcXferStoreInt:    Ctx.XferInt[Instr.Immediate] := Ctx.IntRegs[Instr.Src1];
     bcXferStoreFloat:  Ctx.XferFloat[Instr.Immediate] := Ctx.FloatRegs[Instr.Src1];
@@ -10852,27 +11227,18 @@ begin
     bcCondDestroy:   DestroyCond(Ctx.IntRegs[Instr.Src1]);
     // UDT/record heap (M3)
     bcRecordNew:
-      // Immediate bit 48: allocate in the shared cross-thread region (e.g. a SHARED UDT scalar).
-      if (Instr.Immediate shr 48) and 1 <> 0 then
-        Ctx.IntRegs[Instr.Dest] := AllocSharedRecord(Instr.Src1,
-                                          Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF)
-      else
-        Ctx.IntRegs[Instr.Dest] := AllocRecord(Ctx, Instr.Src1,
-                                          Instr.Immediate and $FFFF, (Instr.Immediate shr 32) and $FFFF);
+      // Immediate bit 48: allocate in the shared cross-thread region (e.g. a SHARED UDT scalar); bit 49: native.
+      Ctx.IntRegs[Instr.Dest] := ExecRecordNew(Ctx, Instr.Src1, Instr.Immediate);
     bcRecordNewArray:
       RecordNewArrayInit(Ctx, Ctx.ArrMap[Instr.Src1], Instr.Immediate);  // Src1=array id; Imm=packed slot counts
     bcRecordNewArrayInd:
       // Array-of-UDT MEMBER: the FArrays id is a runtime handle in IntRegs[Src1]. Imm=packed slot counts.
       RecordNewArrayInit(Ctx, MapArrDyn(Ctx, Ctx.IntRegs[Instr.Src1]), Instr.Immediate);
-    bcRecordNewBlock:  // Callocate(n, SizeOf(T)) of a UDT: n consecutive shared records; Dest = first handle
-      Ctx.IntRegs[Instr.Dest] := AllocSharedRecordBlock(Ctx.IntRegs[Instr.Src1],
-                                   Instr.Immediate and $FFFFFFFF,
-                                   (Instr.Immediate shr 32) and $FFFF, (Instr.Immediate shr 48) and $FFFF);
+    bcRecordNewBlock:  // Callocate(n, SizeOf(T)) of a UDT: n consecutive records; Dest = the first
+      Ctx.IntRegs[Instr.Dest] := ExecRecordNewBlock(Ctx.IntRegs[Instr.Src1], Instr.Immediate);
     bcRecordReallocBlock:  // Reallocate a UDT block: Dest = the (possibly moved) first handle
-      Ctx.IntRegs[Instr.Dest] := ReallocSharedRecordBlock(Ctx.IntRegs[Instr.Src1],
-                                   Integer(Ctx.IntRegs[Instr.Src2]),
-                                   Instr.Immediate and $FFFFFFFF,
-                                   (Instr.Immediate shr 32) and $FFFF, (Instr.Immediate shr 48) and $FFFF);
+      Ctx.IntRegs[Instr.Dest] := ExecRecordReallocBlock(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
+                                                        Instr.Immediate);
     bcRecordBlockLen:  // Delete[] p: how many records the block holds (1 when it is a lone record)
       Ctx.IntRegs[Instr.Dest] := SharedRecordBlockLen(Ctx.IntRegs[Instr.Src1]);
     // FFI: Immediate = index into the foreign declaration table, Src1 = staged argument count.
@@ -12545,6 +12911,7 @@ begin
     if FNativeLoops[i] <> nil then begin hdr := i; Break; end;
   if hdr < 0 then SetLength(FNativeLoops, 0);
   FArraysDirty := True;   // force a descriptor rebuild before the first compiled loop runs
+  FHomeValid := 0;
   FDescAllPending := True; FDescThisCall := False; FDescLo := MaxInt; FDescHi := -1;
 end;
 
@@ -12759,16 +13126,9 @@ function AotRecordNew(VMSelf, CtxObj: Pointer; Counts, Imm: PtrInt): PtrInt; cde
 // Counts = byteSize (A3-i: the record's live image size, where this used to be two slot counts, the
 // second of which is now always zero). Imm is the bytecode Immediate verbatim: string slots in bits
 // 0..15, type id in bits 32..47, "allocate in the shared region" in bit 48.
-var
-  ByteSize, StrC, TypeId: Integer;
+// The decision is ExecRecordNew's, as for the interpreter (bit 49: a native record, phase 3.2).
 begin
-  ByteSize := Integer(Counts and $FFFFFFFF);
-  StrC   := Integer(Imm and $FFFF);
-  TypeId := Integer((Imm shr 32) and $FFFF);
-  if (Imm shr 48) and 1 <> 0 then
-    Result := PtrInt(TBytecodeVM(VMSelf).AllocSharedRecord(ByteSize, StrC, TypeId))
-  else
-    Result := PtrInt(TBytecodeVM(VMSelf).AllocRecord(TExecutionContext(CtxObj), ByteSize, StrC, TypeId));
+  Result := PtrInt(TBytecodeVM(VMSelf).ExecRecordNew(TExecutionContext(CtxObj), Integer(Counts and $FFFFFFFF), Imm));
 end;
 
 procedure AotRecordFree(VMSelf: Pointer; Handle: PtrInt); cdecl;
@@ -12777,13 +13137,17 @@ begin
 end;
 
 procedure AotRecMarkPush(CtxObj: Pointer); cdecl;
+// ⭐ The context names no VM, and ExecRecMarkPush uses none of the VM's state: any instance answers the same.
 var
   C: TExecutionContext;
 begin
   C := TExecutionContext(CtxObj);
   if C.BlockRecMarkTop >= Length(C.BlockRecMark) then
     SetLength(C.BlockRecMark, C.BlockRecMarkTop + 256);
+  if C.BlockRecMarkTop >= Length(C.BlockCellMark) then
+    SetLength(C.BlockCellMark, Length(C.BlockRecMark));
   C.BlockRecMark[C.BlockRecMarkTop] := C.RecordCount;
+  C.BlockCellMark[C.BlockRecMarkTop] := C.FrameCellTop;
   Inc(C.BlockRecMarkTop);
 end;
 
@@ -12792,6 +13156,11 @@ var
   C: TExecutionContext;
 begin
   C := TExecutionContext(CtxObj);
+  if C.RecCellOwner <> nil then
+  begin
+    TBytecodeVM(C.RecCellOwner).ExecRecMarkPop(C);
+    Exit;
+  end;
   if C.BlockRecMarkTop > 0 then
   begin
     Dec(C.BlockRecMarkTop);
@@ -14177,6 +14546,13 @@ begin
   C.IntToFloatU := @AotIntToFloatFlags;
   C.FloatRoundU := @AotFloatRoundU;
   C.RawAlloc := @AotRawAlloc;
+  C.PtrHome := @AotPtrHome;
+  AotSetHomeLayout(Integer(PtrUInt(@FHomeValid) - PtrUInt(Pointer(Self))),
+                   Integer(PtrUInt(@FHomeLo) - PtrUInt(Pointer(Self))),
+                   Integer(PtrUInt(@FHomeHi) - PtrUInt(Pointer(Self))),
+                   Integer(PtrUInt(@FRawLo) - PtrUInt(Pointer(Self))),
+                   Integer(PtrUInt(@FRawHi) - PtrUInt(Pointer(Self))));
+  C.PtrStore := @AotPtrStore;
   // C5: native string lowering - the leaf primitives compiled code calls directly for the hot
   // string ops. (The bank base itself is per-context and is set by the caller.)
   C.StrCmp := @AotStrCmp;
@@ -16843,6 +17219,7 @@ procedure TBytecodeVM.NoteDescSlot(Slot: Integer);
 // without naming a slot says MarkArraysDirtyAll, and an operation that raises before reaching its
 // marker still folds into FDescAllPending (see the note in ExecuteArrayOp).
 begin
+  FHomeValid := 0;
   if Slot < 0 then Exit;
   FDescThisCall := False;
   if FDescLo > FDescHi then begin FDescLo := Slot; FDescHi := Slot; end
@@ -16877,6 +17254,7 @@ procedure TBytecodeVM.MarkArraysDirtyAll(Src: Integer);
 // marker would have avoided, never a stale entry.
 begin
   FArraysDirty := True;
+  FHomeValid := 0;
   FDescAllPending := True;
   if GArrDescDiag and (Src <= High(GADDirtySrc)) then Inc(GADDirtySrc[Src]);
 end;
@@ -17164,6 +17542,7 @@ begin
     if Reshapes then
     begin
       FArraysDirty := True;
+      FHomeValid := 0;
       if GArrDescDiag then Inc(GADDirtySrc[0]);
       // ⛔ SETTLE THE PREVIOUS CALL HERE AND NOT AT ITS OWN END, which is what makes this exception
       // safe without a try..finally on the cold array path: an operation that RAISED never reached
@@ -17467,6 +17846,12 @@ begin
       19: // bcRefAddrField — pack a record-field pointer from a handle (Src1) and slot (Immediate)
         begin
           PtrAddr := Ctx.IntRegs[Instr.Src1];   // record handle (may carry SHARED_REC_FLAG)
+          // ⭐ Phase 3.2: a native record's field is its address plus the field's byte offset - a machine address.
+          if IsNativeRec(PtrAddr) then
+            Ctx.IntRegs[Instr.Dest] := PtrAddr + ((Int64(Instr.Immediate) and RECPTR_SLOT_MASK) shr 4)
+          else if (Instr.Immediate and RECADDR_WANT) <> 0 then
+            Ctx.IntRegs[Instr.Dest] := ManagedMemberAddr(Ctx, PtrAddr, (Int64(Instr.Immediate) and RECPTR_SLOT_MASK) shr 4)
+          else
           // ...or a VIEW (DIVERGENZE 226): a member of a member. Its slot has width 0, so adding the
           // field's slot adds the byte offsets and keeps the field's width code.
           if PtrAddr < 0 then
@@ -18022,6 +18407,7 @@ begin
     if Reshapes then
     begin
       FArraysDirty := True;
+      FHomeValid := 0;
       if GArrDescDiag then Inc(GADDirtySrc[0]);
     end;
   finally

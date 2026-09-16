@@ -258,6 +258,8 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
             pointer read through a "T Ptr" laid over the array), and the interpreter refuses it by name
             - indexed here it was an access violation, or a silent write where the page was mapped
         [7] how many shared records there are: bit 62 is also a RAW address's tag
+        [8] [9] the span [lo, hi] of the array buffers a machine address may come home to (phase 3.2)
+        [10] [11] the VM's raw heap: base and capacity
      A null recdesc disables all four arms. */
 #define RECPTR(h_, out_) do {                                                     \
     int64_t hh_ = (h_);                                                           \
@@ -406,7 +408,23 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
 #else
       case 3: case 9: return pc;
 #endif
-      case 10: return pc;                                /* RTC_PTR64 */
+      case 10: {                                         /* RTC_PTR64 (phase 3.2) */
+        /* RawLoadInt's rule: a user-space address read out of C's memory gets C's mark, unless it names memory the
+           VM owns - which only the interpreter can translate, so inside either span the PC goes back. */
+        uint64_t v_ = (uint64_t)*(int64_t *)p_;
+        if (v_ >= 0x10000ULL && v_ < 0x800000000000ULL) {
+          if (!recdesc) return pc;
+          if (v_ >= (uint64_t)recdesc[10] && v_ - (uint64_t)recdesc[10] < (uint64_t)recdesc[11]) return pc;
+          if (v_ >= (uint64_t)recdesc[8] && v_ <= (uint64_t)recdesc[9]) return pc;
+          v_ |= (1ULL << 61);
+        }
+        ireg[I->dest] = (int64_t)v_;
+        break; }
+      case 11: {                                         /* RTC_NPTR (phase 3.2): an address, marked */
+        uint64_t v_ = (uint64_t)*(int64_t *)p_;
+        if (v_ >= 0x10000ULL && v_ < 0x800000000000ULL) v_ |= (1ULL << 61);
+        ireg[I->dest] = (int64_t)v_;
+        break; }
       default: ireg[I->dest] = *(int64_t  *)p_; break;
     }
     pc++; } NEXT;
@@ -426,7 +444,14 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
 #else
       case 3: case 9: return pc;
 #endif
-      case 10: return pc;
+      case 10:                                           /* RTC_PTR64 (phase 3.2): RawStoreInt's rule */
+        if (((uint64_t)v_ >> 61) == 1) *(int64_t *)p_ = (int64_t)((uint64_t)v_ & ~(1ULL << 61));
+        else if ((uint64_t)v_ >= (1ULL << 32) && ((uint64_t)v_ >> 61) == 0) return pc;   /* a packed name: Pascal's */
+        else *(int64_t *)p_ = v_;
+        break;
+      case 11:                                           /* RTC_NPTR (phase 3.2): the mark comes off */
+        *(int64_t *)p_ = (((uint64_t)v_ >> 61) == 1) ? (int64_t)((uint64_t)v_ & ~(1ULL << 61)) : v_;
+        break;
       default:        *(int64_t  *)p_ = v_;           break;
     }
     pc++; } NEXT;

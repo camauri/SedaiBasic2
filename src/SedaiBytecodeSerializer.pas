@@ -97,7 +97,11 @@ const
   // v7 (15 Sep 2026): one more byte per array, bit 0 = TSSAArrayInfo.AddrNative (phase 2.3 of the pointer model).
   // The v4 flags byte was full: bit 7 was its last free bit. A v6 file reads False - its bytecode has the packed
   // "@a(i)" inside, so False is what it means.
-  BASC_VERSION = 7;
+  // v8 (16 Sep 2026): no new field - a MEANING. Phase 3.2 of the pointer model marks the record allocations of a native
+  // type in their Immediate (RECNEW_NATIVE, RECBLOCK_NATIVE, RECARR_NATIVE) and reads their fields as raw memory, and a VM
+  // that does not know the bits would allocate handles and then read them as addresses. The version bump is what makes an
+  // older VM refuse such a file by name instead. A v7 file is read unchanged: nothing in it carries the bits.
+  BASC_VERSION = 8;
 
   // Flags
   BASC_FLAG_DEBUG_INFO = $0001;  // Contains source line mapping (always included)

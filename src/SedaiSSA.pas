@@ -535,6 +535,8 @@ type
                                           //   (module or proc). A GOTO to one of them exits every open block scope.
     FModernMode: Boolean;                // FB scope: True = MODERN (lexical scope); False = CLASSIC (global-by-name)
     FNativeMemory: Boolean;              // memory mode fb (True) or strict (False) - SedaiMemoryMode; phase 0: carried, not yet read
+    FRecNativeKnob: Boolean;             // phase 3.2: native records in the fb mode; SB_RECNATIVE=0 turns them off (A/B)
+    FNativeRecAsking: TStringList;       // phase 3.2: the types NativeRecordType is answering right now (a list's own pointer)
     // Phase 2.1a: the program's entry block, and where in it a raw module cell's allocation is hoisted (HoistToEntry) -
     // after the SHARED backings are sized and BEFORE static members, hoisted STATIC initialisers and module constructors.
     FEntryBlock: TSSABasicBlock;
@@ -590,6 +592,7 @@ type
     FCtorTypesCount: Integer;         // ...built when FProcDecls had this many entries
     FSingleMemoDepth: Integer;
     FBlockManagedTypes: TStringList;     // types whose "New T[n]" must be MANAGED records (ctor/dtor)
+    FMemberOwnerTypes: TStringList;      // phase 3.2: types that DEFINE any member procedure ("T.x" anywhere)
     FConstDeclSeen: TStringList;         // CONST names already seen: a name declared TWICE must not fold
     FConstStrBytes: TStringList;         // STRING consts: name (UPPER) -> byte size fbc reports (length + 1)
     FTypeAliases: TStringList;           // FB "TYPE alias AS underlying": alias (UPPER) -> underlying (UPPER)
@@ -898,6 +901,8 @@ type
     procedure EmitRecordBlockInit(const FirstHandle, CountVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
     procedure EmitRecordBlockInitFrom(const FirstHandle, StartVal, CountVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
     function UDTBlockIsManaged(const TypeName: string): Boolean;
+    function NativeRecordType(const TypeName: string): Boolean;   // phase 3.2: every value of T is a machine address
+    procedure RecNativeStamp(OpCode: TSSAOpCode; var Src1, Src2, Src3: TSSAValue);   // phase 3.2: mark a native allocation
     procedure EmitRecordBlockCtorDtor(const FirstHandle, CountVal: TSSAValue;
                                       const TypeName: string; Construct: Boolean);  // init each of N records  // alloc nested records
     procedure EmitRecordArrayInit(ArrayIdx, UDTIdx: Integer);  // per-element EmitRecordInit over a DIM'd array-of-UDT
@@ -1886,6 +1891,7 @@ var
 begin
   inherited Create;
   RecMarkCallsAllocate;             // force the gate read before the first EmitInstruction
+  FRecNativeKnob := GetEnvironmentVariable('SB_RECNATIVE') <> '0';   // phase 3.2: on by default; =0 is the A/B
   FProgram := nil;
   FCurrentBlock := nil;
   FLabelCounter := 0;
@@ -2047,6 +2053,10 @@ begin
   FRawPtrScoped := TIndexedStringList.Create;
   FRawPtrScoped.CaseSensitive := False;
   FBlockManagedTypes := TIndexedStringList.Create;
+  FMemberOwnerTypes := TIndexedStringList.Create;
+  FNativeRecAsking := TStringList.Create;
+  FMemberOwnerTypes.Sorted := True;
+  FMemberOwnerTypes.Duplicates := dupIgnore;
   FConstStrBytes := TIndexedStringList.Create;
   FConstStrBytes.CaseSensitive := False;
   FConstDeclSeen := TIndexedStringList.Create;
@@ -2219,6 +2229,8 @@ begin
   FRawPtrVars.Free;
   FRawPtrScoped.Free;
   FBlockManagedTypes.Free;
+  FMemberOwnerTypes.Free;
+  FNativeRecAsking.Free;
   FConstDeclSeen.Free;
   FNulStrConsts.Free;
   FWideNulConsts.Free;
@@ -3354,6 +3366,12 @@ begin
   // inserting one in the middle shifts every ordinal after it.
   if (OpCode = ssaRecordReallocBlock) or (OpCode in RECORD_ALLOCATING_OPS) or
      ((GRecMarkCall = 1) and (OpCode in RECORD_ALLOCATING_CALL_OPS)) then Inc(FRecAllocSeq);
+
+  // ⭐ Phase 3.2: every allocation of a record of a NATIVE type says so, in ONE place - fourteen sites emit these and
+  // none of them has to know. The type id rides the packed immediate (bits 48..63 for the array and block forms,
+  // 32..47 for New), and it is the index into FUDTs.
+  if FRecNativeKnob and FNativeMemory then
+    RecNativeStamp(OpCode, Src1, Src2, Src3);
 
   Instr := TSSAInstruction.Create(OpCode);
   Instr.Dest := Dest;
@@ -26809,6 +26827,12 @@ var
   NameU, Scope: string;
 begin
   Result := '';
+  // ⭐ Phase 3.2: a pointer to a NATIVE record type is raw wherever it is declared - the answer is the type's.
+  if FRecNativeKnob and FNativeMemory then
+  begin
+    NameU := PointerUDTType(Name);
+    if (NameU <> '') and NativeRecordType(NameU) then Exit(NameU);
+  end;
   if FRawUDTPtrs = nil then Exit;
   NameU := UpperFast(Name);
   if FRawUDTScoped = nil then Exit(UpperFast(FRawUDTPtrs.Values[NameU]));
@@ -28078,6 +28102,30 @@ begin
     end;
     TypeName := ''; UDTIdx := -1; TotalSize := 0; IdxNode := nil; SetLength(Offsets, 0);
   end;
+  // ⭐ Phase 3.2: a RECORD VARIABLE of a native type holds its image's address, and so does an ELEMENT of an array of
+  // them - the object itself is the base.
+  if FRecNativeKnob and FNativeMemory then
+  begin
+    CastT := '';
+    if ObjNode.NodeType = antIdentifier then
+      CastT := VarRecordTypeName(VarToStr(ObjNode.Value))
+    else if (ObjNode.NodeType = antArrayAccess) and (ObjNode.Attributes.Values['BRACKET'] <> '1') and
+            (ObjNode.ChildCount >= 2) and (ObjNode.GetChild(0) <> nil) and
+            (ObjNode.GetChild(0).NodeType = antIdentifier) and
+            (ArrayIndexOf(ObjNode.GetChild(0).ValueUpper) >= 0) then
+      CastT := ArrayRecordTypeOf(ObjNode.GetChild(0).ValueUpper);
+    if (CastT <> '') and NativeRecordType(CastT) then
+    begin
+      TypeName := UpperFast(CanonicalType(CastT));
+      UDTIdx := FindUDT(TypeName);
+      if (UDTIdx >= 0) and UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) and (TotalSize > 0) then
+      begin
+        BaseNode := ObjNode;
+        Exit(True);
+      end;
+      TypeName := ''; UDTIdx := -1; TotalSize := 0; SetLength(Offsets, 0);
+    end;
+  end;
   if ObjNode.NodeType = antIdentifier then
     BaseNode := ObjNode
   else if (ObjNode.NodeType = antArrayAccess) and (ObjNode.Attributes.Values['BRACKET'] = '1') and
@@ -28167,6 +28215,13 @@ begin
   AddrVal := EmitRawUDTFieldAddr(BaseNode, IdxNode, ChainNode, TotalSize, Offsets[FieldIdx]);
 
   F := FUDTs[UDTIdx].Fields[FieldIdx];
+  // ⭐ Phase 3.2: a RECORD member held by value is named by its address, as every record of a native type is - it is
+  // not eight bytes to load ("dist(a.p1, a.p2)" passed the first field of p1 as if it were the record).
+  if (F.NestedType <> '') and FRecNativeKnob and FNativeMemory and NativeRecordType(F.NestedType) then
+  begin
+    Value := AddrVal;
+    Exit(True);
+  end;
   UDTFieldCShape(UDTIdx, FieldIdx, Sz, Al);
   if F.Bank = srtString then
   begin
@@ -28222,7 +28277,9 @@ begin
       // ⭐ DIVERGENZE 444 - ...and so does a PROCEDURE field: in C's memory it holds a C function's ADDRESS
       // (libgd's gdIOCtx.gd_free), and read as a bare integer the indirect call took it for a BASIC entry PC and
       // the program ended in silence. The PTR64 arm tags only when the container carries C's mark.
-      if (F.PtrPointee <> '') or (F.RawPtrPointee <> '') or (F.MultiPtrPointee <> '') or (F.FuncPtrSig <> '') then
+      if (F.PtrPointee <> '') and FRecNativeKnob and FNativeMemory and NativeRecordType(F.PtrPointee) then
+        EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_NPTR))   // phase 3.2
+      else if (F.PtrPointee <> '') or (F.RawPtrPointee <> '') or (F.MultiPtrPointee <> '') or (F.FuncPtrSig <> '') then
         EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_PTR64))
       else
         EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64));
@@ -28266,6 +28323,14 @@ begin
 
   F := FUDTs[UDTIdx].Fields[FieldIdx];
   UDTFieldCShape(UDTIdx, FieldIdx, Sz, Al);
+  // ⭐ Phase 3.2: assigning a RECORD member of a native type copies the record's bytes into it.
+  if (F.NestedType <> '') and FRecNativeKnob and FNativeMemory and NativeRecordType(F.NestedType) then
+  begin
+    ProcessExpression(ExprNode, ExprVal);
+    EmitInstruction(ssaRawMemCopy, MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt)), AddrVal,
+                    EnsureIntRegister(ExprVal), EnsureIntRegister(MakeSSAConstInt(Sz)));
+    Exit(True);
+  end;
   ProcessExpression(ExprNode, ExprVal);
   if F.Bank = srtString then
     // A fixed-length string field is its DECLARED width of bytes, terminator and all - the same
@@ -28285,6 +28350,9 @@ begin
   begin
     // The raw type code follows the field's BYTE WIDTH, exactly as the load half derives it: writing a
     // UShort field writes two bytes at its offset, not eight, or the next field goes with it.
+    // ⚠️ The narrowing FIRST, as the managed store does: an UNSIGNED-64 field needs to know what a float is converted
+    // FOR, and EnsureIntRegister alone settles it as signed (bug_float_to_unsigned, found by phase 3.2).
+    ExprVal := ApplyNarrowCode(F.WidthCode, ExprVal);
     ExprVal := EnsureIntRegister(ExprVal);
     case Sz of
       1: EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I8));
@@ -28293,7 +28361,9 @@ begin
     else
       // ⭐ ...and a POINTER field says so on the way IN too, the twin of the load half: written into C's
       // memory a machine address must lose the VM's tag, or C dereferences bit 61 (DIVERGENZE 376).
-      if (F.PtrPointee <> '') or (F.RawPtrPointee <> '') or (F.MultiPtrPointee <> '') then
+      if (F.PtrPointee <> '') and FRecNativeKnob and FNativeMemory and NativeRecordType(F.PtrPointee) then
+        EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_NPTR))   // phase 3.2
+      else if (F.PtrPointee <> '') or (F.RawPtrPointee <> '') or (F.MultiPtrPointee <> '') then
         EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_PTR64))
       else
         EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I64));
@@ -33878,6 +33948,14 @@ begin
   View := MakeSSAValue(svkNone);
   Result := InlineMemberArrayElem(ArrAccessNode, R, E, B);
   if not Result then Exit;
+  // ⭐ Phase 3.2: an element of a NATIVE type is named by its address (see NestedMemberHandle).
+  if FRecNativeKnob and FNativeMemory and (InlineRecordArrayElemUDT(ArrAccessNode) >= 0) and
+     NativeRecordType(FUDTs[InlineRecordArrayElemUDT(ArrAccessNode)].Name) then
+  begin
+    View := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRefAddrField, View, EnsureIntRegister(R), MakeSSAValue(svkNone), MakeSSAConstInt(E or RECADDR_WANT));
+    Exit;
+  end;
   if E = 0 then
   begin
     View := EnsureIntRegister(R);
@@ -33922,7 +34000,9 @@ begin
   if not UDTFieldArrayShape(U, FI, Cnt, EB, True) then Exit;
   n := InlineArrayDims(U, FI, Lbs, Ubs);
   if n <> 1 then Exit;
-  if FUDTs[U].Fields[FI].ArrayElemPtrPointee <> '' then Code := RTC_PTR64
+  if (FUDTs[U].Fields[FI].ArrayElemPtrPointee <> '') and NativeRecordType(FUDTs[U].Fields[FI].ArrayElemPtrPointee) then
+    Code := RTC_NPTR
+  else if FUDTs[U].Fields[FI].ArrayElemPtrPointee <> '' then Code := RTC_PTR64
   else Code := RawTypeCodeOfPointee(CanonicalType(FUDTs[U].Fields[FI].ArrayElemScalarType));
   Bank := FUDTs[U].Fields[FI].ArrayElemBank;
   if (Bank = srtFloat) and (Code <> RTC_SINGLE) then Code := RTC_DOUBLE;
@@ -34663,6 +34743,14 @@ begin
     Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaRecordLoadInt, Result, EnsureIntRegister(Parent), MakeSSAValue(svkNone),
                     MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].Slot));
+    Exit;
+  end;
+  // ⭐ Phase 3.2: a member of a NATIVE type is named by its address, whatever holds it - even at offset 0.
+  if FRecNativeKnob and FNativeMemory and NativeRecordType(FUDTs[UDTIdx].Fields[FieldIdx].NestedType) then
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRefAddrField, Result, EnsureIntRegister(Parent), MakeSSAValue(svkNone),
+                    MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].Slot or RECADDR_WANT));
     Exit;
   end;
   if FUDTs[UDTIdx].Fields[FieldIdx].ByteOffset = 0 then
@@ -39442,6 +39530,89 @@ begin
   // managed records, so the two spellings disagreed about what the storage was.
   Idx := FindUDT(UpperFast(TypeName));
   if (Idx >= 0) and (not UDTCLayoutRaw(Idx, Offsets, Total)) then Result := True;
+end;
+
+procedure TSSAGenerator.RecNativeStamp(OpCode: TSSAOpCode; var Src1, Src2, Src3: TSSAValue);
+  function TypeIdIsNative(Id: Int64): Boolean;
+  begin
+    Result := (Id >= 0) and (Id <= High(FUDTs)) and NativeRecordType(FUDTs[Id].Name);
+  end;
+begin
+  case OpCode of
+    ssaRecordNew:
+      if (Src3.Kind = svkConstInt) and TypeIdIsNative((Src3.ConstInt shr 32) and $FFFF) then
+        Src3.ConstInt := Src3.ConstInt or RECNEW_NATIVE;
+    ssaRecordNewArray, ssaRecordNewArrayInd:
+      if (Src2.Kind = svkConstInt) and TypeIdIsNative((Src2.ConstInt shr 48) and $FFFF) then
+        Src2.ConstInt := Src2.ConstInt or RECARR_NATIVE;
+    ssaRecordNewBlock:
+      if (Src2.Kind = svkConstInt) and TypeIdIsNative((Src2.ConstInt shr 48) and $7FFF) then
+        Src2.ConstInt := Src2.ConstInt or RECBLOCK_NATIVE;
+  else
+    if (OpCode = ssaRecordReallocBlock) and (Src3.Kind = svkConstInt) and
+       TypeIdIsNative((Src3.ConstInt shr 48) and $7FFF) then
+      Src3.ConstInt := Src3.ConstInt or RECBLOCK_NATIVE;
+  end;
+end;
+
+function TSSAGenerator.NativeRecordType(const TypeName: string): Boolean;
+// Phase 3.2 of the pointer model (job/markdown/FASE3-INVENTARIO.md): in the fb memory mode a record of this TYPE is
+// C bytes, and EVERY value that names one - a variable, a "T Ptr", an element of an array, a block - is the machine
+// address of its image with FGNPTR_TAG, as in fbc. Its fields are read and written by the raw path, which already
+// knows C layouts and is native in the three engines.
+// ⛔⛔ THE DECISION IS PER TYPE, and that is the lesson of the withdrawn 3.1: decided per VARIABLE, an address met a
+// consumer that expected a handle of the same type (a parameter, a copy, a member array) and nine guards broke. With
+// one answer per type, a handle and an address of the same type never meet.
+// Only a type with nothing outside its image and nothing to run - the list below is deliberately narrow while the
+// step is built behind SB_RECNATIVE; each exclusion is a thing the raw path does not do yet.
+var
+  Idx, i, k: Integer;
+  T: string;
+  Offsets: TInt64Array;
+  Total: Int64;
+begin
+  Result := False;
+  if not (FNativeMemory and FRecNativeKnob) then Exit;
+  T := UpperFast(TypeName);
+  Idx := FindUDT(T);
+  if Idx < 0 then Exit;
+  if FUDTs[Idx].Parent <> '' then Exit;                      // a type id, a base
+  for k := 0 to High(FUDTs) do                               // ...or a base OF another type: a cast would mix the two
+    if SameText(FUDTs[k].Parent, FUDTs[Idx].Name) then Exit;
+  if FUDTs[Idx].NStr <> 0 then Exit;                         // a String lives outside the image (phase 5)
+  if UDTBlockIsManaged(T) or TypeHasMemberProc(T) then Exit;
+  if FMemberOwnerTypes.IndexOf(T) >= 0 then Exit;
+  // ...nor a STATIC member: "T.counter" names a shared backing, and with T native the member access read the type name
+  // as a record variable (d252/static_shared_member printed an address).
+  for k := 0 to FStaticMembers.Count - 1 do
+    if SameText(Copy(FStaticMembers[k], 1, Length(T) + 1), T + '.') then Exit;
+  for k := 0 to FStaticMemberProcs.Count - 1 do
+    if SameText(Copy(FStaticMemberProcs[k], 1, Length(T) + 1), T + '.') then Exit;
+  if not UDTCLayoutRaw(Idx, Offsets, Total) then Exit;
+  if (Total <= 0) or (Total <> FUDTs[Idx].LiveBytes) then Exit;   // the live image IS the C image
+  // ⛔ A POINTER FIELD must name a native type too: the raw path writes a pointer field as C's address and reads it back
+  // with C's mark, so a record HANDLE stored there came back as a machine address (m535: "a->b = CAllocate" with b a
+  // pointer to a type holding a bit field). A type that points at itself - a list, a tree - is answered optimistically
+  // while it is being asked.
+  if FNativeRecAsking.IndexOf(T) >= 0 then Exit(True);
+  FNativeRecAsking.Add(T);
+  try
+    for i := 0 to High(FUDTs[Idx].Fields) do
+      with FUDTs[Idx].Fields[i] do
+      begin
+        if (Bank = srtString) or (BitWidth > 0) or IsBoolean or IsCvaList or (DefaultExpr <> nil) then Exit;
+        // ⚠️ A PROCEDURE field: the managed store picks an overload of "@fun" from the field's signature, and the raw
+        // store does not yet (m708). Excluded until it does.
+        if FuncPtrSig <> '' then Exit;
+        if (NestedType <> '') and not (InlineNested and NativeRecordType(NestedType)) then Exit;
+        if IsArray and not (InlineArray and (ArrayElemType = '')) then Exit;
+        if (PtrPointee <> '') and not NativeRecordType(PtrPointee) then Exit;
+        if IsArray and (ArrayElemPtrPointee <> '') and not NativeRecordType(ArrayElemPtrPointee) then Exit;
+      end;
+    Result := True;
+  finally
+    FNativeRecAsking.Delete(FNativeRecAsking.IndexOf(T));
+  end;
 end;
 
 procedure TSSAGenerator.EmitRecordBlockCtorDtor(const FirstHandle, CountVal: TSSAValue;
@@ -53039,6 +53210,9 @@ begin
     Nm := Node.GetChild(0).ValueUpper;
     if Pos('~', Nm) > 0 then Nm := Copy(Nm, 1, Pos('~', Nm) - 1);   // an overload carries its signature
     q := LastDelimiter('.', Nm);
+    // ⭐ Phase 3.2: ANY dotted definition is a member of its owner - "Sub PT.SetXY" with no Declare inside the Type is
+    // legal here and leaves no HASMEMBERPROC mark, and a native record has no handle to be its THIS.
+    if q > 1 then FMemberOwnerTypes.Add(Copy(Nm, 1, q - 1));
     if q > 1 then
     begin
       Tail := Copy(Nm, q + 1, MaxInt);
@@ -54846,7 +55020,18 @@ begin
   if not FNativeMemory then Exit;
   C := UpperFast(CanonicalType(Trim(Pointee)));
   W := TypeNameWidthCode(C);
-  if (W >= 1) and (W <= 6) then Result := MakeSSAConstInt(RawTypeCodeOfPointee(C));
+  if (W >= 1) and (W <= 6) then Result := MakeSSAConstInt(RawTypeCodeOfPointee(C))
+  // ⭐ Phase 3.2: a POINTER pointee is C's address in the bytes, read back with the mark and written without it - the
+  // RTC_PTR64 rule the raw path applies to a pointer field. A native record holds its pointer fields that way, so a
+  // "*v.q(0)" reached through the element's address must not read eight bare bytes.
+  else if FRecNativeKnob and (Pos(' PTR', C) > 0) then
+  begin
+    // ...and RTC_NPTR when it points at a native record type: an address by the closure rule, nothing to bring home.
+    if NativeRecordType(Trim(Copy(C, 1, Length(C) - 4))) and (Copy(C, Length(C) - 3, 4) = ' PTR') then
+      Result := MakeSSAConstInt(RTC_NPTR)
+    else
+      Result := MakeSSAConstInt(RTC_PTR64);
+  end;
 end;
 
 function TSSAGenerator.FloatRefArg(const Pointee: string): TSSAValue;
@@ -57229,6 +57414,7 @@ begin
   FByrefRetValue.Clear;
   FRawPtrRetFuncs.Clear;
   FBlockManagedTypes.Clear;
+  FMemberOwnerTypes.Clear;
   FConstDeclSeen.Clear;
   FConstStrBytes.Clear;
   FArrayElemWidth.Clear;

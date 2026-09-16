@@ -87,6 +87,22 @@ const
   // grew: 62 - 24 = 38. Leaving it at 46 would let a large handle spill into the shared flag.
   RECPTR_INDEX_MASK = (Int64(1) shl 38) - 1;
 
+  { ⭐ Phase 3.2 of the pointer model: a record of a NATIVE type (TSSAGenerator.NativeRecordType) is C bytes from libc,
+    and the value that names it is the address with FGNPTR_TAG. The allocating opcodes say so with one bit each, so the
+    SSA marks the instruction in ONE place (EmitInstruction) whatever emitted it:
+      bcRecordNew                bit 49 of the Immediate
+      bcRecordNewBlock/Realloc   bit 63 of the Immediate (the type id above it is 15 bits)
+      bcRecordNewArray[Ind]      bit 47 of the Immediate - the top of the string count, which is 0 for a native type.
+                                 ⛔ NOT bit 16: the byte size took bits 16..31 when records passed 64 KiB, and a flag there
+                                 made every element 65 536 bytes further on. }
+  RECNEW_NATIVE = Int64(1) shl 49;
+  RECBLOCK_NATIVE = Int64(1) shl 63;
+  RECARR_NATIVE = Int64(1) shl 47;
+  { ...and bcRefAddrField with bit 40 of its Immediate answers the MACHINE ADDRESS of the member instead of a view: a
+    record of a native type held by value inside a managed container is still named by an address (a managed record's
+    image is native memory that does not move while the record lives). }
+  RECADDR_WANT = Int64(1) shl 40;
+
   { FreeBASIC raw memory (Allocate/CAST/...). A raw pointer is a byte OFFSET into the VM-internal byte
     heap (FRawHeap), tagged with RAWPTR_TAG (bit 62) so it is distinct from a managed FArrays pointer
     (bit 63=0, bit 62=0) and a record-field pointer (bit 63=1). Deref reads/writes SizeOf(T) bytes at the
@@ -254,6 +270,10 @@ const
     address with its region recorded, or home as the VM pointer it names. As a plain RTC_I64 it came
     back bare and the VM took it for one of its own. }
   RTC_PTR64 = 10;
+  { ⭐ Phase 3.2: a pointer field of a NATIVE record type (TSSAGenerator.NativeRecordType), whose pointee is native too by
+    the closure rule - so the value is always an address and never a VM name to bring home. Read: a user-space address
+    gets C's mark. Written: the mark comes off. No lookup, so every engine does it inline. }
+  RTC_NPTR = 11;
 
   { The width of ONE wide character in the byte IMAGE of a WSTRING - the raw-heap buffer an @-taken
     "WString * n" is backed with, what "Clear w, 0, SizeOf(w)" writes over, and what a UByte or UShort

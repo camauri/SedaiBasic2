@@ -2598,6 +2598,17 @@ begin
   end;
   Result := TASTNode.CreateWithValue(antNew, UpperCase(Context.CurrentToken.Value), Token);
   Context.Advance;  // consume the type name
+  // ⛔ ...AND A QUALIFIED NAME IS ONE NAME (DIVERGENZE 478). "New ns.T" was read as "New NS" followed by a member
+  // access ".T": the allocation named a type that does not exist and the value came out 0, which the managed record
+  // path took for the NULL slot and let the program read and write in silence. After NEW a dot can only continue the
+  // TYPE: a member of the new object is reached with "->", not ".".
+  while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
+        (Context.PeekNext.TokenType = ttIdentifier) do
+  begin
+    Context.Advance;                          // .
+    Result.Value := VarToStr(Result.Value) + '.' + UpperCase(Context.CurrentToken.Value);
+    Context.Advance;                          // the next segment
+  end;
   // "New T Ptr [n]": the ELEMENT is a pointer, not a T - an array of pointers to be filled in later,
   // which is how the manual builds a 2-dimensional object array. The suffix belongs to the TYPE, and
   // without reading it here the "Ptr" was left standing where the '[' was expected, so "New UDT Ptr[4]"

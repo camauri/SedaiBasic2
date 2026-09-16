@@ -3619,9 +3619,17 @@ A variable of a builtin numeric type whose address is taken lives in a cell of n
 an array of integers (`Byte` to `ULongInt`), `Single` or `Double` is the element's machine address — so a `UByte Ptr`
 over such an array reads its bytes, pointer arithmetic counts bytes, and C can keep that address and hand it back. An
 array of `Single` stores its elements four bytes wide, as FreeBASIC does, in both memory modes.
-Records, arrays of `Boolean`, enums, strings or pointers, and strings still live where they always did, so the
-limits listed under "Calling C libraries" below still apply to them (a record whose address C keeps across calls, an
+A **plain record type** is C bytes too (16 September 2026): a type with no method, constructor, destructor, operator or
+property, no base type and no type extending it, no static member, no `String`, bit field, `Boolean`, field default or
+procedure field, whose pointer fields point to plain record types. Every value naming such a record - a variable, a
+`T Ptr`, an element of an array, a `New` or `CAllocate` block, a member held by value, a `ByRef` parameter - is its
+machine address: `@r` and `@r.field` are addresses, the elements of an array of records are contiguous, `p + 1` steps
+`SizeOf(T)` bytes, and C can keep the address and hand it back.
+Records of other types, arrays of `Boolean`, enums, strings or pointers, and strings still live where they always did, so
+the limits listed under "Calling C libraries" below still apply to them (a record whose address C keeps across calls, an
 address C hands back later).
+⚠️ Declared: the block holding an array of plain records is not given back when the array is erased, re-dimensioned
+larger or goes out of scope.
 
 How the mode is chosen, most specific first:
 
@@ -3633,7 +3641,7 @@ How the mode is chosen, most specific first:
 A value that is not `fb` or `strict` is refused, naming where it came from; nothing runs.
 
 **A compiled program keeps its mode.** `sbc` writes it into the `.basc` file (since format version 6, shown by `sbd`
-as `Memory mode`; format 7 also records which arrays hand out machine addresses), and `sb prog.basc` runs it in that
+as `Memory mode`; format 7 also records which arrays hand out machine addresses, and format 8 may hold plain records as C bytes), and `sb prog.basc` runs it in that
 mode. Asking for the other one with `--memory` is refused with the
 command that recompiles it, because the pointer model is decided when a program is compiled. A `.basc` written before
 format 6 runs as `strict`.
@@ -3715,9 +3723,8 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
 - **`stdin`, `stdout` and `stderr` from `crt.bi` are C's streams.** `fprintf(stderr, ...)` and `fputs(text, stdout)`
   used to end with an access violation because the three variables read 0. More generally, an `Extern` variable
   with an `Alias` names that C symbol even outside an `Extern "C"` block.
-- ⚠️ **A field inside a union, read through a pointer a C library passes to a callback, stops the program** with
-  "Invalid record-field pointer" (for example `ev->u.media_meta_changed.meta_type` in a libvlc event callback). Fields
-  outside the union read right.
+- **A field inside a union, read through a pointer a C library passes to a callback, reads right** (for example
+  `ev->u.media_meta_changed.meta_type` in a libvlc event callback); it used to stop with "Invalid record-field pointer".
 - **A struct passed to C by value reaches it with its pointer fields as addresses C can follow.** gdbm's `datum`
   (`dptr As ZString Ptr`, `dsize As Long`) goes by value to every gdbm call; `gdbm_store(db, key, value, flag)` used
   to end with an access violation. C receives a copy, so the program's record is never changed. ⚠️ A field of a
@@ -3746,26 +3753,19 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   an XPath extension function, a callback, a helper — and `*gdbm_version` read in a SUB used to stop the program,
   while the same lines worked at module level. Only a C variable of record type was reachable from a procedure.
   C variables of narrow and floating-point types (`Extern x As Byte`, `As Short`, `As Double`) included.
-- ⚠️ **A record with a `Union` member cannot be passed to C by value, and a pointer member of such a union filled by
-  C cannot be followed.** fontconfig's `FcValue` (a type tag and a union) is the common case: `FcValueEqual(a, b)` and
-  `FcPatternAdd(p, object, value, append)` are refused when the program is compiled, naming the member, and after
-  `FcPatternGet(p, object, 0, @v)` the numeric members `v.u.i` and `v.u.d` read right but `v.u.s` does not. Use the
-  typed functions (`FcPatternAddString`, `FcPatternGetString` and the rest), which work as in FreeBASIC.
+- ⚠️ **A record with a `Union` member cannot be passed to C by value.** fontconfig's `FcValue` (a type tag and a union)
+  is the common case: `FcValueEqual(a, b)` and `FcPatternAdd(p, object, value, append)` are refused when the program is
+  compiled, naming the member. Use the typed functions (`FcPatternAddString` and the rest), which work as in FreeBASIC.
+  A pointer member of such a union that C fills (`FcPatternGet(p, object, 0, @v)`, then `v.u.s`) reads right.
 - **Headers for old library versions are not supported**: `png12.bi`, `png14.bi`, `png15.bi` and `gif_lib4.bi` describe
   libpng 1.2/1.4/1.5 and giflib 4. The headers are accepted, but the libraries a current system installs (libpng 1.6,
   giflib 5) refuse them or have a different ABI, under FreeBASIC too. Use `png16.bi` and `gif_lib5.bi`.
-- ⚠️ **An address the program gives to C and C hands back LATER is not the same pointer again.** After
-  `set_user_data(x, @v)`, the pointer C answers in a later call reads the right value but does not compare equal to
-  `@v`, and a callback that receives `@v` as its user data cannot read through it. A pointer C returns in the same call
-  that received it (`memcpy(@n, @n, 0)`) is right for a numeric variable. The same holds for a record allocated with
-  `Callocate` that the program stores in C's memory and C hands to a later callback (MariaDB's `LOAD DATA LOCAL INFILE`
-  handler): the pointer arrives, but its fields do not read right. Keep such state in a numeric block
-  (`Dim s As Long Ptr = Callocate(3 * SizeOf(Long))`), which works as in FreeBASIC.
-- ⚠️ **A C library that keeps the address of a RECORD of the program and reads it in a later call does not see the
-  record.** MariaDB's prepared statements are the common case: a `MYSQL_BIND` whose `buffer` is `@t`, `t` a
-  `MYSQL_TIME`, is copied by `mysql_stmt_bind_param` and read by `mysql_stmt_execute`, which then fails (or reads
-  zeros). Buffers of numbers and strings work; bind a date and time as a string (`MYSQL_TYPE_STRING`,
-  `"2021-02-03 04:05:06"`).
+- **An address the program gives to C and C hands back later is the same pointer again**, for a plain record (see
+  "Memory mode"): after `set_user_data(x, @v)` the pointer C answers compares equal to `@v`, and a callback that receives
+  it reads through it. So does a record allocated with `Callocate` that C hands to a later callback, and a record whose
+  address C keeps and reads in a later call (MariaDB's `MYSQL_BIND` with `buffer = @t`). ⚠️ A record of a type with
+  methods, a `String` field or a procedure field is not a plain record, and for it C still receives a copy that lives
+  for one call.
 - **A pointer C writes into a cell passed to a parameter declared `Any Ptr` can be dereferenced.**
   `mysql_get_optionv(db, MYSQL_SET_CHARSET_NAME, @name)` and `mariadb_get_infov(db, value, @text)` then `*name` read
   the text; it used to stop with "Null or invalid pointer dereference". A cell C only reads, or does not touch, keeps

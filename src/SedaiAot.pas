@@ -167,6 +167,11 @@ type
     // 2026 (AOTC_DIAG, a procedure taking "@" of two parameters, 3 M calls): 6 000 000 helper calls, 99.9% of the exits,
     // and --aot slower than the interpreter.
     RawAlloc: Pointer;     // offset 344: @AotRawAlloc (VMSelf, CtxObj, bytes, imm) -> Int64
+    // Phase 3.2: RTC_PTR64 as leaf calls - the pointer a native record's field holds comes home or gets C's mark
+    // (TBytecodeVM.PtrLoadHome), and a VM name written there becomes an address (PtrStoreValue). Before, every such load
+    // and store was a helper call: binary-trees under --aot was 11x slower once its records were native.
+    PtrHome: Pointer;      // offset 352: @AotPtrHome (VMSelf, value) -> Int64
+    PtrStore: Pointer;     // offset 360: @AotPtrStore (VMSelf, value) -> Int64
   end;
   PAotCtx = ^TAotCtx;
 
@@ -206,6 +211,8 @@ const
   AOTCTX_INTTOFLTU   = 328;
   AOTCTX_FLTROUNDU   = 336;
   AOTCTX_RAWALLOC    = 344;
+  AOTCTX_PTRHOME     = 352;
+  AOTCTX_PTRSTORE    = 360;
 
   // C9 math table indices. ⛔ ONE list, two users: SedaiAot emits `call [table + INDEX*8]` and
   // SedaiBytecodeVM fills the table at those indices.
@@ -535,6 +542,7 @@ function AotAscMidInline: Boolean;
 function AotRawCodeNative(Code: Int64; IsFloat: Boolean): Boolean;
 
 procedure AotSetRecordLayout(RecordsOff, RecSize, RecIntOff, RecFloatOff, SharedRecOff: Integer);
+procedure AotSetHomeLayout(ValidOff, LoOff, HiOff, RawLoOff, RawHiOff: Integer);   // phase 3.2
 
 // Magic number for a SIGNED 64-bit division by a constant (Hacker's Delight figure 10-4), so that
 // `x \ C` and `x Mod C` become a multiply-high instead of an idiv. Exported for the same reason
@@ -562,6 +570,11 @@ var
   GRecIntOff: Integer = 0;
   GRecFloatOff: Integer = 0;
   GSharedRecOff: Integer = 0;
+  GHomeValidOff: Integer = 0;   // phase 3.2: AotSetHomeLayout
+  GHomeLoOff: Integer = 0;
+  GHomeHiOff: Integer = 0;
+  GRawLoOff: Integer = 0;
+  GRawHiOff: Integer = 0;
   GRecNativeState: Integer = -1;   // -1 unread, 0 off, 1 on
   GRecAllocState: Integer = -1;    // C6 New/Delete/RecMark as leaf calls: -1 unread, 0 off, 1 on
   GPrintOpState: Integer = -1;     // C7 PrintSemicolon/PrintEnd as leaf calls: -1 unread, 0 off, 1 on
@@ -591,6 +604,14 @@ var
   // Diagnostics: how many div/mod sites took the magic path and how many stayed on idiv, and why.
   GDivConstHit: Integer = 0;
   GDivConstMiss: Integer = 0;
+
+procedure AotSetHomeLayout(ValidOff, LoOff, HiOff, RawLoOff, RawHiOff: Integer);
+// ⭐ Phase 3.2: where on the VM instance the span a pointer may come home to lives (TBytecodeVM.RebuildHomeSpan), so the
+// RTC_PTR64 load tests it inline and calls AotPtrHome only for an address inside it. 0 = not supplied: always call.
+begin
+  GHomeValidOff := ValidOff; GHomeLoOff := LoOff; GHomeHiOff := HiOff;
+  GRawLoOff := RawLoOff; GRawHiOff := RawHiOff;
+end;
 
 procedure AotSetRecordLayout(RecordsOff, RecSize, RecIntOff, RecFloatOff, SharedRecOff: Integer);
 begin
@@ -664,11 +685,20 @@ begin
   Result := (GRecNativeState = 1) and (GRecSize > 0);
 end;
 
+function AotRawCodeAot(Code: Int64; IsFloat: Boolean): Boolean;
+// The AOT's own answer: AotRawCodeNative, plus RTC_PTR64 on an integer access (AotRawAccess: EmitPtrLoad / EmitPtrStore).
+begin
+  Result := AotRawCodeNative(Code, IsFloat) or ((not IsFloat) and ((Code = RTC_PTR64) or (Code = RTC_NPTR)));
+end;
+
 function AotRawCodeNative(Code: Int64; IsFloat: Boolean): Boolean;
 begin
   if IsFloat then Exit(True);            // RTC_SINGLE is four bytes, every other code eight
   case Code of
+    // ⛔ STILL False here: the JIT asks this function too and its raw arm has no translation. The AOT admits RTC_PTR64
+    // separately (AotRawCodeAot), because AotRawAccess translates it through a leaf call (phase 3.2).
     RTC_PTR64: Result := False;          // a pointer read from / written into C's memory is translated (250 · 451)
+    RTC_NPTR:  Result := False;          // phase 3.2: the AOT does it inline (AotRawCodeAot); the JIT keeps the helper
     {$IFDEF WINDOWS}
     RTC_I32, RTC_U32: Result := False;   // a cell of a WSTRING block Windows handed back is a UTF-16 unit (239)
     {$ENDIF}
@@ -1562,14 +1592,14 @@ begin
     // or a width the interpreter translates (AotRawCodeNative), takes the helper road whole.
     ssaRawLoadInt, ssaRawLoadFloat:
       Result := GAotRawMem and (Ins.Src3.Kind = svkConstInt) and
-                AotRawCodeNative(Ins.Src3.ConstInt, Ins.OpCode = ssaRawLoadFloat) and
+                AotRawCodeAot(Ins.Src3.ConstInt, Ins.OpCode = ssaRawLoadFloat) and
                 (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt) and
                 (Ins.Dest.Kind = svkRegister) and
                 ((Ins.Dest.RegType = srtFloat) = (Ins.OpCode = ssaRawLoadFloat)) and
                 (Ins.Dest.RegType <> srtString);
     ssaRawStoreInt, ssaRawStoreFloat:
       Result := GAotRawMem and (Ins.Src3.Kind = svkConstInt) and
-                AotRawCodeNative(Ins.Src3.ConstInt, Ins.OpCode = ssaRawStoreFloat) and
+                AotRawCodeAot(Ins.Src3.ConstInt, Ins.OpCode = ssaRawStoreFloat) and
                 (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt) and
                 (Ins.Src2.Kind = svkRegister) and
                 ((Ins.Src2.RegType = srtFloat) = (Ins.OpCode = ssaRawStoreFloat)) and
@@ -1578,7 +1608,7 @@ begin
     ssaRefLoadInt, ssaRefLoadFloat:
       Result := GAotRawMem and
                 ((Ins.Src3.Kind = svkNone) or ((Ins.Src3.Kind = svkConstInt) and
-                  AotRawCodeNative(Ins.Src3.ConstInt, Ins.OpCode = ssaRefLoadFloat))) and
+                  AotRawCodeAot(Ins.Src3.ConstInt, Ins.OpCode = ssaRefLoadFloat))) and
                 (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt) and
                 (Ins.Dest.Kind = svkRegister) and
                 ((Ins.Dest.RegType = srtFloat) = (Ins.OpCode = ssaRefLoadFloat)) and
@@ -1586,7 +1616,7 @@ begin
     ssaRefStoreInt, ssaRefStoreFloat:
       Result := GAotRawMem and
                 ((Ins.Src3.Kind = svkNone) or ((Ins.Src3.Kind = svkConstInt) and
-                  AotRawCodeNative(Ins.Src3.ConstInt, Ins.OpCode = ssaRefStoreFloat))) and
+                  AotRawCodeAot(Ins.Src3.ConstInt, Ins.OpCode = ssaRefStoreFloat))) and
                 (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt) and
                 (Ins.Src2.Kind = svkRegister) and
                 ((Ins.Src2.RegType = srtFloat) = (Ins.OpCode = ssaRefStoreFloat)) and
@@ -4050,6 +4080,87 @@ var
   // The width is Src3 (a raw type code, constant - AotIsNative checked it). The value is loaded first.
   procedure AotRawAccess(apc: Integer; IsFloat, IsStore: Boolean);
   var pr, vr, W, pCold, pDone: Integer;
+
+    // ⭐ Phase 3.2: RTC_PTR64, TBytecodeVM.RawLoadInt's rule. rax = the address. A value outside [64 KiB, 2^47) is
+    // stored as it is; a machine address goes through AotPtrHome, which brings it home or gives it C's mark.
+    procedure EmitPtrLoad;
+    var pKeep, pLow, pCall, pC1, pC2, pC3, pNR, pT1, pTagDone: Integer;
+    begin
+      // ⛔ No r11 before the spill: on Win64 it is an allocatable register.
+      E.EmitBytes([$48, $8B, $00]);                        // mov rax, [rax]
+      E.EmitBytes([$48, $89, $C2]);                        // mov rdx, rax
+      E.EmitBytes([$48, $C1, $EA, 47]);                    // shr rdx, 47
+      E.EmitBytes([$0F, $85]); pKeep := E.Len; E.Emit32(0);   // jnz keep   (>= 2^47, or negative)
+      E.EmitBytes([$48, $3D]); E.Emit32($10000);           // cmp rax, 0x10000
+      E.EmitBytes([$0F, $82]); pLow := E.Len; E.Emit32(0);    // jb keep    (below 64 KiB, NULL included)
+      // Inline: outside the raw heap and the array span, the answer is the address with C's mark - no call.
+      pCall := -1;
+      if GHomeValidOff > 0 then
+      begin
+        E.MemOp([$49, $8B], RDX, R8, AOTCTX_VMSELF);                       // rdx = the VM
+        E.EmitBytes([$48, $83, $BA]); E.Emit32(LongWord(GHomeValidOff)); E.Emit8(0);   // cmp qword [rdx+valid], 0
+        E.EmitBytes([$0F, $84]); pC1 := E.Len; E.Emit32(0);                // je call (span not built)
+        E.EmitBytes([$48, $3B, $82]); E.Emit32(LongWord(GRawLoOff));       // cmp rax, [rdx+rawlo]
+        E.EmitBytes([$72, $00]); pNR := E.Len - 1;                         // jb notraw
+        E.EmitBytes([$48, $3B, $82]); E.Emit32(LongWord(GRawHiOff));       // cmp rax, [rdx+rawhi]
+        E.EmitBytes([$0F, $82]); pC2 := E.Len; E.Emit32(0);                // jb call (inside the raw heap)
+        E.PatchByte(pNR, Byte(E.Len - (pNR + 1)));                         // @notraw
+        E.EmitBytes([$48, $3B, $82]); E.Emit32(LongWord(GHomeLoOff));      // cmp rax, [rdx+lo]
+        E.EmitBytes([$72, $00]); pT1 := E.Len - 1;                         // jb tag
+        E.EmitBytes([$48, $3B, $82]); E.Emit32(LongWord(GHomeHiOff));      // cmp rax, [rdx+hi]
+        E.EmitBytes([$0F, $86]); pC3 := E.Len; E.Emit32(0);                // jbe call (inside the span)
+        E.PatchByte(pT1, Byte(E.Len - (pT1 + 1)));                         // @tag
+        E.EmitBytes([$48, $0F, $BA, $E8, 61]);                             // bts rax, 61
+        E.EmitBytes([$E9]); pTagDone := E.Len; E.Emit32(0);                // jmp keep
+        pCall := E.Len;                                                    // @call
+        E.Patch32(pC1, LongWord(pCall - (pC1 + 4)));
+        E.Patch32(pC2, LongWord(pCall - (pC2 + 4)));
+        E.Patch32(pC3, LongWord(pCall - (pC3 + 4)));
+      end;
+      SpillVolatiles;
+      E.MemOp([$4D, $8B], R11, R8, AOTCTX_PTRHOME);        // r11 = primitive
+      E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);    // arg0 = VMSelf
+      MovRR(ABI_ARG1, RAX);                                // arg1 = the value read
+      E.EmitBytes([$41, $FF, $D3]);                        // call r11
+      StrCallEpilogue;
+      E.Patch32(pKeep, LongWord(E.Len - (pKeep + 4)));     // @keep
+      E.Patch32(pLow, LongWord(E.Len - (pLow + 4)));
+      if pCall >= 0 then E.Patch32(pTagDone, LongWord(E.Len - (pTagDone + 4)));
+      IStore(vr, RAX);
+    end;
+
+    // ...and RawStoreInt's: a C-marked value loses the mark, a packed VM name (>= 2^32, top bits clear) goes through
+    // AotPtrStore, everything else is written as it is. rax = the address, rcx = the value.
+    procedure EmitPtrStore;
+    var pNotTag, pTop, pLow, pWrite: Integer;
+    begin
+      E.EmitBytes([$48, $89, $CA]);                        // mov rdx, rcx
+      E.EmitBytes([$48, $C1, $EA, 61]);                    // shr rdx, 61
+      E.EmitBytes([$83, $FA, $01]);                        // cmp edx, 1
+      E.EmitBytes([$0F, $85]); pNotTag := E.Len; E.Emit32(0);   // jne nottag
+      E.EmitBytes([$48, $0F, $BA, $F1, 61]);               // btr rcx, 61          (a C-marked value: bare)
+      E.EmitBytes([$E9]); pWrite := E.Len; E.Emit32(0);    // jmp write
+      E.Patch32(pNotTag, LongWord(E.Len - (pNotTag + 4))); // @nottag
+      E.EmitBytes([$85, $D2]);                             // test edx, edx
+      E.EmitBytes([$0F, $85]); pTop := E.Len; E.Emit32(0); // jnz write            (top bits set: as it is)
+      E.EmitBytes([$48, $89, $CA]);                        // mov rdx, rcx
+      E.EmitBytes([$48, $C1, $EA, 32]);                    // shr rdx, 32
+      E.EmitBytes([$0F, $84]); pLow := E.Len; E.Emit32(0); // jz write             (below 2^32: as it is)
+      SpillVolatiles;                                      // a packed VM name: the VM decides
+      E.MemOp([$4D, $8B], R11, R8, AOTCTX_PTRSTORE);       // r11 = primitive
+      E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);    // arg0 = VMSelf
+      MovRR(ABI_ARG1, RCX);                                // arg1 = the value
+      E.EmitBytes([$41, $FF, $D3]);                        // call r11
+      StrCallEpilogue;
+      MovRR(RCX, RAX);                                     // rcx = the value to write
+      ILoad(RAX, pr);                                      // rax = the pointer again
+      E.EmitBytes([$48, $0F, $BA, $F0, 61]);               // btr rax, 61
+      E.Patch32(pWrite, LongWord(E.Len - (pWrite + 4)));   // @write
+      E.Patch32(pTop, LongWord(E.Len - (pTop + 4)));
+      E.Patch32(pLow, LongWord(E.Len - (pLow + 4)));
+      E.EmitBytes([$48, $89, $08]);                        // mov [rax], rcx
+    end;
+
   begin
     // A Ref accessor may carry no width (phase 2.3): 0, eight bytes / a Double.
     if Cur.Src3.Kind = svkConstInt then W := Integer(Cur.Src3.ConstInt) else W := 0;
@@ -4085,6 +4196,18 @@ var
         else
           E.EmitBytes([$F2, $0F, $11, $00]);               // movsd [rax], xmm0
       end
+      else if W = RTC_PTR64 then
+        EmitPtrStore
+      else if W = RTC_NPTR then
+      begin
+        // phase 3.2: the mark comes off a C-marked value; anything else is written as it is
+        E.EmitBytes([$48, $89, $CA]);                    // mov rdx, rcx
+        E.EmitBytes([$48, $C1, $EA, 61]);                // shr rdx, 61
+        E.EmitBytes([$83, $FA, $01]);                    // cmp edx, 1
+        E.EmitBytes([$75, $05]);                         // jne +5
+        E.EmitBytes([$48, $0F, $BA, $F1, 61]);           // btr rcx, 61
+        E.EmitBytes([$48, $89, $08]);                    // mov [rax], rcx
+      end
       else
         case W of
           RTC_I8,  RTC_U8:  E.EmitBytes([$88, $08]);       // mov [rax], cl
@@ -4100,6 +4223,20 @@ var
         if W = RTC_SINGLE then E.EmitBytes([$F3, $0F, $5A, $00])   // cvtss2sd xmm0, [rax]
         else E.EmitBytes([$F2, $0F, $10, $00]);                    // movsd xmm0, [rax]
         FStore(vr, XMM0);
+      end
+      else if W = RTC_PTR64 then
+        EmitPtrLoad
+      else if W = RTC_NPTR then
+      begin
+        // phase 3.2: a user-space address gets C's mark
+        E.EmitBytes([$48, $8B, $00]);                    // mov rax, [rax]
+        E.EmitBytes([$48, $89, $C2]);                    // mov rdx, rax
+        E.EmitBytes([$48, $C1, $EA, 47]);                // shr rdx, 47
+        E.EmitBytes([$75, $0D]);                         // jnz +13 (>= 2^47 or negative: as it is)
+        E.EmitBytes([$48, $3D]); E.Emit32($10000);       // cmp rax, 0x10000         (6 bytes)
+        E.EmitBytes([$72, $05]);                         // jb +5                    (2 bytes)
+        E.EmitBytes([$48, $0F, $BA, $E8, 61]);           // bts rax, 61              (5 bytes)
+        IStore(vr, RAX);
       end
       else
       begin

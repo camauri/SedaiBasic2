@@ -337,6 +337,17 @@ type
     // pushed and popped on a different schedule and stay separate.
     BlockRecMark: array of Integer;
     BlockRecMarkTop: Integer;
+    // ⭐ Phase 3.2: a native record local is a FRAME CELL (FrameCells); the block mark keeps FrameCellTop beside
+    // RecordCount, and the pop gives the block's cells back. RecCellOwner is the VM that stacked one - the AOT's leaf
+    // for the pop has only the context in hand.
+    BlockCellMark: array of Integer;
+    RecCellOwner: Pointer;
+    // A native record cell given back by a block or frame is POOLED, not freed: the next record of the same size takes it
+    // (zeroed). That is the life a per-thread record had - reclaimed, but its bytes intact until the next allocation - and
+    // a temporary read just after its block closes ("IIf(k, a, mk(7)).i", m763) depends on it. Each entry is the image
+    // address with FGNPTR_TAG; the 8 bytes before the image hold its size.
+    RecPool: array of Int64;
+    RecPoolTop: Integer;
 
     { ⭐ THE COMPILED PSET FAST PATH'S VIEW OF THE DRAW SURFACE - five Int64: the pixel base, the
       width, the height, and the addresses of the two pen fields. It lived as a LOCAL of the Run

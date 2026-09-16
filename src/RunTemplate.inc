@@ -82,7 +82,7 @@ var
   HotCOk: Boolean;      // may the C hot loop run? see the note at its call
   // The record-field descriptor handed to the C loop. It is built HERE, by the side that knows the
   // layout of TRecordStorage, so hotdisp.c holds no offset of its own and the two cannot drift.
-  HotRecDesc: array[0..7] of Int64;
+  HotRecDesc: array[0..11] of Int64;
   HotRecProbe: TRecordStorage;   // only ever used to take the offset of its Bytes field
   HotNewPC: LongInt;       // NEGATIVE means the back-edge budget ran out, with the PC as -(pc+1)
   HotBudget: LongInt;      // back edges this stay may take; High(LongInt) when nobody needs pumping
@@ -460,6 +460,24 @@ EventPollCounter := 0;
       else
         HotRecDesc[3] := 0;
       HotRecDesc[7] := Length(FSharedRecords);
+      // ⭐ Phase 3.2: where a pointer read out of native memory may come HOME (RTC_PTR64): the span of the array
+      // buffers VMPointerForMachineAddr answers for, and the VM's raw heap. Inside either, the C loop hands the PC back.
+      // With workers the span is not kept, so it covers everything.
+      // With workers the span is rebuilt under FArrDescLock - the lock every walk over all the slots takes - and only
+      // when the storage generation moved. ⚠️ Read without it here: a reshape racing this entry can only make a
+      // pointer INTO the array being reshaped miss its way home, and such a pointer is dangling under fbc too.
+      if FHomeValid = 0 then
+      begin
+        if FHasWorkers then EnterCriticalSection(FArrDescLock);
+        try
+          RebuildHomeSpan;
+        finally
+          if FHasWorkers then LeaveCriticalSection(FArrDescLock);
+        end;
+      end;
+      HotRecDesc[8] := FHomeLo; HotRecDesc[9] := FHomeHi;
+      HotRecDesc[10] := FRawLo;
+      if FRawHi > FRawLo then HotRecDesc[11] := FRawHi - FRawLo else HotRecDesc[11] := 0;
       HotNewPC := sedai_hot_run(Instructions, IntRegs, PDouble(FloatRegs), CurPC, InstrCount, TrueVal,
                                 HotArrDesc, HotFlags, HotXferI, HotXferF, @FHotOp[0], @HotRecDesc[0],
                                 HotBudget, @HotGfxDesc[0]);
@@ -1313,23 +1331,9 @@ EventPollCounter := 0;
           begin DestroyCond(Ctx.IntRegs[Instr^.Src1]); Inc(CurPC); end;
         // Block-scoped record reclamation (M8): mark at a loop-body entry, reclaim at its exit.
         bcRecMarkPush:
-          begin
-            if Ctx.BlockRecMarkTop >= Length(Ctx.BlockRecMark) then
-              SetLength(Ctx.BlockRecMark, Ctx.BlockRecMarkTop + 256);
-            Ctx.BlockRecMark[Ctx.BlockRecMarkTop] := Ctx.RecordCount;
-            Inc(Ctx.BlockRecMarkTop);
-            Inc(CurPC);
-          end;
+          begin ExecRecMarkPush(Ctx); Inc(CurPC); end;
         bcRecMarkPop:
-          begin
-            if Ctx.BlockRecMarkTop > 0 then
-            begin
-              Dec(Ctx.BlockRecMarkTop);
-              if Ctx.BlockRecMark[Ctx.BlockRecMarkTop] < Ctx.RecordCount then
-                Ctx.RecordCount := Ctx.BlockRecMark[Ctx.BlockRecMarkTop];
-            end;
-            Inc(CurPC);
-          end;
+          begin ExecRecMarkPop(Ctx); Inc(CurPC); end;
         // Transfer registers (M2): move a value to/from the non-saved transfer banks.
         bcXferStoreInt:
           begin Ctx.XferInt[Instr^.Immediate] := Ctx.IntRegs[Instr^.Src1]; Inc(CurPC); end;
@@ -1348,12 +1352,8 @@ EventPollCounter := 0;
           begin
             // Immediate bit 48 (M5.2c refinement): allocate in the shared region (cross-thread, e.g. a
             // SHARED UDT scalar); otherwise in this thread's per-context heap. typeId is bits 32..47.
-            if (Instr^.Immediate shr 48) and 1 <> 0 then
-              Ctx.IntRegs[Instr^.Dest] := AllocSharedRecord(Instr^.Src1,
-                                      Instr^.Immediate and $FFFF, (Instr^.Immediate shr 32) and $FFFF)
-            else
-              Ctx.IntRegs[Instr^.Dest] := AllocRecord(Ctx, Instr^.Src1,
-                                      Instr^.Immediate and $FFFF, (Instr^.Immediate shr 32) and $FFFF);
+            // Bit 49 (phase 3.2): a native record - see ExecRecordNew, the one place that decides.
+            Ctx.IntRegs[Instr^.Dest] := ExecRecordNew(Ctx, Instr^.Src1, Instr^.Immediate);
             Inc(CurPC);
           end;
         bcRecordNewArray:
@@ -1380,9 +1380,7 @@ EventPollCounter := 0;
           end;
         bcRecordNewBlock:  // Callocate(n, SizeOf(T)) of a UDT: n consecutive shared records; Dest = first
           begin
-            IntRegs[Instr^.Dest] := AllocSharedRecordBlock(IntRegs[Instr^.Src1],
-                                     Instr^.Immediate and $FFFFFFFF,
-                                     (Instr^.Immediate shr 32) and $FFFF, (Instr^.Immediate shr 48) and $FFFF);
+            IntRegs[Instr^.Dest] := ExecRecordNewBlock(IntRegs[Instr^.Src1], Instr^.Immediate);
             Inc(CurPC);
           end;
         bcRecordBlockLen:  // Delete[] p: how many records the block holds (1 when it is a lone record)
@@ -1407,10 +1405,8 @@ EventPollCounter := 0;
           end;
         bcRecordReallocBlock:  // Reallocate a UDT block: Dest = the (possibly moved) first handle
           begin
-            IntRegs[Instr^.Dest] := ReallocSharedRecordBlock(IntRegs[Instr^.Src1],
-                                     Integer(IntRegs[Instr^.Src2]),
-                                     Instr^.Immediate and $FFFFFFFF,
-                                     (Instr^.Immediate shr 32) and $FFFF, (Instr^.Immediate shr 48) and $FFFF);
+            IntRegs[Instr^.Dest] := ExecRecordReallocBlock(IntRegs[Instr^.Src1], IntRegs[Instr^.Src2],
+                                                           Instr^.Immediate);
             Inc(CurPC);
           end;
         // M5.2c: ResolveRec routes the handle to its record (per-thread heap or the shared region).
