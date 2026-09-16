@@ -953,7 +953,7 @@ EventPollCounter := 0;
       // Group 3 (arrays). The ELEMENT-ACCESS opcodes (sub 3..8) run INLINE here, from the same source
       // text the handler uses (ArrayHotOps.inc). Everything else in group 3 is rare and still delegates.
       DENSE_ARRAY_BASE + 3 .. DENSE_ARRAY_BASE + 8,
-      DENSE_ARRAY_BASE + 55 .. DENSE_ARRAY_BASE + 56:   // phase 2.5: bcArrayLoadNarrow / bcArrayStoreNarrow
+      DENSE_ARRAY_BASE + 55 .. DENSE_ARRAY_BASE + 58:   // phase 2.5 / 2.6: bcArray{Load,Store}{Narrow,Single}
         begin
           // The shared branches never touch the PC, so this path advances it itself.
           // InstrHot is what the shared text below dereferences: this include is compiled into two

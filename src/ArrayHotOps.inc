@@ -108,6 +108,22 @@
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then
           ArrSetIntAt(ArrayIdx, LinearIdx, Ctx.IntRegs[InstrHot^.Dest]);
       end;
+    57: // bcArrayLoadSingle - phase 2.6: an element of a Single array. ArrGetFloat reads the PHYSICAL storage, so a
+      begin  // Double array reached through a Single parameter still answers right here (the compiled arms hand it back).
+        ArrayIdx := ArrMapP[InstrHot^.Src1];
+        LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
+        if ArrayBoundsOK(ArrayIdx, LinearIdx) then
+          Ctx.FloatRegs[InstrHot^.Dest] := ArrGetFloat(FArrays[ArrayIdx], LinearIdx)
+        else
+          Ctx.FloatRegs[InstrHot^.Dest] := 0.0;   // MODERN out-of-bounds read -> default
+      end;
+    58: // bcArrayStoreSingle - the value in Dest, rounded to a Single where the storage is one
+      begin
+        ArrayIdx := ArrMapP[InstrHot^.Src1];
+        LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
+        if ArrayBoundsOK(ArrayIdx, LinearIdx) then
+          ArrSetFloatAt(ArrayIdx, LinearIdx, Ctx.FloatRegs[InstrHot^.Dest]);
+      end;
     8: // bcArrayStoreString
       begin
         ArrayIdx := ArrMapP[InstrHot^.Src1];   // logical -> this context's physical slot

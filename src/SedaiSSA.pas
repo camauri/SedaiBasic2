@@ -1226,6 +1226,7 @@ type
     procedure NoteArrayAddrNative(ArrayIdx: Integer; ET: TSSARegisterType; const ElemTypeName: string);
     function ArrayAddrIsNative(ArrayIdx: Integer): Boolean;
     function NarrowRefArg(const Pointee: string): TSSAValue;
+    function FloatRefArg(const Pointee: string): TSSAValue;   // phase 2.6: a Single pointee's width
     function EmitIsNativeAddr(const P: TSSAValue): TSSAValue;
     procedure NoteArrayElemStorage(ArrayIdx: Integer; ET: TSSARegisterType;
                                    const ArrElemTypeName: string);  // packed storage, guard m884
@@ -4465,7 +4466,7 @@ begin
       DestReg := FProgram.AllocRegister(FuncRetType);
       Result := MakeSSARegister(FuncRetType, DestReg);
       case FuncRetType of
-        srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), FloatRefArg(DerefedType(Node.GetChild(0))));
         srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       else
         // ⭐ ...AND THE READ CARRIES ITS OWN WIDTH. Over a PACKED array the elements are contiguous
@@ -10127,7 +10128,7 @@ begin
           DestReg := FProgram.AllocRegister(FuncRetType);
           Result := MakeSSARegister(FuncRetType, DestReg);
           case FuncRetType of
-            srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), FloatRefArg(PointeeTypeOf(ArrName)));
             srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           else
             EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone),
@@ -11536,7 +11537,7 @@ begin
     srtFloat:
       begin
         ExprValue := EnsureFloatRegister(ExprValue);
-        EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+        EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, FloatRefArg(DerefedType(VarNode.GetChild(0))));
       end;
     srtString:
       begin
@@ -11612,7 +11613,7 @@ begin
       srtFloat:
         begin
           ExprValue := EnsureFloatRegister(ExprValue);
-          EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+          EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, FloatRefArg(ByrefRetPointeeType(VarName)));
         end;
       srtString:
         begin
@@ -11698,7 +11699,7 @@ begin
     end
     else
       case DerefBank of
-        srtFloat:  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, EnsureFloatRegister(ExprValue), MakeSSAValue(svkNone));
+        srtFloat:  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, EnsureFloatRegister(ExprValue), FloatRefArg(DstRecType));
         srtString: EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, EnsureStringRegister(ExprValue), MakeSSAValue(svkNone));
       else
         EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, EnsureIntRegister(ExprValue), NarrowRefArg(DstRecType));
@@ -11775,7 +11776,7 @@ begin
       srtFloat:
         begin
           ExprValue := EnsureFloatRegister(ExprValue);
-          EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+          EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, FloatRefArg(DstRecType));
         end;
       srtString:
         begin
@@ -26733,7 +26734,7 @@ begin
     Exit;
   end;
   case Bank of
-    srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), FloatRefArg(ByrefRetPointeeType(Lbl)));
     // The immediate carries the WIDTH of the pointee, which only a RAW address needs: text there is a C
     // string and a WSTRING one is wide cells. A packed address ignores it.
     srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone),
@@ -26759,7 +26760,7 @@ begin
     Exit;
   end;
   case Bank of
-    srtFloat:  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), AddrVal, EnsureFloatRegister(Val), MakeSSAValue(svkNone));
+    srtFloat:  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), AddrVal, EnsureFloatRegister(Val), FloatRefArg(ByrefRetPointeeType(Lbl)));
     srtString: EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), AddrVal, EnsureStringRegister(Val),
                                MakeSSAConstInt(Ord(Pos('WSTRING', ByrefRetPointeeType(Lbl)) > 0)));
   else         EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), AddrVal, EnsureIntRegister(Val), NarrowRefArg(ByrefRetPointeeType(Lbl)));
@@ -49008,7 +49009,7 @@ begin
   end
   else
     case Bank of
-      srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), FloatRefArg(Pointee));
       srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     else
       EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), NarrowRefArg(Pointee));
@@ -49847,7 +49848,7 @@ begin
     end;
     Result := MakeSSARegister(RetRT, FProgram.AllocRegister(RetRT));
     case RetRT of
-      srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), FloatRefArg(RetPart));
       srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     else         EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), NarrowRefArg(RetPart));
     end;
@@ -49927,7 +49928,7 @@ begin
     if FindUDT(ByrefRetPointeeType(Name)) >= 0 then FuncRetType := srtInt;
     Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
     case FuncRetType of
-      srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), FloatRefArg(ByrefRetPointeeType(Name)));
       srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     else
       EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), NarrowRefArg(ByrefRetPointeeType(Name)));
@@ -54634,8 +54635,8 @@ procedure TSSAGenerator.NoteArrayAddrNative(ArrayIdx: Integer; ET: TSSARegisterT
 // ⭐ PHASE 2.3 OF THE POINTER MODEL (15 Sep 2026): in the fb memory mode "@a(i)" of THIS array is the element's
 // machine address (bcArrayElemAddr), not a packed VM name. Decided by the DECLARED element type, at the same
 // sites that decide the element's width, and for an array PARAMETER from its declared type.
-// ⛔ Only builtin integers and Double - the types whose storage already has the element's true width:
-//   - Single is float-banked in 8-byte cells, so a "Single Ptr" into it would step into the middle of a cell;
+// ⛔ Only builtin integers, Double and - since phase 2.6 - Single, the types whose storage has the element's true
+// width (a Single array is packed at four bytes, NoteArrayElemStorage):
 //   - an array of POINTERS keeps its packed pointers, because C reaches its cells through the second-level
 //     translation (ForeignDeepCell) that only a packed pointer names;
 //   - Boolean, enums, String, records are other questions (fbc widths the storage does not have yet).
@@ -54647,8 +54648,8 @@ begin
   C := UpperFast(CanonicalType(Trim(ElemTypeName)));
   if not ((C = 'BYTE') or (C = 'UBYTE') or (C = 'SHORT') or (C = 'USHORT') or (C = 'LONG') or
           (C = 'ULONG') or (C = 'INTEGER') or (C = 'UINTEGER') or (C = 'LONGINT') or (C = 'ULONGINT') or
-          (C = 'DOUBLE')) then Exit;
-  if (C = 'DOUBLE') <> (ET = srtFloat) then Exit;
+          (C = 'DOUBLE') or (C = 'SINGLE')) then Exit;
+  if ((C = 'DOUBLE') or (C = 'SINGLE')) <> (ET = srtFloat) then Exit;
   if ArrayIdx >= Length(FAddrNativeArrays) then
   begin
     Old := Length(FAddrNativeArrays);
@@ -54681,6 +54682,16 @@ begin
   if (W >= 1) and (W <= 6) then Result := MakeSSAConstInt(RawTypeCodeOfPointee(C));
 end;
 
+function TSSAGenerator.FloatRefArg(const Pointee: string): TSSAValue;
+// ⭐ PHASE 2.6: the width a Ref float load/store owes a SINGLE pointee. A Single array is packed at four bytes, so an
+// element address (a machine address in fb, a packed name in strict) is read four bytes wide - read at eight, "*ps"
+// took the next element with it. RTC_SINGLE is what the raw arms of all four engines already honour; nothing for
+// any other pointee, so every other float dereference keeps the bytecode it had.
+begin
+  Result := MakeSSAValue(svkNone);
+  if UpperFast(CanonicalType(Trim(Pointee))) = 'SINGLE' then Result := MakeSSAConstInt(RTC_SINGLE);
+end;
+
 function TSSAGenerator.EmitIsNativeAddr(const P: TSSAValue): TSSAValue;
 // 1 when P is a tagged machine address (2^61 <= P < 2^62: FGNPTR_TAG set, RAWPTR_TAG clear), else 0.
 // Two compares and two ANDs - no SHR, for the reason EmitManagedPtrStep gives.
@@ -54702,7 +54713,18 @@ end;
 procedure TSSAGenerator.NoteArrayElemStorage(ArrayIdx: Integer; ET: TSSARegisterType;
                                              const ArrElemTypeName: string);
 begin
-  if (ArrayIdx < 0) or (ET <> srtInt) or (ArrElemTypeName = '') then Exit;
+  if (ArrayIdx < 0) or (ArrElemTypeName = '') then Exit;
+  // ⭐ PHASE 2.6: a SINGLE array is packed at four bytes, float-banked (bcArrayLoadSingle / bcArrayStoreSingle), so its
+  // storage is the block of Single a C library and a byte view expect. Every other float array stays in FloatData.
+  if ET = srtFloat then
+  begin
+    if UpperFast(CanonicalType(Trim(ArrElemTypeName))) = 'SINGLE' then
+      FProgram.SetArrayElemWidth(ArrayIdx, 4, True)
+    else
+      FProgram.SetArrayElemWidth(ArrayIdx, 0, False);
+    Exit;
+  end;
+  if ET <> srtInt then Exit;
   // An array of POINTERS says so: a cell handed to C may point into it (DIVERGENZE 257 B).
   if DeclTypeIsPointer(ArrElemTypeName) then FProgram.SetArrayElemIsPtr(ArrayIdx);
   case TypeNameWidthCode(ArrElemTypeName) of

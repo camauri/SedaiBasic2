@@ -302,10 +302,10 @@ the call states it (`malloc`, `calloc`, `realloc`, `CoTaskMemAlloc`, `HeapAlloc`
 
 **Pointer arithmetic and the numeric value of a pointer.** In the default memory mode (`--memory=fb`)
 a pointer obtained from `Allocate`, `SAdd`, `StrPtr` or `ScreenPtr`, from `@` on a variable of a builtin
-numeric type, or from `@` on an element of an array of integers (`Byte` to `ULongInt`) or `Double` is a
-machine address and steps by `SizeOf(pointee)`, exactly as in FreeBASIC: `CInt(p + 1) - CInt(p)`
+numeric type, or from `@` on an element of an array of integers (`Byte` to `ULongInt`), `Single` or
+`Double` is a machine address and steps by `SizeOf(pointee)`, exactly as in FreeBASIC: `CInt(p + 1) - CInt(p)`
 answers `SizeOf(pointee)`, a `UByte Ptr` over a `Short` array reads its bytes one by one, and C can
-keep the pointer and hand it back. A pointer obtained with `@` on an element of an array of `Single`,
+keep the pointer and hand it back. A pointer obtained with `@` on an element of an array of
 `Boolean`, an enum, strings, records or pointers is still a packed (array, element) pair, so its numeric
 value counts ELEMENTS: `CInt(p + 1) - CInt(p)` answers 1 where FreeBASIC answers `SizeOf(pointee)`. In
 the isolated mode (`--memory=strict`) every `@` pointer is such a pair. Dereferencing, indexing and
@@ -3613,9 +3613,10 @@ A program is compiled for one of two **memory modes**, and the mode decides what
 `New` and crt's `malloc`/`calloc`/`realloc`/`free` answer memory from the C library, as in FreeBASIC — the pointer is the
 machine address, C can free a block the program allocated and the program can `Deallocate` a block C allocated.
 A variable of a builtin numeric type whose address is taken lives in a cell of native memory, and `@` on an element of
-an array of integers (`Byte` to `ULongInt`) or `Double` is the element's machine address — so a `UByte Ptr` over such an
-array reads its bytes, pointer arithmetic counts bytes, and C can keep that address and hand it back.
-Records, arrays of `Single`, `Boolean`, enums, strings or pointers, and strings still live where they always did, so the
+an array of integers (`Byte` to `ULongInt`), `Single` or `Double` is the element's machine address — so a `UByte Ptr`
+over such an array reads its bytes, pointer arithmetic counts bytes, and C can keep that address and hand it back. An
+array of `Single` stores its elements four bytes wide, as FreeBASIC does, in both memory modes.
+Records, arrays of `Boolean`, enums, strings or pointers, and strings still live where they always did, so the
 limits listed under "Calling C libraries" below still apply to them (a record whose address C keeps across calls, an
 address C hands back later).
 

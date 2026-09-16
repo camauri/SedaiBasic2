@@ -129,6 +129,7 @@ function Src1IsArrayId(OpCode: TBytecodeOp): Boolean;
 begin
   case OpCode of
     bcArrayLoadNarrow, bcArrayStoreNarrow,   // phase 2.5: packed elements, same operands as the Int pair
+    bcArrayLoadSingle, bcArrayStoreSingle,   // phase 2.6: packed Single elements, same operands as the Float pair
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     // The fused element accesses, read off their own arms in RunTemplate.inc the same way: each one
@@ -412,6 +413,7 @@ begin
     bcDateSerial, bcTimeSerial, bcDateAdd,
     // === GROUP 3: Typed array operations: Src2 is always int (linear index) ===
     bcArrayLoadNarrow, bcArrayStoreNarrow,   // phase 2.5
+    bcArrayLoadSingle, bcArrayStoreSingle,   // phase 2.6
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     bcStrMidAssignArr,   // MID$ into an element: Src2 = the linear index, same as the stores above
@@ -742,6 +744,7 @@ begin
     bcFileDateTime,  // FILEDATETIME(path): last-modified date serial (float Dest, string Src1)
     // === GROUP 3: Array operations ===
     bcArrayLoadFloat,  // Typed array load (float) - Dest is WRITTEN
+    bcArrayLoadSingle, // phase 2.6: packed Single element load - Dest is WRITTEN
     bcArrayLoadIndFloat,  // UDT array member load (float) - Dest is WRITTEN
     bcRefLoadFloat,    // FreeBASIC pointer deref (float) - Dest = value loaded
     bcRawLoadFloat,    // raw deref (float) - Dest = value loaded
@@ -817,6 +820,7 @@ begin
   case OpCode of
     // === GROUP 3: Array operations ===
     bcArrayStoreFloat,   // Dest = value register (float) - READ, not written
+    bcArrayStoreSingle,  // phase 2.6: Dest = value register (float) - READ, not written
     bcArrayStoreIndFloat,  // UDT array member store (float): Dest = value register - READ, not written
     // === GROUP 6: File I/O operations ===
     bcPrintFileFloat,    // Dest = value register (float) - READ, not written

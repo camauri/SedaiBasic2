@@ -598,6 +598,15 @@ const
   // and a NULL in field 0, and an 8-byte arm would dereference that NULL. LoadProgram enforces it (RewritePackedArrayOps).
   bcArrayLoadNarrow    = bcGroupArray + 55;
   bcArrayStoreNarrow   = bcGroupArray + 56;
+  // ⭐ PHASE 2.6 OF THE POINTER MODEL (16 Sep 2026): a SINGLE array is packed too, four bytes per element in ByteData,
+  // so "@s(i)" is a machine address and a byte view reads what fbc reads. Float-banked: Dest is a FLOAT register (the
+  // compactor classifies Dest from the OPCODE, which is why this is a pair of its own and not a flag on the narrow one).
+  // Same operands as bcArrayLoadFloat / bcArrayStoreFloat; the Immediate carries only BC_BOUNDS_SAFE_FLAG.
+  // ⛔ The descriptor of a packed Single array publishes its element base in field 0 and a NULL in field 1 (the mirror of
+  // the narrow int one), so a double arm that reached it would fault instead of reading eight bytes. LoadProgram enforces
+  // that only this pair names such an array (RewritePackedArrayOps).
+  bcArrayLoadSingle    = bcGroupArray + 57;
+  bcArrayStoreSingle   = bcGroupArray + 58;
   BC_NARROW_WIDTH_SHIFT = 1;    // Immediate bits 1..3 = element width in bytes (1, 2 or 4)
   BC_NARROW_WIDTH_MASK  = 7;
   BC_NARROW_SIGNED      = 16;   // Immediate bit 4 = the element type is signed (sign-extends on read)
@@ -2350,6 +2359,8 @@ begin
         54: Result := 'ArrayElemAddr';
         55: Result := 'ArrayLoadNarrow';
         56: Result := 'ArrayStoreNarrow';
+        57: Result := 'ArrayLoadSingle';
+        58: Result := 'ArrayStoreSingle';
         27: Result := 'ArrayRedimPush';
         28: Result := 'ArrayRedimN';
         29: Result := 'ArrayIdxPush';

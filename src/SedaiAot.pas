@@ -2940,7 +2940,12 @@ var
     for k := 0 to NACache - 1 do
     begin
       if ACacheKind[k] = 1 then b := 16
-      else if SSAProg.GetArray(ACacheId[k]).ElementType = srtFloat then b := 8
+      // ⭐ A PACKED array keeps its base in the OTHER bank's field (ArrDescField in the VM): a Single array in field 0,
+      // a narrow int array in field 1 (phase 2.5 / 2.6).
+      else if (SSAProg.GetArray(ACacheId[k]).ElementType = srtFloat) and
+              (SSAProg.GetArray(ACacheId[k]).ElemWidth = 0) then b := 8
+      else if (SSAProg.GetArray(ACacheId[k]).ElementType = srtInt) and
+              (SSAProg.GetArray(ACacheId[k]).ElemWidth > 0) then b := 8
       else b := 0;
       rex := $48; if ACacheReg[k] >= 8 then rex := rex or $04;   // REX.W (+R)
       E.Emit8(rex); E.Emit8($8B);
@@ -4663,6 +4668,97 @@ var
     EmitHelperCall(apc);
     E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));                   // @done
   end;
+  procedure AotSingleElem(IsStore: Boolean; XVal, IdxReg, BaseReg: Integer);
+  // cvtss2sd XVal, [Base+Idx*4]  /  cvtsd2ss xmm1, XVal ; movss [Base+Idx*4], xmm1 (xmm1 is scratch).
+  var rex, sib: Byte;
+    procedure ModSib(RegF: Integer);
+    begin
+      sib := $80 or ((IdxReg and 7) shl 3) or (BaseReg and 7);        // scale 4
+      if (BaseReg and 7) = 5 then
+      begin E.Emit8($40 or ((RegF and 7) shl 3) or 4); E.Emit8(sib); E.Emit8($00); end   // mod=01, disp8=0
+      else
+      begin E.Emit8(((RegF and 7) shl 3) or 4); E.Emit8(sib); end;
+    end;
+    procedure Pfx(Lead, Op: Byte; RegF: Integer);
+    begin
+      rex := 0;
+      if RegF >= 8 then rex := rex or $04;
+      if IdxReg >= 8 then rex := rex or $02;
+      if BaseReg >= 8 then rex := rex or $01;
+      E.Emit8(Lead);
+      if rex <> 0 then E.Emit8($40 or rex);
+      E.Emit8($0F); E.Emit8(Op);
+    end;
+  // ⛔ THE XORPS IS NOT DECORATION. cvtss2sd / cvtsd2ss write only the low bits of their destination and so WAIT for
+  // its previous value - a dependency that crosses loop iterations. Without the zeroing idiom (the one gcc emits) the
+  // Single loop measured 138 ms against 22 for the same loop over Double arrays.
+  begin
+    if IsStore then
+    begin
+      SseRR([$0F, $57], XMM1, XMM1);                                    // xorps xmm1, xmm1
+      SseRR([$F2, $0F, $5A], XMM1, XVal);                               // cvtsd2ss xmm1, XVal
+      Pfx($F3, $11, XMM1); ModSib(XMM1);                               // movss [base+idx*4], xmm1
+    end
+    else
+    begin
+      SseRR([$0F, $57], XVal, XVal);                                    // xorps XVal, XVal
+      Pfx($F3, $5A, XVal); ModSib(XVal);                               // cvtss2sd XVal, [base+idx*4]
+    end;
+  end;
+  procedure AotSingleAccess(IsStore: Boolean; ArrayId, IdxReg, ValReg, apc: Integer; Safe: Boolean);
+  // ⭐ PHASE 2.6: an element of a SINGLE array, packed at four bytes - AotNarrowAccess for the float bank, with the
+  // homes AotArrAccess uses: the index and the value off their own registers when they have one, the base and the
+  // count out of the region's array cache (ReloadArrayCache loads field 0 for a packed Single array). The base is
+  // tested for NULL - a Double array reached through a Single parameter publishes none - and that, or an index out
+  // of range, runs THIS instruction through the helper. Measured: without the homes the loop was 6x slower than the
+  // 8-byte accesses it replaced (23 -> 149 ms), with them it is back.
+  var pOOB, pCold, pDone, cbase, ccount, idxR, baseR, valR: Integer;
+  begin
+    cbase := CachedBase(ArrayId);
+    ccount := CachedCount(ArrayId);
+    if AotArrAddrDirect then idxR := IAlloc(IdxReg) else idxR := -1;
+    if idxR < 0 then begin ILoad(RCX, IdxReg); idxR := RCX; end;
+    if not OK then Exit;
+    if (cbase < 0) or ((not Safe) and (ccount < 0)) then
+      E.MemOp([$49, $8B], RDX, R8, 16);                                // rdx = ctx.ArrDesc
+    pOOB := -1;
+    if not Safe then
+    begin
+      if ccount >= 0 then EmitRR([$3B], idxR, ccount)                  // cmp idx, cachedCount
+      else
+      begin
+        E.MemOp([$48, $8B], RAX, RDX, LongWord(ArrayId) * 32 + 16);    // rax = Count
+        EmitRR([$3B], idxR, RAX);                                      // cmp idx, rax
+      end;
+      E.EmitBytes([$0F, $83]); pOOB := E.Len; E.Emit32(0);             // jae cold (unsigned)
+    end;
+    if cbase >= 0 then baseR := cbase
+    else
+    begin
+      E.MemOp([$48, $8B], RDX, RDX, LongWord(ArrayId) * 32);           // rdx = packed Single base (field 0)
+      baseR := RDX;
+    end;
+    EmitRR([$85], baseR, baseR);                                       // test base, base
+    E.EmitBytes([$0F, $84]); pCold := E.Len; E.Emit32(0);              // jz cold
+    if AotArrAddrMode >= 2 then valR := FAlloc(ValReg) else valR := -1;
+    if IsStore then
+    begin
+      if valR < 0 then begin FLoad(XMM0, ValReg); valR := XMM0; end;
+      AotSingleElem(True, valR, idxR, baseR);
+    end
+    else if valR >= 0 then
+      AotSingleElem(False, valR, idxR, baseR)
+    else
+    begin
+      AotSingleElem(False, XMM0, idxR, baseR);
+      FStore(ValReg, XMM0);
+    end;
+    E.EmitBytes([$E9]); pDone := E.Len; E.Emit32(0);                   // jmp done
+    if pOOB >= 0 then E.Patch32(pOOB, LongWord(E.Len - (pOOB + 4)));   // @cold
+    E.Patch32(pCold, LongWord(E.Len - (pCold + 4)));
+    EmitHelperCall(apc);
+    E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));                   // @done
+  end;
   procedure AotArrBound(apc, ArrayId: Integer; WantUpper: Boolean);
   var p1: Integer;
   begin
@@ -5632,6 +5728,11 @@ var
               end
               else
               begin
+                // ⭐ Phase 2.6: a Single element's cold path is a helper call (AotSingleAccess), so the frame
+                // must be call-ready.
+                if (SSAProg.GetArray(Ins.Src1.ArrayIndex).ElementType = srtFloat) and
+                   (SSAProg.GetArray(Ins.Src1.ArrayIndex).ElemWidth = 4) then
+                  HasHelperCall := True;
                 CountVal(Ins.Dest); CountVal(Ins.Src2);
               end;
               if Ins.Src1.ArrayIndex > MaxArrId then MaxArrId := Ins.Src1.ArrayIndex;
@@ -7561,6 +7662,11 @@ var
           AotNarrowAccess(False, d, IReg(Cur.Src2), IReg(Cur.Dest), apc, Cur.BoundsSafe,
                           SSAProg.GetArray(d).ElemWidth, SSAProg.GetArray(d).ElemSigned);
         end
+        else if (SSAProg.GetArray(d).ElementType = srtFloat) and (SSAProg.GetArray(d).ElemWidth = 4) then
+        begin
+          apc := NeedPC; if not OK then Exit;                          // phase 2.6: a Single array
+          AotSingleAccess(False, d, IReg(Cur.Src2), FReg(Cur.Dest), apc, Cur.BoundsSafe);
+        end
         else if SSAProg.GetArray(d).ElementType = srtString then
           EmitArrLoadStr(d, IReg(Cur.Src2), SReg(Cur.Dest))
         else if SSAProg.GetArray(d).ElementType = srtFloat then
@@ -7578,6 +7684,11 @@ var
           apc := NeedPC; if not OK then Exit;
           AotNarrowAccess(True, d, IReg(Cur.Src2), IReg(Cur.Dest), apc, Cur.BoundsSafe,
                           SSAProg.GetArray(d).ElemWidth, SSAProg.GetArray(d).ElemSigned);
+        end
+        else if (SSAProg.GetArray(d).ElementType = srtFloat) and (SSAProg.GetArray(d).ElemWidth = 4) then
+        begin
+          apc := NeedPC; if not OK then Exit;                          // phase 2.6: a Single array
+          AotSingleAccess(True, d, IReg(Cur.Src2), FReg(Cur.Dest), apc, Cur.BoundsSafe);
         end
         else if SSAProg.GetArray(d).ElementType = srtString then
           EmitArrStoreStr(d, IReg(Cur.Src2), SReg(Cur.Dest))

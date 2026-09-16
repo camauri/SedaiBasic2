@@ -204,7 +204,10 @@ double tan(double);
   X(0x0336, ArrayElemAddr         ) \
   X(0x0337, ArrayLoadNarrow       ) \
   X(0x0338, ArrayStoreNarrow      ) \
-  X(0x0081, NarrowInt             )
+  X(0x0339, ArrayLoadSingle       ) \
+  X(0x033A, ArrayStoreSingle      ) \
+  X(0x0081, NarrowInt             ) \
+  X(0x0082, NarrowSingle          )
 
 
 
@@ -670,6 +673,23 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
           } }
         else if (!(flags & HF_MODERN_ARRAYS) || !b_) return pc; }
       pc++; NEXT;
+  /* ⭐ PHASE 2.6: an element of a SINGLE array, packed at four bytes. The mirror of the narrow pair: the base is
+     descriptor field 0 (field 1 is NULL for such an array, so no double arm can read it), the count is field 2.
+     A NULL base (a Double array reached through a Single parameter, or nothing allocated) hands the PC back. The
+     conversion is C's float <-> double, round-to-nearest like FPC's Single(). */
+  L_ArrayLoadSingle:
+      { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
+        const uint8_t *b_ = (const uint8_t *)(intptr_t)d[0];
+        if (b_ && (uint64_t)li < (uint64_t)d[2]) { float v_; __builtin_memcpy(&v_, b_ + li * 4, 4); freg[I->dest] = v_; }
+        else if ((flags & HF_MODERN_ARRAYS) && b_) freg[I->dest] = 0.0;
+        else return pc; }
+      pc++; NEXT;
+  L_ArrayStoreSingle:   /* the VALUE is in Dest */
+      { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];
+        uint8_t *b_ = (uint8_t *)(intptr_t)d[0];
+        if (b_ && (uint64_t)li < (uint64_t)d[2]) { float v_ = (float)freg[I->dest]; __builtin_memcpy(b_ + li * 4, &v_, 4); }
+        else if (!(flags & HF_MODERN_ARRAYS) || !b_) return pc; }
+      pc++; NEXT;
   /* bcNarrowInt - the WRAP of a value into a narrow type before it is stored (NarrowInt64 in SedaiBytecodeVM.pas: the
      same six codes). It was the one exit HOTC_DIAG named on a loop over packed arrays once phase 2.5 made their
      accesses native: 60 000 000 exits, one per store into a Short or a UByte, in a loop otherwise fully covered. */
@@ -685,6 +705,15 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
           default: break;
         }
         ireg[I->dest] = v_; }
+      pc++; NEXT;
+  /* bcNarrowSingle - Double(Single(x)), the rounding a Single store owes (RunTemplate.inc: B1.5). HOTC_DIAG named it
+     on a loop over Single arrays once phase 2.6 made their accesses native: 30 000 000 exits, one per store.
+     ⛔ Only a finite value inside the Single range is converted here: an overflow, an infinity or a NaN hands the PC
+     back, so the interpreter's floating-point exception rules stay the only ones that apply to them. */
+  L_NarrowSingle:
+      { double x_ = freg[I->s1];
+        if (!(x_ <= 3.4028234663852886e38 && x_ >= -3.4028234663852886e38)) return pc;
+        { float f_ = (float)x_; freg[I->dest] = (double)f_; } }
       pc++; NEXT;
   L_ArrayStoreFloat:
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];

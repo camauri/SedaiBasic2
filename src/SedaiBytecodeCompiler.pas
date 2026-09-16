@@ -675,6 +675,7 @@ begin
     ArrInfo := FSSAProgram.GetArray(ArrayIndex);
     // ⭐ Phase 2.5: a PACKED array (Byte..ULong at its true width) never gets the 8-byte opcode - see bcArrayLoadNarrow.
     if (ArrInfo.ElementType = srtInt) and (ArrInfo.ElemWidth > 0) then Exit(bcArrayLoadNarrow);
+    if (ArrInfo.ElementType = srtFloat) and (ArrInfo.ElemWidth = 4) then Exit(bcArrayLoadSingle);   // phase 2.6
     case ArrInfo.ElementType of
       srtInt: Result := bcArrayLoadInt;
       srtFloat: Result := bcArrayLoadFloat;
@@ -696,6 +697,7 @@ begin
   begin
     ArrInfo := FSSAProgram.GetArray(ArrayIndex);
     if (ArrInfo.ElementType = srtInt) and (ArrInfo.ElemWidth > 0) then Exit(bcArrayStoreNarrow);   // phase 2.5
+    if (ArrInfo.ElementType = srtFloat) and (ArrInfo.ElemWidth = 4) then Exit(bcArrayStoreSingle);  // phase 2.6
     case ArrInfo.ElementType of
       srtInt: Result := bcArrayStoreInt;
       srtFloat: Result := bcArrayStoreFloat;

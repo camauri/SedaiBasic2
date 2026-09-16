@@ -286,7 +286,9 @@ begin
       // descriptor and names no storage it could move.
       bcRefLoadInt, bcRefLoadFloat, bcRefStoreInt, bcRefStoreFloat, bcArrayElemAddr,
       // Phase 2.5: a packed element - it reads or writes element bytes and moves no storage (ArrayOpMayReshape).
-      bcArrayLoadNarrow, bcArrayStoreNarrow:
+      bcArrayLoadNarrow, bcArrayStoreNarrow,
+      // Phase 2.6: a packed Single element - the same, on the float bank.
+      bcArrayLoadSingle, bcArrayStoreSingle:
         Result := True;
     else
       Result := False;
@@ -1411,6 +1413,7 @@ var
         bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat: begin T(J^.Dest); T(J^.Src1); T(J^.Src2); end;
         bcArrayLoadFloat:  T(J^.Dest);               // Dest = loaded float
         bcArrayStoreFloat: T(J^.Dest);               // Dest = stored VALUE (float)
+        bcArrayLoadSingle, bcArrayStoreSingle: T(J^.Dest);   // phase 2.6: the same, packed Single
         bcXferStoreFloat:  T(J^.Src1);               // Src1 = value moved to the transfer slot
         bcXferLoadFloat:   T(J^.Dest);               // Dest = value moved from the transfer slot
         bcRecordLoadFloat: T(J^.Dest);               // Dest = loaded record field (float)
@@ -1468,6 +1471,7 @@ var
           begin T(J^.Dest); T(J^.Src1); T(J^.Src2); end;
         bcIntToFloat: T(J^.Src1);                    // int input (Dest is float)
         bcArrayLoadFloat, bcArrayStoreFloat: T(J^.Src2);   // Src2 = index; Src1 is the array id
+        bcArrayLoadSingle, bcArrayStoreSingle: T(J^.Src2);   // phase 2.6
         bcArrayLoadInt, bcArrayStoreInt: begin T(J^.Dest); T(J^.Src2); end;  // Dest=result/value, Src2=index
         bcXferStoreInt: T(J^.Src1);                  // Src1 = value moved to the transfer slot
         bcXferLoadInt:  T(J^.Dest);                  // Dest = value moved from the transfer slot
@@ -1605,7 +1609,7 @@ var
         bcAddInt, bcSubInt, bcMulInt, bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt, bcCmpEqInt, bcCmpNeInt:
           begin if J^.Dest > ICalleeMax then ICalleeMax := J^.Dest; if J^.Src1 > ICalleeMax then ICalleeMax := J^.Src1; if J^.Src2 > ICalleeMax then ICalleeMax := J^.Src2; end;
         bcIntToFloat, bcJumpIfZero, bcJumpIfNotZero: if J^.Src1 > ICalleeMax then ICalleeMax := J^.Src1;
-        bcArrayLoadFloat, bcArrayStoreFloat: if J^.Src2 > ICalleeMax then ICalleeMax := J^.Src2;
+        bcArrayLoadFloat, bcArrayStoreFloat, bcArrayLoadSingle, bcArrayStoreSingle: if J^.Src2 > ICalleeMax then ICalleeMax := J^.Src2;
         bcArrayLoadInt, bcArrayStoreInt: begin if J^.Dest > ICalleeMax then ICalleeMax := J^.Dest; if J^.Src2 > ICalleeMax then ICalleeMax := J^.Src2; end;
         bcXferStoreInt: if J^.Src1 > ICalleeMax then ICalleeMax := J^.Src1;
         bcXferLoadInt:  if J^.Dest > ICalleeMax then ICalleeMax := J^.Dest;
@@ -1623,7 +1627,7 @@ var
         bcAddInt, bcSubInt, bcMulInt, bcCmpLtInt, bcCmpLeInt, bcCmpGtInt, bcCmpGeInt, bcCmpEqInt, bcCmpNeInt:
           begin IU(J^.Dest); IU(J^.Src1); IU(J^.Src2); end;
         bcIntToFloat, bcJumpIfZero, bcJumpIfNotZero: IU(J^.Src1);
-        bcArrayLoadFloat, bcArrayStoreFloat: IU(J^.Src2);
+        bcArrayLoadFloat, bcArrayStoreFloat, bcArrayLoadSingle, bcArrayStoreSingle: IU(J^.Src2);
         bcArrayLoadInt, bcArrayStoreInt: begin IU(J^.Dest); IU(J^.Src2); end;
         bcXferStoreInt: IU(J^.Src1);
         bcXferLoadInt:  IU(J^.Dest);
@@ -2060,6 +2064,44 @@ var
     IStore(I^.Dest, RAX);
     E.EmitBytes([$E9]); pDone := E.Len; E.Emit32(0);                         // jmp done
     E.Patch32(pCold, LongWord(E.Len - (pCold + 4)));                         // @cold
+    EmitHelperCall(apc);
+    E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));                         // @done
+  end;
+  procedure EmitSingleJ(apc: Integer; IsStore: Boolean);
+  // ⭐ PHASE 2.6: bcArrayLoadSingle / bcArrayStoreSingle, as the AOT's AotSingleAccess. Base from descriptor field 0
+  // (field 1 is NULL for a packed Single array), count from field 2, the value through xmm0: cvtss2sd on a read,
+  // cvtsd2ss then movss on a write. A NULL base or an index out of range runs this instruction through the helper.
+  var pOOB, pCold, pDone: Integer;
+  begin
+    if IsStore then FLoad(XMM0, I^.Dest);                                    // the value is in Dest
+    ILoad(RCX, I^.Src2);                                                     // rcx = linear index
+    pOOB := -1;
+    if (I^.Immediate and BC_BOUNDS_SAFE_FLAG) = 0 then
+    begin
+      R8Load(RDX, LongWord(I^.Src1) * 32 + 16);                              // rdx = Count
+      E.EmitBytes([$48, $39, $D1]);                                          // cmp rcx, rdx
+      E.EmitBytes([$0F, $83]); pOOB := E.Len; E.Emit32(0);                   // jae cold
+    end;
+    R8Load(RDX, LongWord(I^.Src1) * 32);                                     // rdx = packed Single base (field 0)
+    E.EmitBytes([$48, $85, $D2]);                                            // test rdx, rdx
+    E.EmitBytes([$0F, $84]); pCold := E.Len; E.Emit32(0);                    // jz cold
+    // ⛔ The xorps breaks the dependency the conversion has on its destination's previous value (see the AOT's
+    // AotSingleElem): without it a Single loop was six times slower than the same loop over Double.
+    if IsStore then
+    begin
+      SseRR([$0F, $57], XMM1, XMM1);                                         // xorps xmm1, xmm1
+      E.EmitBytes([$F2, $0F, $5A, $C8]);                                     // cvtsd2ss xmm1, xmm0
+      E.EmitBytes([$F3, $0F, $11, $0C, $8A]);                                // movss [rdx+rcx*4], xmm1
+    end
+    else
+    begin
+      SseRR([$0F, $57], XMM0, XMM0);                                         // xorps xmm0, xmm0
+      E.EmitBytes([$F3, $0F, $5A, $04, $8A]);                                // cvtss2sd xmm0, dword [rdx+rcx*4]
+      FStore(I^.Dest, XMM0);
+    end;
+    E.EmitBytes([$E9]); pDone := E.Len; E.Emit32(0);                         // jmp done
+    if pOOB >= 0 then E.Patch32(pOOB, LongWord(E.Len - (pOOB + 4)));         // @cold
+    E.Patch32(pCold, LongWord(E.Len - (pCold + 4)));
     EmitHelperCall(apc);
     E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));                         // @done
   end;
@@ -3109,6 +3151,8 @@ var
         if UseHelper and not (InCallee or InGosub) then EmitArrElemAddrJ(apc) else Exit;
       bcArrayLoadNarrow, bcArrayStoreNarrow:   // phase 2.5
         if UseHelper and not (InCallee or InGosub) then EmitNarrowJ(apc, I^.OpCode = bcArrayStoreNarrow) else Exit;
+      bcArrayLoadSingle, bcArrayStoreSingle:   // phase 2.6
+        if UseHelper and not (InCallee or InGosub) then EmitSingleJ(apc, I^.OpCode = bcArrayStoreSingle) else Exit;
       bcRawLoadInt, bcRawLoadFloat, bcRawStoreInt, bcRawStoreFloat,
       bcRefLoadInt, bcRefLoadFloat, bcRefStoreInt, bcRefStoreFloat:
         // ⛔ NEVER "I^.OpCode in [bcRaw..., ...]": a Pascal set holds 0..255 and these opcodes are two-byte words

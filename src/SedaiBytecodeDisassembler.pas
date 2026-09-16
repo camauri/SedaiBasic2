@@ -426,6 +426,11 @@ begin
     bcArrayStoreNarrow:
       Line := Format('%4d: %-20s ARR[%d], R%d, R%d w%d%s', [Index, 'ArrayStoreNarrow', Instr.Src1, Instr.Src2, Instr.Dest,
         (Instr.Immediate shr BC_NARROW_WIDTH_SHIFT) and BC_NARROW_WIDTH_MASK, BoundsSafeSuffix(Instr)]);
+    // Phase 2.6: a packed Single element.
+    bcArrayLoadSingle:
+      Line := Format('%4d: %-20s R%d, ARR[%d], R%d%s', [Index, 'ArrayLoadSingle', Instr.Dest, Instr.Src1, Instr.Src2, BoundsSafeSuffix(Instr)]);
+    bcArrayStoreSingle:
+      Line := Format('%4d: %-20s ARR[%d], R%d, R%d%s', [Index, 'ArrayStoreSingle', Instr.Src1, Instr.Src2, Instr.Dest, BoundsSafeSuffix(Instr)]);
     bcArrayStoreFloat:
       Line := Format('%4d: %-20s ARR[%d], R%d, R%d%s', [Index, 'ArrayStoreFloat', Instr.Src1, Instr.Src2, Instr.Dest, BoundsSafeSuffix(Instr)]);
     bcArrayStoreString:

@@ -847,11 +847,16 @@ type
       is what 417 corpus failures looked like on the first attempt. Taking the INDEX defers resolving
       FArrays until after the value exists, which restores the original order exactly. }
     procedure ArrSetIntAt(ArrIdx, Idx: Integer; V: Int64); inline;
+    { ⭐ PHASE 2.6: the float pair, for the same reason. A Single array is packed at four bytes (ElemWidth 4 on a
+      float array), every other float array keeps FloatData. The write takes the INDEX for the reason above. }
+    function ArrGetFloat(const A: TArrayStorage; Idx: Integer): Double; inline;
+    procedure ArrSetFloatAt(ArrIdx, Idx: Integer; V: Double); inline;
     function SharedRecordBlockLen(Handle: Int64): Int64;
     procedure GrowArrays(NewLen: Integer);   // resize FArrays with the descriptor lock held
     function  LockArrays: Boolean;           // ...and hold it while ONE array's storage is reshaped
     procedure UnlockArrays(Taken: Boolean);  // Taken = what LockArrays ANSWERED, never re-decided
     function ArrDescCount(const A: TArrayStorage): Int64;  // the count the COMPILED engines see
+    function ArrDescField(const A: TArrayStorage; Field: Integer): Int64;  // ...and the two element bases
     function ImgHandleOf(V: Int64): Integer;   // an image is named by pointer OR by index
     // ⭐ FFI (DIVERGENZE 183). ONE implementation, called from BOTH dispatchers: RunTemplate.inc and
     // ExecuteInstruction are the two arms this VM keeps having to hold in step, and a foreign call is
@@ -946,9 +951,12 @@ type
     function ReadPackedBytes(const A: TArrayStorage; ByteOfs, WidthCode: Integer): Int64;
     procedure WritePackedBytes(ArrIdx, ByteOfs, WidthCode: Integer; V: Int64);  // its WRITE twin
     function PtrDomainLoadInt(Ctx: TExecutionContext; PtrAddr: Int64; WidthCode: Integer = 0): Int64;
-    function PtrDomainLoadFloat(Ctx: TExecutionContext; PtrAddr: Int64): Double;
+    function PtrDomainLoadFloat(Ctx: TExecutionContext; PtrAddr: Int64; TypeCode: Integer = 0): Double;
+    // Phase 2.6: a float read or write through a VM pointer into a PACKED array (a Single array, or a byte view).
+    function PackedFloatLoad(ArrayIdx: Integer; PtrOffset: Int64; TypeCode: Integer; PtrAddr: Int64): Double;
+    procedure PackedFloatStore(ArrayIdx: Integer; PtrOffset: Int64; TypeCode: Integer; PtrAddr: Int64; V: Double);
     procedure PtrDomainStoreInt(Ctx: TExecutionContext; PtrAddr, Value: Int64);
-    procedure PtrDomainStoreFloat(Ctx: TExecutionContext; PtrAddr: Int64; Value: Double);
+    procedure PtrDomainStoreFloat(Ctx: TExecutionContext; PtrAddr: Int64; Value: Double; TypeCode: Integer = 0);
     procedure CleanupSharedRecords;   // free the shared region (destructor)
     procedure UpdateScreenModelGate;          // decide whether the modelled screen must be kept
     procedure RecCacheAdopt(C: PRecCache);    // bind this thread's free-index cache to this VM
@@ -3298,6 +3306,7 @@ begin
     bcRecordStoreInt, bcRecordStoreFloat, bcRecordStoreString, bcRecordFree,
     bcArrayLoadFloat, bcArrayLoadString,
     bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString, bcArrayStoreNarrow,
+    bcArrayLoadSingle, bcArrayStoreSingle,   // phase 2.6: float value, int index
     // Binding an array BYREF parameter moves entries between FArrays slots and a save stack of its
     // own. bcArrayBind/Unbind/BindApply name their arrays by immediate and touch no register at all;
     // bcArrayBindInd takes the member's runtime handle from Src2.
@@ -3379,7 +3388,7 @@ begin
     // Dest is a float register.
     bcLoadConstFloat, bcCopyFloat, bcNarrowSingle,
     bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcNegFloat,
-    bcIntToFloat, bcXferLoadFloat, bcRecordLoadFloat, bcArrayLoadFloat:
+    bcIntToFloat, bcXferLoadFloat, bcRecordLoadFloat, bcArrayLoadFloat, bcArrayLoadSingle:
       Result := BW_DEST;
     // Integer-only work, plus the opcodes that READ a float and write elsewhere: a comparison
     // writes the integer bank, a transfer store writes the transfer bank, an array or record store
@@ -3401,6 +3410,7 @@ begin
     bcArrayLoadInt, bcArrayLoadString, bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     bcArrayLBound, bcArrayUBound, bcArrayBind, bcArrayUnbind, bcArrayBindApply,
     bcArrayBindInd, bcArrayErase, bcArrayElemAddr, bcArrayLoadNarrow, bcArrayStoreNarrow,
+    bcArrayStoreSingle,   // phase 2.6: reads its float value, writes no register
     // ⭐ THE FUSED BRANCH FAMILY WRITES NO REGISTER AT ALL, in any bank - it consumes a comparison
     // and moves the PC - and the loop-counter forms write only the integer counter. Leaving them
     // unaudited is what made the superinstruction pass LOSE on call-heavy programs: BW_UNKNOWN
@@ -3454,6 +3464,7 @@ begin
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayStoreInt, bcArrayStoreFloat, bcArrayStoreString,
     bcArrayLBound, bcArrayUBound, bcArrayBind, bcArrayUnbind, bcArrayBindApply,
     bcArrayBindInd, bcArrayErase, bcArrayElemAddr, bcArrayLoadNarrow, bcArrayStoreNarrow,
+    bcArrayLoadSingle, bcArrayStoreSingle,   // phase 2.6
     // The fused branch family again - and THIS is the bank where leaving it unaudited was expensive,
     // because every entry here is a refcounted assignment. See the note in BcFloatWriteShape.
     bcBranchEqInt, bcBranchNeInt, bcBranchLtInt, bcBranchGtInt, bcBranchLeInt, bcBranchGeInt,
@@ -3558,8 +3569,9 @@ begin
     // Src2 is the element index (or the member handle for BindInd); Src1 is an immediate array id.
     bcArrayLoadInt, bcArrayLoadFloat, bcArrayLoadString,
     bcArrayLBound, bcArrayUBound, bcArrayBindInd, bcArrayElemAddr, bcArrayLoadNarrow,
+    bcArrayLoadSingle,   // phase 2.6
     // A float or string element store reads its index from Src2 and its VALUE from the other bank.
-    bcArrayStoreFloat, bcArrayStoreString:
+    bcArrayStoreFloat, bcArrayStoreString, bcArrayStoreSingle:
       Result := US_SRC2;
     // ... but an INTEGER element store reads the value from Dest, in our bank.
     bcArrayStoreInt, bcArrayStoreNarrow:
@@ -6482,14 +6494,48 @@ begin
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
 end;
 
-function TBytecodeVM.PtrDomainLoadFloat(Ctx: TExecutionContext; PtrAddr: Int64): Double;
+function TBytecodeVM.PackedFloatLoad(ArrayIdx: Integer; PtrOffset: Int64; TypeCode: Integer; PtrAddr: Int64): Double;
+// ⭐ PHASE 2.6: a float read through a VM pointer that names a PACKED array. The bytes are contiguous, so the read
+// takes the width the POINTEE asks (RTC_SINGLE four, RTC_DOUBLE eight) and, with no width stated, the element's own:
+// a Single array answers a Single, a narrow int array a Double image of eight bytes - what fbc reads there too.
+var
+  Ofs, W: Int64;
+begin
+  if TypeCode = RTC_SINGLE then W := 4
+  else if TypeCode = RTC_DOUBLE then W := 8
+  else if (FArrays[ArrayIdx].ElementType = 1) and (FArrays[ArrayIdx].ElemWidth = 4) then W := 4
+  else W := 8;
+  Ofs := PtrOffset * FArrays[ArrayIdx].ElemWidth;
+  if (PtrOffset < 0) or (Ofs + W > Length(FArrays[ArrayIdx].ByteData)) then
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+  if W = 4 then Result := PSingle(@FArrays[ArrayIdx].ByteData[Ofs])^
+  else Result := PDouble(@FArrays[ArrayIdx].ByteData[Ofs])^;
+end;
+
+procedure TBytecodeVM.PackedFloatStore(ArrayIdx: Integer; PtrOffset: Int64; TypeCode: Integer; PtrAddr: Int64;
+  V: Double);
+var
+  Ofs, W: Int64;
+begin
+  if TypeCode = RTC_SINGLE then W := 4
+  else if TypeCode = RTC_DOUBLE then W := 8
+  else if (FArrays[ArrayIdx].ElementType = 1) and (FArrays[ArrayIdx].ElemWidth = 4) then W := 4
+  else W := 8;
+  Ofs := PtrOffset * FArrays[ArrayIdx].ElemWidth;
+  if (PtrOffset < 0) or (Ofs + W > Length(FArrays[ArrayIdx].ByteData)) then
+    raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+  if W = 4 then PSingle(@FArrays[ArrayIdx].ByteData[Ofs])^ := Single(V)
+  else PDouble(@FArrays[ArrayIdx].ByteData[Ofs])^ := V;
+end;
+
+function TBytecodeVM.PtrDomainLoadFloat(Ctx: TExecutionContext; PtrAddr: Int64; TypeCode: Integer): Double;
 var
   Rec: PRecordStorage;
   RecSlot, ArrayIdx: Integer;
   PtrOffset: Int64;
 begin
   if (PtrAddr > 0) and ((PtrAddr and FGNPTR_TAG) <> 0) then
-    Exit(RawLoadFloat(PtrAddr, 0));                      // C's memory - DIVERGENZE 239
+    Exit(RawLoadFloat(PtrAddr, TypeCode));               // C's memory - DIVERGENZE 239
   if PtrAddr < 0 then
   begin
     Rec := RecPtrNum(Ctx, PtrAddr, RecSlot);
@@ -6499,7 +6545,9 @@ begin
   PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-  if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+  if FArrays[ArrayIdx].ElemWidth > 0 then
+    Result := PackedFloatLoad(ArrayIdx, PtrOffset, TypeCode, PtrAddr)   // phase 2.6
+  else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
     Result := FArrays[ArrayIdx].FloatData[PtrOffset]
   else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
     Result := PDouble(@FArrays[ArrayIdx].IntData[PtrOffset])^
@@ -6536,7 +6584,7 @@ begin
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
 end;
 
-procedure TBytecodeVM.PtrDomainStoreFloat(Ctx: TExecutionContext; PtrAddr: Int64; Value: Double);
+procedure TBytecodeVM.PtrDomainStoreFloat(Ctx: TExecutionContext; PtrAddr: Int64; Value: Double; TypeCode: Integer);
 var
   Rec: PRecordStorage;
   RecSlot, ArrayIdx: Integer;
@@ -6544,7 +6592,7 @@ var
 begin
   if (PtrAddr > 0) and ((PtrAddr and FGNPTR_TAG) <> 0) then
   begin
-    RawStoreFloat(PtrAddr, 0, Value);                    // C's memory - DIVERGENZE 239
+    RawStoreFloat(PtrAddr, TypeCode, Value);             // C's memory - DIVERGENZE 239
     Exit;
   end;
   if PtrAddr < 0 then
@@ -6557,7 +6605,9 @@ begin
   PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-  if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+  if FArrays[ArrayIdx].ElemWidth > 0 then
+    PackedFloatStore(ArrayIdx, PtrOffset, TypeCode, PtrAddr, Value)   // phase 2.6
+  else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
     FArrays[ArrayIdx].FloatData[PtrOffset] := Value
   else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
     PDouble(@FArrays[ArrayIdx].IntData[PtrOffset])^ := Value
@@ -8063,6 +8113,20 @@ begin
   end;
 end;
 
+function TBytecodeVM.ArrGetFloat(const A: TArrayStorage; Idx: Integer): Double;
+begin
+  if A.ElemWidth = 4 then Result := PSingle(@A.ByteData[Idx * 4])^
+  else Result := A.FloatData[Idx];
+end;
+
+procedure TBytecodeVM.ArrSetFloatAt(ArrIdx, Idx: Integer; V: Double);
+// A Single store rounds to the nearest Single here, exactly where fbc's does - there is nowhere else for the
+// precision to go.
+begin
+  if FArrays[ArrIdx].ElemWidth = 4 then PSingle(@FArrays[ArrIdx].ByteData[Idx * 4])^ := Single(V)
+  else FArrays[ArrIdx].FloatData[Idx] := V;
+end;
+
 function TBytecodeVM.SharedRecordBlockLen(Handle: Int64): Int64;
 // How many CONSECUTIVE records the block starting at Handle holds. Only the FIRST record of a block
 // carries the number (AllocSharedRecordBlock writes it there), so anything else - a lone record, a
@@ -8745,6 +8809,15 @@ var
       if AI.ElementType <> srtInt then Exit;
       Result := AI.ElemWidth; S := AI.ElemSigned;
     end;
+    // ⭐ PHASE 2.6: a Single array packed at four bytes - the float mirror of PackedWidth.
+    function PackedSingle(Id: Integer): Boolean;
+    var AI: TSSAArrayInfo;
+    begin
+      Result := False;
+      if (Id < 0) or (Id >= FProgram.GetArrayCount) then Exit;
+      AI := FProgram.GetArray(Id);
+      Result := (AI.ElementType = srtFloat) and (AI.ElemWidth = 4);
+    end;
     function Stamp(Imm: Int64; Width: Integer; S: Boolean): Int64;
     begin
       Result := (Imm and BC_BOUNDS_SAFE_FLAG) or (Int64(Width) shl BC_NARROW_WIDTH_SHIFT) or (Ord(S) * BC_NARROW_SIGNED);
@@ -8773,6 +8846,22 @@ var
             'declares that array with %d: the bytecode and its array facts disagree',
             [k, OpcodeToString(Op), Ins[k].Src1, (Ins[k].Immediate shr BC_NARROW_WIDTH_SHIFT) and BC_NARROW_WIDTH_MASK, W]);
       end
+      else if ((Op = bcArrayLoadFloat) or (Op = bcArrayStoreFloat)) and PackedSingle(Ins[k].Src1) then
+      begin
+        if Op = bcArrayLoadFloat then Ins[k].OpCode := bcArrayLoadSingle else Ins[k].OpCode := bcArrayStoreSingle;
+        Ins[k].Immediate := Ins[k].Immediate and BC_BOUNDS_SAFE_FLAG;
+      end
+      else if (Op = bcArrayLoadSingle) or (Op = bcArrayStoreSingle) then
+      begin
+        if not PackedSingle(Ins[k].Src1) then
+          raise Exception.CreateFmt('Instruction %d (%s) reads array %d as Single elements, but the program does not ' +
+            'declare that array as a Single one: the bytecode and its array facts disagree',
+            [k, OpcodeToString(Op), Ins[k].Src1]);
+      end
+      else if (Src1IsArrayId(Op) and PackedSingle(Ins[k].Src1)) or
+              (((Op = bcArrayCopyElement) or (Op = bcArrayMoveElement)) and PackedSingle(Ins[k].Dest)) then
+        raise Exception.CreateFmt('Instruction %d (%s) reads a Single array as eight-byte cells. This bytecode ' +
+          'was built by an older compiler: compile the source again', [k, OpcodeToString(Op)])
       else if (Src1IsArrayId(Op) and (PackedWidth(Ins[k].Src1, Sgn) > 0)) or
               (((Op = bcArrayCopyElement) or (Op = bcArrayMoveElement)) and (PackedWidth(Ins[k].Dest, Sgn) > 0)) then
         raise Exception.CreateFmt('Instruction %d (%s) reads a packed array (Byte, Short or Long elements) as ' +
@@ -9282,7 +9371,7 @@ begin
         end;
 
         // ArrayLoadFloat: float Dest (result), int Src2 (index)
-        bcArrayLoadFloat:
+        bcArrayLoadFloat, bcArrayLoadSingle:
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;  // index is int
@@ -9413,7 +9502,7 @@ begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;  // value
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;  // index
         end;
-        bcArrayStoreFloat:
+        bcArrayStoreFloat, bcArrayStoreSingle:
         begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;  // value
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;      // index
@@ -14410,6 +14499,31 @@ begin
   Result := A.TotalSize;
 end;
 
+function TBytecodeVM.ArrDescField(const A: TArrayStorage; Field: Integer): Int64;
+// Field 0 = the int-bank element base, field 1 = the float-bank one, as every compiled arm reads them.
+// ⭐⭐ A PACKED array publishes its byte block in the field its OWN bank never reads: a narrow int array (phase 2.5)
+// in field 1, a Single array (phase 2.6) in field 0, and NULL in the field its own 8-byte arms read. So
+// bcArrayLoadNarrow / bcArrayLoadSingle find the base where the 8-byte arms of that bank find NULL - and an 8-byte arm
+// that ever reached a packed array would fault loudly instead of reading the wrong width.
+// ⛔ It used to be written out in three places, and the two per-context copies had never learned the packed base:
+// a private narrow array answered NULL there and every compiled access to it went back to the interpreter.
+var
+  IsPacked: Boolean;
+begin
+  Result := 0;
+  IsPacked := (A.ElemWidth > 0) and (Length(A.ByteData) > 0);
+  if Field = 0 then
+  begin
+    if Length(A.IntData) > 0 then Result := Int64(PtrUInt(@A.IntData[0]))
+    else if IsPacked and (A.ElementType = 1) then Result := Int64(PtrUInt(@A.ByteData[0]));
+  end
+  else
+  begin
+    if Length(A.FloatData) > 0 then Result := Int64(PtrUInt(@A.FloatData[0]))
+    else if IsPacked and (A.ElementType = 0) then Result := Int64(PtrUInt(@A.ByteData[0]));
+  end;
+end;
+
 function TBytecodeVM.ActiveCtx: TExecutionContext; inline;
 // ⛔ GActiveCtx is set only inside a WORKER; on the main thread it is nil. Every reader of it in this
 // unit resolves it the same way, and writing that out again at each site is how one of them ends up
@@ -14603,17 +14717,9 @@ begin
     // violation on a worker disproves, and the cost here is two comparisons per slot on a path that
     // already rebuilds the whole table. It turns a crash three layers away into a skipped entry.
     if (a > High(FArrays)) or (a * 4 + 3 > High(FJitArrDesc)) then Break;
-    if Length(FArrays[a].IntData) > 0 then
-      FJitArrDesc[a * 4 + 0] := Int64(PtrUInt(@FArrays[a].IntData[0]))
-    else FJitArrDesc[a * 4 + 0] := 0;
-    if Length(FArrays[a].FloatData) > 0 then
-      FJitArrDesc[a * 4 + 1] := Int64(PtrUInt(@FArrays[a].FloatData[0]))
-    // ⭐ PHASE 2.5: a PACKED array publishes its element base in field 1, which an int-bank array never used (only
-    // float ops read it). bcArrayLoadNarrow/StoreNarrow read it at the width in their Immediate; an 8-byte int array
-    // bound to a narrow parameter answers NULL here, and the narrow arm hands that instruction to the interpreter.
-    else if (FArrays[a].ElemWidth > 0) and (Length(FArrays[a].ByteData) > 0) then
-      FJitArrDesc[a * 4 + 1] := Int64(PtrUInt(@FArrays[a].ByteData[0]))
-    else FJitArrDesc[a * 4 + 1] := 0;
+    // ⭐ PHASE 2.5 / 2.6: a PACKED array publishes its element base in the OTHER bank's field - see ArrDescField.
+    FJitArrDesc[a * 4 + 0] := ArrDescField(FArrays[a], 0);
+    FJitArrDesc[a * 4 + 1] := ArrDescField(FArrays[a], 1);
     FJitArrDesc[a * 4 + 2] := ArrDescCount(FArrays[a]);
     if Length(FArrays[a].LowerBounds) > 0 then
       FJitArrDesc[a * 4 + 3] := FArrays[a].LowerBounds[0]
@@ -14722,12 +14828,8 @@ begin
           // run in six: `desc=0 atteso=7F7D4975B050 size=64`.
           Src := ECtx.ArrMap[i];
           if (Src < 0) or (Src > High(FArrays)) then Continue;
-          if Length(FArrays[Src].IntData) > 0 then
-            ECtx.ArrDescOwn[Dst + 0] := Int64(PtrUInt(@FArrays[Src].IntData[0]))
-          else ECtx.ArrDescOwn[Dst + 0] := 0;
-          if Length(FArrays[Src].FloatData) > 0 then
-            ECtx.ArrDescOwn[Dst + 1] := Int64(PtrUInt(@FArrays[Src].FloatData[0]))
-          else ECtx.ArrDescOwn[Dst + 1] := 0;
+          ECtx.ArrDescOwn[Dst + 0] := ArrDescField(FArrays[Src], 0);   // packed bases too (ArrDescField)
+          ECtx.ArrDescOwn[Dst + 1] := ArrDescField(FArrays[Src], 1);
           ECtx.ArrDescOwn[Dst + 2] := ArrDescCount(FArrays[Src]);
           if Length(FArrays[Src].LowerBounds) > 0 then
             ECtx.ArrDescOwn[Dst + 3] := FArrays[Src].LowerBounds[0]
@@ -14753,12 +14855,8 @@ begin
           if (Src < 0) or (Src > High(FArrays)) then System.Continue;
           Dst := i * 4;
           if Dst + 3 >= Length(ECtx.ArrDescOwn) then System.Continue;
-          if Length(FArrays[Src].IntData) > 0 then
-            ECtx.ArrDescOwn[Dst + 0] := Int64(PtrUInt(@FArrays[Src].IntData[0]))
-          else ECtx.ArrDescOwn[Dst + 0] := 0;
-          if Length(FArrays[Src].FloatData) > 0 then
-            ECtx.ArrDescOwn[Dst + 1] := Int64(PtrUInt(@FArrays[Src].FloatData[0]))
-          else ECtx.ArrDescOwn[Dst + 1] := 0;
+          ECtx.ArrDescOwn[Dst + 0] := ArrDescField(FArrays[Src], 0);   // packed bases too (ArrDescField)
+          ECtx.ArrDescOwn[Dst + 1] := ArrDescField(FArrays[Src], 1);
           ECtx.ArrDescOwn[Dst + 2] := ArrDescCount(FArrays[Src]);
           if Length(FArrays[Src].LowerBounds) > 0 then
             ECtx.ArrDescOwn[Dst + 3] := FArrays[Src].LowerBounds[0]
@@ -16503,7 +16601,13 @@ begin
        end
        else
          for k := 0 to High(FArrays[ArrayIdx].IntData) do ArrSetIntAt(ArrayIdx, k, 0);
-    1: for k := 0 to High(FArrays[ArrayIdx].FloatData) do FArrays[ArrayIdx].FloatData[k] := 0.0;
+    1: if FArrays[ArrayIdx].ElemWidth > 0 then   // phase 2.6: a packed Single array
+       begin
+         if Length(FArrays[ArrayIdx].ByteData) > 0 then
+           FillChar(FArrays[ArrayIdx].ByteData[0], Length(FArrays[ArrayIdx].ByteData), 0);
+       end
+       else
+         for k := 0 to High(FArrays[ArrayIdx].FloatData) do FArrays[ArrayIdx].FloatData[k] := 0.0;
     2: for k := 0 to High(FArrays[ArrayIdx].StringData) do FArrays[ArrayIdx].StringData[k] := '';
   end;
 end;
@@ -16550,7 +16654,20 @@ begin
          if not Preserve then
            for k := 0 to NewSize - 1 do ArrSetIntAt(ArrayIdx, k, 0);
        end;
-    1: begin
+    1: if FArrays[ArrayIdx].ElemWidth > 0 then   // phase 2.6: a packed Single array resizes its byte bank
+       begin
+         k := Length(FArrays[ArrayIdx].ByteData);
+         SetLength(FArrays[ArrayIdx].ByteData, NewSize * FArrays[ArrayIdx].ElemWidth);
+         if Preserve then
+         begin
+           if Length(FArrays[ArrayIdx].ByteData) > k then
+             FillChar(FArrays[ArrayIdx].ByteData[k], Length(FArrays[ArrayIdx].ByteData) - k, 0);
+         end
+         else if Length(FArrays[ArrayIdx].ByteData) > 0 then
+           FillChar(FArrays[ArrayIdx].ByteData[0], Length(FArrays[ArrayIdx].ByteData), 0);
+       end
+       else
+       begin
          SetLength(FArrays[ArrayIdx].FloatData, NewSize);
          if not Preserve then
            for k := 0 to NewSize - 1 do FArrays[ArrayIdx].FloatData[k] := 0.0;
@@ -16620,7 +16737,20 @@ begin
          SetLength(FArrays[ArrayIdx].IntData, NewSize);
          if not Preserve then for k := 0 to NewSize - 1 do ArrSetIntAt(ArrayIdx, k, 0);
        end;
-    1: begin
+    1: if FArrays[ArrayIdx].ElemWidth > 0 then   // phase 2.6: a packed Single array resizes its byte bank
+       begin
+         k := Length(FArrays[ArrayIdx].ByteData);
+         SetLength(FArrays[ArrayIdx].ByteData, NewSize * FArrays[ArrayIdx].ElemWidth);
+         if Preserve then
+         begin
+           if Length(FArrays[ArrayIdx].ByteData) > k then
+             FillChar(FArrays[ArrayIdx].ByteData[k], Length(FArrays[ArrayIdx].ByteData) - k, 0);
+         end
+         else if Length(FArrays[ArrayIdx].ByteData) > 0 then
+           FillChar(FArrays[ArrayIdx].ByteData[0], Length(FArrays[ArrayIdx].ByteData), 0);
+       end
+       else
+       begin
          SetLength(FArrays[ArrayIdx].FloatData, NewSize);
          if not Preserve then for k := 0 to NewSize - 1 do FArrays[ArrayIdx].FloatData[k] := 0.0;
        end;
@@ -16910,6 +17040,13 @@ begin
               for i := 0 to ProdDims - 1 do ArrSetIntAt(ArrayIdx, i, 0);
             end;
           srtFloat:
+            if FArrays[ArrayIdx].ElemWidth > 0 then   // phase 2.6: a Single array, packed at four bytes
+            begin
+              SetLength(FArrays[ArrayIdx].ByteData, ProdDims * FArrays[ArrayIdx].ElemWidth);
+              if ProdDims > 0 then
+                FillChar(FArrays[ArrayIdx].ByteData[0], ProdDims * FArrays[ArrayIdx].ElemWidth, 0);
+            end
+            else
             begin
               SetLength(FArrays[ArrayIdx].FloatData, ProdDims);
               for i := 0 to ProdDims - 1 do FArrays[ArrayIdx].FloatData[i] := 0.0;
@@ -16953,7 +17090,7 @@ begin
   case SubOp of
     9, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     29, 30, 31, 32, 33, 43, 45, 46, 50, 51, 52, 53, 54,
-    55, 56: Result := False;   // phase 2.5: a packed element read/write moves nothing (ArrayHotOps.inc)
+    55, 56, 57, 58: Result := False;   // phase 2.5 / 2.6: a packed element read/write moves nothing (ArrayHotOps.inc)
   else
     Result := True;
   end;
@@ -17044,7 +17181,7 @@ begin
           if ArrayBoundsOK(ArrayIdx, LinearIdx) then
             case FArrays[ArrayIdx].ElementType of
               0: Ctx.IntRegs[Instr.Dest] := ArrGetInt(FArrays[ArrayIdx], LinearIdx);
-              1: Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[LinearIdx];
+              1: Ctx.FloatRegs[Instr.Dest] := ArrGetFloat(FArrays[ArrayIdx], LinearIdx);
               2: Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
             end
           else                                  // MODERN out-of-bounds read -> default (FreeBASIC)
@@ -17063,7 +17200,7 @@ begin
           if ArrayBoundsOK(ArrayIdx, LinearIdx) then   // MODERN out-of-bounds store is dropped (FreeBASIC)
             case FArrays[ArrayIdx].ElementType of
               0: ArrSetIntAt(ArrayIdx, LinearIdx, Ctx.IntRegs[Instr.Dest]);
-              1: FArrays[ArrayIdx].FloatData[LinearIdx] := Ctx.FloatRegs[Instr.Dest];
+              1: ArrSetFloatAt(ArrayIdx, LinearIdx, Ctx.FloatRegs[Instr.Dest]);
               2: FArrays[ArrayIdx].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
             end;
         end;
@@ -17191,7 +17328,7 @@ begin
           end
           // The raw-address kind - see the note in bcRefLoadInt above.
           else if (PtrAddr and (RAWPTR_TAG or FGNPTR_TAG)) <> 0 then   // FGNPTR: DIVERGENZE 239
-            Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(PtrAddr, 0)
+            Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(PtrAddr, Instr.Immediate)   // phase 2.6: the pointee's width
           else
           begin
             ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
@@ -17199,7 +17336,9 @@ begin
             // The bank of the pointer need not be the bank of the storage - see bcRefLoadInt above.
             if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
               raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-            if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+            if FArrays[ArrayIdx].ElemWidth > 0 then
+              Ctx.FloatRegs[Instr.Dest] := PackedFloatLoad(ArrayIdx, PtrOffset, Instr.Immediate, PtrAddr)
+            else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
               Ctx.FloatRegs[Instr.Dest] := FArrays[ArrayIdx].FloatData[PtrOffset]
             else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
               Ctx.FloatRegs[Instr.Dest] := PDouble(@FArrays[ArrayIdx].IntData[PtrOffset])^
@@ -17284,7 +17423,7 @@ begin
           end
           // The raw-address kind - see the note in bcRefLoadInt above.
           else if (PtrAddr and (RAWPTR_TAG or FGNPTR_TAG)) <> 0 then   // FGNPTR: DIVERGENZE 239
-            RawStoreFloat(PtrAddr, 0, Ctx.FloatRegs[Instr.Src2])
+            RawStoreFloat(PtrAddr, Instr.Immediate, Ctx.FloatRegs[Instr.Src2])   // phase 2.6: the pointee's width
           else
           begin
             ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
@@ -17292,7 +17431,9 @@ begin
             // The bank of the pointer need not be the bank of the storage - see bcRefLoadInt above.
             if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
               raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-            if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
+            if FArrays[ArrayIdx].ElemWidth > 0 then
+              PackedFloatStore(ArrayIdx, PtrOffset, Instr.Immediate, PtrAddr, Ctx.FloatRegs[Instr.Src2])
+            else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
               FArrays[ArrayIdx].FloatData[PtrOffset] := Ctx.FloatRegs[Instr.Src2]
             else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
               PDouble(@FArrays[ArrayIdx].IntData[PtrOffset])^ := Ctx.FloatRegs[Instr.Src2]
@@ -17370,7 +17511,7 @@ begin
           if ((PtrAddr and RAWPTR_TAG) <> 0) or ((PtrAddr > 0) and ((PtrAddr and FGNPTR_TAG) <> 0)) then
             Ctx.FloatRegs[Instr.Dest] := RawLoadFloat(PtrAddr, Instr.Immediate)
           else
-            Ctx.FloatRegs[Instr.Dest] := PtrDomainLoadFloat(Ctx, PtrAddr);
+            Ctx.FloatRegs[Instr.Dest] := PtrDomainLoadFloat(Ctx, PtrAddr, Instr.Immediate);
         end;
       // The WRITE half of the same rule, and it must be here too - "*g.pi = 33" through a pointer FIELD
       // holding "@obj.field" wrote into a nonexistent raw block while the READ, once fixed, worked.
@@ -17388,7 +17529,7 @@ begin
           if ((PtrAddr and RAWPTR_TAG) <> 0) or ((PtrAddr > 0) and ((PtrAddr and FGNPTR_TAG) <> 0)) then
             RawStoreFloat(PtrAddr, Instr.Immediate, Ctx.FloatRegs[Instr.Src2])
           else
-            PtrDomainStoreFloat(Ctx, PtrAddr, Ctx.FloatRegs[Instr.Src2]);
+            PtrDomainStoreFloat(Ctx, PtrAddr, Ctx.FloatRegs[Instr.Src2], Instr.Immediate);
         end;
       31: // bcRawMemCopy - FB_MEMCOPY(dst, src, bytes); Dest receives dst (FB returns the destination)
         begin
@@ -17498,9 +17639,9 @@ begin
           // an fbc array does. So "@a(i)" needs no allocator of its own: it needs the buffer's address.
           // ⛔ The slot is resolved HERE, at run time: a private array has one buffer per context, an array
           // parameter names the caller's slot through ArrMap (DIVERGENZE 462), and a REDIM moves the buffer.
-          // The SSA emits this only for arrays of builtin integers and Double (TSSAGenerator.ArrayAddrIsNative):
-          // a Single array still keeps 8-byte cells, and an array of pointers keeps its packed pointers for
-          // the second-level translation towards C (ForeignDeepCell).
+          // The SSA emits this only for arrays of builtin integers, Double and Single (TSSAGenerator.ArrayAddrIsNative;
+          // a Single array is packed at four bytes since phase 2.6, and takes the ByteData branch below). An array of
+          // pointers keeps its packed pointers for the second-level translation towards C (ForeignDeepCell).
           ArrayIdx := Ctx.ArrMap[Instr.Src1];
           PtrAddr := Ctx.IntRegs[Instr.Src2];
           Ctx.IntRegs[Instr.Dest] := 0;
@@ -17852,6 +17993,9 @@ begin
             FArrays[DestArr].IntData     := Copy(FArrays[PtrAddr].IntData);
             FArrays[DestArr].FloatData   := Copy(FArrays[PtrAddr].FloatData);
             FArrays[DestArr].StringData  := Copy(FArrays[PtrAddr].StringData);
+            FArrays[DestArr].ElemWidth   := FArrays[PtrAddr].ElemWidth;    // a packed array copies its bytes
+            FArrays[DestArr].ElemSigned  := FArrays[PtrAddr].ElemSigned;
+            FArrays[DestArr].ByteData    := Copy(FArrays[PtrAddr].ByteData);
           end;
         end;
       48: // bcArrayCopyRecords - value-copy an array-of-UDT member element-wise (independent element records)
@@ -21291,11 +21435,11 @@ begin
                 begin
                   if BinWidth = 4 then
                   begin
-                    BinS := BinArr^.FloatData[k]; Move(BinS, Data[k * 4 + 1], 4);
+                    BinS := ArrGetFloat(BinArr^, k); Move(BinS, Data[k * 4 + 1], 4);   // phase 2.6: packed or not
                   end
                   else
                   begin
-                    BinF := BinArr^.FloatData[k]; Move(BinF, Data[k * 8 + 1], 8);
+                    BinF := ArrGetFloat(BinArr^, k); Move(BinF, Data[k * 8 + 1], 8);
                   end;
                 end
                 else
@@ -21316,11 +21460,15 @@ begin
                 begin
                   if BinWidth = 4 then
                   begin
-                    Move(Data[k * 4 + 1], BinS, 4); BinArr^.FloatData[k] := BinS;
+                    Move(Data[k * 4 + 1], BinS, 4);
+                    if BinArr^.ElemWidth = 4 then PSingle(@BinArr^.ByteData[k * 4])^ := BinS   // phase 2.6
+                    else BinArr^.FloatData[k] := BinS;
                   end
                   else
                   begin
-                    Move(Data[k * 8 + 1], BinF, 8); BinArr^.FloatData[k] := BinF;
+                    Move(Data[k * 8 + 1], BinF, 8);
+                    if BinArr^.ElemWidth = 4 then PSingle(@BinArr^.ByteData[k * 4])^ := BinF
+                    else BinArr^.FloatData[k] := BinF;
                   end;
                 end
                 else
