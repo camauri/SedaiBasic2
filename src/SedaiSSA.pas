@@ -1668,6 +1668,7 @@ type
     function RawChainElemType(Node: TASTNode): string;
     function RawChainElemBytes(const ElemType: string): Int64;
     function RawChainAddr(Node: TASTNode; out Addr: TSSAValue; out ElemType: string): Boolean;
+    function RawChainElemTypeStatic(Node: TASTNode): string;   // DIVERGENZE 372
     function RawChainValue(Node: TASTNode; out Val: TSSAValue; out Pointee: string): Boolean;
     function RawChainNameIsArray(const NameU: string): Boolean;
     function RawObjectPtrFieldMulti(MemberNode: TASTNode): string;
@@ -27552,14 +27553,28 @@ begin
   if Node.GetChild(0).NodeType = antIdentifier then
   begin
     Nm := Node.GetChild(0).ValueUpper;
-    if RawChainNameIsArray(Nm) or (not IsRawPtr(Nm)) then Exit;
+    if RawChainNameIsArray(Nm) then Exit;
     BasePointee := UpperFast(PointeeTypeOf(Nm));
     if BasePointee = '' then Exit;
+    // ⭐ ...or, in the fb memory mode, a pointer to a POINTER whatever it was assigned from (DIVERGENZE 372). There
+    // "@t" of a pointer variable is a machine address (phase 2.1), so "pp = @t : pp[0][0][1]" walks bytes like any
+    // other raw chain. Strict keeps the old rule: there "@t" is a packed name, and walking it raw fails.
+    if not (IsRawPtr(Nm) or
+            (FNativeMemory and (Length(BasePointee) > 4) and
+             (Copy(BasePointee, Length(BasePointee) - 3, 4) = ' PTR'))) then Exit;
     ProcessExpression(Node.GetChild(0), BaseVal);
   end
   else if Node.GetChild(0).NodeType = antArrayAccess then
   begin
     if not RawChainValue(Node.GetChild(0), BaseVal, BasePointee) then Exit;
+  end
+  // ⭐ "(*pp)[0][1]" - the base is an EXPRESSION of pointer type (DIVERGENZE 372), in the fb mode only, for the reason
+  // the name case above gives.
+  else if FNativeMemory and (Node.GetChild(0).NodeType in [antParentheses, antDeref]) then
+  begin
+    BasePointee := UpperFast(Trim(DerefedType(Node.GetChild(0))));
+    if (BasePointee = '') or (FindUDT(BasePointee) >= 0) then Exit;
+    ProcessExpression(Node.GetChild(0), BaseVal);
   end
   else
     Exit;
@@ -27583,6 +27598,27 @@ begin
   Addr := Sum;
   ElemType := BasePointee;
   Result := True;
+end;
+
+function TSSAGenerator.RawChainElemTypeStatic(Node: TASTNode): string;
+// The element type RawChainAddr would answer for "<chain>[i]", WITHOUT emitting anything - for the questions asked
+// before lowering (is this a Single?). '' when the shape is not a chain it would take.
+var
+  T: string;
+begin
+  Result := '';
+  if (Node = nil) or (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 2) then Exit;
+  if Node.Attributes.Values['BRACKET'] <> '1' then Exit;
+  case Node.GetChild(0).NodeType of
+    antIdentifier: Result := UpperFast(PointeeTypeOf(Node.GetChild(0).ValueUpper));
+    antParentheses, antDeref: Result := UpperFast(Trim(DerefedType(Node.GetChild(0))));
+    antArrayAccess:
+      begin
+        T := RawChainElemTypeStatic(Node.GetChild(0));
+        if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
+          Result := Trim(Copy(T, 1, Length(T) - 4));
+      end;
+  end;
 end;
 
 function TSSAGenerator.RawChainValue(Node: TASTNode; out Val: TSSAValue; out Pointee: string): Boolean;
@@ -30726,7 +30762,12 @@ begin
           // "obj.method(args)" returning a SINGLE, or "obj.sp[i]" on a SINGLE PTR field (248)
           Result := MethodReturnIsSingle(Node) or
                     ((Node.ChildCount >= 2) and
-                     (UpperFast(MemberRawPtrPointee(Node.GetChild(0))) = 'SINGLE'));
+                     (UpperFast(MemberRawPtrPointee(Node.GetChild(0))) = 'SINGLE'))
+        else if (Node.ChildCount >= 2) and (Node.GetChild(0).NodeType in [antArrayAccess, antParentheses, antDeref]) then
+          // ⭐ "t[0][1]" - an index applied to an EXPRESSION of type Single Ptr (DIVERGENZE 372): the element is the
+          // pointee of whatever that expression yields. It printed at Double precision (0.1000000014901161).
+          Result := (UpperFast(DerefedType(Node.GetChild(0))) = 'SINGLE') or
+                    (RawChainElemTypeStatic(Node) = 'SINGLE');
       end;
     antDeref:
       // "*p" through a SINGLE PTR is a Single, whatever p is - a variable, a field, a cast, pointer
