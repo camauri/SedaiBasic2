@@ -553,6 +553,19 @@ raw bytes.
   **enum** type, each
   **pointee** type (`Integer Ptr` from `Double Ptr` from `T Ptr`, at any pointer depth), each by-value
   UDT, and `Const` against non-`Const`.
+  ⭐ **An array argument is resolved by everything that describes the array**, as FreeBASIC does: it is
+  told apart from a **scalar** (`f(a())` and `f(x)` reach different overloads, and one *element*
+  `f(a(0))` is a scalar, not the array), by its declared **element type** — the four 64-bit names, the
+  narrow widths, and a **pointer** element such as `Integer Ptr` — and by its **rank**, where the
+  declaration states one: `f(a(Any))` and `f(a(Any, Any))` are two declarations, and a rank-2 array
+  reaches the second. A rank the program has not settled yet is *unknown*, not a rank of its own, so
+  such a call is resolved by the element type instead; `Dim a()` followed by a `ReDim` takes the rank
+  that `ReDim` fixed. Two array parameters that differ **only** by `Const`, or whose ranks cannot be
+  told apart (one of them unstated), are the **same declaration** — FreeBASIC reports *error 4:
+  Duplicated definition* and so do we.
+  ⚠️ Still missing, and refused by FreeBASIC where we accept: a duplicate pair declared with bodiless
+  `Declare`s, and a call that matches **no** array overload or matches two **ambiguously** — we compile
+  it and it fails at run time instead of being refused at compile time.
   ⛔ A pointer argument is matched by its *declared* type, so it has to be a variable or a parameter;
   an expression whose pointer type cannot be derived matches any pointer overload, and is taken only
   when exactly one fits.

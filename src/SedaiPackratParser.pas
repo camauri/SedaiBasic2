@@ -835,7 +835,7 @@ function TPackratParser.ProcSigFromParams(ParamList: TASTNode; SkipThis: Boolean
 var
   i, First: Integer;
   p: TASTNode;
-  T, Nm, Banks, Names, Consts, Widths: string;
+  T, Nm, NmT, Banks, Names, Consts, Widths: string;
   C: Char;
   AnyUDT, AnyConst, AnyWidth: Boolean;
 
@@ -951,10 +951,34 @@ begin
     // declare a TYPE by those names). Left to fall through here they signed a NAME tail - "H~I:INT32%9" -
     // which no call site can reproduce: an Int32 argument has no UDT name, so the width tail it now
     // does produce ('9') could never be reached and the call fell onto the first declaration.
+    NmT := '';
     if (T <> '') and ((not IsBuiltinTypeName(T)) or (Pos(' PTR', T) > 0)) and
        (T <> 'INT32') and (T <> 'UINT32') then
+      NmT := T;
+    // ⭐⭐ AND AN ARRAY PARAMETER'S STATED RANK RIDES IN THIS SAME POSITIONAL TAIL (DIVERGENZE 471), which
+    // is not a convenience: this tail is the only one whose comparison is already the rule the rank needs.
+    // A '-' on the CALL side is a WILDCARD (TypeTailMatchesWithWildcards), a '-' on either side costs
+    // nothing in the ranking (TypeTailUpcastDistance), and a position two candidates both fit is left to
+    // the ranking as an ambiguity - which is exactly what the oracle does with a rank it cannot know
+    // (overload/ambiguous-bydesc is "error 98"), and exactly what it does NOT do when the element type
+    // settles it instead (overload/bydesc, unknownDimensionsArgHasDimensionsFilledIn).
+    // ⛔ ONLY WHEN THE RANK WAS STATED, so every label a program signs today stays BYTE-IDENTICAL: an
+    // "a() As Integer" parameter keeps writing '-' and an "a() As T Ptr" one keeps writing "T PTR". The
+    // rank is an ADDITION to the position, never a replacement, so an array of pointers with a stated
+    // rank signs "INTEGER PTR()1" and both halves still say what they said.
+    // ⛔⛔ ...AND "()" GOES IN FOR EVERY ARRAY PARAMETER, RANK OR NO RANK, because BEING AN ARRAY is
+    // itself a type distinction this tail was not making. Measured on the oracle's own overload/bydesc,
+    // whose "simple" group declares four array overloads BESIDE four scalar ones: a scalar argument
+    // answered the ARRAY overload (1 2 3 4 where fbc answers 5 6 7 8) and a whole array answered the
+    // SCALAR one, because "array() As Integer" and "ByVal As Integer" signed the same bank, the same
+    // width and the same empty name - the label could not tell an array parameter from a scalar at all.
+    // ⚠️ This DOES change the label of every overload set with an array parameter, and that is the point:
+    // the call site writes the same "()" for a whole array (ArgArrayTailOf), so both halves move together.
+    if p.Attributes.Values['ARRAY'] = '1' then
+      NmT := NmT + '()' + p.Attributes.Values['ARRAYRANK'];
+    if NmT <> '' then
     begin
-      Names := Names + T;
+      Names := Names + NmT;
       AnyUDT := True;
     end
     else
@@ -1045,7 +1069,7 @@ function TPackratParser.OverloadCollapseKey(ParamList: TASTNode; SkipThis: Boole
 var
   i, First: Integer;
   p: TASTNode;
-  T, Nm, Md, Cn: string;
+  T, Nm, Md, Cn, Rk: string;
   IsConst, IsPtr: Boolean;
 begin
   Result := '';
@@ -1085,8 +1109,18 @@ begin
     else if IsBuiltinTypeName(T) then Md := 'V'
     else Md := 'R';                                    // a UDT
     if IsConst and not IsPtr then Cn := 'C' else Cn := '-';
+    // ⭐ A FOURTH FIELD, THE ARRAY RANK (DIVERGENZE 471): '-' for a parameter that is not an array, '0'
+    // for one whose declaration stated no rank ("a()"), and the digit for one that did ("a(Any, Any)").
+    // It is a field of its own and not part of the type, because the COMPARISON is not equality: an
+    // unstated rank collides with every rank, two stated ones only when equal. Measured on the oracle's
+    // own suite - bydesc-1-vs-1, bydesc-1-vs-unknown, bydesc-unknown-vs-unknown and bydesc-8-vs-8 are
+    // all "error 4: Duplicated definition", while overload/bydesc declares (any) beside (any, any) and
+    // compiles.
+    if p.Attributes.Values['ARRAY'] <> '1' then Rk := '-'
+    else if p.Attributes.Values['ARRAYRANK'] = '' then Rk := '0'
+    else Rk := p.Attributes.Values['ARRAYRANK'];
     if Result <> '' then Result := Result + ';';
-    Result := Result + T + '|' + Md + '|' + Cn;
+    Result := Result + T + '|' + Md + '|' + Cn + '|' + Rk;
   end;
 end;
 
@@ -1130,7 +1164,33 @@ begin
       // different types. It over-refused fbc's pointers/procptr-namespaces exactly that way, which
       // the suite caught as B1 falling by one: the census is a TRIPLE, and B2 rising is not enough.
       if (Copy(fa[0], 1, 1) = '#') or (Copy(fb[0], 1, 1) = '#') then Exit;
-      if (Pos('()', fa[0]) > 0) or (Pos('()', fb[0]) > 0) then Exit;
+      // ⭐ AN ARRAY PARAMETER NOW SEPARATES BY ITS RANK (DIVERGENZE 471), and the note above - which
+      // said it could never collide because the rank was not recorded - is retired: the parser records
+      // it (ARRAYRANK) and it rides in the fourth field. The two element types are already equal here,
+      // so what is left is the rank, and the rule is the oracle's, measured rather than reasoned:
+      //   (any) vs (any, any)   -> two declarations   (overload/bydesc compiles and calls both)
+      //   (any) vs (any)        -> duplicate          (overload/bydesc-1-vs-1)
+      //   ()    vs (any, any)   -> duplicate          (measured directly: an unstated rank is ANY rank)
+      //   ()    vs ()           -> duplicate          (overload/bydesc-unknown-vs-unknown)
+      // ⚠️ A key written before this field existed cannot reach here - the list is built and compared
+      // within one parse - but the length is tested anyway, so a shorter entry keeps the old behaviour
+      // (never collide) instead of reading a field that is not there.
+      if Pos('()', fa[0]) > 0 then
+      begin
+        if (Length(fa) < 4) or (Length(fb) < 4) then Exit;
+        if (fa[3] <> '0') and (fb[3] <> '0') and (fa[3] <> fb[3]) then Exit;
+        // An array of POINTERS keeps the declared pointer limit below: the const's POSITION inside a
+        // pointer type is not recorded, so those never collide either way.
+        if Pos(' PTR', fa[0]) > 0 then Exit;
+        // ⛔⛔ AND AN ARRAY TAKES NO "BOTH BYREF, CONST DIFFERS" ESCAPE, which is the whole of DIVERGENZE
+        // 471(b). That escape is the one pair that distinguishes for a SCALAR (voce 144, measured), and an
+        // array parameter was falling through it by accident: its effective mode reads 'R' (the type key
+        // "INTEGER()" is not a builtin NAME), so "g(x() As Integer)" beside "g(x() As Const Integer)" read
+        // as the distinguishing pair and was accepted, where fbc answers "error 4: Duplicated definition".
+        // Measured in both spellings and for Sub and Function alike; with a different ELEMENT TYPE fbc
+        // compiles, which is the first test above and why this one is reached only past it.
+        Continue;
+      end;
       if (Pos(' PTR', fa[0]) > 0) or (Pos(' PTR', fb[0]) > 0) then Exit;
       // ...and the one pair that distinguishes without a type difference.
       if (fa[1] = 'R') and (fb[1] = 'R') and (fa[2] <> fb[2]) then Exit;
@@ -3938,6 +3998,7 @@ var
   Kind, MethodType, QualName, ParamMode, OpSym, OpOwnerType, DecoU, RetTypeName, ParamTypeName, ParamNameU: string;
   ProcPtrRet: TASTNode;
   OpSymbolForm: Boolean;   // "OPERATOR <sym>(...)" (arity goes in the label) vs "OPERATOR T.CAST/LET"
+  ArrRank: Integer;        // dimensions an array parameter's declaration STATED (0 = none): DIVERGENZE 471
   NameNode, ParamList, ParamNode, ThisNode, DefExpr: TASTNode;
 begin
   // SUB|FUNCTION name [ ( params ) ] [AS type] <body> END SUB|FUNCTION
@@ -4198,10 +4259,28 @@ begin
         if Context.Check(ttDelimParOpen) then
         begin
           Context.Advance;                        // (
+          // ⭐ AND HOW MANY DIMENSIONS THE DECLARATION STATED, which nothing recorded until 16 Sep 2026
+          // (DIVERGENZE 471). "a()" states nothing - "an array of any rank" - while "a(Any, Any)" states
+          // TWO, and fbc separates overloads on exactly that: its own overload/bydesc declares
+          // "f( array(any) )" beside "f( array(any, any) )" and calls them two declarations, while it
+          // refuses "a(any)" twice over as "error 4: Duplicated definition". With the rank unrecorded the
+          // two signed ONE label here, so the second was silently DISCARDED and both calls answered the
+          // first: measured 1 and 1 where fbc answers 1 and 2.
+          // ⛔ 0 MEANS "NOT STATED", and it is not the same as 1: measured against the oracle, "a()"
+          // beside "a(any, any)" IS a duplicate, so an unstated rank collides with EVERY rank while two
+          // stated ones collide only when equal. That is the "-" convention the other tails already use.
+          // ⚠️ Counted, not parsed: the bounds themselves are skipped exactly as before, so a parameter
+          // list reaches the rest of the pipeline byte-identical to what it did.
+          ArrRank := 0;
           while not Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile, ttSeparStmt]) do
+          begin
+            if Context.Check(ttSeparParam) then Inc(ArrRank)      // one comma = one more dimension
+            else if ArrRank = 0 then ArrRank := 1;                // ...and anything at all = the first
             Context.Advance;                      // skip anything inside (usually empty)
+          end;
           if Context.Check(ttDelimParClose) then Context.Advance;   // )
           ParamNode.Attributes.Values['ARRAY'] := '1';
+          if ArrRank > 0 then ParamNode.Attributes.Values['ARRAYRANK'] := IntToStr(ArrRank);
         end;
         // Optional "AS typename" (M3.1): attach the type as a child antIdentifier so the
         // SSA pre-scan can type the parameter (record handle / explicit builtin bank).

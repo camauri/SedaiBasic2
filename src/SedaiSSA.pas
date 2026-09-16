@@ -853,7 +853,8 @@ type
     function ArgWidthSigFromArgs(ArgsNode: TASTNode; PtrKinds: Boolean = False): string;
     function ArgPtrKindChar(Node: TASTNode): Char;   // 'Z'/'W' for text a pointer parameter would receive  // declared-width tail of a call's arguments
     function DeclaredPointerTypeOfArg(Node: TASTNode): string;  // the declared "T PTR" type of an argument, or ''
-    function ArgUdtSigFromArgs(ArgsNode: TASTNode): string;     // ...and their UDT type tail (every UDT is an int handle)
+    function ArgUdtSigFromArgs(ArgsNode: TASTNode; WithRank: Boolean = False): string;     // ...and their UDT type tail (every UDT is an int handle)
+    function ArgArrayTailOf(Node: TASTNode; WithRank: Boolean): string;  // an ARRAY argument's entry in that tail (DIVERGENZE 471)
     function SigBankPart(const Sig: string): string;
     function ArgIsSurelyNotRecord(Node: TASTNode): Boolean;
     function ArgNotRecordMask(ArgsNode: TASTNode): string;
@@ -870,6 +871,7 @@ type
     function ProcRetFuncPtrSig(const NameU: string): string;   // a procedure whose RETURN is callable, either spelling
     function ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;  // pick an overload
     function ResolveCallLabelRaw(const BaseLabel: string; ArgsNode: TASTNode): string;  // ...before the const-array rule
+    function ResolveCallLabelWith(const BaseLabel: string; ArgsNode: TASTNode; const UdtSigIn: string): string;  // ...with one spelling of the type tail
     function FindCtorWithDefaults(const TypeName: string; ArgCount: Integer): string;  // M4.4h: defaulted ctor
     procedure PreCollectFuncRetTypes(Node: TASTNode);  // FUNCTION name -> return type, before RegisterRecordVars
     function PreProcPtrSigOf(Node: TASTNode): string;   // "ProcPtr(f[,sig])"/"@f" -> f's "FPPARAMS|FPRET", '' if none
@@ -14621,7 +14623,21 @@ begin
     // to fall back to the flat one - which is precisely the fallback ArrayFactKey must not take.
     // Recording it here is what lets the reader stop guessing. See DIVERGENZE 61.
     if RecArrUDTIdx >= 0 then
-      FArrayRecordType.Values[DeclArrName] := ArrElemTypeName;
+      FArrayRecordType.Values[DeclArrName] := ArrElemTypeName
+    // ⛔⛔ ...AND THE SCALAR HALF OF THE SAME FACT, WHICH THAT CURE LEFT BEHIND (DIVERGENZE 471). Every
+    // other element fact of this declaration is filed above and below under the SCOPED name - the record
+    // type, the element BYTES, the fixed-string capacity, the funcptr signature, the pointee type - and
+    // FArrayScalarType alone still had ONE writer: the flat pre-scan (RegisterRecordVars), keyed by the
+    // BARE name with no procedure in hand. So a proc-local "Dim a(0) As UInteger" had no entry under the
+    // key ArrayFactKey builds for it, and the readers that ask through ArrayFactKey got nothing.
+    // 📊 Measured, not reasoned: an overload set taking "array() As Integer" / "As UInteger" /
+    // "As Single" / "As Integer Ptr" answered 1 2 3 4 for MODULE arrays and 1 1 3 1 for the same arrays
+    // declared inside a Sub - and a STATIC local answered correctly, because a static is hoisted to module
+    // level where the flat pre-scan does see it. That pair is what said the gap was in the KEY.
+    // ⚠️ Added, never replaced: the flat entry keeps being written, so every reader that asks by the bare
+    // name answers exactly as it did.
+    else if ArrElemTypeName <> '' then
+      FArrayScalarType.Values[DeclArrName] := ArrElemTypeName;
 
     // ...AND HOW MANY BYTES ONE ELEMENT TAKES. The two registries above split the element type in half
     // by what their READERS wanted (a UDT name / a scalar name), so neither can answer the question that
@@ -35745,7 +35761,77 @@ begin
   Result := Pt + ' ' + 'PTR';
 end;
 
-function TSSAGenerator.ArgUdtSigFromArgs(ArgsNode: TASTNode): string;
+function TSSAGenerator.ArgArrayTailOf(Node: TASTNode; WithRank: Boolean): string;
+// An ARRAY passed WHOLE - "a()" - described the way ProcSigFromParams describes an array PARAMETER: the
+// element type when this tail names it (a pointer), plus "()" and the RANK when the rank is known and
+// WithRank is asked. '' for anything that is not a whole array, which leaves every other argument to the
+// questions below exactly as before. DIVERGENZE 471.
+//
+// ⛔ THE WHOLE ARRAY, NOT AN ELEMENT OF IT. "a()" arrives as an index list with NO indices and "a(0)" as
+// one with a single index - the same node type - so the count is what tells them apart. Reading them
+// alike would describe an ELEMENT as its array and hand "f(a(0))" to the by-descriptor overload.
+// ⚠️ A call the parser could not tell from an index ("a()" with the name resolved later) arrives as an
+// antFunctionCall instead; ArrayIndexOf settles that, exactly as DeclaredIdentCode settles it.
+var
+  N: TASTNode;
+  NameU, ElemT: string;
+  Idx, R: Integer;
+begin
+  Result := '';
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  N := Node;
+  if N.NodeType = antArrayAccess then
+  begin
+    if (N.ChildCount < 2) or (N.GetChild(0).NodeType <> antIdentifier) or
+       (N.GetChild(1).ChildCount <> 0) then Exit;
+    N := N.GetChild(0);
+  end
+  // ⛔⛔ A BARE NAME IS A SCALAR ARGUMENT, NEVER A WHOLE ARRAY. FreeBASIC spells a whole array "a()" -
+  // the parentheses are required - so only the parenthesised spellings reach here. Accepting a bare
+  // identifier because some slot carries that name described a scalar POINTER as an array: m553 passes
+  // "pi", a "Dim As Integer Ptr", to an overload set of (Pt) and (Integer Ptr), the site signed "()"
+  // instead of "INTEGER PTR", no label matched, the arity fallback handed it to the by-value UDT
+  // member, and the program died on an invalid record handle. ⚠️ ArrayIndexOf answering for that name
+  // is not the defect to fix here: the ARGUMENT SPELLING settles it before the registry is asked.
+  else if (N.NodeType = antFunctionCall) and
+          ((N.ChildCount = 0) or ((N.ChildCount = 1) and (N.GetChild(0).ChildCount = 0))) then
+    // "a()" the parser could not tell from a call: the name resolves it, below.
+  else
+    Exit;
+  NameU := N.ValueUpper;
+  Idx := ArrayIndexOf(NameU);
+  if Idx < 0 then Exit;
+  // ⭐ THE ELEMENT TYPE, WHICH THIS TAIL WAS NOT SAYING AT ALL. The DECLARATION side has always named a
+  // pointer element ("Function proc( array() As Integer Ptr )" signs "~I:INTEGER PTR"), and the call site
+  // named nothing - so the label could not be reached, the call fell onto the arity fallback and answered
+  // the FIRST member of the set: fbc's own overload/bydesc expects RESULT_ARRAY_INTPTR and we answered
+  // RESULT_ARRAY_INT, in silence. Only a POINTER is named, because that is the half that was measured
+  // missing; every other element type keeps writing nothing and resolves by the WIDTH tail as it does now.
+  ElemT := UpperFast(Trim(FArrayScalarType.Values[ArrayFactKey(NameU)]));
+  if Copy(ElemT, 1, 6) = 'CONST ' then ElemT := Trim(Copy(ElemT, 7, MaxInt));
+  if Pos(' PTR', ElemT) > 0 then Result := ElemT;
+  // ⛔ BEING AN ARRAY IS ITSELF THE FACT, and it is written whether or not the rank is known: the
+  // declaration side writes "()" for every array parameter, so a scalar argument (which never reaches
+  // here) and a whole array stop signing the same tail. Without it fbc's overload/bydesc answered the
+  // array overload for a scalar and the scalar one for an array.
+  Result := Result + '()';
+  if not WithRank then Exit;
+  // ...and the RANK, when the program has settled it: a declaration with subscripts states it
+  // (RankStated), and a name declared bare takes it from the ReDim that fixed it. 0 is "not known yet",
+  // which must stay a WILDCARD - fbc resolves such a call by the element type and refuses it as ambiguous
+  // when the element type cannot separate either (overload/ambiguous-bydesc).
+  if FProgram.GetArray(Idx).RankStated then R := FProgram.GetArray(Idx).DimCount
+  else R := StrToIntDef(FArrRankOfSlot.Values[UpperFast(FProgram.GetArray(Idx).Name)], 0);
+  // ⛔ THE DIGIT ALONE: the "()" is already there, written above for every whole array. Appending
+  // "()" again here signed "()()1" where the declaration signs "()1", so NOTHING matched and every
+  // call fell onto the arity fallback - rank resolution went back to answering the first member, and
+  // an unrelated set resolved to a by-value UDT overload and died on an invalid record handle. It is
+  // the same fact written twice, which is the shape this file warns about everywhere else.
+  if (R >= 1) and (R <= 9) then Result := Result + IntToStr(R);
+end;
+
+function TSSAGenerator.ArgUdtSigFromArgs(ArgsNode: TASTNode; WithRank: Boolean): string;
 // The UDT-type tail of a call's arguments, in the alphabet the declaration's label uses: the record type
 // name of each argument that IS a record, '-' for every other one (the tail is POSITIONAL). Returns ''
 // when no argument is a record -- that is the case where the declaration carries no tail either.
@@ -35757,6 +35843,16 @@ begin
   if ArgsNode = nil then Exit;
   for i := 0 to ArgsNode.ChildCount - 1 do
   begin
+    // ⭐ AN ARRAY PASSED WHOLE DESCRIBES ITSELF, and it is asked FIRST because the questions below are
+    // about a SCALAR's type and would answer for the array's element or for nothing at all. '' means
+    // "not a whole array", and then nothing here has changed. DIVERGENZE 471.
+    T := ArgArrayTailOf(ArgsNode.GetChild(i), WithRank);
+    if T <> '' then
+    begin
+      if Result <> '' then Result := Result + ',';
+      Result := Result + T;
+      Continue;
+    end;
     // ⛔ THE POINTER QUESTION COMES FIRST. In the managed model a "T PTR" IS the record handle, so
     // ObjectTypeName answers "PT" for a "Pt Ptr" variable just as it does for a Pt one - and the call
     // then asked for the by-value overload. Asked in this order, a UDT VALUE still answers '' here (it
@@ -36436,6 +36532,42 @@ begin
 end;
 
 function TSSAGenerator.ResolveCallLabelRaw(const BaseLabel: string; ArgsNode: TASTNode): string;
+// ⭐⭐ TWO SPELLINGS OF THE TYPE TAIL, THE MOST SPECIFIC FIRST (DIVERGENZE 471). The tail can now carry an
+// array argument's RANK, and a declaration carries one only when ITS OWN declaration stated one - so a
+// call passing a rank-2 array must be able to ask for "()2" and, finding no such declaration, to ask again
+// the way it asked before. Without the second question a set declared "a() As Integer" / "a() As Single"
+// would stop resolving the moment the ARGUMENT's rank became known, which is a fact about the caller and
+// says nothing about which overload was meant.
+// ⛔⛔ AND THE SPELLING IS CHOSEN FROM WHAT THE DECLARATIONS SIGNED, NOT BY ASKING TWICE. Asking with the
+// rank and falling back to asking without it CANNOT WORK, and it was measured failing: the resolver ends
+// in an ARITY fallback that always answers something, so the first question never returns '' and the
+// second never runs - an array of pointers kept answering the Integer overload with the tail right there
+// in OVL_DIAG. ⇒ The call site reproduces what the declaration WROTE, which is this unit's rule
+// everywhere else: if some declaration of this name states a rank, the call spells its rank; if none
+// does, it spells the tail exactly as it did before this entry.
+var
+  k, d: Integer;
+  Pref, Nm: string;
+  WantRank: Boolean;
+begin
+  Pref := BaseLabel + '~';
+  WantRank := False;
+  // ⛔ A STATED RANK, not merely an array: since every array parameter writes "()", the question here is
+  // whether some declaration wrote a DIGIT after it. Asking for "()" alone would make the call spell its
+  // argument's rank at a set whose members state none - "a() As Integer" signs "()" and the call would
+  // ask for "()2", which matches nothing and falls onto the arity fallback, where the wrong overload is.
+  for k := 0 to FProcedureNames.Count - 1 do
+  begin
+    if Copy(FProcedureNames[k], 1, Length(Pref)) <> Pref then Continue;
+    Nm := SigNamePart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt));
+    for d := 1 to 9 do
+      if Pos('()' + Chr(Ord('0') + d), Nm) > 0 then begin WantRank := True; Break; end;
+    if WantRank then Break;
+  end;
+  Result := ResolveCallLabelWith(BaseLabel, ArgsNode, ArgUdtSigFromArgs(ArgsNode, WantRank));
+end;
+
+function TSSAGenerator.ResolveCallLabelWith(const BaseLabel: string; ArgsNode: TASTNode; const UdtSigIn: string): string;
 // Resolve a call to an OVERLOADED procedure. A name declared once keeps its bare label, so the first
 // test settles every non-overloaded program and this costs nothing. An overload set has no bare label
 // at all (the parser gave every member a "~<sig>" suffix), so:
@@ -36511,7 +36643,7 @@ begin
   if FProcDecls.ContainsKey(BaseLabel) then Exit(BaseLabel);
   Sig := ArgSigFromArgs(ArgsNode);
   if ArgsNode = nil then ArgCount := 0 else ArgCount := ArgsNode.ChildCount;
-  UdtSig := ArgUdtSigFromArgs(ArgsNode);
+  UdtSig := UdtSigIn;                          // one spelling of the tail: see ResolveCallLabelRaw
   ConstSig := ArgConstSigFromArgs(ArgsNode);
   WidthSig := ArgWidthSigFromArgs(ArgsNode);
   if GetEnvironmentVariable('OVL_DIAG') = '1' then
