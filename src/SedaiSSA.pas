@@ -489,6 +489,8 @@ type
     FWStringVars: TStringList;           // FreeBASIC WSTRING vars (UPPER): share the srtString bank but hold UTF-8 bytes
                                          // whose LEN/MID/LEFT/RIGHT count/index by Unicode codepoint (not byte). Assignment/
                                          // concat/copy/PRINT are unchanged (UTF-8 in, UTF-8 out); only width-aware ops differ.
+    FFwdDeclProcs: TStringList;          // DIVERGENZE 495: procedures with a forward DECLARE (FWDDECL)
+    FDeclTypeOnce: TStringList;          // DIVERGENZE 495: NAME=TYPE for a name declared with ONE type in the program, NAME=? otherwise
     FByrefCallNames: TStringList;        // procedures whose call arguments need a home (CollectAddressTakenVars); nil outside it
     FAtTakenOnly: TStringList;           // the names CollectDimVarBanks alone put in the @-dictionary,
                                          // i.e. the ones that are there BECAUSE an @ was taken. That
@@ -1053,6 +1055,10 @@ type
     // with a 1-element global array (reusing the SHARED-scalar machinery), so it has a stable address.
     procedure CollectFixedStrNames(Node: TASTNode);   // fills FFixedStrNames
     procedure CollectAddressTakenVars(Node: TASTNode);
+    procedure CollectDeclTypeOnce(Node: TASTNode);
+    procedure CheckByrefArgType(const ProcName: string; ParamNode, ArgNode: TASTNode; Index: Integer);
+    function ByrefArgRelation(const ProcName: string; ParamNode, ArgNode: TASTNode; out PT, AT: string): Integer;
+    function ByrefArgIsTemporary(const ProcName: string; ParamNode, ArgNode: TASTNode): Boolean;
     // "Dim As V v": a variable named exactly like a type that owns member procedures — rejected, as fbc does.
     function DimPrecedesProcedure(const NameU: string; DimNode: TASTNode): Boolean;
     procedure CheckTypeNameShadowedByVar(Node: TASTNode; InProc: Boolean = False);
@@ -2265,6 +2271,8 @@ begin
   FLexVarTypes.Free;
   FPointerVars.Free;
   FAtTakenOnly.Free;
+  FDeclTypeOnce.Free;
+  FFwdDeclProcs.Free;
   FAddrTakenScalars.Free;
   FRawModuleScalars.Free;
   FAddrSharedScalars.Free;
@@ -41705,6 +41713,7 @@ begin
     // the callee holds a temporary, not the object. Copying the slot back would overwrite the caller's
     // UDT variable with a string. FreeBASIC binds such a conversion to a temporary too, for this reason.
     if (RT = srtString) and HasUDTStringCast(ArgExpr) then Continue;
+    if ByrefArgIsTemporary(UpperFast(ParamOwnerName), ParamI, ArgExpr) then Continue;   // DIVERGENZE 495: a converted temporary, nothing comes back
     if ArgExpr.NodeType = antIdentifier then
     begin
       // Plain variable arg: copy the slot's final value straight back into it.
@@ -44836,6 +44845,141 @@ begin
       end;
     end;
   for i := 0 to Node.ChildCount - 1 do CollectFixedStrNames(Node.GetChild(i));
+end;
+
+procedure TSSAGenerator.CollectDeclTypeOnce(Node: TASTNode);
+// DIVERGENZE 495: which names the program declares with exactly ONE type, everywhere - a DIM, a FOR counter, a
+// parameter. The type registries answer by BARE NAME, so a rule that trusts them must first know the name is not
+// declared twice with two types (two procedures, two scopes); such a name, or one declared in a form this walk does
+// not read the type of (an inferred Var, an array), is filed as "?" and the rule stays silent on it.
+  procedure Note(const NameU, TypeU: string);
+  var
+    k: Integer;
+    T: string;
+  begin
+    if NameU = '' then Exit;
+    T := TypeU;
+    if T <> '?' then T := UpperFast(CanonicalType(T));
+    k := FDeclTypeOnce.IndexOfName(NameU);
+    if k < 0 then FDeclTypeOnce.Add(NameU + '=' + T)
+    else if FDeclTypeOnce.ValueFromIndex[k] <> T then FDeclTypeOnce.ValueFromIndex[k] := '?';
+  end;
+  procedure Walk(N: TASTNode);
+  var
+    i, j: Integer;
+    P: TASTNode;
+  begin
+    if N = nil then Exit;
+    case N.NodeType of
+      antArrayDecl:
+        if (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antIdentifier) then
+        begin
+          if (N.ChildCount = 2) and (N.GetChild(1).NodeType = antIdentifier) and
+             (N.Attributes.Values['INFER'] <> '1') then
+            Note(N.GetChild(0).ValueUpper, N.GetChild(1).ValueUpper)
+          else
+            Note(N.GetChild(0).ValueUpper, '?');
+        end;
+      antForLoop:
+        if (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antIdentifier) then
+        begin
+          if N.Attributes.Values['VARTYPE'] <> '' then
+            Note(N.GetChild(0).ValueUpper, N.Attributes.Values['VARTYPE'])
+          else
+            Note(N.GetChild(0).ValueUpper, '?');
+        end;
+      antParameterList:
+        for j := 0 to N.ChildCount - 1 do
+        begin
+          P := N.GetChild(j);
+          if P.NodeType <> antIdentifier then Continue;
+          if (P.ChildCount >= 1) and (P.GetChild(0).NodeType = antIdentifier) and
+             (P.Attributes.Values['ARRAY'] <> '1') then
+            Note(P.ValueUpper, P.GetChild(0).ValueUpper)
+          else
+            Note(P.ValueUpper, '?');
+        end;
+    end;
+    for i := 0 to N.ChildCount - 1 do Walk(N.GetChild(i));
+  end;
+begin
+  if FDeclTypeOnce = nil then
+  begin
+    FDeclTypeOnce := TIndexedStringList.Create;
+    FDeclTypeOnce.CaseSensitive := False;
+  end;
+  FDeclTypeOnce.Clear;
+  Walk(Node);
+  if FFwdDeclProcs = nil then
+  begin
+    FFwdDeclProcs := TStringList.Create;
+    FFwdDeclProcs.Delimiter := ',';
+    FFwdDeclProcs.StrictDelimiter := True;
+  end;
+  FFwdDeclProcs.DelimitedText := UpperFast(Node.Attributes.Values['FWDDECL']);
+end;
+
+function TSSAGenerator.ByrefArgRelation(const ProcName: string; ParamNode, ArgNode: TASTNode; out PT, AT: string): Integer;
+// ⛔ DIVERGENZE 495: a VARIABLE handed to an explicit BYREF numeric parameter must be of the same SIZE and the same
+// CLASS (integer or floating point; a Boolean is a one-byte integer) - signedness does not matter. fbc: "error 58:
+// Type mismatch, at parameter N". Measured over ten types, 74 pairs of 100 refused, and sb accepted all of them,
+// passing a converted temporary whose write never came back. Only a plain name whose single declared type is known
+// is judged (CollectDeclTypeOnce); anything else keeps the old path.
+  function Shape(const T: string; out Sz: Integer; out Flt: Boolean): Boolean;
+  begin
+    Result := True; Flt := False;
+    if (T = 'BYTE') or (T = 'UBYTE') or (T = 'BOOLEAN') then Sz := 1
+    else if (T = 'SHORT') or (T = 'USHORT') then Sz := 2
+    else if (T = 'LONG') or (T = 'ULONG') then Sz := 4
+    else if (T = 'INTEGER') or (T = 'UINTEGER') or (T = 'LONGINT') or (T = 'ULONGINT') then Sz := 8
+    else if T = 'SINGLE' then begin Sz := 4; Flt := True; end
+    else if T = 'DOUBLE' then begin Sz := 8; Flt := True; end
+    else Result := False;
+  end;
+// 0 = nothing to say, 1 = refused (another size or class), 2 = a BOOLEAN against a one-byte integer (or the reverse):
+// fbc accepts it and binds a converted TEMPORARY - the callee's write does not come back (measured both ways).
+var
+  k, PS, AS_: Integer;
+  PF, AF: Boolean;
+  A: TASTNode;
+begin
+  Result := 0; PT := ''; AT := '';
+  if (not FModernMode) or (FDeclTypeOnce = nil) or (GetEnvironmentVariable('SB_NO_BYREF_TYPECHECK') = '1') then Exit;
+  if (ParamNode = nil) or (ArgNode = nil) then Exit;
+  if ParamNode.Attributes.Values['BYREF'] <> '1' then Exit;
+  if UpperFast(ArgNode.Attributes.Values['ARGPASSMODE']) = 'BYVAL' then Exit;
+  // ⛔ fbc judges a call against the DECLARE when there is one, and a Declare may say "ByRef a As Any" over a definition
+  // that says Integer (the manual's misc/any-param). That declaration is not kept by position here: stay silent.
+  if (FFwdDeclProcs <> nil) then
+    for k := 0 to FFwdDeclProcs.Count - 1 do
+      if (FFwdDeclProcs[k] <> '') and (Pos(Trim(FFwdDeclProcs[k]), UpperFast(ProcName)) = 1) then Exit;
+  A := ArgNode;
+  if A.NodeType <> antIdentifier then Exit;          // a parenthesised name is an expression: a temporary, as in fbc
+  if A.ChildCount <> 0 then Exit;
+  k := FDeclTypeOnce.IndexOfName(A.ValueUpper);
+  if k < 0 then Exit;
+  AT := FDeclTypeOnce.ValueFromIndex[k];
+  if AT = '?' then Exit;
+  PT := UpperFast(CanonicalType(ParamDeclaredTypeName(ParamNode)));
+  if not (Shape(PT, PS, PF) and Shape(AT, AS_, AF)) then Exit;
+  if (PS <> AS_) or (PF <> AF) then Exit(1);
+  if (PT = 'BOOLEAN') <> (AT = 'BOOLEAN') then Exit(2);
+end;
+
+procedure TSSAGenerator.CheckByrefArgType(const ProcName: string; ParamNode, ArgNode: TASTNode; Index: Integer);
+var
+  PT, AT: string;
+begin
+  if ByrefArgRelation(ProcName, ParamNode, ArgNode, PT, AT) = 1 then
+    raise Exception.CreateFmt('Type mismatch, at parameter %d (%s) of %s(): a variable of type %s cannot be passed ByRef as %s',
+      [Index + 1, LowerCase(ParamNode.ValueUpper), ProcName, LowerCase(AT), LowerCase(PT)]);
+end;
+
+function TSSAGenerator.ByrefArgIsTemporary(const ProcName: string; ParamNode, ArgNode: TASTNode): Boolean;
+var
+  PT, AT: string;
+begin
+  Result := ByrefArgRelation(ProcName, ParamNode, ArgNode, PT, AT) = 2;
 end;
 
 procedure TSSAGenerator.CollectAddressTakenVars(Node: TASTNode);
@@ -54461,6 +54605,10 @@ begin
     if ParamList.GetChild(i).Attributes.Values['FUNCPTR'] = '1' then
       StampFuncPtrTarget(ArgListNode.GetChild(i), ParamList.GetChild(i).Attributes.Values['FPPARAMS']);
 
+  // DIVERGENZE 495: a variable of another size or class for a BYREF numeric parameter is refused, as fbc does.
+  for i := 0 to NArgs - 1 do
+    CheckByrefArgType(UpperFast(ParamOwnerName), ParamList.GetChild(i), ArgListNode.GetChild(i), i);
+
   // Phase 1: evaluate every explicit argument (in source order, preserving side-effect order) into a
   // bank register, recording its target transfer slot.
   for i := 0 to NArgs - 1 do
@@ -54572,7 +54720,8 @@ begin
     begin
       if UpperFast(ArgExpr.Attributes.Values['ARGPASSMODE']) = 'BYVAL' then
         ProcessExpression(ArgExpr, ArgVal)
-      else if not TryEmitArgAddress(ArgExpr, ArgVal) then
+      // DIVERGENZE 495: a Boolean against a one-byte integer is a converted temporary, as in fbc
+      else if ByrefArgIsTemporary(UpperFast(ParamOwnerName), ParamList.GetChild(i), ArgExpr) or not TryEmitArgAddress(ArgExpr, ArgVal) then
       begin
         ProcessExpression(ArgExpr, ArgVal);
         if ParamDeclaredTypeName(ParamList.GetChild(i)) <> 'ANY' then
@@ -58396,6 +58545,7 @@ begin
   PreMarkStart; CollectNonPtrNames(AST); PreMarkEnd('CollectNonPtrNames');
   PreMarkStart; CollectBlockManagedTypes(AST); PreMarkEnd('CollectBlockManagedTypes');   // before the raw-pointer fixpoint: it asks whether New T[n] is managed
   PreMarkStart; CollectAddressTakenVars(AST); PreMarkEnd('CollectAddressTakenVars');
+  PreMarkStart; CollectDeclTypeOnce(AST); PreMarkEnd('CollectDeclTypeOnce');
   NoteDeclaredProcNames(AST);
   CountIdentifierUses(AST);
   // ⭐ DyLibLoad / DyLibSymbol / DyLibFree - FreeBASIC's own way of loading a library at RUN time (strato 3
