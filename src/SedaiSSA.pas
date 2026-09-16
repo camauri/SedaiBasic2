@@ -548,6 +548,7 @@ type
     FRecNativeBits: Boolean;             // phase 3 (exclusions): a type with BIT FIELDS can be native
     FRawBitUnit, FRawBitOfs: TInt64Array; // ...the unit size and bit offset of each bit field in the LAST UDTCLayoutRaw walk
     FRecNativeDefaults: Boolean;         // phase 3 (exclusions): a type with field DEFAULTS can be native
+    FRecNativeRecArrays: Boolean;        // phase 3 (exclusions): an inline array of native records
     FBoolArrays: Boolean;                // DIVERGENZE 493: a Boolean array is packed at one byte holding C's 0/1
     FNativeRecAsking: TStringList;       // phase 3.2: the types NativeRecordType is answering right now (a list's own pointer)
     // Phase 2.1a: the program's entry block, and where in it a raw module cell's allocation is hoisted (HoistToEntry) -
@@ -1021,6 +1022,7 @@ type
     function InlineArrayDims(UDTIdx, FieldIdx: Integer; out Lbs, Ubs: TInt64Array): Integer;
     function InlineMemberArrayElem(ArrAccessNode: TASTNode; out RecVal: TSSAValue; out Enc: Int64;
                                    out ElemBank: TSSARegisterType): Boolean;
+    function RawMemberRecordElemAddr(ArrAccessNode: TASTNode; out Addr: TSSAValue): Boolean;
     function RawMemberArrayElemAddr(ArrAccessNode: TASTNode; out Addr: TSSAValue; out Code: Integer;
       out Bank: TSSARegisterType): Boolean;   // "p->m(i)" over raw memory, a scalar element (DIVERGENZE 477)
     function EmitInlineMemberArrayLoad(ArrAccessNode: TASTNode; out Res: TSSAValue): Boolean;
@@ -1945,6 +1947,7 @@ begin
   FRecNativeBool := GetEnvironmentVariable('SB_RECNATIVE_BOOL') <> '0';                 // phase 3 exclusions: same
   FRecNativeBits := GetEnvironmentVariable('SB_RECNATIVE_BITS') <> '0';                 // phase 3 exclusions: =0 is the A/B
   FRecNativeDefaults := GetEnvironmentVariable('SB_RECNATIVE_DEFAULTS') <> '0';         // phase 3 exclusions: =0 is the A/B
+  FRecNativeRecArrays := GetEnvironmentVariable('SB_RECNATIVE_RECARRAYS') <> '0';     // phase 3 exclusions: =0 is the A/B
   FBoolArrays := GetEnvironmentVariable('SB_BOOL_ARRAYS') <> '0';                        // DIVERGENZE 493: =0 is the A/B
   FProgram := nil;
   FCurrentBlock := nil;
@@ -27329,6 +27332,12 @@ begin
     begin
       if not UDTFieldArrayShape(UDTIdx, i, Cnt, EB, True) then Exit;
       Sz := Cnt * EB; Al := EB;
+      // ⛔ ...and an array of RECORDS is aligned like its ELEMENT TYPE, not like its size: a 16-byte record of Longs aligns at
+      // 4 (glib's GValue.data, xmp's channel_info). Aligned at 8, every field from the member on moved (phase 3).
+      if (FUDTs[UDTIdx].Fields[i].ArrayElemType <> '') and
+         NestedMemberShape(FUDTs[UDTIdx].Fields[i].ArrayElemType, True, Sz2, Al2) then
+        Al := Al2;
+      if Al > 8 then Al := 8;
     end
     else
     begin
@@ -34395,6 +34404,9 @@ var
   B: TSSARegisterType;
 begin
   View := MakeSSAValue(svkNone);
+  // ⭐ Phase 3: an element of an inline array of native records inside a NATIVE container is an address computed on the raw
+  // path; the managed view below carries the offset in an encoding, which is no address when the index is a run-time value.
+  if RawMemberRecordElemAddr(ArrAccessNode, View) then Exit(True);
   Result := InlineMemberArrayElem(ArrAccessNode, R, E, B);
   if not Result then Exit;
   // ⭐ Phase 3.2: an element of a NATIVE type is named by its address (see NestedMemberHandle).
@@ -34412,6 +34424,55 @@ begin
   end;
   View := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaRefAddrField, View, EnsureIntRegister(R), MakeSSAValue(svkNone), MakeSSAConstInt(E));
+end;
+
+function TSSAGenerator.RawMemberRecordElemAddr(ArrAccessNode: TASTNode; out Addr: TSSAValue): Boolean;
+// "obj.m(i)" where m is a one-dimensional inline array of NATIVE records inside a native container (phase 3): the element
+// is the container's address + the member's C offset + (i - lbound) * SizeOf(element) - an address, like every native record.
+var
+  MemberNode, IdxN: TASTNode;
+  TypeName: string;
+  U, FI, k, EU: Integer;
+  Offsets, Lbs, Ubs: TInt64Array;
+  TotalSize, EB: Int64;
+  BaseNode, IdxNode, ChainNode: TASTNode;
+  FieldAddr, IV, Lin, Prod: TSSAValue;
+begin
+  Result := False;
+  Addr := MakeSSAValue(svkNone);
+  if not (FRecNativeKnob and FNativeMemory and FRecNativeRecArrays) then Exit;
+  if (ArrAccessNode = nil) or (ArrAccessNode.NodeType <> antArrayAccess) or (ArrAccessNode.ChildCount < 2) then Exit;
+  MemberNode := ArrAccessNode.GetChild(0);
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  IdxN := ArrAccessNode.GetChild(1);
+  if (IdxN = nil) or (IdxN.ChildCount <> 1) then Exit;
+  if not ResolveRawUDTBase(MemberNode.GetChild(0), TypeName, U, Offsets, TotalSize,
+                           BaseNode, IdxNode, ChainNode) then Exit;
+  if not NativeRecordType(FUDTs[U].Name) then Exit;
+  FI := -1;
+  for k := 0 to High(FUDTs[U].Fields) do
+    if UpperFast(FUDTs[U].Fields[k].Name) = MemberNode.ValueUpper then begin FI := k; Break; end;
+  if (FI < 0) or (FI > High(Offsets)) then Exit;
+  if (not FUDTs[U].Fields[FI].IsArray) or (FUDTs[U].Fields[FI].ArrayElemType = '') then Exit;
+  EU := FindUDT(FUDTs[U].Fields[FI].ArrayElemType);
+  if (EU < 0) or not NativeRecordType(FUDTs[EU].Name) then Exit;
+  if InlineArrayDims(U, FI, Lbs, Ubs) <> 1 then Exit;
+  EB := NativeImageBytes(EU);
+  FieldAddr := EmitRawUDTFieldAddr(BaseNode, IdxNode, ChainNode, TotalSize, Offsets[FI]);
+  ProcessExpression(IdxN.GetChild(0), IV);
+  if IV.Kind = svkConstFloat then IV := MakeSSAConstInt(Trunc(IV.ConstFloat));
+  IV := EnsureIntRegister(IV);
+  Lin := IV;
+  if Lbs[0] <> 0 then
+  begin
+    Lin := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaSubInt, Lin, IV, EnsureIntRegister(MakeSSAConstInt(Lbs[0])), MakeSSAValue(svkNone));
+  end;
+  Prod := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaMulInt, Prod, Lin, EnsureIntRegister(MakeSSAConstInt(EB)), MakeSSAValue(svkNone));
+  Addr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, Addr, EnsureIntRegister(FieldAddr), Prod, MakeSSAValue(svkNone));
+  Result := True;
 end;
 
 function TSSAGenerator.RawMemberArrayElemAddr(ArrAccessNode: TASTNode; out Addr: TSSAValue; out Code: Integer;
@@ -40255,10 +40316,15 @@ begin
                                        NativeRecordType(NestedType)) then Exit(No('nested ' + Name + ' As ' + NestedType));
         // ...and (phase 3.7) a one-dimensional array of scalars or POINTERS that the managed layout keeps outside its
         // bytes: C's bytes all the same, and the raw path indexes it (RawMemberArrayElemAddr).
-        if IsArray and not ((ArrayElemType = '') and
+        if IsArray and not (
+             // phase 3: an INLINE array of NATIVE records (glib's GValue.data, fbc's FBARRAY.dimTB) - its elements are C bytes
+             (FRecNativeRecArrays and (ArrayElemType <> '') and InlineArray and
+              (InlineArrayDims(Idx, i, Lbs, Ubs) = 1) and
+              (not UDTBlockIsManaged(ArrayElemType)) and NativeRecordType(ArrayElemType)) or
+             ((ArrayElemType = '') and
                             (InlineArray or (FRecNativeProcFields and (ArrayElemPtrPointee <> '') and
                                              UDTFieldArrayShape(Idx, i, ACnt, AEB, True) and
-                                             (InlineArrayDims(Idx, i, Lbs, Ubs) = 1)))) then
+                                             (InlineArrayDims(Idx, i, Lbs, Ubs) = 1))))) then
           Exit(No('array member ' + Name));
         if (PtrPointee <> '') and not NativeRecordType(PtrPointee) then Exit(No('pointer ' + Name + ' to ' + PtrPointee));
         if IsArray and (ArrayElemPtrPointee <> '') and not NativeRecordType(ArrayElemPtrPointee) then Exit(No('pointer array ' + Name));
