@@ -3628,8 +3628,8 @@ machine address: `@r` and `@r.field` are addresses, the elements of an array of 
 Records of other types, arrays of `Boolean`, enums, strings or pointers, and strings still live where they always did, so
 the limits listed under "Calling C libraries" below still apply to them (a record whose address C keeps across calls, an
 address C hands back later).
-⚠️ Declared: the block holding an array of plain records is not given back when the array is erased, re-dimensioned
-larger or goes out of scope.
+The block holding an array of plain records goes back to the C library when the array is erased, re-dimensioned, or
+leaves scope with its procedure; a pointer into it dangles then, as in FreeBASIC.
 
 How the mode is chosen, most specific first:
 

@@ -398,6 +398,12 @@ type
     // single-threaded program keeps the old behaviour exactly and pays nothing.
     FRetiredArrDesc: array of TInt64Array;
     FArrDescLock: TRTLCriticalSection;
+    // ⭐ Phase 3.2: the blocks RecordNewArrayNative allocated for arrays of native records, sorted, and their own lock (the
+    // callers hold LockArrays or FArrDescLock, not always the same one). A block is freed only if it is found here, so an
+    // address that merely LOOKS native (an Any Ptr array holding malloc'd pointers) is never touched.
+    FNatArrBlocks: array of Int64;
+    FNatArrN: Integer;
+    FNatArrLock: TRTLCriticalSection;
     FArraysDirty: Boolean;
     // ⭐ Phase 3.2: the [lo, hi] span of every array buffer VMPointerForMachineAddr can bring an address home to, and the
     // raw heap's reserved range [RawLo, RawHi). A pointer read out of native memory outside both needs no walk over the
@@ -984,6 +990,9 @@ type
     procedure RecCacheFlush(C: PRecCache);    // give a batch of free indices back to the region
     procedure RecCacheRefill(C: PRecCache);   // restock a dry cache from the region
     procedure RecordNewArrayNative(ArrayId: Integer; ByteSize: Int64);   // phase 3.2
+    procedure NatArrAdd(B: Int64);                                        // phase 3.2: a block is the VM's
+    function NatArrTake(B: Int64): Boolean;                               // ...and is no longer
+    procedure ReleaseNativeArrayBlock(const A: TArrayStorage);            // free the block an array holds
     procedure RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);  // M3.1: fill UDT array
     procedure StampRecordRuns(ArrayId: Integer);  // which of its elements lie at CONSECUTIVE region indices (336)
     procedure DeepCopyArrayRecords(Ctx: TExecutionContext; DestArr, SrcArr: Int64; PackedCounts: Int64);  // value-copy array-of-UDT member
@@ -1853,6 +1862,7 @@ begin
   SetLength(FWorkerThreads, 0);
   InitCriticalSection(FWorkerLock);
   InitCriticalSection(FArrDescLock);
+  InitCriticalSection(FNatArrLock);
   // The deterministic clock (see bcDateNow). Read once per VM: a program cannot turn it on or off.
   FFakeClock := SysUtils.GetEnvironmentVariable('SB_FAKE_CLOCK') = '1';
   FFakeClockTicks := 0;
@@ -2042,6 +2052,7 @@ begin
   // lock is released here, once nothing can spawn or join any more.
   DoneCriticalSection(FWorkerLock);
   DoneCriticalSection(FArrDescLock);
+  DoneCriticalSection(FNatArrLock);
   // M5.4: free any sync primitives the program left undestroyed.
   CleanupConds;
   DoneCriticalSection(FCondTableLock);
@@ -4702,11 +4713,18 @@ begin
       // The invocation that is ending had its array in a spill slot (see TArrayPrivSave.Spill): the
       // name goes back to the suspended invocation's slot, which nobody cleared, and the spill is freed.
       Ctx.ArrMap[Ctx.ArrPrivSave[i].LogicalId] := Ctx.ArrPrivSave[i].HomeSlot;
+      if (Ctx.ArrPrivSave[i].SlotId >= 0) and (Ctx.ArrPrivSave[i].SlotId <= High(FArrays)) then
+        ReleaseNativeArrayBlock(FArrays[Ctx.ArrPrivSave[i].SlotId]);   // phase 3.2: the ending invocation's block
       SpillSlotGive(Ctx.ArrPrivSave[i].SlotId);
       Ctx.ArrPrivSave[i].Spill := False;
     end
     else
     begin
+      // phase 3.2: the ending invocation's block, unless the suspended one holds the very same storage
+      if (Length(FArrays[Ctx.ArrPrivSave[i].SlotId].IntData) = 0) or
+         (Length(Ctx.ArrPrivSave[i].Saved.IntData) = 0) or
+         (FArrays[Ctx.ArrPrivSave[i].SlotId].IntData[0] <> Ctx.ArrPrivSave[i].Saved.IntData[0]) then
+        ReleaseNativeArrayBlock(FArrays[Ctx.ArrPrivSave[i].SlotId]);
       FArrays[Ctx.ArrPrivSave[i].SlotId] := Ctx.ArrPrivSave[i].Saved;
       Ctx.ArrPrivSave[i].Saved := Default(TArrayStorage);   // drop this stack slot's references
     end;
@@ -7437,11 +7455,61 @@ begin
   FillChar(BlockAddr(Ctx, DstPtr, ByteCount, True)^, ByteCount, Value);
 end;
 
+procedure TBytecodeVM.NatArrAdd(B: Int64);
+var
+  lo, hi, mid: Integer;
+begin
+  EnterCriticalSection(FNatArrLock);
+  lo := 0; hi := FNatArrN;
+  while lo < hi do
+  begin
+    mid := (lo + hi) shr 1;
+    if FNatArrBlocks[mid] < B then lo := mid + 1 else hi := mid;
+  end;
+  if FNatArrN >= Length(FNatArrBlocks) then SetLength(FNatArrBlocks, FNatArrN * 2 + 16);
+  if lo < FNatArrN then
+    Move(FNatArrBlocks[lo], FNatArrBlocks[lo + 1], (FNatArrN - lo) * SizeOf(Int64));
+  FNatArrBlocks[lo] := B;
+  Inc(FNatArrN);
+  LeaveCriticalSection(FNatArrLock);
+end;
+
+function TBytecodeVM.NatArrTake(B: Int64): Boolean;
+var
+  lo, hi, mid: Integer;
+begin
+  Result := False;
+  EnterCriticalSection(FNatArrLock);
+  lo := 0; hi := FNatArrN;
+  while lo < hi do
+  begin
+    mid := (lo + hi) shr 1;
+    if FNatArrBlocks[mid] < B then lo := mid + 1 else hi := mid;
+  end;
+  if (lo < FNatArrN) and (FNatArrBlocks[lo] = B) then
+  begin
+    Dec(FNatArrN);
+    if lo < FNatArrN then
+      Move(FNatArrBlocks[lo + 1], FNatArrBlocks[lo], (FNatArrN - lo) * SizeOf(Int64));
+    Result := True;
+  end;
+  LeaveCriticalSection(FNatArrLock);
+end;
+
+procedure TBytecodeVM.ReleaseNativeArrayBlock(const A: TArrayStorage);
+// The block an array of native records holds is its element 0's address - RecordNewArrayNative lays the elements from the
+// block's start - and it goes back to libc only if the VM allocated it (NatArrTake).
+begin
+  if (FNatArrN = 0) or (Length(A.IntData) = 0) then Exit;
+  if IsNativeRec(A.IntData[0]) and NatArrTake(A.IntData[0]) then
+    NativeFree(A.IntData[0], True);
+end;
+
 procedure TBytecodeVM.RecordNewArrayNative(ArrayId: Integer; ByteSize: Int64);
 var
   k, n: Integer;
   Missing: Boolean;
-  Base, Old: Int64;
+  Base, Old, OldBase: Int64;
 begin
   n := FArrays[ArrayId].TotalSize;
   if n <= 0 then Exit;
@@ -7450,6 +7518,7 @@ begin
     if ArrGetInt(FArrays[ArrayId], k) = 0 then begin Missing := True; Break; end;
   if not Missing then Exit;
   if ByteSize < 1 then ByteSize := 1;
+  OldBase := ArrGetInt(FArrays[ArrayId], 0);
   Base := NativeAlloc(PtrUInt(n * ByteSize), True);
   if Base = 0 then raise EOutOfMemory.Create('Out of memory allocating an array of records');
   for k := 0 to n - 1 do
@@ -7459,6 +7528,9 @@ begin
       Move(Pointer(PtrUInt(Old and not FGNPTR_TAG))^, Pointer(PtrUInt((Base and not FGNPTR_TAG) + k * ByteSize))^, ByteSize);
     ArrSetIntAt(ArrayId, k, Base + k * ByteSize);
   end;
+  // A REDIM PRESERVE that grew the array: the kept elements are copied, and the block they lived in is the VM's to free.
+  if IsNativeRec(OldBase) and NatArrTake(OldBase) then NativeFree(OldBase, True);
+  NatArrAdd(Base);
 end;
 
 procedure TBytecodeVM.RecordNewArrayInit(Ctx: TExecutionContext; ArrayId: Integer; PackedCounts: Int64);
@@ -7476,8 +7548,9 @@ begin
   // ⭐ Phase 3.2: the elements of an array of a NATIVE type are ONE contiguous libc block, as in fbc, and each element's value
   // is its address - so "@a(i)", "@a(i + 1) - @a(i)" and a C function walking "@a(0)" see what fbc gives. A REDIM that
   // grows the array gets a new block with the kept elements copied in.
-  // ⚠️ The superseded block is not freed (a live pointer may still name it, and nothing here knows the block's start),
-  // the same leak ReallocSharedRecordBlock declares; nor is a block freed by Erase or at the end of a procedure.
+  // The superseded block is freed (ReleaseNativeArrayBlock and the PRESERVE path below), as are the blocks of an array
+  // erased, re-dimensioned without PRESERVE, or ending with its procedure (ArrPrivRestoreSlow): a pointer into one of them
+  // dangles then, as under fbc.
   if (PackedCounts and RECARR_NATIVE) <> 0 then
   begin
     RecordNewArrayNative(ArrayId, ByteSize);
@@ -14739,6 +14812,7 @@ begin
     for i := Base to Base + FPrivArrCount - 1 do
       if i <= High(FArrays) then
       begin
+        ReleaseNativeArrayBlock(FArrays[i]);   // phase 3.2
         SetLength(FArrays[i].IntData, 0);
         SetLength(FArrays[i].FloatData, 0);
         SetLength(FArrays[i].StringData, 0);
@@ -16954,6 +17028,7 @@ var
   k, d: Integer;
 begin
   if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then Exit;
+  ReleaseNativeArrayBlock(FArrays[ArrayIdx]);   // phase 3.2
   if Deallocate then
   begin
     SetLength(FArrays[ArrayIdx].IntData, 0);
@@ -16997,6 +17072,7 @@ var
   Lb, NewSize, k: Integer;
 begin
   if (ArrayIdx < 0) or (ArrayIdx >= Length(FArrays)) then Exit;
+  if not Preserve then ReleaseNativeArrayBlock(FArrays[ArrayIdx]);   // phase 3.2 (PRESERVE: RecordNewArrayNative)
   FArrays[ArrayIdx].IsDynamic := True;   // a REDIM'd array is DYNAMIC: ERASE frees it (see EraseArray)
   FArrays[ArrayIdx].DescDims := 1;       // ...and it now HAS one dimension, which an ERASE will not undo
   Lb := 0;
@@ -17072,6 +17148,8 @@ procedure TBytecodeVM.RedimArrayN(ArrayIdx: Integer; const Uppers: array of Inte
 var
   d, NewSize, k, Lb: Integer;
 begin
+  if (not Preserve) and (ArrayIdx >= 0) and (ArrayIdx < Length(FArrays)) then
+    ReleaseNativeArrayBlock(FArrays[ArrayIdx]);   // phase 3.2
   if (ArrayIdx >= 0) and (ArrayIdx < Length(FArrays)) then
   begin
     FArrays[ArrayIdx].IsDynamic := True;   // as RedimArray: a REDIM'd array is DYNAMIC
