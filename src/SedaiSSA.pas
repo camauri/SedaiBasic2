@@ -545,6 +545,9 @@ type
     FRecNativeHoist: Boolean;            // phase 3.7: a native local record's cell is allocated at the frame's entry
     FRecNativeProcFields: Boolean;       // phase 3.7: a type with PROCEDURE fields can be native
     FRecNativeBool: Boolean;             // phase 3 (exclusions): a type with BOOLEAN fields can be native
+    FRecNativeBits: Boolean;             // phase 3 (exclusions): a type with BIT FIELDS can be native
+    FRawBitUnit, FRawBitOfs: TInt64Array; // ...the unit size and bit offset of each bit field in the LAST UDTCLayoutRaw walk
+    FRecNativeDefaults: Boolean;         // phase 3 (exclusions): a type with field DEFAULTS can be native
     FBoolArrays: Boolean;                // DIVERGENZE 493: a Boolean array is packed at one byte holding C's 0/1
     FNativeRecAsking: TStringList;       // phase 3.2: the types NativeRecordType is answering right now (a list's own pointer)
     // Phase 2.1a: the program's entry block, and where in it a raw module cell's allocation is hoisted (HoistToEntry) -
@@ -915,6 +918,7 @@ type
     procedure EmitRecordBlockInit(const FirstHandle, CountVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
     procedure EmitRecordBlockInitFrom(const FirstHandle, StartVal, CountVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
     function UDTBlockIsManaged(const TypeName: string): Boolean;
+    function TypeHasFieldDefaults(UDTIdx, Depth: Integer): Boolean;
     function UDTRecordsAreHandles(const TypeName: string): Boolean;   // managed AND not native: a value is a handle
     function NativeRecordType(const TypeName: string): Boolean;
     function NativeRecordTypeCore(const TypeName: string): Boolean;   // phase 3.2: every value of T is a machine address
@@ -1309,8 +1313,10 @@ type
                             out UnitOfs, UnitSize, AlignContrib: Int64;
                             out BitOfs: Integer; out Continues: Boolean);
     function UDTFieldIndex(UDTIdx: Integer; const FieldName: string): Integer;   // a field's index in its type
-    function EmitBitFieldExtract(const UnitVal: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
-    function EmitBitFieldInsert(const UnitVal, NewVal: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
+    procedure EmitRawFieldValueStore(AddrVal: TSSAValue; UDTIdx, FieldIdx: Integer; ExprVal: TSSAValue);
+    function RawBitUnitCode(UDTIdx, FieldIdx: Integer; out BitOfs: Integer): Integer;
+    function EmitBitFieldExtract(const UnitVal: TSSAValue; UDTIdx, FieldIdx: Integer; BitOfsOverride: Integer = -1): TSSAValue;
+    function EmitBitFieldInsert(const UnitVal, NewVal: TSSAValue; UDTIdx, FieldIdx: Integer; BitOfsOverride: Integer = -1): TSSAValue;
     procedure ComputeUDTLiveLayout(UDTIdx: Integer);   // A3: the LIVE byte image of a UDT, for every type
     function EmitBinFileBlock(IsGet: Boolean; const HandleReg: TSSAValue;
                               ValueNode, CountNode: TASTNode): Boolean;  // GET/PUT #n of a whole array / raw memory block
@@ -1936,6 +1942,8 @@ begin
   FRecNativeHoist := GetEnvironmentVariable('SB_RECNATIVE_HOIST') <> '0';         // phase 3.7: on by default; =0 is the A/B
   FRecNativeProcFields := GetEnvironmentVariable('SB_RECNATIVE_PROCFIELDS') <> '0'; // phase 3.7: same
   FRecNativeBool := GetEnvironmentVariable('SB_RECNATIVE_BOOL') <> '0';                 // phase 3 exclusions: same
+  FRecNativeBits := GetEnvironmentVariable('SB_RECNATIVE_BITS') <> '0';                 // phase 3 exclusions: =0 is the A/B
+  FRecNativeDefaults := GetEnvironmentVariable('SB_RECNATIVE_DEFAULTS') <> '0';         // phase 3 exclusions: =0 is the A/B
   FBoolArrays := GetEnvironmentVariable('SB_BOOL_ARRAYS') <> '0';                        // DIVERGENZE 493: =0 is the A/B
   FProgram := nil;
   FCurrentBlock := nil;
@@ -27231,9 +27239,21 @@ var
   SGrpCur, SGrpOfs: Integer;   // anonymous Type run inside a nested UNION block
   Run: TBitRunState;
   IsBit, BitCont: Boolean;
+
+  procedure NoteRawBit(FI: Integer; USz: Int64; BOfs: Integer);
+  begin
+    if Length(FRawBitUnit) < n then
+    begin
+      SetLength(FRawBitUnit, n); SetLength(FRawBitOfs, n);
+    end;
+    FRawBitUnit[FI] := USz;
+    FRawBitOfs[FI] := BOfs;
+  end;
+
 begin
   Run.Open := False; RunU := 0; RunS := 0;
   UOfs := 0; USize := 0; AContrib := 1; BitOfs := 0; BitCont := False;
+  SetLength(FRawBitUnit, 0); SetLength(FRawBitOfs, 0);
   Result := False;
   GrpCur := 0; GrpBase := 0; GrpMax := 0; GrpAl := 1; Sz2 := 0; Al2 := 1;
   // ⛔ ...AND THE ANONYMOUS-STRUCT PAIR, which two of the three layout routines did NOT initialise:
@@ -27271,6 +27291,16 @@ begin
           Offsets[i] := 0
         else
           Offsets[i] := ByteOffset;
+        // ...and a BIT FIELD there is where the live layout put it (the live offsets ARE the C ones in a union): the unit
+        // size is the one its slot is read with (wire width 2/4/6 = 1/2/4 bytes, 0 = 8), the bit offset the live one.
+        if BitWidth > 0 then
+          case Slot and $F of
+            2: NoteRawBit(i, 1, BitOffset);
+            4: NoteRawBit(i, 2, BitOffset);
+            6: NoteRawBit(i, 4, BitOffset);
+          else
+            NoteRawBit(i, 8, BitOffset);
+          end;
       end;
     if (not UDTShapeOf(UDTIdx, True, Sz, Al)) or (Sz <= 0) then Exit;
     TotalSize := Sz;
@@ -27356,6 +27386,7 @@ begin
         if IsBit then
         begin
           PlaceBitField(UDTIdx, i, Run, SGrpOfs, UOfs, USize, AContrib, BitOfs, BitCont);
+          NoteRawBit(i, USize, BitOfs);
           Sz := USize; Al := 1; SGrpOfs := UOfs;
           if AContrib > MaxAl then MaxAl := AContrib;
         end;
@@ -27370,6 +27401,7 @@ begin
         if IsBit then
         begin
           PlaceBitField(UDTIdx, i, Run, 0, UOfs, USize, AContrib, BitOfs, BitCont);
+          NoteRawBit(i, USize, BitOfs);
           Sz := USize;
           if AContrib > MaxAl then MaxAl := AContrib;
         end;
@@ -27383,6 +27415,7 @@ begin
       if IsBit then
       begin
         PlaceBitField(UDTIdx, i, Run, Ofs, UOfs, USize, AContrib, BitOfs, BitCont);
+        NoteRawBit(i, USize, BitOfs);
         Sz := USize; Al := 1; Ofs := UOfs;
         if AContrib > MaxAl then MaxAl := AContrib;
       end;
@@ -28366,6 +28399,27 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.RawBitUnitCode(UDTIdx, FieldIdx: Integer; out BitOfs: Integer): Integer;
+// The raw code (unsigned, at the unit's width) and the bit offset of a bit field in a type's C image - asked of the
+// C walk itself, whose unit can differ from the live layout's (phase 3, bit-field exclusion).
+var
+  Offs: TInt64Array;
+  Tot, U: Int64;
+begin
+  Result := RTC_I64; BitOfs := 0;
+  if not UDTCLayoutRaw(UDTIdx, Offs, Tot) then Exit;
+  if FieldIdx > High(FRawBitUnit) then Exit;
+  U := FRawBitUnit[FieldIdx];
+  BitOfs := FRawBitOfs[FieldIdx];
+  case U of
+    1: Result := RTC_U8;
+    2: Result := RTC_U16;
+    4: Result := RTC_U32;
+  else
+    Result := RTC_I64;
+  end;
+end;
+
 function TSSAGenerator.TryEmitRawUDTField(ObjNode: TASTNode; const FieldName: string;
   out Value: TSSAValue): Boolean;
 // "h->field" where h holds a RAW ADDRESS: read the field at its C-LAYOUT BYTE OFFSET, with the width and
@@ -28382,6 +28436,7 @@ var
   AddrVal, ExprTmp: TSSAValue;
   BaseNode, IdxNode, ChainNode: TASTNode;
   F: TUDTField;
+  BitCode, BitOfsC: Integer;
 begin
   Result := False;
   Value := MakeSSAValue(svkNone);
@@ -28435,6 +28490,16 @@ begin
     // was sign-extended on load: SDL's palette entry "pal[255].r" (Uint8 255) printed 18446744073709551615
     // where fbc prints 255 (SDL2 deck, DIVERGENZE 383). Nothing had shown it: every field read before sat
     // below 128. WidthCode is the table ForeignStructRetSpec already reads (2 u8, 4 u16, 6 u32).
+    // ⭐ Phase 3 (bit fields): the UNIT is read unsigned at its own width, and the bits come out of it as they do on the
+    // managed path (EmitBitFieldExtract - a Boolean bit field included).
+    if F.BitWidth > 0 then
+    begin
+      BitCode := RawBitUnitCode(UDTIdx, FieldIdx, BitOfsC);
+      ExprTmp := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRawLoadInt, ExprTmp, EnsureIntRegister(AddrVal), MakeSSAValue(svkNone), MakeSSAConstInt(BitCode));
+      Value := EmitBitFieldExtract(ExprTmp, UDTIdx, FieldIdx, BitOfsC);
+      Exit(True);
+    end;
     // ⭐ Phase 3 (Boolean fields): a BOOLEAN is one byte holding 0 or 1 in C's image, as fbc lays it out, and -1/0 in the
     // VM - so the byte is read unsigned and compared with zero (any nonzero byte is true).
     if F.IsBoolean then
@@ -28478,6 +28543,82 @@ begin
   Result := True;
 end;
 
+procedure TSSAGenerator.EmitRawFieldValueStore(AddrVal: TSSAValue; UDTIdx, FieldIdx: Integer; ExprVal: TSSAValue);
+// The store half of TryEmitRawUDTFieldStore once the address and the value are known - also what a native record's field
+// DEFAULTS are written with (EmitRecordInit, phase 3).
+var
+  Sz, Al: Int64;
+  Tmp1: TSSAValue;
+  F: TUDTField;
+  BitCode, BitOfsC: Integer;
+begin
+  F := FUDTs[UDTIdx].Fields[FieldIdx];
+  UDTFieldCShape(UDTIdx, FieldIdx, Sz, Al);
+  if F.Bank = srtString then
+    // A fixed-length string field is its DECLARED width of bytes, terminator and all - the same
+    // capacity code the load half passes.
+    EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), AddrVal, EnsureStringRegister(ExprVal),
+                    MakeSSAConstInt(2 + F.StrCapacity))
+  else if F.Bank = srtFloat then
+  begin
+    if Sz = 4 then
+      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), AddrVal, EnsureFloatRegister(ExprVal),
+                      MakeSSAConstInt(RTC_SINGLE))
+    else
+      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), AddrVal, EnsureFloatRegister(ExprVal),
+                      MakeSSAConstInt(RTC_DOUBLE));
+  end
+  else
+  begin
+    // The raw type code follows the field's BYTE WIDTH, exactly as the load half derives it: writing a
+    // UShort field writes two bytes at its offset, not eight, or the next field goes with it.
+    // ⚠️ The narrowing FIRST, as the managed store does: an UNSIGNED-64 field needs to know what a float is converted
+    // FOR, and EnsureIntRegister alone settles it as signed (bug_float_to_unsigned, found by phase 3.2).
+    // ⭐ ...and a BIT FIELD: load the unit, splice the bits in, store the unit back - at the unit's own width.
+    if F.BitWidth > 0 then
+    begin
+      BitCode := RawBitUnitCode(UDTIdx, FieldIdx, BitOfsC);
+      Tmp1 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      AddrVal := EnsureIntRegister(AddrVal);
+      EmitInstruction(ssaRawLoadInt, Tmp1, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(BitCode));
+      ExprVal := EmitBitFieldInsert(Tmp1, EnsureIntRegister(ExprVal), UDTIdx, FieldIdx, BitOfsC);
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(BitCode));
+      Exit;
+    end;
+    // ⭐ ...and a BOOLEAN is written as C's 0 or 1, whatever nonzero value the VM holds for true (the twin of the load).
+    if F.IsBoolean then
+    begin
+      Tmp1 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      if IsFloatOperand(ExprVal) then
+        EmitInstruction(ssaCmpNeFloat, Tmp1, EnsureFloatRegister(ExprVal), EnsureFloatRegister(MakeSSAConstFloat(0.0)),
+                        MakeSSAValue(svkNone))
+      else
+        EmitInstruction(ssaCmpNeInt, Tmp1, EnsureIntRegister(ExprVal), EnsureIntRegister(MakeSSAConstInt(0)),
+                        MakeSSAValue(svkNone));
+      ExprVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaBitwiseAnd, ExprVal, Tmp1, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I8));
+      Exit;
+    end;
+    ExprVal := ApplyNarrowCode(F.WidthCode, ExprVal);
+    ExprVal := EnsureIntRegister(ExprVal);
+    case Sz of
+      1: EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I8));
+      2: EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I16));
+      4: EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I32));
+    else
+      // ⭐ ...and a POINTER field says so on the way IN too, the twin of the load half: written into C's
+      // memory a machine address must lose the VM's tag, or C dereferences bit 61 (DIVERGENZE 376).
+      if (F.PtrPointee <> '') and FRecNativeKnob and FNativeMemory and NativeRecordType(F.PtrPointee) then
+        EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_NPTR))   // phase 3.2
+      else if (F.PtrPointee <> '') or (F.RawPtrPointee <> '') or (F.MultiPtrPointee <> '') then
+        EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_PTR64))
+      else
+        EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I64));
+    end;
+  end;
+end;
+
 function TSSAGenerator.TryEmitRawUDTFieldStore(ObjNode: TASTNode; const FieldName: string;
   ExprNode: TASTNode): Boolean;
 // "h->field = expr" where h holds a RAW ADDRESS: the WRITE half of TryEmitRawUDTField, and it did not
@@ -28499,6 +28640,7 @@ var
   AddrVal, ExprVal, Tmp1: TSSAValue;
   BaseNode, IdxNode, ChainNode: TASTNode;
   F: TUDTField;
+  BitCode, BitOfsC: Integer;
 begin
   Result := False;
   if not ResolveRawUDTBase(ObjNode, TypeName, UDTIdx, Offsets, TotalSize, BaseNode, IdxNode, ChainNode) then Exit;
@@ -28507,7 +28649,9 @@ begin
     if UpperFast(FUDTs[UDTIdx].Fields[i].Name) = UpperFast(FieldName) then begin FieldIdx := i; Break; end;
   if (FieldIdx < 0) or (FieldIdx > High(Offsets)) then Exit;
   if FUDTs[UDTIdx].Fields[FieldIdx].IsArray then Exit;   // an array member is bound, not stored
-  if FUDTs[UDTIdx].Fields[FieldIdx].BitWidth > 0 then Exit;  // a bit field is a read-modify-write: leave it
+  // A bit field is a read-modify-write of its unit: done below for a native type (phase 3), left to the managed path else.
+  if (FUDTs[UDTIdx].Fields[FieldIdx].BitWidth > 0) and
+     not (FRecNativeKnob and FNativeMemory and FRecNativeBits and NativeRecordType(FUDTs[UDTIdx].Name)) then Exit;
 
   AddrVal := EmitRawUDTFieldAddr(BaseNode, IdxNode, ChainNode, TotalSize, Offsets[FieldIdx]);
 
@@ -28525,58 +28669,7 @@ begin
     Exit(True);
   end;
   ProcessExpression(ExprNode, ExprVal);
-  if F.Bank = srtString then
-    // A fixed-length string field is its DECLARED width of bytes, terminator and all - the same
-    // capacity code the load half passes.
-    EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), AddrVal, EnsureStringRegister(ExprVal),
-                    MakeSSAConstInt(2 + F.StrCapacity))
-  else if F.Bank = srtFloat then
-  begin
-    if Sz = 4 then
-      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), AddrVal, EnsureFloatRegister(ExprVal),
-                      MakeSSAConstInt(RTC_SINGLE))
-    else
-      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), AddrVal, EnsureFloatRegister(ExprVal),
-                      MakeSSAConstInt(RTC_DOUBLE));
-  end
-  else
-  begin
-    // The raw type code follows the field's BYTE WIDTH, exactly as the load half derives it: writing a
-    // UShort field writes two bytes at its offset, not eight, or the next field goes with it.
-    // ⚠️ The narrowing FIRST, as the managed store does: an UNSIGNED-64 field needs to know what a float is converted
-    // FOR, and EnsureIntRegister alone settles it as signed (bug_float_to_unsigned, found by phase 3.2).
-    // ⭐ ...and a BOOLEAN is written as C's 0 or 1, whatever nonzero value the VM holds for true (the twin of the load).
-    if F.IsBoolean then
-    begin
-      Tmp1 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      if IsFloatOperand(ExprVal) then
-        EmitInstruction(ssaCmpNeFloat, Tmp1, EnsureFloatRegister(ExprVal), EnsureFloatRegister(MakeSSAConstFloat(0.0)),
-                        MakeSSAValue(svkNone))
-      else
-        EmitInstruction(ssaCmpNeInt, Tmp1, EnsureIntRegister(ExprVal), EnsureIntRegister(MakeSSAConstInt(0)),
-                        MakeSSAValue(svkNone));
-      ExprVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaBitwiseAnd, ExprVal, Tmp1, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
-      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I8));
-      Exit(True);
-    end;
-    ExprVal := ApplyNarrowCode(F.WidthCode, ExprVal);
-    ExprVal := EnsureIntRegister(ExprVal);
-    case Sz of
-      1: EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I8));
-      2: EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I16));
-      4: EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I32));
-    else
-      // ⭐ ...and a POINTER field says so on the way IN too, the twin of the load half: written into C's
-      // memory a machine address must lose the VM's tag, or C dereferences bit 61 (DIVERGENZE 376).
-      if (F.PtrPointee <> '') and FRecNativeKnob and FNativeMemory and NativeRecordType(F.PtrPointee) then
-        EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_NPTR))   // phase 3.2
-      else if (F.PtrPointee <> '') or (F.RawPtrPointee <> '') or (F.MultiPtrPointee <> '') then
-        EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_PTR64))
-      else
-        EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I64));
-    end;
-  end;
+  EmitRawFieldValueStore(AddrVal, UDTIdx, FieldIdx, ExprVal);
   Result := True;
 end;
 
@@ -31450,8 +31543,12 @@ begin
       begin
         // ...and a BOOLEAN field prints "true"/"false", like the scalar and the function-return forms.
         // A Boolean has no width code - it is not a narrowed integer - so it is asked by name.
+        // ⛔ ...but a Boolean BIT FIELD prints as a NUMBER, -1 or 0: that is what fbc prints (boolean/boolean_bitfield).
         if UDTFieldIsBoolean(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value)) then
+        begin
+          if UDTFieldBitWidth(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value)) > 0 then Exit(0);
           Exit(1);
+        end;
         // ⭐ ...and READING A BIT FIELD IS UNSIGNED, whatever the member was declared AS. The extraction
         // is a mask and a shift - it cannot produce a negative - and fbc types it that way, so it
         // prints with NO sign column: "w.l32 = &hFFFFFFFF : Print w.l32" writes 4294967295 flush left
@@ -33748,22 +33845,25 @@ begin
   end;
 end;
 
-function TSSAGenerator.EmitBitFieldExtract(const UnitVal: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
+function TSSAGenerator.EmitBitFieldExtract(const UnitVal: TSSAValue; UDTIdx, FieldIdx: Integer; BitOfsOverride: Integer): TSSAValue;
 // A BIT FIELD is read out of its storage unit: (unit SHR BitOffset) AND ((1 SHL BitWidth) - 1).
 // The unit itself is loaded by the ordinary field op - the two share a slot - so the whole feature
 // costs a shift and a mask in the SSA and NOTHING on the wire.
 var
   OfsReg, MaskReg, Shifted: TSSAValue;
   Mask: Int64;
+  BO: Integer;
 begin
   Result := UnitVal;
   if (UDTIdx < 0) or (FieldIdx < 0) then Exit;
   if FUDTs[UDTIdx].Fields[FieldIdx].BitWidth <= 0 then Exit;
   Result := EnsureIntRegister(UnitVal);
-  if FUDTs[UDTIdx].Fields[FieldIdx].BitOffset > 0 then
+  // A native record reads its unit where the C walk put it (UDTCLayoutRaw): the caller passes that bit offset.
+  if BitOfsOverride >= 0 then BO := BitOfsOverride else BO := FUDTs[UDTIdx].Fields[FieldIdx].BitOffset;
+  if BO > 0 then
   begin
     OfsReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, OfsReg, MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].BitOffset),
+    EmitInstruction(ssaLoadConstInt, OfsReg, MakeSSAConstInt(BO),
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Shifted := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaShr, Shifted, Result, OfsReg, MakeSSAValue(svkNone));
@@ -33780,19 +33880,29 @@ begin
   Shifted := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaBitwiseAnd, Shifted, Result, MaskReg, MakeSSAValue(svkNone));
   Result := Shifted;
+  // ⛔ A BOOLEAN bit field is true when its bits are not zero, and true is -1: read as the bare bits it answered 1
+  // (fbc boolean/boolean_bitfield, "CU_ASSERT_EQUAL(a.b0, -1)").
+  if FUDTs[UDTIdx].Fields[FieldIdx].IsBoolean then
+  begin
+    Shifted := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaCmpNeInt, Shifted, Result, EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
+    Result := Shifted;
+  end;
 end;
 
-function TSSAGenerator.EmitBitFieldInsert(const UnitVal, NewVal: TSSAValue; UDTIdx, FieldIdx: Integer): TSSAValue;
+function TSSAGenerator.EmitBitFieldInsert(const UnitVal, NewVal: TSSAValue; UDTIdx, FieldIdx: Integer; BitOfsOverride: Integer): TSSAValue;
 // ...and written back into it: (unit AND NOT (mask SHL ofs)) OR ((value AND mask) SHL ofs). The caller
 // loads the unit, calls this, and stores the result through the same ordinary field op - a
 // read-modify-write, which is what a bit field IS.
 var
   Mask: Int64;
   MaskReg, OfsReg, KeepMaskReg, Kept, Vm, Vs, Res: TSSAValue;
+  BO: Integer;
 begin
   Result := NewVal;
   if (UDTIdx < 0) or (FieldIdx < 0) then Exit;
   if FUDTs[UDTIdx].Fields[FieldIdx].BitWidth <= 0 then Exit;
+  if BitOfsOverride >= 0 then BO := BitOfsOverride else BO := FUDTs[UDTIdx].Fields[FieldIdx].BitOffset;
   // ⛔ A 64-BIT-WIDE FIELD HAS NO SHIFT THAT BUILDS ITS MASK. "1 shl 64" on a 64-bit word shifts by
   // 64 mod 64 = 0, so the mask came out 1-1 = 0 and every read and write of a ":64" member answered 0
   // - fbc's own structs/bitfield-types declares one for LONGINT and one for ULONGINT and asserts
@@ -33804,17 +33914,17 @@ begin
   Vm := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaBitwiseAnd, Vm, EnsureIntRegister(NewVal), MaskReg, MakeSSAValue(svkNone));
   Vs := Vm;
-  if FUDTs[UDTIdx].Fields[FieldIdx].BitOffset > 0 then
+  if BO > 0 then
   begin
     OfsReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaLoadConstInt, OfsReg, MakeSSAConstInt(FUDTs[UDTIdx].Fields[FieldIdx].BitOffset),
+    EmitInstruction(ssaLoadConstInt, OfsReg, MakeSSAConstInt(BO),
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Vs := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaShl, Vs, Vm, OfsReg, MakeSSAValue(svkNone));
   end;
   KeepMaskReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaLoadConstInt, KeepMaskReg,
-                  MakeSSAConstInt(not (Mask shl FUDTs[UDTIdx].Fields[FieldIdx].BitOffset)),
+                  MakeSSAConstInt(not (Mask shl BO)),
                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   Kept := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaBitwiseAnd, Kept, EnsureIntRegister(UnitVal), KeepMaskReg, MakeSSAValue(svkNone));
@@ -39706,6 +39816,18 @@ begin
         EmitRecordInit(NestedHandle, NestedUDT, WithDefaults);
         EmitConstructorCall(NestedHandle, FUDTs[NestedUDT].Name);
       end;
+    // ⭐ ...and its field DEFAULTS, written on the raw path at the member's C offset (phase 3, "default" exclusion), after
+    // the members' constructors and before the type's own, as the managed path orders them. Not for CAllocate.
+    if WithDefaults then
+      for i := 0 to High(FUDTs[UDTIdx].Fields) do
+        if (FUDTs[UDTIdx].Fields[i].DefaultExpr <> nil) and (i <= High(COfs)) then
+        begin
+          NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaAddInt, NestedHandle, EnsureIntRegister(HandleVal),
+                          EnsureIntRegister(MakeSSAConstInt(COfs[i])), MakeSSAValue(svkNone));
+          ProcessExpression(FUDTs[UDTIdx].Fields[i].DefaultExpr, DefVal);
+          EmitRawFieldValueStore(NestedHandle, UDTIdx, i, DefVal);
+        end;
     Exit;
   end;
   // "As String * n" fields start as n NULs: the buffer exists at full capacity from construction, so a
@@ -39945,6 +40067,25 @@ begin
   // managed records, so the two spellings disagreed about what the storage was.
   Idx := FindUDT(UpperFast(TypeName));
   if (Idx >= 0) and (not UDTCLayoutRaw(Idx, Offsets, Total)) then Result := True;
+  // ⭐ ...and a type with FIELD INITIALISERS has an implicit constructor in fbc: "New T[n]" runs them on every element.
+  // Answered no, the block went raw and nothing ran - every element read 0 (and in strict "p[i]" was no record at all).
+  if (not Result) and (Idx >= 0) and TypeHasFieldDefaults(Idx, 0) then Result := True;
+end;
+
+function TSSAGenerator.TypeHasFieldDefaults(UDTIdx, Depth: Integer): Boolean;
+// Does a record of this type (a base or a member held by value included) have a field initialiser to run?
+var
+  i: Integer;
+begin
+  Result := False;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) or (Depth > 16) then Exit;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+  begin
+    if FUDTs[UDTIdx].Fields[i].DefaultExpr <> nil then Exit(True);
+    if (FUDTs[UDTIdx].Fields[i].NestedType <> '') and
+       TypeHasFieldDefaults(FindUDT(FUDTs[UDTIdx].Fields[i].NestedType), Depth + 1) then Exit(True);
+  end;
+  if FUDTs[UDTIdx].Parent <> '' then Result := TypeHasFieldDefaults(FindUDT(FUDTs[UDTIdx].Parent), Depth + 1);
 end;
 
 function TSSAGenerator.UDTRecordsAreHandles(const TypeName: string): Boolean;
@@ -40083,6 +40224,11 @@ begin
   for k := 0 to FStaticMemberProcs.Count - 1 do
     if SameText(Copy(FStaticMemberProcs[k], 1, Length(T) + 1), T + '.') then Exit;
   if not UDTCLayoutRaw(Idx, Offsets, Total) then Exit(No('no C layout'));
+  // ⛔ ...and every BIT FIELD must have been placed by that walk (FRawBitUnit), or the raw path would read it at bit 0:
+  // a shape the walk does not record stays managed (phase 3; the whole-type union was one, udt/type3 of the manual).
+  for i := 0 to High(FUDTs[Idx].Fields) do
+    if (FUDTs[Idx].Fields[i].BitWidth > 0) and
+       ((i > High(FRawBitUnit)) or (FRawBitUnit[i] <= 0)) then Exit(No('bit field ' + FUDTs[Idx].Fields[i].Name + ' not placed by the C walk'));
   if Total <= 0 then Exit;   // (phase 3.7: sized by its C image, NativeImageBytes - the live layout is the managed one's)
   // ⛔ A POINTER FIELD must name a native type too: the raw path writes a pointer field as C's address and reads it back
   // with C's mark, so a record HANDLE stored there came back as a machine address (m535: "a->b = CAllocate" with b a
@@ -40098,7 +40244,7 @@ begin
         // address yet: admitted only inside a UNION (libjpeg's jpeg_error_mgr.msg_parm), where no program writes it whole.
         if ((Bank = srtString) and not (IsZString and (not IsWString) and (StrCapacity > 0) and FRecNativeProcFields and
                                         FUDTs[Idx].IsUnion)) or
-           (BitWidth > 0) or (IsBoolean and not FRecNativeBool) or IsCvaList or (DefaultExpr <> nil) then Exit(No('field ' + Name + ': string/bits/boolean/va/default'));
+           ((BitWidth > 0) and not FRecNativeBits) or (IsBoolean and not FRecNativeBool) or IsCvaList or ((DefaultExpr <> nil) and not (FRecNativeDefaults and (NestedType = '') and not IsArray)) then Exit(No('field ' + Name + ': string/bits/boolean/va/default'));
         // A PROCEDURE field: the raw store picks the overload of "@fun" from the field's signature since phase 3.7, as the
         // managed store does (m708). SB_RECNATIVE_PROCFIELDS=0 keeps such types managed (A/B).
         if (FuncPtrSig <> '') and not FRecNativeProcFields then Exit(No('procedure field ' + Name));
@@ -40167,7 +40313,12 @@ var
   procedure OneElement(const H: TSSAValue);
   begin
     if Construct then
-      EmitConstructorCall(H, TypeName)
+    begin
+      // A NATIVE block is calloc'ed bytes: its members' constructors and its field initialisers run here, element by
+      // element (a managed block had them from EmitRecordBlockInit).
+      if Native then EmitRecordInit(H, FindUDT(TypeName), True);
+      EmitConstructorCall(H, TypeName);
+    end
     else
     begin
       EmitDestructorCall(H, TypeName);
@@ -51388,7 +51539,9 @@ begin
       // "w.b3 - 100" does too on a field declared As BYTE. That is the arithmetic half of
       // DIVERGENZE 96: m744 closed the RENDERING of a bare read, this closes the TYPE.
       if FModernMode and (Node.ChildCount >= 1) then
-        Result := (UDTFieldBitWidth(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value)) > 0) or
+        // (...except a BOOLEAN bit field, which reads -1/0 and prints signed: fbc boolean/boolean_bitfield)
+        Result := ((UDTFieldBitWidth(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value)) > 0) and
+                   not UDTFieldIsBoolean(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value))) or
                   (UDTFieldWidthCode(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value)) = 8);
     antFunctionCall, antArrayAccess:
       begin

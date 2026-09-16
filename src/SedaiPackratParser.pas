@@ -2838,6 +2838,10 @@ begin
         else if Assigned(Context.PeekNext) and
                 (Context.PeekNext.TokenType in [ttNumber, ttInteger, ttFloat, ttStringLiteral, ttIdentifier,
                                                 ttOpSub, ttOpAdd,
+                                                // ...or a DEREFERENCE or an ADDRESS: "Show *p", "Show @x" (DIVERGENZE
+                                                // 500). Neither can open anything else after a name: "x * y" is no
+                                                // statement, and the spaced compound "x * = y" is excluded below.
+                                                ttOpMul, ttOpAt,
                                                 // A first argument may itself start with a builtin-function
                                                 // keyword, e.g. "Split RTrim(s,sep), ...", "f Len(x), y".
                                                 ttStringFunction, ttMathFunction, ttMemoryFunction,
@@ -2864,7 +2868,7 @@ begin
                 // therefore came here and was parsed as a bare call with a signed first argument.
                 // ("=>" is folded into one ttOpEq by the lexer, so both spellings of the '=' are this
                 // one test.)
-                not ((Context.PeekNext.TokenType in [ttOpAdd, ttOpSub]) and
+                not ((Context.PeekNext.TokenType in [ttOpAdd, ttOpSub, ttOpMul]) and
                      Assigned(Context.PeekToken(2)) and (Context.PeekToken(2).TokenType = ttOpEq)) then
           // A value token (or a leading +/- sign of a signed numeric argument, e.g. "bitwise -15, 3")
           // right after the name makes this a bare SUB call, never an assignment.
