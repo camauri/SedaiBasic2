@@ -580,6 +580,7 @@ type
     // chiamata a uno di questi non e' un array mancante: e' una procedura senza corpo, che `fbc`
     // compila e lascia fallire al LINK.
     FDeclProcNames: TFPStringHashTable;
+    FOvlDeclSigs: TStringList;          // "<name>>T|A|R|D,..." per module-level OVERLOAD DECLARE (DIVERGENZE 472)
     FBareTypeNames: TFPStringHashTable;   // ultimo segmento dei nomi di tipo qualificati
 
     // La memoria di IsSingleExpr, viva solo dentro una domanda: vedi la nota su 2^profondita'.
@@ -870,6 +871,7 @@ type
     function ArgConstSigFromArgs(ArgsNode: TASTNode): string;   // positional 'C'/'-' of const arguments
     function ProcRetFuncPtrSig(const NameU: string): string;   // a procedure whose RETURN is callable, either spelling
     function ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;  // pick an overload
+    function CheckArrayOverloadCall(const BaseLabel: string; ArgsNode: TASTNode): string;  // DIVERGENZE 472
     function ResolveCallLabelRaw(const BaseLabel: string; ArgsNode: TASTNode): string;  // ...before the const-array rule
     function ResolveCallLabelWith(const BaseLabel: string; ArgsNode: TASTNode; const UdtSigIn: string): string;  // ...with one spelling of the type tail
     function FindCtorWithDefaults(const TypeName: string; ArgCount: Integer): string;  // M4.4h: defaulted ctor
@@ -2178,6 +2180,7 @@ begin
   FreeAndNil(FCanonCache);
   FreeAndNil(FDeclKnownCache);
   FreeAndNil(FDeclProcNames);
+  FreeAndNil(FOvlDeclSigs);
   FreeAndNil(FBareTypeNames);
   FreeAndNil(FSingleMemo);
   FreeAndNil(FCtorTypes);
@@ -10246,6 +10249,9 @@ begin
                             MakeSSAConstString('undefined reference to `' + UpperFast(ArrName) +
                                                ''': the procedure is declared and never defined'),
                             MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            // ⛔ ...but a call NO member of a declared overload set can take is fbc's compile-time
+            // refusal, not the linker's (DIVERGENZE 472): asked first.
+            CheckArrayOverloadCall(UpperFast(ArrName), Node.GetChild(1));
             // The VM reads the code out of an INT REGISTER (IntRegs[Src1]), so it is loaded into one: a
             // bare constant operand read whatever that register held - Err came back 0, and an abort
             // reported "runtime error 3".
@@ -31920,6 +31926,15 @@ var
 begin
   if FDeclProcNames = nil then FDeclProcNames := TFPStringHashTable.Create;
   if AST = nil then Exit;
+  // The signatures of the module-level OVERLOAD DECLAREs ride beside the names (DIVERGENZE 472).
+  if FOvlDeclSigs = nil then FOvlDeclSigs := TStringList.Create;
+  FOvlDeclSigs.Clear;
+  if AST.Attributes.Values['OVLDECLS'] <> '' then
+  begin
+    FOvlDeclSigs.Delimiter := ';';
+    FOvlDeclSigs.StrictDelimiter := True;
+    FOvlDeclSigs.DelimitedText := AST.Attributes.Values['OVLDECLS'];
+  end;
   Txt := AST.Attributes.Values['DECLPROCS'];
   if Txt = '' then Exit;
   b := 1;
@@ -36455,6 +36470,213 @@ begin
   Result := False;
 end;
 
+function TSSAGenerator.CheckArrayOverloadCall(const BaseLabel: string; ArgsNode: TASTNode): string;
+// ⛔ A WHOLE ARRAY PASSED TO AN OVERLOAD SET THAT NO MEMBER CAN TAKE - OR THAT TWO TAKE ALIKE - IS A
+// COMPILE-TIME REFUSAL IN fbc, and it was a silent choice here (DIVERGENZE 472). An array parameter is
+// passed BY DESCRIPTOR, so fbc converts nothing: the element type must be the same type (Integer and
+// LongInt are two, measured) and a stated rank must be the same rank. The resolver below ranks
+// conversions and ends in an ARITY fallback that always answers something, so "f( array3() )" against
+// f( a(any) As Integer ) / f( a(any, any) As Integer ) called one of them, where fbc answers "error 99:
+// No matching overloaded function"; and a rank nobody stated against those two is fbc's "error 98:
+// Ambiguous call", measured also for an array PARAMETER passed on (a(any) / a(any, any) called with b()).
+// ⭐ ASKED BEFORE THE RESOLVER, AND ONLY WHERE IT IS CERTAIN, so every call it does not refuse resolves
+// exactly as it did:
+//  · only a set of two or more members, and only a call that passes at least one WHOLE array;
+//  · only the array positions constrain: a scalar argument is the resolver's business;
+//  · an element type either side cannot name, and a rank either side did not state, is a WILDCARD;
+//  · a method (a THIS first) and a variadic member leave the whole call alone.
+// ⭐ The members are the DEFINITIONS when there are any, and the OVERLOAD DECLAREs otherwise: a set with
+// no body at all has no label, and fbc refuses the call before any linker is asked.
+// ⭐⭐ AND WHEN EXACTLY ONE DEFINITION TAKES THE ARRAYS, IT IS THE ANSWER - returned, '' otherwise. No
+// conversion reaches an array parameter, so a single fitting member is the only call fbc can make; the
+// resolver below does not know that and answered by declaration order: an array of record U against
+// f( a() As T ) / f( a() As U ) called T, where fbc calls U (measured).
+type
+  TOvlP = record
+    T: string;
+    Arr, Def: Boolean;
+    Rank: Integer;
+  end;
+  TOvlSig = array of TOvlP;
+var
+  Cands: array of TOvlSig;
+  Labels: array of string;
+  CallArr: array of Boolean;
+  CallT: array of string;
+  CallRank: array of Integer;
+  N, i, j, k, c, nComp, First: Integer;
+  Pref, Nm, Tail, Body, Part, NameU: string;
+  Decl, PL, PN, A: TASTNode;
+  AnyArr, Ok: Boolean;
+  Comp: array of Integer;
+  Fields: TStringArray;
+  ParmList: TStringArray;
+
+  function CanonOf(const T: string): string;
+  begin
+    Result := UpperFast(Trim(T));
+    if Copy(Result, 1, 6) = 'CONST ' then Result := Trim(Copy(Result, 7, MaxInt));
+    if Result <> '' then Result := UpperFast(CanonicalType(Result));
+  end;
+
+  procedure AddFromParamList(P: TASTNode);
+  var q, m: Integer;
+      S: TOvlSig;
+      X: TASTNode;
+  begin
+    S := nil;
+    SetLength(S, P.ChildCount);
+    for q := 0 to P.ChildCount - 1 do
+    begin
+      X := P.GetChild(q);
+      S[q].T := '';
+      if (X.ChildCount >= 1) and (X.GetChild(0).NodeType = antIdentifier) and
+         not ((X.Attributes.Values['HASDEFAULT'] = '1') and (X.ChildCount = 1)) then
+        S[q].T := CanonOf(X.GetChild(0).ValueUpper);
+      S[q].Arr := X.Attributes.Values['ARRAY'] = '1';
+      S[q].Rank := StrToIntDef(X.Attributes.Values['ARRAYRANK'], 0);
+      S[q].Def := X.Attributes.Values['HASDEFAULT'] = '1';
+    end;
+    m := Length(Cands);
+    SetLength(Cands, m + 1);
+    Cands[m] := S;
+    SetLength(Labels, m + 1);
+    Labels[m] := Nm;
+  end;
+
+  function Fits(const S: TOvlSig): Boolean;
+  var q: Integer;
+  begin
+    Result := False;
+    if Length(S) < N then Exit;
+    for q := N to High(S) do
+      if not S[q].Def then Exit;
+    for q := 0 to N - 1 do
+      if CallArr[q] then
+      begin
+        if not S[q].Arr then Exit;
+        if (CallT[q] <> '') and (S[q].T <> '') and (CallT[q] <> S[q].T) then Exit;
+        if (CallRank[q] > 0) and (S[q].Rank > 0) and (CallRank[q] <> S[q].Rank) then Exit;
+      end;
+    Result := True;
+  end;
+
+  // Two fitting members that name the same types everywhere and differ only in a rank the call did not
+  // state: fbc's ambiguity. Same ranks too would be a DUPLICATE, which is another refusal's business.
+  function OnlyRankApart(const S1, S2: TOvlSig): Boolean;
+  var q: Integer;
+      Differ: Boolean;
+  begin
+    Result := False;
+    if (Length(S1) <> N) or (Length(S2) <> N) then Exit;
+    Differ := False;
+    for q := 0 to N - 1 do
+    begin
+      if (S1[q].Arr <> S2[q].Arr) or (S1[q].T <> S2[q].T) or (S1[q].T = '') then Exit;
+      if S1[q].Rank <> S2[q].Rank then
+      begin
+        if (not CallArr[q]) or (CallRank[q] > 0) then Exit;
+        Differ := True;
+      end;
+    end;
+    Result := Differ;
+  end;
+
+begin
+  Result := '';
+  if (ArgsNode = nil) or (ArgsNode.ChildCount = 0) then Exit;
+  N := ArgsNode.ChildCount;
+  SetLength(CallArr, N);
+  SetLength(CallT, N);
+  SetLength(CallRank, N);
+  AnyArr := False;
+  for i := 0 to N - 1 do
+  begin
+    CallArr[i] := False; CallT[i] := ''; CallRank[i] := 0;
+    Tail := ArgArrayTailOf(ArgsNode.GetChild(i), True);
+    if Tail = '' then Continue;
+    CallArr[i] := True;
+    AnyArr := True;
+    j := Pos('()', Tail);
+    CallRank[i] := StrToIntDef(Copy(Tail, j + 2, MaxInt), 0);
+    A := ArgsNode.GetChild(i);
+    while (A.NodeType = antParentheses) and (A.ChildCount >= 1) do A := A.GetChild(0);
+    if A.NodeType = antArrayAccess then A := A.GetChild(0);
+    NameU := A.ValueUpper;
+    CallT[i] := CanonOf(FArrayScalarType.Values[ArrayFactKey(NameU)]);
+    // An array of RECORDS files its element type in its own registry.
+    if CallT[i] = '' then CallT[i] := CanonOf(FArrayRecordType.Values[ArrayFactKey(NameU)]);
+  end;
+  if not AnyArr then Exit;
+
+  // The members.
+  Cands := nil;
+  Labels := nil;
+  Pref := BaseLabel + '~';
+  for k := 0 to FProcedureNames.Count - 1 do
+  begin
+    Nm := FProcedureNames[k];
+    if Copy(Nm, 1, Length(Pref)) <> Pref then Continue;
+    if not (FProcDecls.TryGetValue(Nm, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2)) then Exit;
+    if Decl.Attributes.Values['VARIADIC'] = '1' then Exit;
+    PL := Decl.GetChild(1);
+    if (PL = nil) or (PL.NodeType <> antParameterList) then Exit;
+    if (PL.ChildCount > 0) and SameText(VarToStr(PL.GetChild(0).Value), 'THIS') then Exit;
+    AddFromParamList(PL);
+  end;
+  if (Length(Cands) = 0) and (not FProcDecls.ContainsKey(BaseLabel)) and Assigned(FOvlDeclSigs) then
+    for k := 0 to FOvlDeclSigs.Count - 1 do
+    begin
+      Nm := FOvlDeclSigs[k];
+      c := Pos('>', Nm);
+      if (c = 0) or (Copy(Nm, 1, c - 1) <> BaseLabel) then Continue;
+      Body := Copy(Nm, c + 1, MaxInt);
+      c := Length(Cands);
+      SetLength(Cands, c + 1);
+      Cands[c] := nil;
+      SetLength(Labels, c + 1);
+      Labels[c] := '';                                 // a DECLARE has no label to answer with
+      if Body = '' then Continue;
+      ParmList := Body.Split(',');
+      SetLength(Cands[c], Length(ParmList));
+      for j := 0 to High(ParmList) do
+      begin
+        Part := ParmList[j];
+        Fields := Part.Split('|');
+        if Length(Fields) < 4 then Exit;               // not a shape this reader wrote: leave the call alone
+        Cands[c][j].T := CanonOf(Fields[0]);
+        Cands[c][j].Arr := Fields[1] = '1';
+        Cands[c][j].Rank := StrToIntDef(Fields[2], 0);
+        Cands[c][j].Def := Fields[3] = '1';
+      end;
+    end;
+  if Length(Cands) < 2 then Exit;
+
+  Comp := nil;
+  for c := 0 to High(Cands) do
+    if Fits(Cands[c]) then
+    begin
+      SetLength(Comp, Length(Comp) + 1);
+      Comp[High(Comp)] := c;
+    end;
+  nComp := Length(Comp);
+  if nComp = 0 then
+    raise Exception.CreateFmt('No matching overloaded function "%s": no member of the set takes ' +
+      'these array arguments (an array is passed by descriptor: same element type, same rank)', [BaseLabel]);
+  if nComp < 2 then
+  begin
+    Result := Labels[Comp[0]];
+    Exit;
+  end;
+  First := Comp[0];
+  Ok := True;
+  for c := 1 to nComp - 1 do
+    if not OnlyRankApart(Cands[First], Cands[Comp[c]]) then begin Ok := False; Break; end;
+  if Ok then
+    raise Exception.CreateFmt('Ambiguous call to overloaded procedure "%s": the array argument''s rank ' +
+      'is not stated, and more than one member takes it', [BaseLabel]);
+end;
+
 function TSSAGenerator.ResolveCallLabel(const BaseLabel: string; ArgsNode: TASTNode): string;
 // ⭐ DIVERGENZE 471 (residue): A CONST ARRAY ARGUMENT DOES NOT BIND A NON-CONST ARRAY PARAMETER. In fbc that is a
 // constraint, not a preference: fbc suite overload/const, "f4( ca(), i )" against f4( a() As Integer, x As Integer )
@@ -36505,6 +36727,8 @@ var
   end;
 
 begin
+  Result := CheckArrayOverloadCall(BaseLabel, ArgsNode);
+  if Result <> '' then Exit;                       // the one member that takes the arrays (DIVERGENZE 472)
   Result := ResolveCallLabelRaw(BaseLabel, ArgsNode);
   if (Result = '') or (ArgsNode = nil) or (ArgsNode.ChildCount = 0) then Exit;
   AnyConstArr := False;

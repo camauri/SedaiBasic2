@@ -150,6 +150,12 @@ type
     // "is this name a procedure at all"; this one keys on "PREFIX|BASE" and owns the decision.
     FProcSeenNs: TStringList;
     FProcOverloadKeys: TStringList;   // "<ns>|<base>"#1"<collapse key>" per DEFINITION (DIVERGENZE 144)
+    FDeclOverloadKeys: TStringList;   // ...the same, per bodiless OVERLOAD DECLARE (DIVERGENZE 472)
+    FDeclOverloadSigs: TStringList;   // "<name>>T|A|R|D,..." per module-level OVERLOAD DECLARE, for the SSA
+    FProcNameSeen: TStringList;       // "<ns>|<base>" of every module-level DECLARE or SUB/FUNCTION met so far
+    FProcNameOvl: TStringList;        // ...those whose FIRST appearance said OVERLOAD (DIVERGENZE 472)
+    FProtoDecls: TStringList;         // "<ns>|<base>=<kind>#1<return>#1<variadic>#1<key>" per non-overloaded DECLARE
+    FOvlProtos: TStringList;          // "<ns>|<base>"#2"<kind>#1<return>#1<variadic>#1<key>" per OVERLOAD DECLARE
     FNsPrefix: string;               // the namespace body being parsed ('' at module level)
     // ...and the procedures whose result is a REFERENCE ("Function f() ByRef As T"), by bare name.
     // A call to one of these is NOT a temporary, which is the question the BYREF-return lifetime
@@ -455,6 +461,14 @@ type
     // current token is FUNCTION/SUB, consume the whole type and mark Node with FUNCPTR / FPPARAMS /
     // FPRET attributes (the variable holds a procedure entry PC, int-banked). Returns True if matched.
     function TryParseProcPtrType(Node: TASTNode): Boolean;
+    procedure ParseProcParamList(Owner, ParamList: TASTNode; SkipDefaults: Boolean; AllowUnnamed: Boolean = False);
+    procedure CheckDeclaredOverloadDuplicate(const Base: string);
+    function NoteProcNameSeen(const Key: string; SaysOverload: Boolean): Boolean;
+    procedure CheckBodyMatchesPrototype(const Key, Kind, RetType: string; ParamList: TASTNode; At: TLexerToken);
+    function ProtoMismatch(const Rec, Kind, RetType: string; ParamList: TASTNode): string;
+    function ReadDeclaredReturn: string;
+    procedure ClearProtoLists;
+    procedure ReplayPrototypeDefaults(Proto: TASTNode; ParamList: TASTNode);
     procedure ConsumeEndProcedure;
     function ParseForStatement: TASTNode;
     function ParseDoStatement: TASTNode;
@@ -696,6 +710,22 @@ begin
   FProcSeenNs.CaseSensitive := False;
   FProcOverloadKeys := TStringList.Create;
   FProcOverloadKeys.CaseSensitive := False;
+  FDeclOverloadKeys := TStringList.Create;
+  FDeclOverloadKeys.CaseSensitive := False;
+  FDeclOverloadSigs := TStringList.Create;
+  FProcNameSeen := TStringList.Create;
+  FProcNameSeen.CaseSensitive := False;
+  FProcNameSeen.Sorted := True;
+  FProcNameSeen.Duplicates := dupIgnore;
+  FProcNameOvl := TStringList.Create;
+  FProtoDecls := TStringList.Create;
+  FOvlProtos := TStringList.Create;
+  FProtoDecls.CaseSensitive := False;
+  FProtoDecls.Sorted := True;
+  FProtoDecls.Duplicates := dupIgnore;
+  FProcNameOvl.CaseSensitive := False;
+  FProcNameOvl.Sorted := True;
+  FProcNameOvl.Duplicates := dupIgnore;
   FNsPrefix := '';
   FByrefRetProcs := TStringList.Create;
   FByrefRetProcs.CaseSensitive := False;
@@ -773,6 +803,13 @@ begin
   FForwardDeclNames.Free;
   FProcSeen.Free;
   FProcOverloadKeys.Free;
+  FDeclOverloadKeys.Free;
+  FDeclOverloadSigs.Free;
+  FProcNameSeen.Free;
+  FProcNameOvl.Free;
+  ClearProtoLists;
+  FProtoDecls.Free;
+  FOvlProtos.Free;
   FProcSeenNs.Free;
   FByrefRetProcs.Free;
   FConstNames.Free;
@@ -1470,6 +1507,11 @@ begin
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
   FProcSeenNs.Clear;
   FProcOverloadKeys.Clear;
+  FDeclOverloadKeys.Clear;
+  FDeclOverloadSigs.Clear;
+  FProcNameSeen.Clear;
+  FProcNameOvl.Clear;
+  ClearProtoLists;
   FNsPrefix := '';
   FByrefRetProcs.Clear;
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
@@ -1570,6 +1612,11 @@ begin
   FProcSeen.Clear;   // overload detection is per-program (the parser instance is reused)
   FProcSeenNs.Clear;
   FProcOverloadKeys.Clear;
+  FDeclOverloadKeys.Clear;
+  FDeclOverloadSigs.Clear;
+  FProcNameSeen.Clear;
+  FProcNameOvl.Clear;
+  ClearProtoLists;
   FNsPrefix := '';
   FByrefRetProcs.Clear;
   FConstNames.Clear; // ...and so is the set of CONST names (the parser instance is reused)
@@ -1768,6 +1815,10 @@ begin
  // una sub che chiama CoTaskMemFree, dichiarata in win/combaseapi.bi.
  // ⚠️ DUE registri, e servono ENTRAMBI: FProcSeen tiene le procedure DEFINITE, FForwardDeclNames i
  // nomi dichiarati e basta - ed e' il secondo che porta i nomi degli header (una DECLARE senza corpo).
+ // ⭐ ...and the SIGNATURES of the module-level OVERLOAD DECLAREs (DIVERGENZE 472), for the one question
+ // only a call can ask: does any member of a set with no body take these arguments?
+ if FDeclOverloadSigs.Count > 0 then
+   Result.Attributes.Values['OVLDECLS'] := StringReplace(FDeclOverloadSigs.Text, sLineBreak, ';', [rfReplaceAll]);
  if (FProcSeen.Count > 0) or (FForwardDeclNames.Count > 0) then
    Result.Attributes.Values['DECLPROCS'] :=
      StringReplace(FProcSeen.Text, sLineBreak, ';', [rfReplaceAll]) + ';' +
@@ -2018,21 +2069,19 @@ begin
       Assigned(Context.PeekToken(2)) and (Context.PeekToken(2).TokenType = ttIdentifier) and
       (Pos('.', VarToStr(Context.PeekToken(2).Value)) = 0) then
    begin
-     // ⛔⛔⛔ LA REGOLA SUI DOPPIONI E' STATA SCRITTA, MISURATA E RITIRATA (10 set 2026), e resta
-     // qui come nota perche' la misura vale piu' del codice. `fbc` risponde "error 4: Duplicated
-     // definition" a DUE DECLARE dello stesso nome a livello di modulo - identiche, con ritorno
-     // diverso o con PARAMETRI diversi: in FreeBASIC non c'e' overloading implicito. La regola chiude
-     // `crt/win32/ctype.bi`, ma cosi' com'e' rifiuta anche due programmi validi e vuole due esenzioni
-     // che non sono ancora misurate:
-     //   1. una DECLARE dentro un corpo di TYPE e' un METODO, non un doppione (guard m809: "declare
-     //      function f1()" al modulo e la stessa riga dentro un Type);
-     //   2. `fastcgi/fcgi_stdio.bi` dichiara `perror` accanto a quella di `crt`, entrambe con ALIAS,
-     //      e `fbc` la prende - quindi la regola vera non e' «due DECLARE dello stesso nome».
-     // 📊 Con la regola accesa: bi_sweep DIFF 0 -> 1, corpus 1039 -> 1038. Senza: `crt/win32/ctype.bi`
-     // resta OVER. Prima di riscriverla si misurano le due forme sopra contro l'oracolo.
+     // ⛔⛔⛔ LA REGOLA SUI DOPPIONI, scritta e ritirata il 10 set 2026 e RISCRITTA il 16 set (DIVERGENZE
+     // 472): `fbc` risponde "error 4: Duplicated definition" a un secondo DECLARE dello stesso nome -
+     // identico, con ritorno diverso o con parametri diversi - salvo che il nome sia un insieme OVERLOAD.
+     // I due programmi validi che la prima versione rifiutava non erano eccezioni, e la regola nuova li
+     // tiene entrambi (dettagli in CheckDeclaredOverloadDuplicate):
+     //   1. guard m809: "f1" in nsA e in nsA.nsB sono due NOMI - la chiave porta il namespace intero;
+     //   2. `fastcgi/fcgi_stdio.bi` ridichiara `perror` dopo "#undef perror", che in fbc ritira anche
+     //      una procedura: un nome ritirato da un #undef non viene giudicato.
      DupNm := UpperFast(VarToStr(Context.PeekToken(2).Value));
      if FForwardDeclNames.IndexOf(DupNm) < 0 then
        FForwardDeclNames.Add(DupNm);
+     if FModernMode then
+       CheckDeclaredOverloadDuplicate(DupNm);
    end;
    // ⭐ ...AND A DECLARE THAT CARRIES AN "ALIAS" IS A FOREIGN PROCEDURE, so its SIGNATURE is collected
    // on the way past. The line is skipped token by token anyway; reading it while walking costs
@@ -3992,6 +4041,521 @@ begin
   end;
 end;
 
+function TPackratParser.NoteProcNameSeen(const Key: string; SaysOverload: Boolean): Boolean;
+// Record an appearance of a module-level procedure name. TRUE when the name had appeared before; the
+// FIRST appearance alone decides whether the name is an OVERLOAD set (DIVERGENZE 472).
+begin
+  Result := FProcNameSeen.IndexOf(Key) >= 0;
+  if Result then Exit;
+  FProcNameSeen.Add(Key);
+  if SaysOverload then FProcNameOvl.Add(Key);
+end;
+
+procedure TPackratParser.ClearProtoLists;
+// The two prototype lists OWN the parameter lists they keep (DIVERGENZE 472).
+var
+  i: Integer;
+begin
+  for i := 0 to FProtoDecls.Count - 1 do FProtoDecls.Objects[i].Free;
+  FProtoDecls.Clear;
+  for i := 0 to FOvlProtos.Count - 1 do FOvlProtos.Objects[i].Free;
+  FOvlProtos.Clear;
+end;
+
+procedure TPackratParser.ReplayPrototypeDefaults(Proto: TASTNode; ParamList: TASTNode);
+// A default FreeBASIC allows on the DECLARE alone is given to the body, which is what every later pass
+// reads: the module-level twin of ApplyDeclaredDefaults. A default the body writes itself wins.
+var
+  i: Integer;
+  P, B: TASTNode;
+begin
+  if (Proto = nil) or (ParamList = nil) then Exit;
+  for i := 0 to Proto.ChildCount - 1 do
+  begin
+    if i >= ParamList.ChildCount then Break;
+    P := Proto.GetChild(i);
+    B := ParamList.GetChild(i);
+    if P.Attributes.Values['HASDEFAULT'] <> '1' then Continue;
+    if B.Attributes.Values['HASDEFAULT'] = '1' then Continue;
+    if P.ChildCount = 0 then Continue;
+    B.AddChild(P.GetChild(P.ChildCount - 1).Clone);   // last child = default-value expression
+    B.Attributes.Values['HASDEFAULT'] := '1';
+  end;
+end;
+
+function TPackratParser.ReadDeclaredReturn: string;
+// The return type a DECLARE states, read from the cursor just past its parameter list: '' for none, '?'
+// for a shape the prototype check does not compare (a procedure pointer, anything unexpected).
+begin
+  Result := '';
+  if Context.Check(ttParamMode) and (UpperFast(VarToStr(Context.CurrentToken.Value)) = kBYREF) then
+    Context.Advance;
+  if not Context.Check(ttAsType) then Exit;
+  Context.Advance;
+  SkipTypeQualifiers;
+  if Context.Check(ttProcedureStart) then Exit('?');
+  if not AtDottedTypeName then Exit('?');
+  Result := UpperFast(ParseDottedName);
+  while AtPointerSuffix do
+  begin
+    Result := Result + ' PTR';
+    Context.Advance;
+  end;
+end;
+
+procedure TPackratParser.CheckBodyMatchesPrototype(const Key, Kind, RetType: string; ParamList: TASTNode;
+  At: TLexerToken);
+// A SUB / FUNCTION body must say what its DECLARE said (DIVERGENZE 472). fbc refuses, measured one shape at
+// a time: another parameter type ("error 58: Type mismatch, at parameter n"), another passing mode, a
+// Const added or dropped, another array rank - "a()" against "a(Any)" included, an unstated rank is not
+// any rank HERE - another parameter count ("error 1: Argument count mismatch"), another return type or a
+// SUB for a FUNCTION ("error 40: Return type here does not match DECLARE prototype"). A parameter NAME and
+// a DEFAULT may differ, and so may a type spelled through an ALIAS.
+// ⭐ IN AN OVERLOAD SET the body is paired with the prototype its key COLLIDES with (the duplicate rule):
+// a body that collides and does not match is the same refusal (measured: "a()" declared, "a(Any, Any)"
+// defined), and a body that collides with none is simply another member of the set.
+var
+  Idx, i: Integer;
+  Pfx, Msg, BKey, PKey, Rec: string;
+begin
+  Idx := FProtoDecls.IndexOfName(Key);
+  if Idx >= 0 then
+  begin
+    Msg := ProtoMismatch(FProtoDecls.ValueFromIndex[Idx], Kind, RetType, ParamList);
+    if Msg <> '' then Context.AddError(Msg + ': ' + Copy(Key, Pos('|', Key) + 1, MaxInt), At)
+    else ReplayPrototypeDefaults(TASTNode(FProtoDecls.Objects[Idx]), ParamList);
+    Exit;
+  end;
+  if FProcNameOvl.IndexOf(Key) < 0 then Exit;
+  Pfx := Key + #2;
+  BKey := OverloadCollapseKey(ParamList, False);
+  if BKey = '' then BKey := #2;
+  for i := 0 to FOvlProtos.Count - 1 do
+  begin
+    if Copy(FOvlProtos[i], 1, Length(Pfx)) <> Pfx then Continue;
+    Rec := Copy(FOvlProtos[i], Length(Pfx) + 1, MaxInt);
+    PKey := Copy(Rec, RPos(#1, Rec) + 1, MaxInt);
+    if PKey = '' then PKey := #2;
+    if not (((PKey = #2) and (BKey = #2)) or OverloadKeysCollide(BKey, PKey)) then Continue;
+    Msg := ProtoMismatch(Rec, Kind, RetType, ParamList);
+    if Msg = '' then
+    begin
+      ReplayPrototypeDefaults(TASTNode(FOvlProtos.Objects[i]), ParamList);
+      Exit;                                         // the body of this prototype
+    end;
+    Context.AddError(Msg + ': ' + Copy(Key, Pos('|', Key) + 1, MaxInt), At);
+    Exit;
+  end;
+end;
+
+function TPackratParser.ProtoMismatch(const Rec, Kind, RetType: string; ParamList: TASTNode): string;
+// '' when the body matches the prototype record, else fbc's words for the first difference.
+// ⛔ THE ALIAS IS WHY THE TYPE TEST IS HALF A TEST. The parser does not resolve a type alias (the SSA
+// does), so two different spellings are called a mismatch only when BOTH reduce to a builtin type;
+// anything else - an alias, a record, a namespace path, a suffix-typed parameter - is left alone.
+// ⚠️ Errs toward accepting everywhere it cannot see: a procedure-pointer return, a variadic tail.
+var
+  i: Integer;
+  PKind, PRet, PKey, BKey: string;
+  Parts, PA, PB, FA, FB: TStringArray;
+
+  function Builtinish(T: string): Boolean;
+  begin
+    T := Trim(T);
+    if Copy(T, 1, 1) = '#' then Exit(False);
+    if Copy(T, 1, 6) = 'CONST ' then T := Trim(Copy(T, 7, MaxInt));
+    if Copy(T, Length(T) - 1, 2) = '()' then T := Copy(T, 1, Length(T) - 2);
+    while Copy(T, Length(T) - 3, 4) = ' PTR' do T := Trim(Copy(T, 1, Length(T) - 4));
+    if Copy(T, 1, 6) = 'CONST ' then T := Trim(Copy(T, 7, MaxInt));
+    Result := (T <> '') and IsBuiltinTypeName(T);
+  end;
+
+  function TypesDiffer(const A, B: string): Boolean;
+  begin
+    Result := (A <> B) and Builtinish(A) and Builtinish(B);
+  end;
+
+begin
+  Result := '';
+  Parts := Rec.Split([#1]);
+  if Length(Parts) < 4 then Exit;
+  PKind := Parts[0]; PRet := Parts[1]; PKey := Parts[3];
+  if Parts[2] = '1' then Exit;                     // a variadic prototype: the key does not see "..."
+  if (PKind <> Kind) or ((PRet <> '?') and (RetType <> '?') and TypesDiffer(PRet, RetType)) then
+    Exit('Return type here does not match DECLARE prototype');
+  BKey := OverloadCollapseKey(ParamList, False);
+  if PKey = '' then PA := nil else PA := PKey.Split([';']);
+  if BKey = '' then PB := nil else PB := BKey.Split([';']);
+  if Length(PA) <> Length(PB) then
+    Exit('Argument count mismatch: the body does not take the parameters its DECLARE takes');
+  for i := 0 to High(PA) do
+  begin
+    FA := PA[i].Split(['|']);
+    FB := PB[i].Split(['|']);
+    if (Length(FA) < 4) or (Length(FB) < 4) then Continue;
+    // A type the parser cannot name on either side leaves the whole parameter alone: its mode is a
+    // guess too (a UDT is BYREF, an alias of Integer is not).
+    if not (Builtinish(FA[0]) and Builtinish(FB[0])) then Continue;
+    if TypesDiffer(FA[0], FB[0]) or (FA[1] <> FB[1]) or (FA[2] <> FB[2]) or (FA[3] <> FB[3]) then
+      Exit(Format('Type mismatch, at parameter %d: the body does not match its DECLARE', [i + 1]));
+  end;
+end;
+
+procedure TPackratParser.CheckDeclaredOverloadDuplicate(const Base: string);
+// Two bodiless "DECLARE ... OVERLOAD" of one name whose parameters FreeBASIC calls the same are
+// "error 4: Duplicated definition" there, and were accepted here (DIVERGENZE 472): RegisterOverloadLabel
+// only ever sees DEFINITIONS, and a DECLARE emits no node, so the pair was never compared.
+// ⭐ THE SAME KEY AND THE SAME COMPARISON as the definitions (OverloadCollapseKey / OverloadKeysCollide),
+// read by the same parameter reader, so the rule measured over 33 variants and the rank rule of voce 471
+// apply unchanged: "a(any)" beside "a(any)" collides, beside "a(any, any)" it does not, and "a()" - an
+// unstated rank - collides with either.
+// ⛔ KEPT IN ITS OWN LIST, never beside the definitions: a DECLARE and the body it announces carry the
+// SAME key, and that pair is a prototype, not a duplicate.
+// ⭐ AND OUTSIDE A SET, ANY SECOND DECLARE IS A DUPLICATE - see the body for the rule and for the two
+// programs that made a first version of it be retired on 10 Sep 2026.
+// ⚠️ Errs toward accepting: a variadic tail is never compared (the key does not see it).
+// Called with the cursor on DECLARE; the cursor is restored, the line is still skipped by the caller.
+var
+  Saved, k: Integer;
+  D, CKey, Pfx, Sig, T, DKind, Ret: string;
+  HasOvl, SeenBefore, IsSet, Undef, KeepPL: Boolean;
+  NameTok: TLexerToken;
+  Probe, PL, PN: TASTNode;
+begin
+  Saved := Context.CurrentIndex;
+  try
+    Context.Advance;                                // DECLARE
+    DKind := UpperFast(VarToStr(Context.CurrentToken.Value));
+    Context.Advance;                                // SUB / FUNCTION
+    NameTok := Context.CurrentToken;
+    Context.Advance;                                // the name
+    HasOvl := False;
+    while Context.Check(ttIdentifier) do
+    begin
+      D := UpperFast(VarToStr(Context.CurrentToken.Value));
+      if D = 'OVERLOAD' then
+      begin
+        HasOvl := True;
+        Context.Advance;
+      end
+      else if (D = 'CDECL') or (D = 'STDCALL') or (D = 'PASCAL') or (D = 'FASTCALL') or
+              (D = 'THISCALL') then
+        Context.Advance
+      else if (D = kALIAS) or (D = kLIB) then
+      begin
+        Context.Advance;
+        if Context.Check(ttStringLiteral) then Context.Advance;
+      end
+      else
+        Break;
+    end;
+    Pfx := FNsPrefix + '|' + Base + #1;
+    // ⭐⭐ THE GENERAL RULE, measured on thirty shapes against fbc: FreeBASIC has no implicit
+    // overloading, so a name met a SECOND time - by a DECLARE after a DECLARE, or after its own body -
+    // is "error 4: Duplicated definition", identical or not, unless the name is an OVERLOAD SET. And
+    // what makes it one is its FIRST appearance: "Declare p Overload" then "Declare p" is a set (the
+    // word is needed once), "Declare p" then "Declare p Overload" is a duplicate.
+    // ⛔ THE TWO VALID PROGRAMS THE RULE REFUSED ON 10 SEP, and why they are not exceptions:
+    //   · m809 declares f1 in "nsA" and in "nsA.nsB" - two NAMES, which a bare-name key could not tell
+    //     apart; the key is the full namespace path now;
+    //   · fastcgi/fcgi_stdio.bi redeclares crt's perror after "#undef perror", and fbc's #undef
+    //     retires a PROCEDURE too (quirk/undef, measured). The preprocessor knows every name a #undef
+    //     retired, not WHERE, so such a name is left alone entirely: the rule errs toward accepting.
+    Undef := (GPPUndefNames <> nil) and (GPPUndefNames.IndexOf(Base) >= 0);
+    SeenBefore := NoteProcNameSeen(FNsPrefix + '|' + Base, HasOvl);
+    IsSet := FProcNameOvl.IndexOf(FNsPrefix + '|' + Base) >= 0;
+    if SeenBefore and (not IsSet) and (not Undef) then
+    begin
+      Context.AddError('Duplicated definition: ' + Base +
+        ' - declared again, and it is not an OVERLOAD set', NameTok);
+      Exit;
+    end;
+    if not IsSet then
+    begin
+      // ⭐ THE PROTOTYPE, kept for the BODY to be checked against (CheckBodyMatchesPrototype). Only a
+      // first appearance of a SUB / FUNCTION that is not undone by a #undef: after a #undef the body may
+      // belong to a different declaration, and the rule errs toward accepting.
+      if SeenBefore or Undef or ((DKind <> kSUB) and (DKind <> kFUNCTION)) then Exit;
+      // The DEFAULTS are parsed for real here and the list is KEPT: FreeBASIC lets a default stand on the
+      // DECLARE alone, and the body - the only thing the rest of the pipeline sees - must be given it
+      // (ReplayPrototypeDefaults). Without it "pn( 1 )" passed 0 for a declared "= 7", in silence.
+      Probe := TASTNode.Create(antProcedureDecl, NameTok);
+      PL := TASTNode.Create(antParameterList, NameTok);
+      try
+        ParseProcParamList(Probe, PL, False, True);
+        Ret := ReadDeclaredReturn;
+        if Probe.Attributes.Values['VARIADIC'] = '1' then Ret := '?';   // the key does not see "..."
+        FProtoDecls.AddObject(FNsPrefix + '|' + Base + '=' + DKind + #1 + Ret + #1 +
+          BoolToStr(Probe.Attributes.Values['VARIADIC'] = '1', '1', '0') + #1 + OverloadCollapseKey(PL, False), PL);
+        PL := nil;
+      finally
+        PL.Free;
+        Probe.Free;
+      end;
+      Exit;
+    end;
+    Probe := TASTNode.Create(antProcedureDecl, NameTok);
+    PL := TASTNode.Create(antParameterList, NameTok);
+    KeepPL := False;
+    try
+      ParseProcParamList(Probe, PL, False, True);
+      Ret := ReadDeclaredReturn;
+      // ⛔ AN OVERLOAD SET TAKES NO VARIADIC MEMBER: fbc answers "error 4: Duplicated definition" to the
+      // very first "Declare Sub p Overload( a As Integer, ... )", alone in its program (measured).
+      if Probe.Attributes.Values['VARIADIC'] = '1' then
+      begin
+        if not Undef then
+          Context.AddError('Duplicated definition: ' + Base +
+            ' - an OVERLOAD procedure cannot be variadic', NameTok);
+        Exit;
+      end;
+      CKey := OverloadCollapseKey(PL, False);
+      if CKey = '' then CKey := #2;
+      // ...against every earlier DECLARE of the set - two with no parameters at all are the same one
+      // (measured), which the shared comparison leaves out on purpose for DEFINITIONS - and against
+      // every earlier BODY: a DECLARE after the definition it repeats is a duplicate too (measured).
+      if not Undef then
+      begin
+        for k := 0 to FDeclOverloadKeys.Count - 1 do
+          if (Copy(FDeclOverloadKeys[k], 1, Length(Pfx)) = Pfx) and
+             (((CKey = #2) and (Copy(FDeclOverloadKeys[k], Length(Pfx) + 1, MaxInt) = #2)) or
+              OverloadKeysCollide(CKey, Copy(FDeclOverloadKeys[k], Length(Pfx) + 1, MaxInt))) then
+          begin
+            Context.AddError('Duplicated definition: ' + Base +
+              ' - two overloaded DECLAREs FreeBASIC calls the same declaration', NameTok);
+            Exit;
+          end;
+        for k := 0 to FProcOverloadKeys.Count - 1 do
+          if (Copy(FProcOverloadKeys[k], 1, Length(Pfx)) = Pfx) and
+             OverloadKeysCollide(CKey, Copy(FProcOverloadKeys[k], Length(Pfx) + 1, MaxInt)) then
+          begin
+            Context.AddError('Duplicated definition: ' + Base +
+              ' - an overloaded DECLARE repeats a procedure already defined', NameTok);
+            Exit;
+          end;
+      end;
+      FDeclOverloadKeys.Add(Pfx + CKey);
+      if (DKind = kSUB) or (DKind = kFUNCTION) then
+      begin
+        FOvlProtos.AddObject(FNsPrefix + '|' + Base + #2 + DKind + #1 + Ret + #1 + '0' + #1 +
+          OverloadCollapseKey(PL, False), PL);
+        KeepPL := True;                            // kept: its defaults are replayed onto the body
+      end;
+      // ⭐ ...and the SIGNATURE travels to the SSA, which is the only pass that can match it against a
+      // CALL: a set with no body at all has no label to resolve against, and fbc still refuses a call
+      // no member can take (error 99) or two can take alike (error 98) - at compile time, before any
+      // linker is asked. Module level only: a namespaced name is mangled later, and a key the SSA
+      // cannot spell would never be read. One "T|A|R|D" per parameter: type, array, rank, default.
+      if FNsPrefix = '' then
+      begin
+        Sig := '';
+        for k := 0 to PL.ChildCount - 1 do
+        begin
+          PN := PL.GetChild(k);
+          T := '';
+          if (PN.ChildCount >= 1) and (PN.GetChild(0).NodeType = antIdentifier) then
+            T := PN.GetChild(0).ValueUpper;
+          if k > 0 then Sig := Sig + ',';
+          Sig := Sig + T + '|' + PN.Attributes.Values['ARRAY'] + '|' + PN.Attributes.Values['ARRAYRANK'] + '|';
+          if PN.Attributes.Values['HASDEFAULT'] = '1' then Sig := Sig + '1';
+        end;
+        FDeclOverloadSigs.Add(Base + '>' + Sig);
+      end;
+    finally
+      if not KeepPL then PL.Free;
+      Probe.Free;
+    end;
+  finally
+    Context.CurrentIndex := Saved;
+  end;
+end;
+
+procedure TPackratParser.ParseProcParamList(Owner, ParamList: TASTNode; SkipDefaults: Boolean;
+  AllowUnnamed: Boolean = False);
+// The parenthesised parameter list of a SUB / FUNCTION / OPERATOR / PROPERTY, appended to ParamList
+// (a variadic tail marks Owner). Lifted out of ParseProcedureDecl so a bodiless DECLARE can read the
+// SAME signature a definition reads - the duplicate-overload check compares the two kinds of key and
+// they must be built by one reader (DIVERGENZE 472). Starts on the "(", or does nothing without one.
+var
+  ParamMode, ParamTypeName, ParamNameU: string;
+  ArrRank, Depth: Integer;
+  Unnamed: Boolean;
+  ParamNode, DefExpr: TASTNode;
+  RetTok: TLexerToken;
+begin
+  if Context.Check(ttDelimParOpen) then
+  begin
+    Context.Advance;                              // (
+    while (not Context.Check(ttDelimParClose)) and (not Context.Check(ttEndOfFile)) and
+          (not Context.Check(ttEndOfLine)) do
+    begin
+      // QuickBASIC-style "OPTIONAL" keyword before a parameter. FreeBASIC has no such keyword — an
+      // optional parameter is expressed by giving a default directly ("name AS T = expr"), which is
+      // handled below. Skip a leading OPTIONAL so it is not mistaken for a bare (untyped) parameter
+      // named "OPTIONAL", which would shift every following argument by one slot. Only skip when it is
+      // followed by another name or a BYVAL/BYREF qualifier, so a parameter literally named "optional"
+      // ("optional AS T") is preserved.
+      if Context.Check(ttIdentifier) and (SameText(Context.CurrentToken.Value, 'OPTIONAL')) and
+         Assigned(Context.PeekNext) and
+         ((Context.PeekNext.TokenType = ttIdentifier) or (Context.PeekNext.TokenType = ttParamMode)) then
+        Context.Advance;                            // consume OPTIONAL keyword
+
+      // Optional passing convention (V4): BYVAL (copy) or BYREF (alias, the default) before the
+      // parameter name. Recorded on the param node as the 'BYVAL' attribute for the SSA prologue.
+      ParamMode := '';
+      if Context.Check(ttParamMode) then
+      begin
+        ParamMode := UpperFast(Context.CurrentToken.Value);
+        Context.Advance;
+      end;
+      // ⭐ A DECLARE may leave a parameter UNNAMED - "byval as integer", "() as integer" - and a reader that
+      // skipped those counted fewer parameters than the declaration has (fbc suite functions/bydesc).
+      Unnamed := AllowUnnamed and (Context.Check(ttAsType) or Context.Check(ttDelimParOpen));
+      if Context.Check(ttIdentifier) or Unnamed then
+      begin
+        if Unnamed then
+          ParamNode := TASTNode.CreateWithValue(antIdentifier, '', Context.CurrentToken)
+        else
+          ParamNode := TASTNode.CreateWithValue(antIdentifier,
+                         UpperFast(Context.CurrentToken.Value), Context.CurrentToken);
+        if ParamMode = kBYVAL then ParamNode.Attributes.Values['BYVAL'] := '1';
+        // An explicit BYREF on a scalar parameter requests write-back (the callee's mutations are
+        // copied back into the caller's variable argument). Recorded for the SSA call lowering; BYREF
+        // is also the implicit default, but only an explicit BYREF opts a scalar into write-back.
+        if ParamMode = kBYREF then ParamNode.Attributes.Values['BYREF'] := '1';
+        if not Unnamed then Context.Advance;
+        // FreeBASIC array parameter: "name() AS type" (empty parens; arrays are always passed ByRef,
+        // with unspecified bounds). Consume the "()" and mark the parameter as an array. Without this
+        // the '(' is never consumed and the parameter loop spins forever.
+        if Context.Check(ttDelimParOpen) then
+        begin
+          Context.Advance;                        // (
+          // ⭐ AND HOW MANY DIMENSIONS THE DECLARATION STATED, which nothing recorded until 16 Sep 2026
+          // (DIVERGENZE 471). "a()" states nothing - "an array of any rank" - while "a(Any, Any)" states
+          // TWO, and fbc separates overloads on exactly that: its own overload/bydesc declares
+          // "f( array(any) )" beside "f( array(any, any) )" and calls them two declarations, while it
+          // refuses "a(any)" twice over as "error 4: Duplicated definition". With the rank unrecorded the
+          // two signed ONE label here, so the second was silently DISCARDED and both calls answered the
+          // first: measured 1 and 1 where fbc answers 1 and 2.
+          // ⛔ 0 MEANS "NOT STATED", and it is not the same as 1: measured against the oracle, "a()"
+          // beside "a(any, any)" IS a duplicate, so an unstated rank collides with EVERY rank while two
+          // stated ones collide only when equal. That is the "-" convention the other tails already use.
+          // ⚠️ Counted, not parsed: the bounds themselves are skipped exactly as before, so a parameter
+          // list reaches the rest of the pipeline byte-identical to what it did.
+          ArrRank := 0;
+          while not Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile, ttSeparStmt]) do
+          begin
+            if Context.Check(ttSeparParam) then Inc(ArrRank)      // one comma = one more dimension
+            else if ArrRank = 0 then ArrRank := 1;                // ...and anything at all = the first
+            Context.Advance;                      // skip anything inside (usually empty)
+          end;
+          if Context.Check(ttDelimParClose) then Context.Advance;   // )
+          ParamNode.Attributes.Values['ARRAY'] := '1';
+          if ArrRank > 0 then ParamNode.Attributes.Values['ARRAYRANK'] := IntToStr(ArrRank);
+        end;
+        // Optional "AS typename" (M3.1): attach the type as a child antIdentifier so the
+        // SSA pre-scan can type the parameter (record handle / explicit builtin bank).
+        ParamTypeName := '';
+        if Context.Check(ttAsType) then
+        begin
+          Context.Advance;                        // AS
+          if SkipTypeQualifiersConst then         // FB: "As Const <type>" - part of the SIGNATURE
+            ParamNode.Attributes.Values['CONSTP'] := '1';
+          // FreeBASIC "AS CONST <type>": a read-only (immutable) parameter. Immutability is not enforced
+          // here, so consume and ignore the CONST qualifier and take the type that follows — otherwise
+          // CONST (a keyword, not an identifier) is skipped and the parameter is left untyped (mis-banked
+          // to numeric, so a "Const String" arg reads as 0).
+          if Context.Check(ttConstant) then Context.Advance;   // optional CONST qualifier
+          // FreeBASIC function-pointer parameter "f AS FUNCTION(...) AS ret": the parameter is an int
+          // (a procedure entry PC); the signature is recorded on the node, no UDT type child attached.
+          if TryParseProcPtrType(ParamNode) then
+            ParamTypeName := ''
+          // ⛔ ...and a PARAMETER's type may carry the global-scope dots too ("ByVal p As ..r.foo.t1").
+          // Asking ttIdentifier alone did not fail here - it fell through with an EMPTY type name, so
+          // the parameter silently defaulted and the callee read a different object. Same spelling as
+          // the DIM gate, and the same reader now answers for both.
+          else if AtDottedTypeName then
+          begin
+            RetTok := Context.CurrentToken;
+            ParamTypeName := UpperFast(ParseDottedName);
+            // FreeBASIC pointer parameter "<type> PTR" (one or more PTR): keep the PTR suffix on the type
+            // name (the pointee bank is recorded from it) and — crucially — CONSUME the PTR token(s). Left
+            // unconsumed, a following parameter list ("..., x As Integer") mis-parses: the stray "PTR" is
+            // taken as the next parameter, so every parameter after a pointer one is mis-slotted (its
+            // transfer slot no longer matches the caller's staging). Applies to array-of-pointer params
+            // ("a() As T PTR") too.
+            while AtPointerSuffix do
+            begin
+              ParamTypeName := ParamTypeName + ' PTR';
+              Context.Advance;                      // consume PTR
+            end;
+            ParamNode.AddChild(TASTNode.CreateWithValue(antIdentifier,
+                         ParamTypeName, RetTok));  // dotted: namespace-qualified param type
+          end;
+        end;
+        // FreeBASIC -lang fb default (MODERN): String / ZString / WString parameters are passed BYREF by
+        // default (the callee's mutations propagate back to the caller's argument), unless BYVAL/BYREF
+        // was given explicitly. Numeric scalars stay BYVAL, matching FB. A bare "name$" (no AS type) is a
+        // string too. CLASSIC keeps its own convention (untouched).
+        if FModernMode and (ParamMode = '') then
+        begin
+          ParamNameU := ParamNode.ValueUpper;
+          if (ParamTypeName = 'STRING') or (ParamTypeName = 'ZSTRING') or (ParamTypeName = 'WSTRING') or
+             ((ParamTypeName = '') and (Length(ParamNameU) > 0) and (ParamNameU[Length(ParamNameU)] = '$')) then
+            ParamNode.Attributes.Values['BYREF'] := '1';
+        end;
+        // Optional default value "= expr" (M7): a call that omits this trailing argument has the
+        // default staged in its place. Marked with 'HASDEFAULT'; the default expression is the
+        // parameter node's last child (after the optional type child).
+        if Context.Check(ttOpEq) and SkipDefaults then
+        begin
+          // A READING that only wants the signature (a bodiless DECLARE, DIVERGENZE 472) steps over the
+          // default instead of parsing it: the key does not look at it, and parsing an expression may
+          // report. Stops at the ',' or ')' that closes this parameter.
+          ParamNode.Attributes.Values['DEFSKIPPED'] := '1';
+          Depth := 0;
+          while not Context.CheckAny([ttEndOfLine, ttEndOfFile, ttSeparStmt]) do
+          begin
+            if Context.Check(ttDelimParOpen) then Inc(Depth)
+            else if Context.Check(ttDelimParClose) then
+            begin
+              if Depth = 0 then Break;
+              Dec(Depth);
+            end
+            else if Context.Check(ttSeparParam) and (Depth = 0) then Break;
+            Context.Advance;
+          end;
+        end
+        else if Context.Check(ttOpEq) then
+        begin
+          Context.Advance;                        // =
+          DefExpr := FExpressionParser.ParseExpression;
+          if Assigned(DefExpr) then
+          begin
+            ParamNode.Attributes.Values['HASDEFAULT'] := '1';
+            ParamNode.AddChild(DefExpr);          // last child = default-value expression
+          end;
+        end;
+        ParamList.AddChild(ParamNode);
+      end
+      // FreeBASIC variadic tail "...": the declaration accepts any number of further arguments. It used
+      // to fall into the defensive skip below, so the dots vanished and the procedure looked ordinary -
+      // the surplus arguments at every call site were then dropped in silence.
+      else if Context.Check(ttOpDot) then
+      begin
+        while Context.Check(ttOpDot) do Context.Advance;        // "..."
+        Owner.Attributes.Values['VARIADIC'] := '1';
+      end
+      else
+        Context.Advance;                          // skip unexpected token (defensive)
+      if Context.Check(ttSeparParam) then
+        Context.Advance;                          // ,
+    end;
+    if Context.Check(ttDelimParClose) then
+      Context.Advance;                            // )
+  end;
+end;
+
 function TPackratParser.ParseProcedureDecl: TASTNode;
 var
   Token, NameTok, RetTok: TLexerToken;
@@ -4000,7 +4564,10 @@ var
   OpSymbolForm: Boolean;   // "OPERATOR <sym>(...)" (arity goes in the label) vs "OPERATOR T.CAST/LET"
   ArrRank: Integer;        // dimensions an array parameter's declaration STATED (0 = none): DIVERGENZE 471
   NameNode, ParamList, ParamNode, ThisNode, DefExpr: TASTNode;
+  SaidOverload: Boolean;   // the decorators named OVERLOAD (DIVERGENZE 472)
+  DefRet: string;
 begin
+  SaidOverload := False;
   // SUB|FUNCTION name [ ( params ) ] [AS type] <body> END SUB|FUNCTION
   // Method form (M4.1): SUB|FUNCTION Type.method(...) — qualified name "TYPE.METHOD" with an
   // implicit first parameter THIS AS Type (the instance handle).
@@ -4176,7 +4743,10 @@ begin
     DecoU := UpperFast(Context.CurrentToken.Value);
     if (DecoU = 'CDECL') or (DecoU = 'STDCALL') or (DecoU = 'PASCAL') or
        (DecoU = 'FASTCALL') or (DecoU = 'THISCALL') or (DecoU = 'OVERLOAD') then
-      Context.Advance
+    begin
+      if DecoU = 'OVERLOAD' then SaidOverload := True;
+      Context.Advance;
+    end
     else if (DecoU = kALIAS) or (DecoU = kLIB) then
     begin
       Context.Advance;                            // ALIAS / LIB
@@ -4218,152 +4788,7 @@ begin
     ThisNode.AddChild(TASTNode.CreateWithValue(antIdentifier, MethodType, Token));
     ParamList.AddChild(ThisNode);
   end;
-  if Context.Check(ttDelimParOpen) then
-  begin
-    Context.Advance;                              // (
-    while (not Context.Check(ttDelimParClose)) and (not Context.Check(ttEndOfFile)) and
-          (not Context.Check(ttEndOfLine)) do
-    begin
-      // QuickBASIC-style "OPTIONAL" keyword before a parameter. FreeBASIC has no such keyword — an
-      // optional parameter is expressed by giving a default directly ("name AS T = expr"), which is
-      // handled below. Skip a leading OPTIONAL so it is not mistaken for a bare (untyped) parameter
-      // named "OPTIONAL", which would shift every following argument by one slot. Only skip when it is
-      // followed by another name or a BYVAL/BYREF qualifier, so a parameter literally named "optional"
-      // ("optional AS T") is preserved.
-      if Context.Check(ttIdentifier) and (SameText(Context.CurrentToken.Value, 'OPTIONAL')) and
-         Assigned(Context.PeekNext) and
-         ((Context.PeekNext.TokenType = ttIdentifier) or (Context.PeekNext.TokenType = ttParamMode)) then
-        Context.Advance;                            // consume OPTIONAL keyword
-
-      // Optional passing convention (V4): BYVAL (copy) or BYREF (alias, the default) before the
-      // parameter name. Recorded on the param node as the 'BYVAL' attribute for the SSA prologue.
-      ParamMode := '';
-      if Context.Check(ttParamMode) then
-      begin
-        ParamMode := UpperFast(Context.CurrentToken.Value);
-        Context.Advance;
-      end;
-      if Context.Check(ttIdentifier) then
-      begin
-        ParamNode := TASTNode.CreateWithValue(antIdentifier,
-                       UpperFast(Context.CurrentToken.Value), Context.CurrentToken);
-        if ParamMode = kBYVAL then ParamNode.Attributes.Values['BYVAL'] := '1';
-        // An explicit BYREF on a scalar parameter requests write-back (the callee's mutations are
-        // copied back into the caller's variable argument). Recorded for the SSA call lowering; BYREF
-        // is also the implicit default, but only an explicit BYREF opts a scalar into write-back.
-        if ParamMode = kBYREF then ParamNode.Attributes.Values['BYREF'] := '1';
-        Context.Advance;
-        // FreeBASIC array parameter: "name() AS type" (empty parens; arrays are always passed ByRef,
-        // with unspecified bounds). Consume the "()" and mark the parameter as an array. Without this
-        // the '(' is never consumed and the parameter loop spins forever.
-        if Context.Check(ttDelimParOpen) then
-        begin
-          Context.Advance;                        // (
-          // ⭐ AND HOW MANY DIMENSIONS THE DECLARATION STATED, which nothing recorded until 16 Sep 2026
-          // (DIVERGENZE 471). "a()" states nothing - "an array of any rank" - while "a(Any, Any)" states
-          // TWO, and fbc separates overloads on exactly that: its own overload/bydesc declares
-          // "f( array(any) )" beside "f( array(any, any) )" and calls them two declarations, while it
-          // refuses "a(any)" twice over as "error 4: Duplicated definition". With the rank unrecorded the
-          // two signed ONE label here, so the second was silently DISCARDED and both calls answered the
-          // first: measured 1 and 1 where fbc answers 1 and 2.
-          // ⛔ 0 MEANS "NOT STATED", and it is not the same as 1: measured against the oracle, "a()"
-          // beside "a(any, any)" IS a duplicate, so an unstated rank collides with EVERY rank while two
-          // stated ones collide only when equal. That is the "-" convention the other tails already use.
-          // ⚠️ Counted, not parsed: the bounds themselves are skipped exactly as before, so a parameter
-          // list reaches the rest of the pipeline byte-identical to what it did.
-          ArrRank := 0;
-          while not Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile, ttSeparStmt]) do
-          begin
-            if Context.Check(ttSeparParam) then Inc(ArrRank)      // one comma = one more dimension
-            else if ArrRank = 0 then ArrRank := 1;                // ...and anything at all = the first
-            Context.Advance;                      // skip anything inside (usually empty)
-          end;
-          if Context.Check(ttDelimParClose) then Context.Advance;   // )
-          ParamNode.Attributes.Values['ARRAY'] := '1';
-          if ArrRank > 0 then ParamNode.Attributes.Values['ARRAYRANK'] := IntToStr(ArrRank);
-        end;
-        // Optional "AS typename" (M3.1): attach the type as a child antIdentifier so the
-        // SSA pre-scan can type the parameter (record handle / explicit builtin bank).
-        ParamTypeName := '';
-        if Context.Check(ttAsType) then
-        begin
-          Context.Advance;                        // AS
-          if SkipTypeQualifiersConst then         // FB: "As Const <type>" - part of the SIGNATURE
-            ParamNode.Attributes.Values['CONSTP'] := '1';
-          // FreeBASIC "AS CONST <type>": a read-only (immutable) parameter. Immutability is not enforced
-          // here, so consume and ignore the CONST qualifier and take the type that follows — otherwise
-          // CONST (a keyword, not an identifier) is skipped and the parameter is left untyped (mis-banked
-          // to numeric, so a "Const String" arg reads as 0).
-          if Context.Check(ttConstant) then Context.Advance;   // optional CONST qualifier
-          // FreeBASIC function-pointer parameter "f AS FUNCTION(...) AS ret": the parameter is an int
-          // (a procedure entry PC); the signature is recorded on the node, no UDT type child attached.
-          if TryParseProcPtrType(ParamNode) then
-            ParamTypeName := ''
-          // ⛔ ...and a PARAMETER's type may carry the global-scope dots too ("ByVal p As ..r.foo.t1").
-          // Asking ttIdentifier alone did not fail here - it fell through with an EMPTY type name, so
-          // the parameter silently defaulted and the callee read a different object. Same spelling as
-          // the DIM gate, and the same reader now answers for both.
-          else if AtDottedTypeName then
-          begin
-            RetTok := Context.CurrentToken;
-            ParamTypeName := UpperFast(ParseDottedName);
-            // FreeBASIC pointer parameter "<type> PTR" (one or more PTR): keep the PTR suffix on the type
-            // name (the pointee bank is recorded from it) and — crucially — CONSUME the PTR token(s). Left
-            // unconsumed, a following parameter list ("..., x As Integer") mis-parses: the stray "PTR" is
-            // taken as the next parameter, so every parameter after a pointer one is mis-slotted (its
-            // transfer slot no longer matches the caller's staging). Applies to array-of-pointer params
-            // ("a() As T PTR") too.
-            while AtPointerSuffix do
-            begin
-              ParamTypeName := ParamTypeName + ' PTR';
-              Context.Advance;                      // consume PTR
-            end;
-            ParamNode.AddChild(TASTNode.CreateWithValue(antIdentifier,
-                         ParamTypeName, RetTok));  // dotted: namespace-qualified param type
-          end;
-        end;
-        // FreeBASIC -lang fb default (MODERN): String / ZString / WString parameters are passed BYREF by
-        // default (the callee's mutations propagate back to the caller's argument), unless BYVAL/BYREF
-        // was given explicitly. Numeric scalars stay BYVAL, matching FB. A bare "name$" (no AS type) is a
-        // string too. CLASSIC keeps its own convention (untouched).
-        if FModernMode and (ParamMode = '') then
-        begin
-          ParamNameU := ParamNode.ValueUpper;
-          if (ParamTypeName = 'STRING') or (ParamTypeName = 'ZSTRING') or (ParamTypeName = 'WSTRING') or
-             ((ParamTypeName = '') and (Length(ParamNameU) > 0) and (ParamNameU[Length(ParamNameU)] = '$')) then
-            ParamNode.Attributes.Values['BYREF'] := '1';
-        end;
-        // Optional default value "= expr" (M7): a call that omits this trailing argument has the
-        // default staged in its place. Marked with 'HASDEFAULT'; the default expression is the
-        // parameter node's last child (after the optional type child).
-        if Context.Check(ttOpEq) then
-        begin
-          Context.Advance;                        // =
-          DefExpr := FExpressionParser.ParseExpression;
-          if Assigned(DefExpr) then
-          begin
-            ParamNode.Attributes.Values['HASDEFAULT'] := '1';
-            ParamNode.AddChild(DefExpr);          // last child = default-value expression
-          end;
-        end;
-        ParamList.AddChild(ParamNode);
-      end
-      // FreeBASIC variadic tail "...": the declaration accepts any number of further arguments. It used
-      // to fall into the defensive skip below, so the dots vanished and the procedure looked ordinary -
-      // the surplus arguments at every call site were then dropped in silence.
-      else if Context.Check(ttOpDot) then
-      begin
-        while Context.Check(ttOpDot) do Context.Advance;        // "..."
-        Result.Attributes.Values['VARIADIC'] := '1';
-      end
-      else
-        Context.Advance;                          // skip unexpected token (defensive)
-      if Context.Check(ttSeparParam) then
-        Context.Advance;                          // ,
-    end;
-    if Context.Check(ttDelimParClose) then
-      Context.Advance;                            // )
-  end;
+  ParseProcParamList(Result, ParamList, False);
 
   // PROPERTY (FreeBASIC OOP) desugars to a method: a getter "PROPERTY T.p() AS RT" becomes
   // FUNCTION T.p (read via obj.p), a setter "PROPERTY T.p(v AS VT)" becomes SUB T.p.SET (write via
@@ -4539,6 +4964,19 @@ begin
   // reachable here, un-renamed) -- "BAR.G~I" / "BAR.G~F". A name declared only once keeps its bare label,
   // so nothing about a non-overloaded program changes. Constructors ("#sig") and operators ("@arity")
   // already carry their own discriminator and are left alone.
+  // ⭐ A module-level SUB / FUNCTION is an appearance of its name, and the FIRST appearance decides
+  // whether the name is an overload set - a later DECLARE of it is judged by that (DIVERGENZE 472).
+  if FModernMode and (MethodType = '') and ((Kind = kSUB) or (Kind = kFUNCTION)) and Assigned(NameNode) and
+     (Pos('~', NameNode.ValueUpper) = 0) then
+  begin
+    NoteProcNameSeen(FNsPrefix + '|' + NameNode.ValueUpper, SaidOverload);
+    // ...and a body is checked against the DECLARE that announced it.
+    if NameNode.Attributes.Values['FUNCPTR'] = '1' then DefRet := '?'
+    else if Kind = kFUNCTION then DefRet := UpperFast(RetTypeName)
+    else DefRet := '';
+    if Result.Attributes.Values['VARIADIC'] = '1' then DefRet := '?';
+    CheckBodyMatchesPrototype(FNsPrefix + '|' + NameNode.ValueUpper, Kind, DefRet, ParamList, NameTok);
+  end;
   RegisterOverloadLabel(Result, NameNode, ParamList, MethodType <> '');
 
   // FreeBASIC module-level constructor/destructor: "Sub name [()] Constructor [priority]" runs before

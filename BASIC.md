@@ -563,9 +563,26 @@ raw bytes.
   that `ReDim` fixed. Two array parameters that differ **only** by `Const`, or whose ranks cannot be
   told apart (one of them unstated), are the **same declaration** — FreeBASIC reports *error 4:
   Duplicated definition* and so do we.
-  ⚠️ Still missing, and refused by FreeBASIC where we accept: a duplicate pair declared with bodiless
-  `Declare`s, and a call that matches **no** array overload or matches two **ambiguously** — we compile
-  it and it fails at run time instead of being refused at compile time.
+  An array is passed **by descriptor**, so no conversion reaches it: a call whose array argument no
+  member takes (another element type — `Integer` and `LongInt` are two — or another stated rank) is
+  refused at compile time with *No matching overloaded function*, and an array whose rank is not
+  stated, passed to members that differ only by rank, with *Ambiguous call* — as FreeBASIC does, and
+  also when the set is declared with bodiless `Declare`s only. When exactly one member takes the
+  array, that member is called (an array of record `U` reaches `f(a() As U)`, not `f(a() As T)`).
+  **Declarations follow FreeBASIC's rules too.** A name declared a second time — by another
+  `Declare`, identical or not, or by a `Declare` after its own body — is *error 4: Duplicated
+  definition* unless the name is an **overload set**, and what makes it one is its **first**
+  appearance saying `Overload`. Inside a set, two `Declare`s FreeBASIC calls the same declaration are
+  the same error, and a variadic member is refused. A `#undef` of the name retires it, as in FreeBASIC,
+  and it may then be declared again. A body must say what its `Declare` said: the same parameter
+  types, passing modes, `Const`, array ranks (`a()` is not `a(Any)` here), parameter count and return
+  type (*Type mismatch*, *Argument count mismatch*, *Return type here does not match DECLARE
+  prototype*); parameter names and defaults may differ. A **default written only on the `Declare`**
+  applies to calls of the body.
+  ⚠️ Still accepted where FreeBASIC refuses: a variable and a procedure `Declare` of the same name; a
+  repeated `Declare` of a name that a `#undef` retired anywhere in the program; and, because type
+  aliases are resolved after this check, a body whose parameter types differ from its `Declare` only
+  through a type that is not a builtin one.
   ⛔ A pointer argument is matched by its *declared* type, so it has to be a variable or a parameter;
   an expression whose pointer type cannot be derived matches any pointer overload, and is taken only
   when exactly one fits.
