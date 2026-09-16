@@ -988,6 +988,8 @@ type
     function InlineArrayDims(UDTIdx, FieldIdx: Integer; out Lbs, Ubs: TInt64Array): Integer;
     function InlineMemberArrayElem(ArrAccessNode: TASTNode; out RecVal: TSSAValue; out Enc: Int64;
                                    out ElemBank: TSSARegisterType): Boolean;
+    function RawMemberArrayElemAddr(ArrAccessNode: TASTNode; out Addr: TSSAValue; out Code: Integer;
+      out Bank: TSSARegisterType): Boolean;   // "p->m(i)" over raw memory, a scalar element (DIVERGENZE 477)
     function EmitInlineMemberArrayLoad(ArrAccessNode: TASTNode; out Res: TSSAValue): Boolean;
     function EmitInlineMemberArrayStore(ArrAccessNode, ExprNode: TASTNode): Boolean;
     function EmitInlineMemberArrayAddr(ArrAccessNode: TASTNode; out Res: TSSAValue): Boolean;
@@ -4124,7 +4126,10 @@ begin
       // type name may stand.
       if (Node.GetChild(0).NodeType = antIdentifier) and (Node.GetChild(0).ChildCount = 0) and
          (FindUDT(Node.GetChild(0).ValueUpper) >= 0) and
-         (VarRecordTypeName(VarToStr(Node.GetChild(0).Value)) = '') then
+         (VarRecordTypeName(VarToStr(Node.GetChild(0).Value)) = '') and
+         // ⛔ ...and not a VARIABLE of another kind that shares the type's name: "Dim As E Ptr e" then
+         // "Cast(Long Ptr, e)" built a default E and cast THAT (DIVERGENZE 439, crt/open/c06).
+         (not IsDeclaredVariable(VarToStr(Node.GetChild(0).Value))) then
       begin
         ExprList2 := TASTNode.Create(antExpressionList, Node.GetChild(0).Token);
         try
@@ -12114,6 +12119,15 @@ begin
   // by EmitRecordInit). p is NOT marked raw (see CollectRawPtrVars), so it stays a managed handle. Scalar
   // /byte pointees keep the raw byte-heap path below. REALLOCATE of a UDT pointer stays raw (rare).
   LhsRecType := PointerUDTType(VarName);
+  // ⛔ ...unless the pre-scan has ALREADY marked p raw: "calloc" of crt.bi is a C call (DIVERGENZE 239), so
+  // every field access through p reads bytes, and a block of records here was read as bytes - "Raw pointer
+  // dereference out of bounds ... > 0 bytes" on the first field (DIVERGENZE 439). The two decisions are one.
+  // ⚠️ The wider rule - every POD "T Ptr = CAllocate" raw in the fb mode - was tried on 16 Sep 2026 and
+  // WITHDRAWN: the raw mark is per NAME and per scope, and the value flows into parameters, record copies
+  // and member arrays that keep the managed path (nine corpus guards). In fb a record handle has to
+  // BECOME an address instead (job/markdown/FASE3-INVENTARIO.md).
+  if (LhsRecType <> '') and (RawUDTPtrType(VarName) <> '') then
+    LhsRecType := '';
   // "p = Reallocate(p, n * SizeOf(T))" where p is a MANAGED block of UDT records. It used to take the
   // RAW path below, which read the managed handle as a byte offset - proguide/dynamicmemory printed its
   // first line and died on an access violation. The block is records, so the resize is a record
@@ -27062,7 +27076,37 @@ begin
   SGrpCur := 0; SGrpOfs := 0;
   SetLength(Offsets, 0); TotalSize := 0;
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
-  if FUDTs[UDTIdx].IsUnion then Exit;
+  // ⭐ A WHOLE-TYPE UNION HAS A C IMAGE TOO (DIVERGENZE 439). "e->u.m.meta" over C's bytes,
+  // with "u As U" and "Union U", declined here and the managed record path took the address for a
+  // handle: "Invalid record-field pointer". Every alternative starts at 0; a member of an anonymous
+  // "Type" run inside the union follows its siblings, and the live layout has already placed exactly
+  // that (UDTShapeOf reads the same offsets for the SIZE, which is what bi_layout checks against fbc).
+  // ⚠️ Only where the live offset IS the C offset: a member that keeps a handle (a variable-length
+  // String, a nested record with no image) and an array inside an anonymous run decline, as before.
+  if FUDTs[UDTIdx].IsUnion then
+  begin
+    n := Length(FUDTs[UDTIdx].Fields);
+    if n = 0 then Exit;
+    SetLength(Offsets, n);
+    for i := 0 to n - 1 do
+      with FUDTs[UDTIdx].Fields[i] do
+      begin
+        if ((NestedType <> '') and not NestedMemberShape(NestedType, False, Sz2, Al2)) or
+           ((Bank = srtString) and (StrCapacity <= 0)) then Exit;
+        if IsArray then
+        begin
+          if (StructGroup <> 0) or not UDTFieldArrayShape(UDTIdx, i, Cnt, EB, True) then Exit;
+          Offsets[i] := 0;
+        end
+        else if StructGroup = 0 then
+          Offsets[i] := 0
+        else
+          Offsets[i] := ByteOffset;
+      end;
+    if (not UDTShapeOf(UDTIdx, True, Sz, Al)) or (Sz <= 0) then Exit;
+    TotalSize := Sz;
+    Exit(True);
+  end;
   n := Length(FUDTs[UDTIdx].Fields);
   SetLength(Offsets, n);
   MaxAl := 1; Ofs := 0;
@@ -33843,13 +33887,85 @@ begin
   EmitInstruction(ssaRefAddrField, View, EnsureIntRegister(R), MakeSSAValue(svkNone), MakeSSAConstInt(E));
 end;
 
+function TSSAGenerator.RawMemberArrayElemAddr(ArrAccessNode: TASTNode; out Addr: TSSAValue; out Code: Integer;
+  out Bank: TSSARegisterType): Boolean;
+// "p->m(i)" where p holds a RAW ADDRESS and m is a one-dimensional array member of SCALARS: the element is
+// bytes at base + the member's C-layout offset + (i - lbound) * its width, read and written at that width.
+// ⛔ DIVERGENZE 477: the raw resolver knew "p->m(i).field" (an array of RECORDS, 293) and nothing about a
+// scalar element, so "wp->b(0)" on a struct malloc'd by C took the managed record path and died on
+// "Invalid record handle" - the same shape as every other rung of ResolveRawUDTBase before it existed.
+// Declines (leaving the managed path alone) for anything but one index into a fixed scalar member.
+var
+  MemberNode, IdxN: TASTNode;
+  TypeName: string;
+  U, FI, k, n: Integer;
+  Offsets, Lbs, Ubs: TInt64Array;
+  TotalSize, Cnt, EB: Int64;
+  BaseNode, IdxNode, ChainNode: TASTNode;
+  FieldAddr, IV, Lin, Prod: TSSAValue;
+begin
+  Result := False;
+  Addr := MakeSSAValue(svkNone); Code := RTC_I64; Bank := srtInt;
+  if (ArrAccessNode = nil) or (ArrAccessNode.NodeType <> antArrayAccess) or (ArrAccessNode.ChildCount < 2) then Exit;
+  MemberNode := ArrAccessNode.GetChild(0);
+  if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
+  IdxN := ArrAccessNode.GetChild(1);
+  if (IdxN = nil) or (IdxN.ChildCount <> 1) then Exit;
+  if not ResolveRawUDTBase(MemberNode.GetChild(0), TypeName, U, Offsets, TotalSize,
+                           BaseNode, IdxNode, ChainNode) then Exit;
+  FI := -1;
+  for k := 0 to High(FUDTs[U].Fields) do
+    if UpperFast(FUDTs[U].Fields[k].Name) = MemberNode.ValueUpper then begin FI := k; Break; end;
+  if (FI < 0) or (FI > High(Offsets)) then Exit;
+  with FUDTs[U].Fields[FI] do
+    if (not IsArray) or (ArrayElemType <> '') or (ArrayElemBank = srtString) then Exit;
+  if not UDTFieldArrayShape(U, FI, Cnt, EB, True) then Exit;
+  n := InlineArrayDims(U, FI, Lbs, Ubs);
+  if n <> 1 then Exit;
+  if FUDTs[U].Fields[FI].ArrayElemPtrPointee <> '' then Code := RTC_PTR64
+  else Code := RawTypeCodeOfPointee(CanonicalType(FUDTs[U].Fields[FI].ArrayElemScalarType));
+  Bank := FUDTs[U].Fields[FI].ArrayElemBank;
+  if (Bank = srtFloat) and (Code <> RTC_SINGLE) then Code := RTC_DOUBLE;
+  FieldAddr := EmitRawUDTFieldAddr(BaseNode, IdxNode, ChainNode, TotalSize, Offsets[FI]);
+  ProcessExpression(IdxN.GetChild(0), IV);
+  if IV.Kind = svkConstFloat then IV := MakeSSAConstInt(Trunc(IV.ConstFloat));
+  IV := EnsureIntRegister(IV);
+  Lin := IV;
+  if Lbs[0] <> 0 then
+  begin
+    Lin := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaSubInt, Lin, IV, EnsureIntRegister(MakeSSAConstInt(Lbs[0])), MakeSSAValue(svkNone));
+  end;
+  Prod := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaMulInt, Prod, Lin, EnsureIntRegister(MakeSSAConstInt(EB)), MakeSSAValue(svkNone));
+  Addr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, Addr, EnsureIntRegister(FieldAddr), Prod, MakeSSAValue(svkNone));
+  Result := True;
+end;
+
 function TSSAGenerator.EmitInlineMemberArrayLoad(ArrAccessNode: TASTNode; out Res: TSSAValue): Boolean;
 var
   R: TSSAValue;
   E: Int64;
   B: TSSARegisterType;
+  RC: Integer;
 begin
   Res := MakeSSAValue(svkNone);
+  // Over raw memory the element is bytes (DIVERGENZE 477).
+  if RawMemberArrayElemAddr(ArrAccessNode, R, RC, B) then
+  begin
+    if B = srtFloat then
+    begin
+      Res := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+      EmitInstruction(ssaRawLoadFloat, Res, R, MakeSSAValue(svkNone), MakeSSAConstInt(RC));
+    end
+    else
+    begin
+      Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRawLoadInt, Res, R, MakeSSAValue(svkNone), MakeSSAConstInt(RC));
+    end;
+    Exit(True);
+  end;
   // A record element's value is the record - its view (DIVERGENZE 389).
   if InlineRecordArrayElemUDT(ArrAccessNode) >= 0 then
     Exit(InlineMemberRecordElem(ArrAccessNode, Res));
@@ -33872,9 +33988,19 @@ var
   R, V: TSSAValue;
   E: Int64;
   B: TSSARegisterType;
-  EU: Integer;
+  EU, RC: Integer;
   SrcT: string;
 begin
+  // Over raw memory the element is bytes (DIVERGENZE 477): the address first, then the value.
+  if RawMemberArrayElemAddr(ArrAccessNode, R, RC, B) then
+  begin
+    ProcessExpression(ExprNode, V);
+    if B = srtFloat then
+      EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), R, EnsureFloatRegister(V), MakeSSAConstInt(RC))
+    else
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), R, EnsureIntRegister(V), MakeSSAConstInt(RC));
+    Exit(True);
+  end;
   // "obj.m(i) = rec" on a record element (DIVERGENZE 389) COPIES the record into the element's bytes, as
   // fbc does - the element is a place, and there is no handle in it to point elsewhere.
   EU := InlineRecordArrayElemUDT(ArrAccessNode);

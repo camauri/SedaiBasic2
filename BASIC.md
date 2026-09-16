@@ -3754,8 +3754,6 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
 - **Headers for old library versions are not supported**: `png12.bi`, `png14.bi`, `png15.bi` and `gif_lib4.bi` describe
   libpng 1.2/1.4/1.5 and giflib 4. The headers are accepted, but the libraries a current system installs (libpng 1.6,
   giflib 5) refuse them or have a different ABI, under FreeBASIC too. Use `png16.bi` and `gif_lib5.bi`.
-- ⚠️ **A block from `calloc` in `crt.bi`, read before anything is written to it, stops the program** with "Raw pointer
-  dereference out of bounds". Writing a field first and then reading it works.
 - ⚠️ **An address the program gives to C and C hands back LATER is not the same pointer again.** After
   `set_user_data(x, @v)`, the pointer C answers in a later call reads the right value but does not compare equal to
   `@v`, and a callback that receives `@v` as its user data cannot read through it. A pointer C returns in the same call
