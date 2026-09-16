@@ -65,6 +65,7 @@ type
     // name = an ordinary numeric FOR.
     IterType: string;           // T, or '' when this is not a type-driven loop
     IterHasStep: Boolean;       // the source wrote STEP, so the one-argument operators are used
+    IterExitLabel: string;      // the block that holds the "Operator Next" exit branch (the call splits CondLabel)
     CounterScoped: Boolean;     // "For i As T": the counter got a scope frame of its own, popped at NEXT
     // ...and what the counter's NAME meant in the flat width / print-form maps BEFORE the head wrote
     // over it (-1 = it had no entry). Those maps are keyed by bare name and outlive the scope frame,
@@ -536,6 +537,8 @@ type
     FModernMode: Boolean;                // FB scope: True = MODERN (lexical scope); False = CLASSIC (global-by-name)
     FNativeMemory: Boolean;              // memory mode fb (True) or strict (False) - SedaiMemoryMode; phase 0: carried, not yet read
     FRecNativeKnob: Boolean;             // phase 3.2: native records in the fb mode; SB_RECNATIVE=0 turns them off (A/B)
+    FRecNativeMethods: Boolean;          // phase 3.6: a type with METHODS can be native too; SB_RECNATIVE_METHODS=0 is the A/B
+    FRecNativeCtors: Boolean;            // phase 3.6b: ...and one with a CONSTRUCTOR or DESTRUCTOR (SB_RECNATIVE_CTORS)
     FNativeRecAsking: TStringList;       // phase 3.2: the types NativeRecordType is answering right now (a list's own pointer)
     // Phase 2.1a: the program's entry block, and where in it a raw module cell's allocation is hoisted (HoistToEntry) -
     // after the SHARED backings are sized and BEFORE static members, hoisted STATIC initialisers and module constructors.
@@ -901,8 +904,11 @@ type
     procedure EmitRecordBlockInit(const FirstHandle, CountVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
     procedure EmitRecordBlockInitFrom(const FirstHandle, StartVal, CountVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
     function UDTBlockIsManaged(const TypeName: string): Boolean;
+    function UDTRecordsAreHandles(const TypeName: string): Boolean;   // managed AND not native: a value is a handle
     function NativeRecordType(const TypeName: string): Boolean;   // phase 3.2: every value of T is a machine address
     procedure RecNativeStamp(OpCode: TSSAOpCode; var Src1, Src2, Src3: TSSAValue);   // phase 3.2: mark a native allocation
+    procedure EmitRecordBlockDelete(const FirstHandle: TSSAValue; const TypeName: string);   // Delete[] of a New T[n] block
+    procedure EmitNativeImageCopy(const DstAddr, SrcAddr: TSSAValue; Bytes: Int64);   // phase 3.6: a native record copy
     procedure EmitRecordBlockCtorDtor(const FirstHandle, CountVal: TSSAValue;
                                       const TypeName: string; Construct: Boolean);  // init each of N records  // alloc nested records
     procedure EmitRecordArrayInit(ArrayIdx, UDTIdx: Integer);  // per-element EmitRecordInit over a DIM'd array-of-UDT
@@ -1312,6 +1318,7 @@ type
     function IsSingleExprUncached(Node: TASTNode): Boolean;                     // SINGLE-typed value (7-digit print)
     procedure EmitIntToFloat(const Dest, Src: TSSAValue; SrcNode: TASTNode;
                              ToSingle: Boolean = False);   // Src3 bits: 1=unsigned src, 2=to binary32
+    procedure ProcessEnumMembers(Node: TASTNode);   // an ENUM statement: its members, as folded constants
     function FoldEnumMemberExpr(Node: TASTNode; const EnumName: string; out V: Int64): Boolean;
     function TryFoldEnumMemberName(const NameU: string; out V: Int64): Boolean;  // a BARE enum member's compile-time value
     function ApplyNarrowCode(W: Integer; Value: TSSAValue; SrcNode: TASTNode = nil): TSSAValue;  // narrow by an explicit width code
@@ -1388,6 +1395,8 @@ type
     procedure ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
                                 ArgsNode: TASTNode; out Result: TSSAValue; ForceStatic: Boolean = False;
                                 WantAddress: Boolean = False);   // BYREF result: keep the ADDRESS (lvalue use)
+    procedure ProcessMethodCallOn(ObjNode: TASTNode; const ObjType, MethNm: string;
+                                  ArgsNode: TASTNode; out Result: TSSAValue; ForceStatic, WantAddress: Boolean);
     function TryStaticMethodCall(ObjNode: TASTNode; const MethNm: string;     // TypeName.method(args) (static member, no instance)
                                  ArgsNode: TASTNode; out CallResult: TSSAValue): Boolean;
     // Map parameter at Index (within ParamList) to its transfer-bank type and per-bank slot.
@@ -1892,6 +1901,8 @@ begin
   inherited Create;
   RecMarkCallsAllocate;             // force the gate read before the first EmitInstruction
   FRecNativeKnob := GetEnvironmentVariable('SB_RECNATIVE') <> '0';   // phase 3.2: on by default; =0 is the A/B
+  FRecNativeMethods := GetEnvironmentVariable('SB_RECNATIVE_METHODS') <> '0';   // phase 3.6: same, for types with methods
+  FRecNativeCtors := GetEnvironmentVariable('SB_RECNATIVE_CTORS') <> '0';         // phase 3.6b: on by default; =0 is the A/B
   FProgram := nil;
   FCurrentBlock := nil;
   FLabelCounter := 0;
@@ -18755,6 +18766,7 @@ begin
   LoopInfo.ContUsed := False;
   LoopInfo.IterType := TypeName;
   LoopInfo.IterHasStep := HasStep;
+  LoopInfo.IterExitLabel := '';
   SetLength(FLoopStack, Length(FLoopStack) + 1);
   FLoopStack[High(FLoopStack)] := LoopInfo;
 
@@ -18777,6 +18789,11 @@ begin
   // The branch may have been emitted further down the chain than CondBlock (an argument expression can
   // open blocks of its own) - take the edge from where we actually are. See ProcessDoLoop's note.
   CondBlock := FCurrentBlock;
+  // ...and the EXIT edge leaves from the same block. It used to be added to CondLabel at the Next, which the call to
+  // "Operator Next" has already split: the head block then had a successor it never jumps to, and the SUB inliner, which
+  // takes the call's continuation from those successors, sent the operator's return to the loop's end (phase 3.6 made
+  // the operators inlinable - a For over a type with operators ran zero times).
+  FLoopStack[High(FLoopStack)].IterExitLabel := CondBlock.LabelName;
   FCurrentBlock := FProgram.CreateBlock(BodyLabel);
   BodyBlock := FCurrentBlock;
   CondBlock.AddSuccessor(BodyBlock);
@@ -19312,6 +19329,7 @@ begin
   LoopInfo.ContUsed := False;
   LoopInfo.IterType := '';
   LoopInfo.IterHasStep := False;
+  LoopInfo.IterExitLabel := '';
   LoopInfo.CounterScoped := CounterScoped;   // "For i As T": pop the counter's frame at NEXT
   LoopInfo.CounterName := CtrKey;            // ...and put the NAME's facts back with it (DIVERGENZE 99)
   LoopInfo.CounterProc := CtrProc;
@@ -19710,7 +19728,10 @@ begin
       CondBlock.AddPredecessor(BodyBlock);
     end;
     EndBlock := FProgram.CreateBlock(LoopInfo.EndLabel);
-    CondBlock := FProgram.FindBlock(LoopInfo.CondLabel);
+    if LoopInfo.IterExitLabel <> '' then
+      CondBlock := FProgram.FindBlock(LoopInfo.IterExitLabel)
+    else
+      CondBlock := FProgram.FindBlock(LoopInfo.CondLabel);
     if Assigned(CondBlock) then
     begin
       CondBlock.AddSuccessor(EndBlock);
@@ -26890,7 +26911,7 @@ begin
   T := UpperFast(CanonicalType(Trim(Copy(T, 1, Length(T) - 4))));
   if Pos(' PTR', T) > 0 then Exit;            // "T Ptr Ptr" is not this rung
   if FindUDT(T) < 0 then Exit;
-  if UDTBlockIsManaged(T) then Exit;          // records this compiler owns, not C's bytes
+  if UDTRecordsAreHandles(T) then Exit;          // records this compiler owns, not C's bytes
   Result := T;
 end;
 
@@ -27650,7 +27671,7 @@ begin
   // "New T[n]" gave a block of RECORDS and the value is a HANDLE: the next index is "handle + j", not
   // "base + j*SizeOf(T)", and the field is a record slot rather than a byte offset. Decline here and let
   // ResolveRecordObject own the shape, or the stride would turn a handle into a wild address.
-  if (FindUDT(BasePointee) >= 0) and UDTBlockIsManaged(BasePointee) then Exit;
+  if (FindUDT(BasePointee) >= 0) and UDTRecordsAreHandles(BasePointee) then Exit;
   Stride := RawChainElemBytes(BasePointee);
   if Stride <= 0 then Exit;
   Addr := EnsureIntRegister(BaseVal);
@@ -27842,7 +27863,7 @@ begin
   begin
     TypeName := RawChainElemType(ObjNode);
     if TypeName = '' then Exit;
-    if UDTBlockIsManaged(TypeName) then Exit;   // records, not bytes: ResolveRecordObject owns it
+    if UDTRecordsAreHandles(TypeName) then Exit;   // records, not bytes: ResolveRecordObject owns it
     UDTIdx := FindUDT(TypeName);
     if UDTIdx < 0 then Exit;
     if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then Exit;
@@ -27944,7 +27965,7 @@ begin
       if TypeName <> '' then
       begin
         UDTIdx := FindUDT(TypeName);
-        if (UDTIdx >= 0) and (not UDTBlockIsManaged(TypeName)) and
+        if (UDTIdx >= 0) and (not UDTRecordsAreHandles(TypeName)) and
            UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) and (TotalSize > 0) then
           Exit(True);
       end;
@@ -27969,7 +27990,7 @@ begin
   begin
     TypeName := UpperFast(CanonicalType(RawUDTArithType(ObjNode)));
     UDTIdx := FindUDT(TypeName);
-    if (UDTIdx >= 0) and (not UDTBlockIsManaged(TypeName)) and
+    if (UDTIdx >= 0) and (not UDTRecordsAreHandles(TypeName)) and
        UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) and (TotalSize > 0) then
     begin
       BaseNode := ObjNode;
@@ -28013,13 +28034,15 @@ begin
       // "a->klass->type" did not. The run-time tag test of DIVERGENZE 259 cannot stand in for this rung:
       // the loaded address carries no tag, so inside a SUB or a callback its test chose the managed record
       // path. Here the base of the access is the member access itself, evaluated once.
+      // ⚠️ A native container (phase 3.6) has no managed path to fall back on - its value IS an address - so a
+      // construction "UDT2(u).px->i" is taken here too; the base is evaluated once (EmitRawUDTFieldAddr).
       if (MemIdx >= 0) and (MemIdx <= High(OuterOfs)) and (not FUDTs[OuterIdx].Fields[MemIdx].IsArray) and
          (FUDTs[OuterIdx].Fields[MemIdx].NestedType = '') and (FUDTs[OuterIdx].Fields[MemIdx].PtrPointee <> '') and
-         SideEffectFreeObject(ObjNode) then
+         (SideEffectFreeObject(ObjNode) or NativeRecordType(OuterName)) then
       begin
         TypeName := UpperFast(CanonicalType(FUDTs[OuterIdx].Fields[MemIdx].PtrPointee));
         UDTIdx := FindUDT(TypeName);
-        if (UDTIdx >= 0) and (not UDTBlockIsManaged(TypeName)) and
+        if (UDTIdx >= 0) and (not UDTRecordsAreHandles(TypeName)) and
            UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) and (TotalSize > 0) then
         begin
           BaseNode := ObjNode;
@@ -28093,7 +28116,7 @@ begin
     begin
       TypeName := UpperFast(CanonicalType(Trim(Copy(CastT, 1, Length(CastT) - 4))));
       UDTIdx := FindUDT(TypeName);
-      if (UDTIdx >= 0) and (not UDTBlockIsManaged(TypeName)) and
+      if (UDTIdx >= 0) and (not UDTRecordsAreHandles(TypeName)) and
          UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) and (TotalSize > 0) then
       begin
         BaseNode := CastNode;
@@ -28114,6 +28137,14 @@ begin
             (ObjNode.GetChild(0).NodeType = antIdentifier) and
             (ArrayIndexOf(ObjNode.GetChild(0).ValueUpper) >= 0) then
       CastT := ArrayRecordTypeOf(ObjNode.GetChild(0).ValueUpper);
+    // ...and "T(args)" / "Type<T>(args)", a CONSTRUCTION of a native type (phase 3.6): its value is the new image's
+    // address. "With UDT2( UDT( 123 ) ) : .px->alive" took the managed path with that address for a handle.
+    if (CastT = '') and (ObjNode.NodeType = antArrayAccess) and (ObjNode.Attributes.Values['BRACKET'] <> '1') and
+       (ObjNode.ChildCount >= 1) and (ObjNode.GetChild(0) <> nil) and
+       (ObjNode.GetChild(0).NodeType = antIdentifier) and
+       (ArrayIndexOf(ObjNode.GetChild(0).ValueUpper) < 0) and (FindUDT(ObjNode.GetChild(0).ValueUpper) >= 0) and
+       (VarRecordTypeName(ObjNode.GetChild(0).ValueUpper) = '') then
+      CastT := ObjNode.GetChild(0).ValueUpper;
     if (CastT <> '') and NativeRecordType(CastT) then
     begin
       TypeName := UpperFast(CanonicalType(CastT));
@@ -34114,8 +34145,16 @@ var
   R: TSSAValue;
   E: Int64;
   B: TSSARegisterType;
+  RC: Integer;
 begin
   Res := MakeSSAValue(svkNone);
+  // Over raw memory - C's, or a native record's (phase 3.6: "Return this.v(i)" of a ByRef operator) - the element is
+  // bytes, and its address is a machine address, as the load and store beside this already answer (DIVERGENZE 477).
+  if RawMemberArrayElemAddr(ArrAccessNode, R, RC, B) then
+  begin
+    Res := R;
+    Exit(True);
+  end;
   // "@obj.m(i)" of a record element is the element - its view - which is what "p->field" reads (389).
   if InlineRecordArrayElemUDT(ArrAccessNode) >= 0 then
     Exit(InlineMemberRecordElem(ArrAccessNode, Res));
@@ -34188,6 +34227,47 @@ begin
     end;
   end;
   Result := EnsureIntRegister(MakeSSAConstInt(Answer(d)));
+end;
+
+procedure TSSAGenerator.EmitNativeImageCopy(const DstAddr, SrcAddr: TSSAValue; Bytes: Int64);
+// Copy the C image of a native record (phase 3.6): up to 256 bytes as 8/4/2/1-byte raw moves at the address plus the
+// offset - the ops the C hot loop, the AOT and the JIT run natively - and past that as one block copy.
+var
+  D, S, T, DA, SA: TSSAValue;
+  P: Int64;
+
+  function At(const Base: TSSAValue; Ofs: Int64): TSSAValue;
+  begin
+    if Ofs = 0 then Exit(Base);
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, Result, Base, EnsureIntRegister(MakeSSAConstInt(Ofs)), MakeSSAValue(svkNone));
+  end;
+
+  procedure Move1(Width: Int64; Code: Integer);
+  begin
+    SA := At(S, P);
+    DA := At(D, P);
+    T := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRawLoadInt, T, SA, MakeSSAValue(svkNone), MakeSSAConstInt(Code));
+    EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), DA, T, MakeSSAConstInt(Code));
+    P := P + Width;
+  end;
+
+begin
+  if Bytes <= 0 then Exit;
+  D := EnsureIntRegister(DstAddr);
+  S := EnsureIntRegister(SrcAddr);
+  if Bytes > 256 then
+  begin
+    EmitInstruction(ssaRawMemCopy, MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt)), D, S,
+                    EnsureIntRegister(MakeSSAConstInt(Bytes)));
+    Exit;
+  end;
+  P := 0;
+  while Bytes - P >= 8 do Move1(8, RTC_I64);
+  if Bytes - P >= 4 then Move1(4, RTC_U32);
+  if Bytes - P >= 2 then Move1(2, RTC_U16);
+  if Bytes - P >= 1 then Move1(1, RTC_U8);
 end;
 
 procedure TSSAGenerator.EmitRecBytesCopy(const DstRec, SrcRec: TSSAValue; ByteOfs, Bytes: Int64);
@@ -39532,6 +39612,14 @@ begin
   if (Idx >= 0) and (not UDTCLayoutRaw(Idx, Offsets, Total)) then Result := True;
 end;
 
+function TSSAGenerator.UDTRecordsAreHandles(const TypeName: string): Boolean;
+// The REPRESENTATION question the raw-path gates ask - "is a value of this type a record handle rather than bytes?" -
+// kept apart from UDTBlockIsManaged's "is there code to run per element?". Until phase 3.6 the two answers coincided; a
+// NATIVE type with a constructor or destructor has code to run AND is bytes (h.p->v with p a pointer to such a type).
+begin
+  Result := UDTBlockIsManaged(TypeName) and not NativeRecordType(TypeName);
+end;
+
 procedure TSSAGenerator.RecNativeStamp(OpCode: TSSAOpCode; var Src1, Src2, Src3: TSSAValue);
   function TypeIdIsNative(Id: Int64): Boolean;
   begin
@@ -39577,11 +39665,16 @@ begin
   Idx := FindUDT(T);
   if Idx < 0 then Exit;
   if FUDTs[Idx].Parent <> '' then Exit;                      // a type id, a base
+  // ...and an IMPLEMENTS clause is a base too: a call through the interface dispatches on the record's type id.
+  if Assigned(FUDTs[Idx].Node) and (FUDTs[Idx].Node.Attributes.Values['IMPLEMENTS'] <> '') then Exit;
   for k := 0 to High(FUDTs) do                               // ...or a base OF another type: a cast would mix the two
     if SameText(FUDTs[k].Parent, FUDTs[Idx].Name) then Exit;
   if FUDTs[Idx].NStr <> 0 then Exit;                         // a String lives outside the image (phase 5)
-  if UDTBlockIsManaged(T) or TypeHasMemberProc(T) then Exit;
-  if FMemberOwnerTypes.IndexOf(T) >= 0 then Exit;
+  // A constructor or destructor to run per element: native since phase 3.6b (SB_RECNATIVE_CTORS=0 keeps such types managed).
+  if UDTBlockIsManaged(T) and not (FRecNativeMethods and FRecNativeCtors) then Exit;
+  // ⭐ Phase 3.6: a METHOD takes the address as its THIS - "This" resolves to the owner type (VarRecordTypeName), so its
+  // fields go the raw way like any other variable of the type. SB_RECNATIVE_METHODS=0 keeps such types managed (A/B).
+  if (not FRecNativeMethods) and (TypeHasMemberProc(T) or (FMemberOwnerTypes.IndexOf(T) >= 0)) then Exit;
   // ...nor a STATIC member: "T.counter" names a shared backing, and with T native the member access read the type name
   // as a record variable (d252/static_shared_member printed an address).
   for k := 0 to FStaticMembers.Count - 1 do
@@ -39615,6 +39708,29 @@ begin
   end;
 end;
 
+procedure TSSAGenerator.EmitRecordBlockDelete(const FirstHandle: TSSAValue; const TypeName: string);
+// "Delete[] p" of a block "New T[n]" made, T with a constructor or destructor: one destructor per element, then the storage.
+// ⭐ Phase 3.6: a NATIVE block is what fbc allocates - the element count in the UInteger in FRONT of the images, and ONE
+// libc block (see EmitNewObject) - so the count is read at p - 8 and the block freed from there. A managed block keeps
+// its count on its first record (ssaRecordBlockLen) and frees record by record.
+var
+  H, CountReg, BaseReg: TSSAValue;
+begin
+  H := EnsureIntRegister(FirstHandle);
+  CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  if NativeRecordType(TypeName) then
+  begin
+    BaseReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaSubInt, BaseReg, H, EnsureIntRegister(MakeSSAConstInt(8)), MakeSSAValue(svkNone));
+    EmitInstruction(ssaRawLoadInt, CountReg, BaseReg, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_I64));
+    EmitRecordBlockCtorDtor(H, CountReg, TypeName, False);
+    EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), BaseReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
+  EmitInstruction(ssaRecordBlockLen, CountReg, H, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  EmitRecordBlockCtorDtor(H, CountReg, TypeName, False);
+end;
+
 procedure TSSAGenerator.EmitRecordBlockCtorDtor(const FirstHandle, CountVal: TSSAValue;
   const TypeName: string; Construct: Boolean);
 // Run the default CONSTRUCTOR (Construct) or the DESTRUCTOR (not Construct) on each of the N
@@ -39629,6 +39745,10 @@ var
   Hi, CounterVar, LimitReg, CmpReg: TSSAValue;
   CondLabel, BodyLabel, EndLabel, CounterName: string;
   PrevBlock, CondBlock, BodyBlock, EndBlock: TSSABasicBlock;
+  Native: Boolean;
+  Stride: Int64;
+  k: Int64;
+  IdxVal, Last: TSSAValue;
 
   procedure OneElement(const H: TSSAValue);
   begin
@@ -39637,16 +39757,32 @@ var
     else
     begin
       EmitDestructorCall(H, TypeName);
-      EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), EnsureIntRegister(H),
-                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // A native block is ONE allocation, released once by EmitRecordBlockDelete.
+      if not Native then
+        EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), EnsureIntRegister(H),
+                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     end;
   end;
 
+  // Element i: handle + i for managed records, image + i * SizeOf(T) for a native block (phase 3.6).
+  function Scaled(const IdxVal: TSSAValue): TSSAValue;
+  begin
+    if not Native then Exit(IdxVal);
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaMulInt, Result, EnsureIntRegister(IdxVal), EnsureIntRegister(MakeSSAConstInt(Stride)),
+                    MakeSSAValue(svkNone));
+  end;
+
 begin
+  Native := NativeRecordType(TypeName);
+  Stride := 0;
+  if Native then Stride := FUDTs[FindUDT(TypeName)].LiveBytes;
   if (CountVal.Kind = svkConstInt) and (CountVal.ConstInt <= UNROLL_MAX) then
   begin
-    for i := 0 to CountVal.ConstInt - 1 do
+    for k := 0 to CountVal.ConstInt - 1 do
     begin
+      // ⭐ Destruction runs BACKWARDS, as fbc's does (Delete[], Erase and a local array alike: "d 3 d 2 d 1").
+      if Construct then i := k else i := CountVal.ConstInt - 1 - k;
       if i = 0 then
         Hi := FirstHandle
       else
@@ -39654,7 +39790,7 @@ begin
         Hi := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         // ⚠️ ssaAddInt takes two REGISTERS -- a constant operand is read as R0.
         EmitInstruction(ssaAddInt, Hi, EnsureIntRegister(FirstHandle),
-                        EnsureIntRegister(MakeSSAConstInt(i)), MakeSSAValue(svkNone));
+                        EnsureIntRegister(Scaled(MakeSSAConstInt(i))), MakeSSAValue(svkNone));
       end;
       OneElement(Hi);
     end;
@@ -39684,14 +39820,27 @@ begin
   FCurrentBlock := FProgram.CreateBlock(BodyLabel);
   BodyBlock := FCurrentBlock;
   CondBlock.AddSuccessor(BodyBlock); BodyBlock.AddPredecessor(CondBlock);
+  // Destruction counts down: element (count - 1 - counter).
+  if Construct then
+    IdxVal := GetOrAllocateVariable(CounterName)
+  else
+  begin
+    Last := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaSubInt, Last, LimitReg, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+    IdxVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaSubInt, IdxVal, Last, EnsureIntRegister(GetOrAllocateVariable(CounterName)), MakeSSAValue(svkNone));
+  end;
   Hi := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaAddInt, Hi, EnsureIntRegister(FirstHandle),
-                  EnsureIntRegister(GetOrAllocateVariable(CounterName)), MakeSSAValue(svkNone));
+                  EnsureIntRegister(Scaled(IdxVal)), MakeSSAValue(svkNone));
   OneElement(Hi);
   EmitInstruction(ssaAddInt, GetOrAllocateVariable(CounterName),
                   EnsureIntRegister(GetOrAllocateVariable(CounterName)),
                   EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
   EmitInstruction(ssaJump, MakeSSALabel(CondLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  // ⛔ The back edge leaves from where the jump IS: a constructor call split the body, and an edge from the stale body
+  // block made the call block a second latch - strength reduction then advanced its accumulator twice per element.
+  BodyBlock := FCurrentBlock;
   BodyBlock.AddSuccessor(CondBlock); CondBlock.AddPredecessor(BodyBlock);
 
   FCurrentBlock := FProgram.CreateBlock(EndLabel);
@@ -39778,6 +39927,9 @@ begin
                   EnsureIntRegister(GetOrAllocateVariable(CounterName)),
                   EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
   EmitInstruction(ssaJump, MakeSSALabel(CondLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  // ⛔ The back edge leaves from where the jump IS: a constructor call split the body, and an edge from the stale body
+  // block made the call block a second latch - strength reduction then advanced its accumulator twice per element.
+  BodyBlock := FCurrentBlock;
   BodyBlock.AddSuccessor(CondBlock); CondBlock.AddPredecessor(BodyBlock);
 
   FCurrentBlock := FProgram.CreateBlock(EndLabel);
@@ -39963,6 +40115,7 @@ begin
   BodyBlock.AddSuccessor(InitBlock); InitBlock.AddPredecessor(BodyBlock);
   EmitRecordInit(HandleVal, UDTIdx);
   EmitInstruction(ssaJump, MakeSSALabel(IncrLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  InitBlock := FCurrentBlock;   // the init may have called a constructor, which split the block: the edge leaves from here
 
   // incr: counter += 1; loop.
   FCurrentBlock := FProgram.CreateBlock(IncrLabel);
@@ -39992,7 +40145,7 @@ procedure TSSAGenerator.EmitRecordArrayConstruct(ArrayIdx: Integer; const TypeNa
 // list has already constructed with arguments of their own.
 var
   ArrayRef, One, Acc, DimReg, Ub, Lb, Diff, Cnt, NewAcc: TSSAValue;
-  CmpReg, HandleVal, CounterVar: TSSAValue;
+  CmpReg, HandleVal, CounterVar, IdxVal, Last: TSSAValue;
   d, DimCount: Integer;
   CounterName, CondLabel, BodyLabel, IncrLabel, EndLabel: string;
   PrevBlock, CondBlock, BodyBlock, IncrBlock, EndBlock: TSSABasicBlock;
@@ -40056,13 +40209,25 @@ begin
   BodyBlock := FCurrentBlock;
   CondBlock.AddSuccessor(BodyBlock); BodyBlock.AddPredecessor(CondBlock);
   HandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  EmitInstruction(ssaArrayLoad, HandleVal, ArrayRef,
-                  EnsureIntRegister(GetOrAllocateVariable(CounterName)), MakeSSAValue(svkNone));
+  if RunDtor then
+  begin
+    // ⭐ Destruction runs BACKWARDS, as fbc's does ("d 3 d 2 d 1" for a local array and for Erase): element
+    // (count - 1) - (counter - From).
+    IdxVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, IdxVal, Acc, EnsureIntRegister(MakeSSAConstInt(FromFlatIndex - 1)), MakeSSAValue(svkNone));
+    Last := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaSubInt, Last, IdxVal, EnsureIntRegister(GetOrAllocateVariable(CounterName)), MakeSSAValue(svkNone));
+    EmitInstruction(ssaArrayLoad, HandleVal, ArrayRef, Last, MakeSSAValue(svkNone));
+  end
+  else
+    EmitInstruction(ssaArrayLoad, HandleVal, ArrayRef,
+                    EnsureIntRegister(GetOrAllocateVariable(CounterName)), MakeSSAValue(svkNone));
   if RunDtor then
     EmitDestructorCall(HandleVal, TypeName)
   else
     EmitConstructorCall(HandleVal, TypeName, nil);
   EmitInstruction(ssaJump, MakeSSALabel(IncrLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  BodyBlock := FCurrentBlock;   // the call split the body: the edge to the increment leaves from here
 
   FCurrentBlock := FProgram.CreateBlock(IncrLabel);
   IncrBlock := FCurrentBlock;
@@ -41004,6 +41169,9 @@ begin
   if GetEnvironmentVariable('OOP_DYNTYPE') = '0' then Exit;
   u := FindUDT(TypeName);
   if u < 0 then Exit;
+  // A NATIVE type has no base and no derived type (NativeRecordType), so nothing can dispatch on its dynamic type -
+  // and its THIS is an address, with no record storage to stamp (phase 3.6).
+  if NativeRecordType(TypeName) then Exit;
   EmitInstruction(ssaRecordSetTypeId, MakeSSAValue(svkNone), GetOrAllocateVariable('THIS'),
                   MakeSSAValue(svkNone), MakeSSAConstInt(u));
 end;
@@ -42445,6 +42613,91 @@ begin
   i := FEnumQualVals.IndexOfName(EnumName + '.' + NameU);
   if i < 0 then Exit;
   Result := TryStrToInt64(FEnumQualVals.ValueFromIndex[i], V);
+end;
+
+procedure TSSAGenerator.ProcessEnumMembers(Node: TASTNode);
+// ENUM members lower to a sequence of plain assignments (member = value), like CONST.
+// ⛔ ...except one with no storage: nothing reads it, so there is nowhere to write it to.
+// ⛔⛔ AND THE VALUE IS A CONSTANT, FOLDED HERE, never an expression lowered at run time (DIVERGENZE 488). A member with
+// no "=" is written by the parser as "<previous> + 1", and lowering that as an ordinary expression consulted the
+// program's OPERATORS: with "Operator +(ByVal a As thing, ByRef r As foo) As foo" in scope, "two" became the RECORD the
+// operator returned (fbc's overload/implicit_ctor2; its handle happened to be 1 while records were handles). The members
+// of THIS enum already folded are substituted in order - an anonymous enum has no name to key them by - and anything
+// that still does not fold keeps the old path.
+var
+  i, Idx: Integer;
+  Asn, Work: TASTNode;
+  Folded: TStringList;
+  V: Int64;
+
+  procedure Substitute(N: TASTNode);
+  var
+    c, fi: Integer;
+    Ch: TASTNode;
+  begin
+    if N = nil then Exit;
+    for c := 0 to N.ChildCount - 1 do
+    begin
+      Ch := N.GetChild(c);
+      if (Ch <> nil) and (Ch.NodeType = antIdentifier) and (Ch.ChildCount = 0) then
+      begin
+        fi := Folded.IndexOfName(Ch.ValueUpper);
+        if fi >= 0 then
+        begin
+          Ch.NodeType := antLiteral;
+          Ch.Value := StrToInt64Def(Folded.ValueFromIndex[fi], 0);   // an Int64, not its text (see FoldEnumMemberExpr)
+        end;
+      end
+      else
+        Substitute(Ch);
+    end;
+  end;
+
+begin
+  Folded := TStringList.Create;
+  try
+    for i := 0 to Node.ChildCount - 1 do
+    begin
+      Asn := Node.GetChild(i);
+      if Asn.NodeType <> antAssignment then Continue;
+      Work := nil;
+      if (Asn.ChildCount >= 2) and (Asn.GetChild(0).NodeType = antIdentifier) then
+      begin
+        Work := Asn.Clone;
+        if Work.GetChild(1).NodeType = antIdentifier then
+        begin
+          // the value is itself one name: substitute it in place
+          Idx := Folded.IndexOfName(Work.GetChild(1).ValueUpper);
+          if Idx >= 0 then
+          begin
+            Work.GetChild(1).NodeType := antLiteral;
+            Work.GetChild(1).Value := StrToInt64Def(Folded.ValueFromIndex[Idx], 0);
+          end;
+        end
+        else
+          Substitute(Work.GetChild(1));
+        if TryFoldConstIntExpr(Work.GetChild(1), V) then
+        begin
+          Folded.Values[Asn.GetChild(0).ValueUpper] := IntToStr(V);
+          Work.RemoveChildAt(1);
+          Work.AddChild(TASTNode.CreateWithValue(antLiteral, V, Asn.Token));   // attributes travel with the clone
+        end
+        else
+        begin
+          Work.Free;
+          Work := nil;
+        end;
+      end;
+      try
+        if Asn.Attributes.Values['CONSTNOSTORE'] = '1' then Continue;
+        if Work <> nil then ProcessAssignment(Work) else ProcessAssignment(Asn);
+      finally
+        Work.Free;
+      end;
+    end;
+  finally
+    Folded.Free;
+  end;
 end;
 
 function TSSAGenerator.FoldEnumMemberExpr(Node: TASTNode; const EnumName: string;
@@ -46657,7 +46910,7 @@ var
     // ...unless the cell holds a MANAGED block. Then its value is a record HANDLE, and marking the
     // target raw would send "q[j].field" onto the byte heap with a handle for an address.
     ET := Trim(Copy(ET, 1, Length(ET) - 4));
-    Result := not ((FindUDT(ET) >= 0) and UDTBlockIsManaged(ET));
+    Result := not ((FindUDT(ET) >= 0) and UDTRecordsAreHandles(ET));
   end;
 
   function IsRawPtrFieldExpr(Rhs: TASTNode): Boolean;
@@ -46701,7 +46954,7 @@ var
     if FieldT <> '' then
       // ...unless that pointee's blocks are MANAGED: then the field holds a record HANDLE, and marking
       // the target raw would send "q->field" onto the byte heap - the mirror of the accident above.
-      Exit(not UDTBlockIsManaged(FieldT));
+      Exit(not UDTRecordsAreHandles(FieldT));
     // ⭐⭐ ...AND A FIELD DECLARED "<SCALAR> PTR" IS JUST AS RAW, which this rule did not say. It only
     // ever asked about a "<UDT> Ptr" field - and in a C header the common case is the OTHER one:
     // "data as gchar ptr" (GArray), "char *", "void *", "guint8 *". A "Dim As Long Ptr d =
@@ -46789,7 +47042,7 @@ var
           TypeDeclaresAllocOperator(PointerUDTType(TargetU), 'OPERATORNEW') and
           (not TypeHasMemberProc(PointerUDTType(TargetU)))) or
          ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] = '1') and
-          (not UDTBlockIsManaged(PointerUDTType(TargetU)))) then
+          (not UDTRecordsAreHandles(PointerUDTType(TargetU)))) then
         if AddRawUDTPtr(FRawScanProc, TargetU, PointerUDTType(TargetU)) then
         begin
           // ⛔ RAWPTRDIAG had a HOLE here: this is the busiest raw marking in the unit - every UDT
@@ -48870,6 +49123,25 @@ begin
     // destructor at Delete[]. A raw block could run neither: a method's THIS is a record handle, and the
     // bytes of a raw block are not a record. See UDTBlockIsManaged for why the discriminator is that
     // question and not "is it a UDT".
+    if (UDTIdx >= 0) and UDTBlockIsManaged(NewType) and NativeRecordType(NewType) then
+    begin
+      // ⭐ Phase 3.6: fbc's own shape - a UInteger with the element count, then the images, in ONE block; the value is the
+      // address of the first image. calloc zeroes the images (a native type has no field initialisers to run).
+      CheckInstantiable(FUDTs[UDTIdx].Name);
+      CountVal := EnsureIntRegister(CountVal);
+      BytesVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaMulInt, BytesVal, CountVal, EnsureIntRegister(MakeSSAConstInt(FUDTs[UDTIdx].LiveBytes)),
+                      MakeSSAValue(svkNone));
+      ElemVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaAddInt, ElemVal, BytesVal, EnsureIntRegister(MakeSSAConstInt(8)), MakeSSAValue(svkNone));
+      BytesVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRawAlloc, BytesVal, ElemVal, MakeSSAValue(svkNone), MakeSSAConstInt(RAWALLOC_PROGRAM));
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), BytesVal, CountVal, MakeSSAConstInt(RTC_I64));
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaAddInt, Result, BytesVal, EnsureIntRegister(MakeSSAConstInt(8)), MakeSSAValue(svkNone));
+      EmitRecordBlockCtorDtor(Result, CountVal, NewType, True);
+      Exit;
+    end;
     if (UDTIdx >= 0) and UDTBlockIsManaged(NewType) then
     begin
       CheckInstantiable(FUDTs[UDTIdx].Name);
@@ -48963,8 +49235,28 @@ procedure TSSAGenerator.EmitDeleteObject(Node: TASTNode);
 var
   PtrName, PtrType, OpLbl: string;
   HandleReg, CountReg: TSSAValue;
+  Implicit, Rewritten: TASTNode;
 begin
   if Node.ChildCount < 1 then Exit;
+  // ⛔ "Delete nxt" inside a method, nxt a FIELD of THIS: the bare name is the field, as it is for a read (DIVERGENZE 487).
+  // It was refused - 'DELETE expects a UDT pointer, "NXT" is not one' - on a program fbc runs (a destructor that frees
+  // the rest of its list). Rewritten to "Delete This.nxt", which the member-access arm below owns.
+  if (FCurrentThisType <> '') and (Node.GetChild(0).NodeType = antIdentifier) and
+     (Node.GetChild(0).ChildCount = 0) and not SameText(VarToStr(Node.GetChild(0).Value), 'THIS') and
+     TryImplicitThisField(VarToStr(Node.GetChild(0).Value), Node.GetChild(0).Token, Implicit) then
+  begin
+    Rewritten := Node.Clone;
+    try
+      Rewritten.RemoveChildAt(0);
+      Rewritten.InsertChild(0, Implicit);
+      Implicit := nil;
+      EmitDeleteObject(Rewritten);
+    finally
+      Implicit.Free;
+      Rewritten.Free;
+    end;
+    Exit;
+  end;
   // "Delete @r" where r is a REFERENCE (or a UDT variable): "@r" of a record is its HANDLE in this
   // model, so the object to destroy is the one r names. It is the manual's own way of freeing what a
   // reference was bound to, and it reached here as an antProcAddress rather than a name - a shape
@@ -48993,10 +49285,7 @@ begin
       if (FindUDT(PtrType) >= 0) and UDTBlockIsManaged(PtrType) then
       begin
         ProcessExpression(Node.GetChild(0), HandleReg);
-        HandleReg := EnsureIntRegister(HandleReg);
-        CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-        EmitInstruction(ssaRecordBlockLen, CountReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-        EmitRecordBlockCtorDtor(HandleReg, CountReg, PtrType, False);
+        EmitRecordBlockDelete(HandleReg, PtrType);
         Exit;
       end;
     end;
@@ -49036,9 +49325,7 @@ begin
     begin
       if (Node.Attributes.Values['NEWARRAY'] = '1') and UDTBlockIsManaged(PtrType) then
       begin
-        CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-        EmitInstruction(ssaRecordBlockLen, CountReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-        EmitRecordBlockCtorDtor(HandleReg, CountReg, PtrType, False);
+        EmitRecordBlockDelete(HandleReg, PtrType);
         Exit;
       end;
       EmitDestructorCall(HandleReg, PtrType);
@@ -49053,15 +49340,14 @@ begin
   PtrName := VarToStr(Node.GetChild(0).Value);
   // "Delete[] p" on a MANAGED block: one destructor per element, then the records. Asked before the raw
   // form below, which would free a byte block that was never allocated.
-  if (Node.Attributes.Values['NEWARRAY'] = '1') and (not IsRawPtr(PtrName)) and
+  // ⚠️ A pointer to a NATIVE type answers "raw" (RawUDTPtrType), and its block is exactly as managed as the type says.
+  if (Node.Attributes.Values['NEWARRAY'] = '1') and
+     ((not IsRawPtr(PtrName)) or NativeRecordType(PointerUDTType(PtrName))) and
      (PointerUDTType(PtrName) <> '') and UDTBlockIsManaged(PointerUDTType(PtrName)) then
   begin
     PtrType := PointerUDTType(PtrName);
     ProcessExpression(Node.GetChild(0), HandleReg);   // see the note at the head: the VALUE, not the register
-  HandleReg := EnsureIntRegister(HandleReg);
-    CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaRecordBlockLen, CountReg, HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    EmitRecordBlockCtorDtor(HandleReg, CountReg, PtrType, False);
+    EmitRecordBlockDelete(HandleReg, PtrType);
     Exit;
   end;
 
@@ -49796,6 +50082,14 @@ var
   LoadOp, StoreOp: TSSAOpCode;
 begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  // ⭐ Phase 3.6: a NATIVE type is one C image with no subtype to slice and nothing outside the bytes, and both values are
+  // addresses - so the copy is the image, in raw moves every engine runs natively. Field by field it went through the
+  // Record* ops, which leave the C hot loop on an address (26 M exits on job/tests/bench/oop_vec3.bas).
+  if NativeRecordType(FUDTs[UDTIdx].Name) then
+  begin
+    EmitNativeImageCopy(DestHandle, SrcHandle, FUDTs[UDTIdx].LiveBytes);
+    Exit;
+  end;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
   begin
     Slot := FUDTs[UDTIdx].Fields[i].Slot;
@@ -50751,6 +51045,19 @@ begin
   begin
     Result := VarRecordTypeName(VarToStr(ObjNode.Value));
     if Result = '' then Result := PointerUDTType(VarToStr(ObjNode.Value));  // UDT pointer: p.field / p->field
+    // ...and a BARE FIELD of THIS inside a method ("i.prod()", "nx->total()"): the field's type, by the same rule
+    // ProcessMethodCall uses to rewrite the object (see there).
+    if (Result = '') and (FCurrentThisType <> '') and (ObjNode.ChildCount = 0) and
+       not SameText(VarToStr(ObjNode.Value), 'THIS') then
+    begin
+      CancelObj := nil;
+      if TryImplicitThisField(VarToStr(ObjNode.Value), ObjNode.Token, CancelObj) then
+      try
+        if CancelObj.GetChild(0).ValueUpper = 'THIS' then Result := ObjectTypeName(CancelObj);
+      finally
+        CancelObj.Free;
+      end;
+    end;
   end
   else if ObjNode.NodeType = antCast then
   begin
@@ -50861,7 +51168,7 @@ begin
       if (Length(ArrName) >= 4) and (Copy(ArrName, Length(ArrName) - 3, 4) = ' PTR') then
       begin
         ArrName := Trim(Copy(ArrName, 1, Length(ArrName) - 4));
-        if (FindUDT(ArrName) >= 0) and UDTBlockIsManaged(ArrName) then Result := ArrName;
+        if (FindUDT(ArrName) >= 0) and UDTRecordsAreHandles(ArrName) then Result := ArrName;
       end;
     end
     // ⛔ ...AND THE BASE OF AN INDEX MAY BE AN EXPRESSION, not a name. "(*pp)[0].i" is fbc's own
@@ -51617,6 +51924,31 @@ end;
 
 procedure TSSAGenerator.ProcessMethodCall(ObjNode: TASTNode; const ObjType, MethNm: string;
   ArgsNode: TASTNode; out Result: TSSAValue; ForceStatic: Boolean = False; WantAddress: Boolean = False);
+// ⛔ The OBJECT of a call can be a BARE FIELD of THIS: "nx->total()" / "i.prod()" inside a method of the owner type. The
+// type was resolved (ObjectTypeName knows implicit fields) but the object was evaluated as a variable of that name,
+// which does not exist - THIS was garbage, and the call answered a number from nowhere with no error (a recursive
+// list total gave 2 instead of 321, a nested member's method 2 instead of 43; both before the pointer model). The
+// same rewrite, and the same shadowing rules, as a bare field read (TryImplicitThisField).
+var
+  Implicit: TASTNode;
+begin
+  Implicit := nil;
+  if (FCurrentThisType <> '') and (ObjNode <> nil) and (ObjNode.NodeType = antIdentifier) and
+     (ObjNode.ChildCount = 0) and (not SameText(VarToStr(ObjNode.Value), 'THIS')) and
+     (ObjNode.Attributes.Values['BASEREF'] = '') then
+    if not TryImplicitThisField(VarToStr(ObjNode.Value), ObjNode.Token, Implicit) then Implicit := nil;
+  try
+    if Implicit <> nil then
+      ProcessMethodCallOn(Implicit, ObjType, MethNm, ArgsNode, Result, ForceStatic, WantAddress)
+    else
+      ProcessMethodCallOn(ObjNode, ObjType, MethNm, ArgsNode, Result, ForceStatic, WantAddress);
+  finally
+    Implicit.Free;
+  end;
+end;
+
+procedure TSSAGenerator.ProcessMethodCallOn(ObjNode: TASTNode; const ObjType, MethNm: string;
+  ArgsNode: TASTNode; out Result: TSSAValue; ForceStatic, WantAddress: Boolean);
 // Lower obj.method(args): pass the object handle as the implicit THIS first argument, then the
 // declared args. A monomorphic call goes straight to the resolved method; a polymorphic one goes
 // through a generated virtual dispatcher (chosen by the instance's runtime type-id). Read the
@@ -51682,7 +52014,9 @@ begin
   // what a raw base is.
   if (ObjNode <> nil) and
      ResolveRawUDTBase(ObjNode, RawTypeName, RawUDTIdx, RawOffsets, RawTotal,
-                       RawBaseNode, RawIdxNode, RawChainNode) then
+                       RawBaseNode, RawIdxNode, RawChainNode) and
+     // ⭐ Phase 3.6: a NATIVE type's methods are compiled for an address - THIS is the raw base they expect.
+     not NativeRecordType(RawTypeName) then
     raise Exception.CreateFmt('Calling method %s on a RAW pointer to %s is not supported: it holds an ' +
       'Allocate/CAllocate address and a method needs a managed record. Its FIELDS can be read and ' +
       'written; use "New %s" when you need methods.', [MethNm, RawTypeName, RawTypeName]);
@@ -52156,7 +52490,7 @@ begin
          (Copy(MemberArrElemType, Length(MemberArrElemType) - 3, 4) = ' PTR') then
       begin
         MemberArrElemType := Trim(Copy(MemberArrElemType, 1, Length(MemberArrElemType) - 4));
-        if (FindUDT(MemberArrElemType) >= 0) and UDTBlockIsManaged(MemberArrElemType) and
+        if (FindUDT(MemberArrElemType) >= 0) and UDTRecordsAreHandles(MemberArrElemType) and
            RawChainValue(ObjNode.GetChild(0), ParentHandle, ParentType) then
         begin
           ChainIdx := ObjNode.GetChild(1);
@@ -53200,7 +53534,7 @@ procedure TSSAGenerator.CollectBlockManagedTypes(Node: TASTNode);
 // The DEFINITION is the right thing to look for, not the declaration inside the TYPE body: a method with
 // no body cannot run, and the in-TYPE line is skipped by the parser without leaving a node to find.
 var
-  i, q: Integer;
+  i, q, k: Integer;
   Nm, Tail: string;
 begin
   if Node = nil then Exit;
@@ -53221,8 +53555,12 @@ begin
       // match saw every DESTRUCTOR and no CONSTRUCTOR at all. That reads as "a type with only a
       // constructor is not managed", which is a rule nobody wrote: "New T[2]" of such a type ran
       // nothing and answered zeros, while the same type with a destructor beside it worked.
-      while (Tail <> '') and not (Tail[Length(Tail)] in ['A'..'Z']) do
-        SetLength(Tail, Length(Tail) - 1);
+      // ⛔ ...and the sigil is followed by the SIGNATURE ("PT.CONSTRUCTOR#II%CC"), which can end with a letter: trimming
+      // from the right stopped there, and a type whose only constructor takes arguments read as having none (phase 3.6
+      // made it native and its constructor wrote into an address the frame never allocated). Cut at the first non-letter.
+      k := 1;
+      while (k <= Length(Tail)) and (Tail[k] in ['A'..'Z']) do Inc(k);
+      SetLength(Tail, k - 1);
       if (Tail = kCONSTRUCTOR) or (Tail = kDESTRUCTOR) then
         Nm := Copy(Nm, 1, q - 1)     // the owner may itself be dotted: a NESTED type owns methods too
       else
@@ -56489,12 +56827,7 @@ begin
     antLSet: ProcessLRSetStatement(Node, True);
     antRSet: ProcessLRSetStatement(Node, False);
     antEnum:
-      // ENUM members lower to a sequence of plain assignments (member = value), like CONST.
-      // ⛔ ...except one with no storage: nothing reads it, so there is nowhere to write it to.
-      for i := 0 to Node.ChildCount - 1 do
-        if (Node.GetChild(i).NodeType = antAssignment) and
-           (Node.GetChild(i).Attributes.Values['CONSTNOSTORE'] <> '1') then
-          ProcessAssignment(Node.GetChild(i));
+      ProcessEnumMembers(Node);
     antDef: ProcessDefFn(Node);
     antForLoop: ProcessForLoop(Node);
     antDoLoop: ProcessDoLoop(Node);

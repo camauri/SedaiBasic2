@@ -1121,7 +1121,7 @@ library for the whole program, which is the way to check whether a difference is
 | Function | Status | Description |
 |----------|--------|-------------|
 | `CINT` | ✓ | Convert to Integer, rounding to nearest (banker's rounding) |
-| `CLNG` | ✓ | Convert to Long, rounding to nearest |
+| `CLNG` | ✓ | Convert to Long, rounding to nearest. ⚠️ **Known difference**: `CLng(<pointer>)` is accepted, while FreeBASIC refuses it (`Type mismatch`); write `Cast(Integer, p)`, which both accept. |
 | `CLNGINT` | ✓ | Convert to LongInt (64-bit), rounding to nearest |
 | `CSHORT` | ✓ | Convert to Short, rounding to nearest |
 | `CBYTE` | ✓ | Convert to Byte, rounding to nearest |
@@ -2081,7 +2081,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 
 | Keyword | Status | Description |
 |---|---|---|
-| `ENUM...END ENUM` | ✓ | Named integer constants (auto-increment). A member named through its enum (`E.member`) is a compile-time CONSTANT: an ordinary variable of the same name cannot shadow it, and two enums may declare the same member name. The BARE name stays an ordinary module-wide value, which an explicit `DIM` may shadow — as `fbc` does. |
+| `ENUM...END ENUM` | ✓ | Named integer constants (auto-increment). A member's value is always a compile-time constant: an `Operator +` the program declares never takes part in the implicit "previous + 1" (fixed 16 Sep 2026). A member named through its enum (`E.member`) is a compile-time CONSTANT: an ordinary variable of the same name cannot shadow it, and two enums may declare the same member name. The BARE name stays an ordinary module-wide value, which an explicit `DIM` may shadow — as `fbc` does. |
 | `TYPE...END TYPE` | ✓ | User defined structure (M3): scalar + nested fields, `DIM v AS T`, arrays of UDT, `v.a.b`, WITH. M4.1: instance methods `SUB/FUNCTION Type.m(...)` + `THIS` + `obj.m(args)`. M4.2: `EXTENDS`. M4.3: virtual dispatch (runtime type-id). M4.4: `CONSTRUCTOR`/`DESTRUCTOR` (overloaded by arity & type, default args, `BASE`). `PROPERTY` getter/setter, `OPERATOR` overloading. Value semantics (FreeBASIC): assignment/return copy, BYREF default params, scope/block/global RAII. Heap instances via `NEW T`/`DELETE` reachable through `T PTR` (linked lists/trees). `EXTENDS Object` RTTI + `IS`. Static member methods & variables. Explicit `DECLARE [VIRTUAL\|ABSTRACT\|STATIC]` and `OVERRIDE` accepted (virtual dispatch is automatic via runtime type-id). Field default values (`x AS Integer = 10`, applied on every scalar/nested instantiation, overridden by aggregate init). Fixed-size array members (`DIM data(100) AS Integer`) are auto-sized at construction; `Any` members size via `REDIM`. `OPERATOR` overloads dispatch with a non-UDT right operand (`vec * scalar`). |
 | `CLASS...END CLASS` | ✓ | Modelled as a `TYPE` (member access control is not enforced): fields, methods, arrays, construction all behave as for a record. |
 | `UNION...END UNION` | ✓ | Record whose members share storage. Overlap is faithful within a bank — members of the same type alias the same slot (write one, read another of the same type). Members in different banks (int/float/string) occupy distinct slots; cross-bank byte reinterpretation is not modelled (slot-based record model, v1). |
@@ -2108,7 +2108,7 @@ The following PETSCII codes are silently ignored because they require full-scree
 |---|---|---|
 | `BASE (initialization)` | ✓ | `BASE(args)` calls the base type's constructor from a derived constructor. |
 | `CONSTRUCTOR` | ✓ | Member procedure auto-called when an instance is created: `DIM v AS T` / `DIM v AS T(args)` / `NEW T(args)` (nested members first, then the object); overloading by arity and by parameter type (M4.4d/g); base-constructor auto-chaining and explicit `BASE(args)` (M4.4f); inherited if the subtype has none. |
-| `DESTRUCTOR` | ✓ | Member procedure auto-called when an instance goes out of scope, in reverse construction order: procedure-local DIM'd UDTs, block-scoped DIMs (per loop iteration), module globals (program end / `END` in a proc), nested members, and BYVAL-param copies (V5/V5b/V5c/V5d). |
+| `DESTRUCTOR` | ✓ | Member procedure auto-called when an instance goes out of scope, in reverse construction order: procedure-local DIM'd UDTs, block-scoped DIMs (per loop iteration), module globals (program end / `END` in a proc), nested members, and BYVAL-param copies (V5/V5b/V5c/V5d). The elements of an array of objects are destroyed from the last to the first, as in FreeBASIC, at the end of their procedure, by `Delete[]` and by `Erase` (fixed 16 Sep 2026). ⚠️ **Known difference**: at program end a `Static` object inside a procedure and a `Dim Shared` one are destroyed in the opposite order from FreeBASIC's (FreeBASIC destroys the `Static` one first). |
 | `FUNCTION` | ✓ | Declares or defines a member procedure returning a value |
 | `OPERATOR` | ✓ | Overloaded operator `OPERATOR <sym>(a AS T, b AS T) AS R` (binary, direct operands; resolved by left operand type) |
 | `OVERRIDE` | ✓ | Accepted in an in-TYPE Declare; dispatch already works via runtime type-id (M4.3). |
@@ -2848,7 +2848,7 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 | `INP` | ◐ | Name recognised, **behaviour not implemented**: always answers `-8` (*no port access*), never reads a port. |
 | `LPRINT` | ✓ | Line-printer output — no printer, so routed to stdout (reuses the PRINT machinery). |
 | `LPOS` | ✓ | Printer head column — always 1 (no printer). |
-| `OUT` | ◐ | Name recognised, **behaviour not implemented**: evaluates its operands and writes nothing. |
+| `OUT` | ◐ | Name recognised, **behaviour not implemented**: evaluates its operands and writes nothing. ⚠️ **Known difference**: a TYPE named `Out` is refused (`Constructor Out()` reads the name as the keyword); FreeBASIC accepts it. |
 | `WAIT` | ◐ | Name recognised, **behaviour not implemented**: returns at once. Built on `INP`, so it cannot do more than `INP` does. |
 
 ##### Operating System
@@ -2908,14 +2908,14 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 | `OPTION STATIC` | ⚠️ | Refused in the FreeBASIC dialect, exactly as `OPTION DYNAMIC` above. |
 | `'$STATIC` | ✓ | Advisory metacommand, accepted and ignored. |
 | `DIM` | ✓ | Defines any type of array. Supports `lo TO hi` bounds (incl. negative), positional initializers `= { ... }` / `=> { ... }`, an empty variable-length array `DIM x()` (`UBOUND = -1` until `REDIM`), and an ellipsis upper bound `DIM x(lb TO ...) = { ... }` / `DIM x(...) = { ... }` sized from the initializer. |
-| `REDIM` | ✓ | Resizes an array: `REDIM [PRESERVE] arr(ub [, ub ...])` (B1.4) — single or multi-dimensional; each existing dimension's lower bound is kept. If the array was not DIM'd first, REDIM declares it as a fresh dynamic array (honouring the element type and any `lb TO ub` bounds). A multi-dim REDIM'd array computes its element strides at runtime. |
+| `REDIM` | ✓ | ⚠️ **Known difference** for an array of objects with a constructor or destructor: the elements a `REDIM PRESERVE` adds are not constructed (they read 0), and a `REDIM` without `PRESERVE` neither destroys the old elements nor constructs the new ones — FreeBASIC does both. Resizes an array: `REDIM [PRESERVE] arr(ub [, ub ...])` (B1.4) — single or multi-dimensional; each existing dimension's lower bound is kept. If the array was not DIM'd first, REDIM declares it as a fresh dynamic array (honouring the element type and any `lb TO ub` bounds). A multi-dim REDIM'd array computes its element strides at runtime. |
 | `PRESERVE` | ✓ | Preserves the overlapping array contents when used with `REDIM` (B1.4). |
 
 #### Clearing Array Data
 
 | Keyword | Status | Description |
 |---|---|---|
-| `ERASE` | ✓ | `ERASE arr [, arr ...]` resets every element to its default (0 / 0.0 / "") keeping the current size (B1.4). Also erases a UDT **array member**, written out (`Erase obj.arr`) or with the leading dot inside a `WITH` block (`Erase .arr`). |
+| `ERASE` | ✓ | ⚠️ On an array of objects it destroys the elements in reverse order, as FreeBASIC does, but it destroys the elements the array holds after a `REDIM` of such an array only as far as `REDIM` kept them (see `REDIM`). `ERASE arr [, arr ...]` resets every element to its default (0 / 0.0 / "") keeping the current size (B1.4). Also erases a UDT **array member**, written out (`Erase obj.arr`) or with the leading dot inside a `WITH` block (`Erase .arr`). |
 
 #### Retrieving Array Size
 

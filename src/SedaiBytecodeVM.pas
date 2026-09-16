@@ -8680,17 +8680,26 @@ procedure TBytecodeVM.DeepCopyArrayRecords(Ctx: TExecutionContext; DestArr, SrcA
 var
   ByteSize, StrC, TypeId, k: Integer;
   SrcRec, DestRec: PRecordStorage;
+  Native: Boolean;
 begin
   if (DestArr < 1) or (DestArr > High(FArrays)) or (SrcArr < 1) or (SrcArr > High(FArrays)) then Exit;
   ByteSize := PackedCounts and $FFFFFFFF;   // 32 bits: a record past 64 KiB (DIVERGENZE 226)
   StrC := (PackedCounts shr 32) and $FFFF;
   TypeId := (PackedCounts shr 48) and $FFFF;
+  // ⭐ Phase 3.2: elements of a NATIVE type are one contiguous block of images (RecordNewArrayNative), so the copy is the
+  // destination's own block with the source's bytes in it. The element values are addresses: ResolveRec refused them, and
+  // "b = a" of a record holding a dynamic array of plain records stopped the program (DIVERGENZE 480).
+  Native := ((FArrays[SrcArr].TotalSize > 0) and IsNativeRec(ArrGetInt(FArrays[SrcArr], 0))) or
+            ((FArrays[DestArr].TotalSize > 0) and IsNativeRec(ArrGetInt(FArrays[DestArr], 0)));
   // Match the destination's shape to the source. On a size change, release the dest's current element
   // records first (this is a distinct value instance, so they are not aliased) to avoid a leak.
   if FArrays[DestArr].TotalSize <> FArrays[SrcArr].TotalSize then
   begin
-    for k := 0 to FArrays[DestArr].TotalSize - 1 do
-      if ArrGetInt(FArrays[DestArr], k) <> 0 then FreeSharedRecord(ArrGetInt(FArrays[DestArr], k));
+    if Native then
+      ReleaseNativeArrayBlock(FArrays[DestArr])
+    else
+      for k := 0 to FArrays[DestArr].TotalSize - 1 do
+        if ArrGetInt(FArrays[DestArr], k) <> 0 then FreeSharedRecord(ArrGetInt(FArrays[DestArr], k));
     FArrays[DestArr].ElementType := FArrays[SrcArr].ElementType;
     FArrays[DestArr].DimCount    := FArrays[SrcArr].DimCount;
     FArrays[DestArr].TotalSize   := FArrays[SrcArr].TotalSize;
@@ -8698,6 +8707,15 @@ begin
     FArrays[DestArr].LowerBounds := Copy(FArrays[SrcArr].LowerBounds);
     SetLength(FArrays[DestArr].IntData, FArrays[SrcArr].TotalSize);
     for k := 0 to FArrays[DestArr].TotalSize - 1 do ArrSetIntAt(DestArr, k, 0);
+  end;
+  if Native then
+  begin
+    RecordNewArrayNative(DestArr, ByteSize);   // allocates only if the destination has no block yet
+    for k := 0 to FArrays[SrcArr].TotalSize - 1 do
+      if IsNativeRec(ArrGetInt(FArrays[SrcArr], k)) and IsNativeRec(ArrGetInt(FArrays[DestArr], k)) then
+        Move(Pointer(PtrUInt(ArrGetInt(FArrays[SrcArr], k) and not FGNPTR_TAG))^,
+             Pointer(PtrUInt(ArrGetInt(FArrays[DestArr], k) and not FGNPTR_TAG))^, ByteSize);
+    Exit;
   end;
   for k := 0 to FArrays[SrcArr].TotalSize - 1 do
   begin

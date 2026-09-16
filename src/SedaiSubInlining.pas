@@ -312,9 +312,13 @@ begin
   ProcEntry := FProgram.Blocks[FirstB];
   // The continuation is the call block's successor that is NOT the proc entry
   // (EmitCallSubLabel wired exactly these two).
+  // ⛔ ...and EXACTLY those two only if nobody else added an edge to the call block. The For-iterator lowering once did
+  // (its exit edge), and "the last successor that is not the entry" was then the loop's END: the inlined operator
+  // returned out of the loop. The block EmitCallSubLabel creates is named "aftercall_<n>", so that one is preferred.
   ContBlk := nil;
   for i := 0 to CallBlk.Successors.Count - 1 do
-    if TSSABasicBlock(CallBlk.Successors[i]) <> ProcEntry then
+    if (TSSABasicBlock(CallBlk.Successors[i]) <> ProcEntry) and
+       ((ContBlk = nil) or (Copy(ContBlk.LabelName, 1, 10) <> 'aftercall_')) then
       ContBlk := TSSABasicBlock(CallBlk.Successors[i]);
   if (ContBlk = nil) or (ContBlk.LabelName = '') then Exit;
   ContLabel := ContBlk.LabelName;
