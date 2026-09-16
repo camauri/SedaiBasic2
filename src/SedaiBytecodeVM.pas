@@ -6644,7 +6644,7 @@ var
   W: Integer;
 begin
   case WidthCode of
-    RTC_I8, RTC_U8:   W := 1;
+    RTC_I8, RTC_U8, RTC_BOOL: W := 1;
     RTC_I16, RTC_U16: W := 2;
     RTC_I32, RTC_U32: W := 4;
     RTC_I64, RTC_PTR64, RTC_NPTR: W := 8;   // a pointer is eight bytes wherever it is read (DIVERGENZE 250)
@@ -6657,6 +6657,7 @@ begin
   case WidthCode of
     RTC_I8:  Result := PShortInt(@A.ByteData[ByteOfs])^;
     RTC_U8:  Result := A.ByteData[ByteOfs];
+    RTC_BOOL: Result := -Ord(A.ByteData[ByteOfs] <> 0);
     RTC_I16: Result := PSmallInt(@A.ByteData[ByteOfs])^;
     RTC_U16: Result := PWord(@A.ByteData[ByteOfs])^;
     RTC_I32: Result := PLongInt(@A.ByteData[ByteOfs])^;
@@ -6685,6 +6686,7 @@ var
 begin
   case WidthCode of
     RTC_I8, RTC_U8:   W := 1;
+    RTC_BOOL:         begin W := 1; V := Ord(V <> 0); end;
     RTC_I16, RTC_U16: W := 2;
     RTC_I32, RTC_U32: W := 4;
     RTC_I64, RTC_PTR64, RTC_NPTR: W := 8;   // a pointer is eight bytes wherever it is read (DIVERGENZE 250)
@@ -6947,6 +6949,7 @@ begin
     RTC_I32: Result := PLongInt(RawAddr(RawPtr, 4))^;
     // The unsigned views ZERO-extend: a UByte holding 200 is 200 in the int bank, not -56.
     RTC_U8:  Result := PByte(RawAddr(RawPtr, 1))^;
+    RTC_BOOL: Result := -Ord(PByte(RawAddr(RawPtr, 1))^ <> 0);   // C's 0/1 (any nonzero) -> the VM's 0/-1
     RTC_U16: Result := PWord(RawAddr(RawPtr, 2))^;
     RTC_U32: Result := PLongWord(RawAddr(RawPtr, 4))^;
     // ⭐ A POINTER read out of raw memory (DIVERGENZE 250). From C's own memory it is C's pointer: it
@@ -7318,6 +7321,7 @@ begin
     RTC_I32: PLongInt(RawAddr(RawPtr, 4, True))^ := LongInt(Value);
     // Unsigned views: same WIDTH, so the bytes written are the same - they exist for the LOAD.
     RTC_U8:  PByte(RawAddr(RawPtr, 1, True))^ := Byte(Value);
+    RTC_BOOL: PByte(RawAddr(RawPtr, 1, True))^ := Ord(Value <> 0);   // the VM's true -> C's 1
     RTC_U16: PWord(RawAddr(RawPtr, 2, True))^ := Word(Value);
     RTC_U32: PLongWord(RawAddr(RawPtr, 4, True))^ := LongWord(Value);
     // ⭐ A POINTER written INTO C's memory - the write twin of the RTC_PTR64 load. Inside the VM a machine
@@ -11775,6 +11779,10 @@ begin
           Ctx.IntRegs[Instr.Dest] := DataItemToInt64(FDataPool[Ctx.DataIndex]);
           Inc(Ctx.DataIndex);
         end
+        // ⭐ MODERN: a READ past the last DATA item answers 0 / "" in silence, as fbc's does (DIVERGENZE 496, fbc
+        // boolean/boolean_data reads twenty items out of nineteen). Commodore BASIC raises ?OUT OF DATA.
+        else if Assigned(FProgram) and FProgram.ModernMode then
+          Ctx.IntRegs[Instr.Dest] := 0
         else
           raise Exception.Create('?OUT OF DATA ERROR');
       end;
@@ -11787,6 +11795,8 @@ begin
           Ctx.FloatRegs[Instr.Dest] := VarAsType(FDataPool[Ctx.DataIndex], varDouble);
           Inc(Ctx.DataIndex);
         end
+        else if Assigned(FProgram) and FProgram.ModernMode then   // see bcDataReadInt
+          Ctx.FloatRegs[Instr.Dest] := 0
         else
           raise Exception.Create('?OUT OF DATA ERROR');
       end;
@@ -11798,6 +11808,8 @@ begin
           Ctx.StringRegs[Instr.Dest] := string(FDataPool[Ctx.DataIndex]);
           Inc(Ctx.DataIndex);
         end
+        else if Assigned(FProgram) and FProgram.ModernMode then   // see bcDataReadInt
+          Ctx.StringRegs[Instr.Dest] := ''
         else
           raise Exception.Create('?OUT OF DATA ERROR');
       end;
@@ -17754,8 +17766,9 @@ begin
           // array pointer, whose array id is then nonsense ("Null or invalid pointer dereference,
           // address 4611686018427387920"). The tag is IN the value, so the question is answered here,
           // where every path that produces one arrives.
+          // ...at the width the lowering names (0 = eight bytes): a ByRef Boolean's temporary is one byte (RTC_BOOL).
           else if (PtrAddr and RAWPTR_TAG) <> 0 then
-            Ctx.IntRegs[Instr.Dest] := RawLoadInt(PtrAddr, 0)
+            Ctx.IntRegs[Instr.Dest] := RawLoadInt(PtrAddr, Instr.Immediate)
           // ⭐ Memory a foreign call returned, read at the width the lowering names (DIVERGENZE 239).
           else if (PtrAddr and FGNPTR_TAG) <> 0 then
             Ctx.IntRegs[Instr.Dest] := RawLoadInt(PtrAddr, Instr.Immediate)
@@ -17859,7 +17872,7 @@ begin
           // The raw-address kind - see the note in bcRefLoadInt above. The WRITE half must know it too,
           // or "**pp = 5" stores into a nonexistent array while "*p = 5" works.
           else if (PtrAddr and RAWPTR_TAG) <> 0 then
-            RawStoreInt(PtrAddr, 0, Ctx.IntRegs[Instr.Src2])
+            RawStoreInt(PtrAddr, Instr.Immediate, Ctx.IntRegs[Instr.Src2])
           // ⭐ Memory a foreign call returned, written at the store's own width (DIVERGENZE 239).
           else if (PtrAddr and FGNPTR_TAG) <> 0 then
             RawStoreInt(PtrAddr, Instr.Immediate, Ctx.IntRegs[Instr.Src2])

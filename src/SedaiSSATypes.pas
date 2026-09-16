@@ -274,6 +274,10 @@ const
     the closure rule - so the value is always an address and never a VM name to bring home. Read: a user-space address
     gets C's mark. Written: the mark comes off. No lookup, so every engine does it inline. }
   RTC_NPTR = 11;
+  { ⭐ A BOOLEAN pointee (phase 3, Boolean exclusion): one byte holding C's 0 or 1, as fbc lays it out. Read: any nonzero
+    byte is the VM's true (-1). Written: the VM's nonzero value becomes 1. As RTC_I8 a true written through a
+    "Boolean Ptr" or a "ByRef ... As Boolean" put 255 in the byte (fbc: 1), and a 1 that C wrote read back as 1, not -1. }
+  RTC_BOOL = 12;
 
   { The width of ONE wide character in the byte IMAGE of a WSTRING - the raw-heap buffer an @-taken
     "WString * n" is backed with, what "Clear w, 0, SizeOf(w)" writes over, and what a UByte or UShort

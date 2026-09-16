@@ -489,6 +489,7 @@ type
     FWStringVars: TStringList;           // FreeBASIC WSTRING vars (UPPER): share the srtString bank but hold UTF-8 bytes
                                          // whose LEN/MID/LEFT/RIGHT count/index by Unicode codepoint (not byte). Assignment/
                                          // concat/copy/PRINT are unchanged (UTF-8 in, UTF-8 out); only width-aware ops differ.
+    FByrefCallNames: TStringList;        // procedures whose call arguments need a home (CollectAddressTakenVars); nil outside it
     FAtTakenOnly: TStringList;           // the names CollectDimVarBanks alone put in the @-dictionary,
                                          // i.e. the ones that are there BECAUSE an @ was taken. That
                                          // dictionary is enriched afterwards for reasons that have
@@ -541,6 +542,7 @@ type
     FRecNativeCtors: Boolean;            // phase 3.6b: ...and one with a CONSTRUCTOR or DESTRUCTOR (SB_RECNATIVE_CTORS)
     FRecNativeHoist: Boolean;            // phase 3.7: a native local record's cell is allocated at the frame's entry
     FRecNativeProcFields: Boolean;       // phase 3.7: a type with PROCEDURE fields can be native
+    FRecNativeBool: Boolean;             // phase 3 (exclusions): a type with BOOLEAN fields can be native
     FNativeRecAsking: TStringList;       // phase 3.2: the types NativeRecordType is answering right now (a list's own pointer)
     // Phase 2.1a: the program's entry block, and where in it a raw module cell's allocation is hoisted (HoistToEntry) -
     // after the SHARED backings are sized and BEFORE static members, hoisted STATIC initialisers and module constructors.
@@ -1068,6 +1070,7 @@ type
     function ManagedPtrPointee(const Name: string): string;                     // pointee type of a managed pointer (per-proc param or DIM'd), else ''
     function PointerUDTType(const PtrName: string): string;                     // pointee UDT type if p is a "T PTR" (T a UDT), else ''
     function IsAddrParam(const Name: string): Boolean;                          // BYREF-return address-carrying param?
+    function AddrParamType(const Name: string): string;
     function AddrParamBank(const Name: string): TSSARegisterType;               // pointee bank of an address param
     function IsRefVar(const Name: string): Boolean;                             // BYREF reference variable (auto-deref)?
     function RefVarAddrValue(const Name: string): TSSAValue;                    // the address a reference carries (its home if Shared, 270)
@@ -1618,6 +1621,7 @@ type
     procedure ProcessFilter(Node: TASTNode);
     // DATA/READ/RESTORE
     procedure ProcessData(Node: TASTNode);
+    procedure EmitReadBoolean(const DestReg: TSSAValue);
     procedure ProcessRead(Node: TASTNode);
     procedure ProcessRestore(Node: TASTNode);
     // Input commands
@@ -1922,6 +1926,7 @@ begin
   FRecNativeCtors := GetEnvironmentVariable('SB_RECNATIVE_CTORS') <> '0';         // phase 3.6b: on by default; =0 is the A/B
   FRecNativeHoist := GetEnvironmentVariable('SB_RECNATIVE_HOIST') <> '0';         // phase 3.7: on by default; =0 is the A/B
   FRecNativeProcFields := GetEnvironmentVariable('SB_RECNATIVE_PROCFIELDS') <> '0'; // phase 3.7: same
+  FRecNativeBool := GetEnvironmentVariable('SB_RECNATIVE_BOOL') <> '0';                 // phase 3 exclusions: same
   FProgram := nil;
   FCurrentBlock := nil;
   FLabelCounter := 0;
@@ -4778,11 +4783,13 @@ begin
         Left := EnsureIntRegister(GetOrAllocateVariable(VarName));
         FuncRetType := AddrParamBank(VarName);
         Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
+        // ⭐ ...at the pointee's OWN width in the fb mode (phase 3): the address may be a one-byte Boolean or a four-byte
+        // Single inside a native record, and read at eight bytes it took the next field with it.
         case FuncRetType of
-          srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), FloatRefArg(AddrParamType(VarName)));
           srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         else
-          EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), NarrowRefArg(AddrParamType(VarName)));
         end;
       end
       // BYREF reference variable (DIM BYREF r AS T = target): r's register carries target's address —
@@ -11183,12 +11190,13 @@ begin
   begin
     ProcessExpression(ExprNode, ExprValue);
     VarReg := EnsureIntRegister(GetOrAllocateVariable(VarName));   // the carried address
+    // ...written at the pointee's own width in the fb mode, the twin of the read (phase 3).
     case AddrParamBank(VarName) of
-      srtFloat:  begin ExprValue := EnsureFloatRegister(ExprValue);  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone)); end;
+      srtFloat:  begin ExprValue := EnsureFloatRegister(ExprValue);  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, FloatRefArg(AddrParamType(VarName))); end;
       srtString: begin ExprValue := EnsureStringRegister(ExprValue); EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone)); end;
     else
       ExprValue := EnsureIntRegister(ExprValue);
-      EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+      EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, NarrowRefArg(AddrParamType(VarName)));
     end;
     Exit;
   end;
@@ -23653,6 +23661,27 @@ begin
   end;
 end;
 
+procedure TSSAGenerator.EmitReadBoolean(const DestReg: TSSAValue);
+// READ into a BOOLEAN: the DATA item as text, true when it is the word "true" (any case) or a number other than zero -
+// the conversion CBool applies to a string (EmitBitMacro), written once more here because that one works on a node.
+var
+  SArg, SLow, SWord, FVal, IsWord, IsNum: TSSAValue;
+begin
+  SArg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaDataRead, SArg, MakeSSAConstInt(Ord(srtString)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  SLow := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaStrLCase, SLow, SArg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  SWord := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaLoadConstString, SWord, MakeSSAConstString('true'), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  IsWord := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpEqString, IsWord, SLow, SWord, MakeSSAValue(svkNone));
+  FVal := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+  EmitInstruction(ssaStrVal, FVal, SArg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  IsNum := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpNeFloat, IsNum, FVal, EnsureFloatRegister(MakeSSAConstFloat(0.0)), MakeSSAValue(svkNone));
+  EmitInstruction(ssaBitwiseOr, DestReg, IsWord, IsNum, MakeSSAValue(svkNone));
+end;
+
 procedure TSSAGenerator.ProcessRead(Node: TASTNode);
 var
   i, ai: Integer;
@@ -23680,6 +23709,11 @@ begin
       // Read-target bank from the variable's ACTUAL bank (DestReg is allocated in the variable's declared
       // bank), not just the $/% suffix — "Read word" on a suffixless "Dim As String word" must read a
       // STRING, not default to float (which mis-read a string DATA item -> "invalid variant type cast").
+      // ⭐ A BOOLEAN destination reads the item as TEXT and converts it the way fbc's DATAREADBOOL does: the word
+      // "true" in any case, or a number that is not zero (fbc boolean/boolean_data). Read as an integer, "true" was 0.
+      if FModernMode and (DestReg.RegType = srtInt) and (PrintKindOf(VarName) = 1) then
+        EmitReadBoolean(DestReg)
+      else
       EmitInstruction(ssaDataRead, DestReg, MakeSSAConstInt(Ord(DestReg.RegType)),
                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       // READ into a NARROW numeric is a store to it, exactly as INPUT and INPUT # already are
@@ -28310,7 +28344,7 @@ var
   UDTIdx, FieldIdx, i: Integer;
   Offsets: TInt64Array;
   TotalSize, Sz, Al: Int64;
-  AddrVal: TSSAValue;
+  AddrVal, ExprTmp: TSSAValue;
   BaseNode, IdxNode, ChainNode: TASTNode;
   F: TUDTField;
 begin
@@ -28366,6 +28400,16 @@ begin
     // was sign-extended on load: SDL's palette entry "pal[255].r" (Uint8 255) printed 18446744073709551615
     // where fbc prints 255 (SDL2 deck, DIVERGENZE 383). Nothing had shown it: every field read before sat
     // below 128. WidthCode is the table ForeignStructRetSpec already reads (2 u8, 4 u16, 6 u32).
+    // ⭐ Phase 3 (Boolean fields): a BOOLEAN is one byte holding 0 or 1 in C's image, as fbc lays it out, and -1/0 in the
+    // VM - so the byte is read unsigned and compared with zero (any nonzero byte is true).
+    if F.IsBoolean then
+    begin
+      AddrVal := EnsureIntRegister(AddrVal);
+      ExprTmp := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRawLoadInt, ExprTmp, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_U8));
+      EmitInstruction(ssaCmpNeInt, Value, ExprTmp, EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
+      Exit(True);
+    end;
     case Sz of
       1: if F.WidthCode = 2 then
            EmitInstruction(ssaRawLoadInt, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_U8))
@@ -28417,7 +28461,7 @@ var
   UDTIdx, FieldIdx, i: Integer;
   Offsets: TInt64Array;
   TotalSize, Sz, Al: Int64;
-  AddrVal, ExprVal: TSSAValue;
+  AddrVal, ExprVal, Tmp1: TSSAValue;
   BaseNode, IdxNode, ChainNode: TASTNode;
   F: TUDTField;
 begin
@@ -28466,6 +28510,21 @@ begin
     // UShort field writes two bytes at its offset, not eight, or the next field goes with it.
     // ⚠️ The narrowing FIRST, as the managed store does: an UNSIGNED-64 field needs to know what a float is converted
     // FOR, and EnsureIntRegister alone settles it as signed (bug_float_to_unsigned, found by phase 3.2).
+    // ⭐ ...and a BOOLEAN is written as C's 0 or 1, whatever nonzero value the VM holds for true (the twin of the load).
+    if F.IsBoolean then
+    begin
+      Tmp1 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      if IsFloatOperand(ExprVal) then
+        EmitInstruction(ssaCmpNeFloat, Tmp1, EnsureFloatRegister(ExprVal), EnsureFloatRegister(MakeSSAConstFloat(0.0)),
+                        MakeSSAValue(svkNone))
+      else
+        EmitInstruction(ssaCmpNeInt, Tmp1, EnsureIntRegister(ExprVal), EnsureIntRegister(MakeSSAConstInt(0)),
+                        MakeSSAValue(svkNone));
+      ExprVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaBitwiseAnd, ExprVal, Tmp1, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I8));
+      Exit(True);
+    end;
     ExprVal := ApplyNarrowCode(F.WidthCode, ExprVal);
     ExprVal := EnsureIntRegister(ExprVal);
     case Sz of
@@ -35239,7 +35298,11 @@ begin
       WireW := FUDTs[UDTIdx].Fields[i].WidthCode;
       if WireW = 8 then WireW := 0
       else if WireW = 9 then WireW := 5
-      else if WireW = 10 then WireW := 6;
+      else if WireW = 10 then WireW := 6
+      // ⛔ ...and a BOOLEAN (11) is ONE byte in the image, but no decoder knows 11: its "anything else" arm read and wrote
+      // eight, so "x.f = True" wrote -1 over the Boolean after it ("f As Boolean : g As Boolean" read g true). As a
+      // signed byte the VM's -1/0 comes back unchanged. (A NATIVE type writes C's 0/1 on the raw path instead.)
+      else if WireW = 11 then WireW := 1;
       // ⭐ A BIT FIELD IS READ THROUGH ITS UNIT, NOT THROUGH ITS DECLARED TYPE, and the width on the
       // wire has to say so: the unit can be NARROWER than the type ("As ULong b:3" one byte into a
       // window is a two-byte unit under FIELD=2), and a load of the declared width would reach past
@@ -38912,6 +38975,10 @@ begin
           begin
             ParamNode.Attributes.Values['ADDRCARRIER'] := '1';   // int address, not its declared bank (ParamDeclaredBank)
             RegisterTypedVar(VarName, 'INTEGER');
+            // ...but it still READS as its declared type: a "ByRef b As Boolean" prints "true"/"false" (the auto-deref
+            // gives the value; the print form was never recorded, so it printed -1).
+            if (TypeName <> '') and (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+              SetPrintKindScoped(Node.GetChild(0).ValueUpper, VarName, TypeName);
           end
           else if TypeName <> '' then
           begin
@@ -39988,7 +40055,7 @@ begin
         // address yet: admitted only inside a UNION (libjpeg's jpeg_error_mgr.msg_parm), where no program writes it whole.
         if ((Bank = srtString) and not (IsZString and (not IsWString) and (StrCapacity > 0) and FRecNativeProcFields and
                                         FUDTs[Idx].IsUnion)) or
-           (BitWidth > 0) or IsBoolean or IsCvaList or (DefaultExpr <> nil) then Exit(No('field ' + Name + ': string/bits/boolean/va/default'));
+           (BitWidth > 0) or (IsBoolean and not FRecNativeBool) or IsCvaList or (DefaultExpr <> nil) then Exit(No('field ' + Name + ': string/bits/boolean/va/default'));
         // A PROCEDURE field: the raw store picks the overload of "@fun" from the field's signature since phase 3.7, as the
         // managed store does (m708). SB_RECNATIVE_PROCFIELDS=0 keeps such types managed (A/B).
         if (FuncPtrSig <> '') and not FRecNativeProcFields then Exit(No('procedure field ' + Name));
@@ -44236,6 +44303,11 @@ begin
       // InProc: everything under here IS a procedure body, so its pointer DIMs must not overwrite a
       // module declaration of the same name in the global map (see the ⭐ note at the registration).
       CollectDimVarBanks(Node, ProcDict, True);  // the @-taken names of this procedure's own subtree
+      // ⛔ ...AND THE NAMES THIS PROCEDURE PASSES TO A BYREF PARAMETER, which are in the program-wide dictionary for
+      // that reason too. Without them the m885 rule below read "the @ that put B there is in another procedure" and
+      // dropped a "Dim As Boolean b" passed ByRef here: the call got a TEMPORARY and the write was lost (fbc suite
+      // boolean/boolean_args, two TESTs with a local "b", one of them @-taken).
+      if FByrefCallNames <> nil then MarkByrefRetCallArgs(Node, FByrefCallNames, ProcDict);
       // ...and a BYREF-return function's returned NAMES are address-taken by definition (see the note
       // on CollectByrefReturnedNames): the caller is handed their storage.
       // ⛔ EXCEPT AN EXPLICIT-BYREF PARAMETER, WHICH ALREADY CARRIES THE CALLER'S ADDRESS. Giving it a
@@ -44756,6 +44828,7 @@ begin
     GatherByrefRetFuncNames(Node, ByrefRetNames);
     if ByrefRetNames.Count > 0 then
       MarkByrefRetCallArgs(Node, ByrefRetNames, Dict);   // back the args of byref-return calls
+    FByrefCallNames := ByrefRetNames;                    // ...and MarkAddressTaken asks them per procedure
     // ...and back every fixed-length WSTRING when the program has a WSTRING PTR parameter to pass one
     // to: the pointee has to be the UCS-2 BUFFER, not the managed string's UTF-8 bytes.
     if AnyWStringPtrParam(Node) then
@@ -44774,6 +44847,7 @@ begin
     end;
     MarkAddressTaken(Node, Dict);     // mark their DIMs SHARED
   finally
+    FByrefCallNames := nil;
     Dict.Free;
     ByrefRetNames.Free;
   end;
@@ -45025,6 +45099,17 @@ function TSSAGenerator.IsAddrParam(const Name: string): Boolean;
 // so reads/writes auto-dereference)? Only ever non-empty inside a byref-return function.
 begin
   Result := (FCurrentProcAddrParams <> nil) and (FCurrentProcAddrParams.IndexOfName(UpperFast(Name)) >= 0);
+end;
+
+function TSSAGenerator.AddrParamType(const Name: string): string;
+// The declared pointee type of an address parameter ('' when unknown).
+var
+  idx: Integer;
+begin
+  Result := '';
+  if FCurrentProcAddrParams = nil then Exit;
+  idx := FCurrentProcAddrParams.IndexOfName(UpperFast(Name));
+  if idx >= 0 then Result := FCurrentProcAddrParams.ValueFromIndex[idx];
 end;
 
 function TSSAGenerator.AddrParamBank(const Name: string): TSSARegisterType;
@@ -45669,7 +45754,8 @@ begin
   end
   else if T = 'USHORT' then Result := RTC_U16
   else if T = 'ULONG' then Result := RTC_U32
-  else if (T = 'BYTE') or (T = 'BOOLEAN') then Result := RTC_I8
+  else if T = 'BYTE' then Result := RTC_I8
+  else if T = 'BOOLEAN' then Result := RTC_BOOL   // phase 3 (Boolean): C's 0/1 byte, normalised both ways
   else if T = 'SHORT' then Result := RTC_I16
   else if T = 'LONG' then Result := RTC_I32
   else if T = 'SINGLE' then Result := RTC_SINGLE
@@ -45816,7 +45902,7 @@ begin
   // i-th cell. Left to the scalar ladder it stepped by 8 and the cells overlapped.
   if SameText(PointeeType, 'STRING') then Exit(24);
   case RawTypeCodeOfPointee(PointeeType) of
-    RTC_I8, RTC_U8: Result := 1;
+    RTC_I8, RTC_U8, RTC_BOOL: Result := 1;
     RTC_I16, RTC_U16: Result := 2;
     RTC_I32, RTC_U32, RTC_SINGLE: Result := 4;
   else
@@ -55830,10 +55916,13 @@ var
   W: Integer;
 begin
   Result := MakeSSAValue(svkNone);
-  if not FNativeMemory then Exit;
   C := UpperFast(CanonicalType(Trim(Pointee)));
   W := TypeNameWidthCode(C);
-  if (W >= 1) and (W <= 6) then Result := MakeSSAConstInt(RawTypeCodeOfPointee(C))
+  // ⭐ A BOOLEAN pointee normalises in BOTH modes (phase 3): its byte holds C's 1, and read at eight bytes a true
+  // came back as 1 instead of -1 ("CU_ASSERT_EQUAL(b, cbool(i))" in boolean/boolean_args).
+  if W = 11 then Exit(MakeSSAConstInt(RTC_BOOL));
+  if not FNativeMemory then Exit;
+  if ((W >= 1) and (W <= 6)) or (W = 11) then Result := MakeSSAConstInt(RawTypeCodeOfPointee(C))   // 11: RTC_BOOL
   // ⭐ Phase 3.2: a POINTER pointee is C's address in the bytes, read back with the mark and written without it - the
   // RTC_PTR64 rule the raw path applies to a pointer field. A native record holds its pointer fields that way, so a
   // "*v.q(0)" reached through the element's address must not read eight bare bytes.
@@ -56724,8 +56813,12 @@ begin
         end;
         // B1.5: a parameter declared with a narrow integer type (child 0 = AS-type identifier) wraps
         // the incoming argument to that width, in place. Only when it lands in the int bank.
+        // ⛔ ...never one that carries the caller's ADDRESS (a "ByRef b As Boolean"): its register is not the value, and
+        // normalised to 0/-1 the address became -1 - every write through a ByRef Boolean died on "Invalid record-field
+        // pointer" (found by the phase 3 Boolean-field probe, job/tests/bas/fase3/bool_field2.bas).
         if (RT = srtInt) and (ParamNodeJ.ChildCount >= 1) and
-           (ParamNodeJ.GetChild(0).NodeType = antIdentifier) then
+           (ParamNodeJ.GetChild(0).NodeType = antIdentifier) and
+           (ParamNodeJ.Attributes.Values['ADDRCARRIER'] <> '1') then
         begin
           WIdx := TypeNameWidthCode(VarToStr(ParamNodeJ.GetChild(0).Value));
           if (WIdx >= 1) and (WIdx <= 6) then

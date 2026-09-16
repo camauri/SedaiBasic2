@@ -9880,6 +9880,12 @@ begin
           RTC_I16: B.OpMem(wopI64Load16S, 1, 0);
           RTC_I32: B.OpMem(wopI64Load32S, 2, 0);
           RTC_U8:  B.OpMem(wopI64Load8U, 0, 0);
+          RTC_BOOL:                        // C's 0/1 (any nonzero) -> the VM's 0/-1
+            begin
+              B.OpMem(wopI64Load8U, 0, 0);
+              B.I64Const(0); B.Op(wopI64Ne); B.Op(wopI64ExtendI32U);
+              B.I64Const(-1); B.Op(wopI64Mul);
+            end;
           RTC_U16: B.OpMem(wopI64Load16U, 1, 0);
           RTC_U32: B.OpMem(wopI64Load32U, 2, 0);
         else
@@ -9897,6 +9903,11 @@ begin
         LoadReg(B, Instr.Src2);
         case Instr.Src3.ConstInt of
           RTC_I8, RTC_U8:   B.OpMem(wopI64Store8, 0, 0);
+          RTC_BOOL:                        // the VM's true -> C's 1
+            begin
+              B.I64Const(0); B.Op(wopI64Ne); B.Op(wopI64ExtendI32U);
+              B.OpMem(wopI64Store8, 0, 0);
+            end;
           RTC_I16, RTC_U16: B.OpMem(wopI64Store16, 1, 0);
           RTC_I32, RTC_U32: B.OpMem(wopI64Store32, 2, 0);
         else

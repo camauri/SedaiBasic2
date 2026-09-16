@@ -698,6 +698,7 @@ begin
     // ⛔ STILL False here: the JIT asks this function too and its raw arm has no translation. The AOT admits RTC_PTR64
     // separately (AotRawCodeAot), because AotRawAccess translates it through a leaf call (phase 3.2).
     RTC_PTR64: Result := False;          // a pointer read from / written into C's memory is translated (250 · 451)
+    RTC_BOOL:  Result := False;          // phase 3 (Boolean): a normalisation, not a width - the helper does it
     RTC_NPTR:  Result := False;          // phase 3.2: the AOT does it inline (AotRawCodeAot); the JIT keeps the helper
     {$IFDEF WINDOWS}
     RTC_I32, RTC_U32: Result := False;   // a cell of a WSTRING block Windows handed back is a UTF-16 unit (239)
