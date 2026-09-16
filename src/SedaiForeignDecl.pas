@@ -224,6 +224,8 @@ begin
   // ⭐ ...and "REC:<declared type>" is a pointer parameter handed the address of a BASIC RECORD: the call
   // site knows it statically, the runtime cannot tell a record handle from a small integer (DIVERGENZE 245).
   if Copy(T, 1, 4) = 'REC:' then Exit(fkPointer);
+  // ...and "NREC:<type>" the address of a NATIVE record whose PROCEDURE fields are made callable for the call (phase 3.7).
+  if Copy(T, 1, 5) = 'NREC:' then Exit(fkPointer);
   // ...and "W<k>:<declared type>" one handed the address of a NARROW value (DIVERGENZE 247).
   if ForeignNarrowCode(T) > 0 then Exit(fkPointer);
   // ⭐ ...and a RETURN type "DATA:<T> PTR" marks an entry that is not a function at all but a DATA

@@ -909,6 +909,10 @@ var
   Sh: PInt64;                            // W8: the translated copies of pointed POINTER cells (257 B)
   RPAddr: array[0..127] of PInt64;       // REC: a pointer FIELD of a record handed to C (259 b)
   RPOrig, RPTr: array[0..127] of Int64;  // ...its program value, and what C was given
+  RPNat: array[0..127] of Boolean;       // ...in a NATIVE record's own bytes (phase 3.7): C's values are left as C wrote them
+  RPProc: array[0..127] of Boolean;      // ...a PROCEDURE field (its BASIC entry PC comes back after the call)
+  RPIsNat: Boolean;
+  NSpec: string;
   NRP, RPk, RPo, RPh: Integer;
   RPElems, RPStride, RPe, RPx: Integer;  // ...over every element of a gathered run of records (428)
   SrSize, SrAlign, SrK: Integer;         // the pointer fields of a struct returned by value (432)
@@ -1164,10 +1168,27 @@ begin
           // is a record HANDLE that no run-time test can tell from a number. C gets the record's C image.
           // ⛔ A value that names no record is refused aloud: passing the handle on as an address is the
           // access violation this entry was opened for.
-          else if Assigned(FRecBytes) and (XferInt[SlotI] <> 0) and
-                  ((XferInt[SlotI] and FGNPTR_TAG) = 0) and (i <= High(B^.Decl.ParamTypeNames)) and
-                  (UpperCase(Copy(B^.Decl.ParamTypeNames[i], 1, 4)) = 'REC:') then
+          else if Assigned(FRecBytes) and (XferInt[SlotI] <> 0) and (i <= High(B^.Decl.ParamTypeNames)) and
+                  ((((XferInt[SlotI] and FGNPTR_TAG) = 0) and
+                    (UpperCase(Copy(B^.Decl.ParamTypeNames[i], 1, 4)) = 'REC:')) or
+                   (((XferInt[SlotI] and FGNPTR_TAG) <> 0) and
+                    (UpperCase(Copy(B^.Decl.ParamTypeNames[i], 1, 5)) = 'NREC:'))) then
           begin
+            // ⭐ Phase 3.7: "NREC:<size>:<type>@o#FNPTR..." is a NATIVE record - its address IS the image - whose
+            // PROCEDURE fields hold BASIC entry PCs: they become closures for the call and come back after it, in place.
+            RPIsNat := (XferInt[SlotI] and FGNPTR_TAG) <> 0;
+            if RPIsNat then
+            begin
+              P := Pointer(PtrUInt(XferInt[SlotI] and not FGNPTR_TAG));
+              // "NREC:<size>*<count>:..." - the record, or <count> adjacent ones of an array
+              NSpec := Copy(B^.Decl.ParamTypeNames[i], 6, Pos(':', Copy(B^.Decl.ParamTypeNames[i], 6, MaxInt)) - 1);
+              RPStride := StrToIntDef(Copy(NSpec, 1, Pos('*', NSpec + '*') - 1), 0);
+              RPElems := StrToIntDef(Copy(NSpec, Pos('*', NSpec + '*') + 1, MaxInt), 1);
+              if RPElems < 1 then RPElems := 1;
+              Avail := PtrUInt(RPStride) * PtrUInt(RPElems);
+            end
+            else
+            begin
             P := FRecBytes(ACtx, XferInt[SlotI], Avail);
             if P = nil then
               raise EForeignCallError.CreateFmt('%s: argument %d is the address of a record that does not exist',
@@ -1202,6 +1223,7 @@ begin
                 RunCnt[NRun] := RunN; RunStride[NRun] := RunW;
                 Inc(NRun);
               end;
+            end;
             end;
             PPointer(Vals[i])^ := P;
             // ⭐ ...and its POINTER FIELDS (DIVERGENZE 259 b), listed by the call site as "REC:<T>@o1/o2".
@@ -1240,7 +1262,14 @@ begin
                   if PtrUInt(RPx) + 8 > Avail then Break;
                   RPAddr[NRP] := PInt64(PByte(P) + RPx);
                   RPOrig[NRP] := RPAddr[NRP]^;
-                  if RPSig <> '' then
+                  RPNat[NRP] := RPIsNat;
+                  RPProc[NRP] := RPSig <> '';
+                  // ⭐ In a native record a procedure field C filled (jpeg_std_error) holds C's own address, untagged: only a
+                  // value that is NOT a machine address is a BASIC entry PC.
+                  if RPIsNat and ((RPOrig[NRP] = 0) or ((RPSig <> '') and (RPOrig[NRP] < 0)) or
+                                  ForeignIsMachineAddress(PtrUInt(RPOrig[NRP] and not FGNPTR_TAG))) then
+                    RPTr[NRP] := RPOrig[NRP] and not FGNPTR_TAG
+                  else if RPSig <> '' then
                   begin
                     // A C address ("@c_function", a value C wrote) is passed as it is; a BASIC entry PC becomes
                     // the closure C can call. It is given back after the call by the loop below AbiCall.
@@ -1399,8 +1428,24 @@ begin
   // "@buf(got)", "next_out - @buf(0)" answered a number from another domain, and a read through it left
   // the mapped block (lzma deck, z02).
   for RPk := 0 to NRP - 1 do
-    if RPAddr[RPk]^ = RPTr[RPk] then
+    if RPNat[RPk] and (not RPProc[RPk]) and (RPAddr[RPk]^ = RPTr[RPk]) then
+      // (see below: the native data pointer keeps its address)
+    else if RPAddr[RPk]^ = RPTr[RPk] then
       RPAddr[RPk]^ := RPOrig[RPk]
+    else if RPNat[RPk] and not RPProc[RPk] then
+      // a DATA pointer of a native record keeps the machine address it was given: C may keep it past this call (MYSQL_BIND,
+      // an lzma stream), and in the fb mode an address is what that field holds anyway
+    else if RPNat[RPk] then
+    begin
+      // a NATIVE record's field C changed: an address inside the PROGRAM's memory comes home as the name it had (a stream
+      // advancing next_out over a VM buffer); anything else stays exactly as C left it - these bytes are C's to read again.
+      if Assigned(FPtrHome) and ForeignIsMachineAddress(PtrUInt(RPAddr[RPk]^)) and
+         not ForeignIsMachineAddress(PtrUInt(RPOrig[RPk] and not FGNPTR_TAG)) then
+      begin
+        HomeV := FPtrHome(ACtx, PtrUInt(RPAddr[RPk]^));
+        if HomeV <> 0 then RPAddr[RPk]^ := HomeV;
+      end;
+    end
     else if ForeignIsMachineAddress(PtrUInt(RPAddr[RPk]^)) then   // a value that is not one stays as C wrote it (451)
     begin
       HomeV := 0;

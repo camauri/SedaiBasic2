@@ -540,6 +540,7 @@ type
     FRecNativeMethods: Boolean;          // phase 3.6: a type with METHODS can be native too; SB_RECNATIVE_METHODS=0 is the A/B
     FRecNativeCtors: Boolean;            // phase 3.6b: ...and one with a CONSTRUCTOR or DESTRUCTOR (SB_RECNATIVE_CTORS)
     FRecNativeHoist: Boolean;            // phase 3.7: a native local record's cell is allocated at the frame's entry
+    FRecNativeProcFields: Boolean;       // phase 3.7: a type with PROCEDURE fields can be native
     FNativeRecAsking: TStringList;       // phase 3.2: the types NativeRecordType is answering right now (a list's own pointer)
     // Phase 2.1a: the program's entry block, and where in it a raw module cell's allocation is hoisted (HoistToEntry) -
     // after the SHARED backings are sized and BEFORE static members, hoisted STATIC initialisers and module constructors.
@@ -598,6 +599,8 @@ type
     FBlockManagedTypes: TStringList;     // types whose "New T[n]" must be MANAGED records (ctor/dtor)
     FMemberOwnerTypes: TStringList;      // phase 3.2: types that DEFINE any member procedure ("T.x" anywhere)
     FNonPtrNames: TStringList;           // DIVERGENZE 483: names SOME declaration gives a type that is not a pointer
+    FNativeNo, FNativeYes, FNativeProvisional: TStringList;   // phase 3.7: NativeRecordType's memory (see there)
+    FNativeCacheReady: Boolean;
     FConstDeclSeen: TStringList;         // CONST names already seen: a name declared TWICE must not fold
     FConstStrBytes: TStringList;         // STRING consts: name (UPPER) -> byte size fbc reports (length + 1)
     FTypeAliases: TStringList;           // FB "TYPE alias AS underlying": alias (UPPER) -> underlying (UPPER)
@@ -733,7 +736,8 @@ type
     function TryEmitForeignElemFieldStore(MemberNode, ExprNode: TASTNode): Boolean;    // ...its WRITE half (259)
     function ForeignElemObject(Node: TASTNode; out Obj: TASTNode; out TypeName: string): Boolean;  // the shape both ask
     function EmitForeignElemTemps(Obj: TASTNode; const TypeName: string): string;      // the temporaries both use
-    function ForeignRecPtrOffsets(ArgNode: TASTNode): string;                          // "@o1/o2": a REC's pointer fields (259 b)
+    function ForeignRecPtrOffsets(ArgNode: TASTNode; OnlyProcs: Boolean = False; SkipMulti: Boolean = False): string;   // "@o1/o2": a REC's pointer fields (259 b)
+    function ForeignNativeRecSpec(ArgNode: TASTNode): string;   // phase 3.7: "NREC:<size>:<type>@o#sig" or ''
     function ForeignFieldClosureSig(const FieldSig: string): string;                   // "p,p|r" -> "FNPTR:r:p~p" for a procedure field (423)
     function ForeignDynEntry(const Sig: string): string;                               // the "*" entry calling a C address with Sig
     function EmitIndirectCallVM(const PCValIn: TSSAValue; const Sig: string; ArgListNode: TASTNode): TSSAValue;
@@ -907,10 +911,12 @@ type
     procedure EmitRecordBlockInitFrom(const FirstHandle, StartVal, CountVal: TSSAValue; UDTIdx: Integer; WithDefaults: Boolean = True);
     function UDTBlockIsManaged(const TypeName: string): Boolean;
     function UDTRecordsAreHandles(const TypeName: string): Boolean;   // managed AND not native: a value is a handle
-    function NativeRecordType(const TypeName: string): Boolean;   // phase 3.2: every value of T is a machine address
+    function NativeRecordType(const TypeName: string): Boolean;
+    function NativeRecordTypeCore(const TypeName: string): Boolean;   // phase 3.2: every value of T is a machine address
     procedure RecNativeStamp(OpCode: TSSAOpCode; var Src1, Src2, Src3: TSSAValue);   // phase 3.2: mark a native allocation
     procedure EmitRecordBlockDelete(const FirstHandle: TSSAValue; const TypeName: string);   // Delete[] of a New T[n] block
     procedure EmitNativeImageCopy(const DstAddr, SrcAddr: TSSAValue; Bytes: Int64);   // phase 3.6: a native record copy
+    function NativeImageBytes(UDTIdx: Integer): Int64;   // phase 3.7: the C size of a native record
     procedure EmitRecordBlockCtorDtor(const FirstHandle, CountVal: TSSAValue;
                                       const TypeName: string; Construct: Boolean);  // init each of N records  // alloc nested records
     procedure EmitRecordArrayInit(ArrayIdx, UDTIdx: Integer);  // per-element EmitRecordInit over a DIM'd array-of-UDT
@@ -1915,6 +1921,7 @@ begin
   FRecNativeMethods := GetEnvironmentVariable('SB_RECNATIVE_METHODS') <> '0';   // phase 3.6: same, for types with methods
   FRecNativeCtors := GetEnvironmentVariable('SB_RECNATIVE_CTORS') <> '0';         // phase 3.6b: on by default; =0 is the A/B
   FRecNativeHoist := GetEnvironmentVariable('SB_RECNATIVE_HOIST') <> '0';         // phase 3.7: on by default; =0 is the A/B
+  FRecNativeProcFields := GetEnvironmentVariable('SB_RECNATIVE_PROCFIELDS') <> '0'; // phase 3.7: same
   FProgram := nil;
   FCurrentBlock := nil;
   FLabelCounter := 0;
@@ -2078,6 +2085,9 @@ begin
   FBlockManagedTypes := TIndexedStringList.Create;
   FMemberOwnerTypes := TIndexedStringList.Create;
   FNonPtrNames := TIndexedStringList.Create;
+  FNativeNo := TIndexedStringList.Create;  FNativeNo.Sorted := True;  FNativeNo.Duplicates := dupIgnore;
+  FNativeYes := TIndexedStringList.Create; FNativeYes.Sorted := True; FNativeYes.Duplicates := dupIgnore;
+  FNativeProvisional := TStringList.Create;
   FNonPtrNames.Sorted := True;
   FNonPtrNames.Duplicates := dupIgnore;
   FNativeRecAsking := TStringList.Create;
@@ -2257,6 +2267,7 @@ begin
   FBlockManagedTypes.Free;
   FMemberOwnerTypes.Free;
   FNonPtrNames.Free;
+  FNativeNo.Free; FNativeYes.Free; FNativeProvisional.Free;
   FNativeRecAsking.Free;
   FConstDeclSeen.Free;
   FNulStrConsts.Free;
@@ -27962,6 +27973,31 @@ begin
     end;
     TypeName := ''; UDTIdx := -1; TotalSize := 0; SetLength(Offsets, 0);
   end;
+  // ⭐ Phase 3.7: "m.tbls(i)->q" - an ELEMENT of an array MEMBER of POINTERS to records, over raw memory: the element
+  // (loaded as the address it is, RawMemberArrayElemAddr) is the base.
+  if (ObjNode.NodeType = antArrayAccess) and (ObjNode.Attributes.Values['BRACKET'] <> '1') and
+     (ObjNode.ChildCount >= 2) and (ObjNode.GetChild(0) <> nil) and
+     (ObjNode.GetChild(0).NodeType = antMemberAccess) and (ObjNode.GetChild(0).ChildCount >= 1) and
+     ResolveRawUDTBase(ObjNode.GetChild(0).GetChild(0), OuterName, OuterIdx, OuterOfs, OuterSize,
+                       BaseNode, IdxNode, ChainNode) then
+  begin
+    BaseNode := nil; IdxNode := nil; ChainNode := nil;
+    MemIdx := UDTFieldIndex(OuterIdx, ObjNode.GetChild(0).ValueUpper);
+    if (MemIdx >= 0) and FUDTs[OuterIdx].Fields[MemIdx].IsArray and
+       (FUDTs[OuterIdx].Fields[MemIdx].ArrayElemType = '') and
+       (FUDTs[OuterIdx].Fields[MemIdx].ArrayElemPtrPointee <> '') then
+    begin
+      TypeName := UpperFast(CanonicalType(FUDTs[OuterIdx].Fields[MemIdx].ArrayElemPtrPointee));
+      UDTIdx := FindUDT(TypeName);
+      if (UDTIdx >= 0) and (not UDTRecordsAreHandles(TypeName)) and
+         UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) and (TotalSize > 0) then
+      begin
+        BaseNode := ObjNode;
+        Exit(True);
+      end;
+    end;
+    TypeName := ''; UDTIdx := -1; TotalSize := 0; SetLength(Offsets, 0);
+  end;
   // ⭐⭐ "o->f[i].x" AND "o->f[i]->x" - A POINTER FIELD OF RAW MEMORY, INDEXED. The rung above wants an
   // ARRAY member; a C struct holds a POINTER to a block instead, and that is FreeType's shape twice over:
   // "slot->outline.points[k].x" (a "FT_Vector Ptr" field of a record nested by value) and
@@ -28398,6 +28434,9 @@ begin
 
   F := FUDTs[UDTIdx].Fields[FieldIdx];
   UDTFieldCShape(UDTIdx, FieldIdx, Sz, Al);
+  // ⭐ Phase 3.7: a PROCEDURE field names the overload "@f" takes, from its own signature - the rule the managed store
+  // already follows (m708) - so a type with procedure fields can be native.
+  if F.FuncPtrSig <> '' then StampFuncPtrTarget(ExprNode, F.FuncPtrSig);
   // ⭐ Phase 3.2: assigning a RECORD member of a native type copies the record's bytes into it.
   if (F.NestedType <> '') and FRecNativeKnob and FNativeMemory and NativeRecordType(F.NestedType) then
   begin
@@ -39537,8 +39576,28 @@ var
   NestedHandle, DefVal: TSSAValue;
   DimsN, UbExpr: TASTNode;
   MemRank: Integer;
+  COfs: TInt64Array;
+  CTot: Int64;
 begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  // ⭐ Phase 3.7: a NATIVE record is C bytes, already zero, with no member arrays or side slots to prepare - only the
+  // constructors of its nested members to run, at the image's address plus the member's C offset.
+  if NativeRecordType(FUDTs[UDTIdx].Name) then
+  begin
+    if not UDTCLayoutRaw(UDTIdx, COfs, CTot) then Exit;
+    for i := 0 to High(FUDTs[UDTIdx].Fields) do
+      if (FUDTs[UDTIdx].Fields[i].NestedType <> '') and (not FUDTs[UDTIdx].Fields[i].IsArray) and (i <= High(COfs)) then
+      begin
+        NestedUDT := FindUDT(FUDTs[UDTIdx].Fields[i].NestedType);
+        if NestedUDT < 0 then Continue;
+        NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaAddInt, NestedHandle, EnsureIntRegister(HandleVal),
+                        EnsureIntRegister(MakeSSAConstInt(COfs[i])), MakeSSAValue(svkNone));
+        EmitRecordInit(NestedHandle, NestedUDT, WithDefaults);
+        EmitConstructorCall(NestedHandle, FUDTs[NestedUDT].Name);
+      end;
+    Exit;
+  end;
   // "As String * n" fields start as n NULs: the buffer exists at full capacity from construction, so a
   // PUT of the instance writes the declared field width even for a field never assigned (fbc's layout).
   if FHasFixedLenFields then
@@ -39786,30 +39845,85 @@ begin
   Result := UDTBlockIsManaged(TypeName) and not NativeRecordType(TypeName);
 end;
 
+function TSSAGenerator.NativeImageBytes(UDTIdx: Integer): Int64;
+// The size of a native record's image: its C size. Phase 3.7: a native type may hold a "ZString * n" or a nested native
+// member that the MANAGED layout keeps outside its bytes, so LiveBytes is not the answer for it.
+var
+  Offsets: TInt64Array;
+begin
+  Result := 0;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  if not UDTCLayoutRaw(UDTIdx, Offsets, Result) then Result := FUDTs[UDTIdx].LiveBytes;
+end;
+
 procedure TSSAGenerator.RecNativeStamp(OpCode: TSSAOpCode; var Src1, Src2, Src3: TSSAValue);
+// ...and the SIZE the allocation carries becomes the C size (NativeImageBytes), in the one place every allocation passes.
   function TypeIdIsNative(Id: Int64): Boolean;
   begin
     Result := (Id >= 0) and (Id <= High(FUDTs)) and NativeRecordType(FUDTs[Id].Name);
+  end;
+  function WithSize(Imm, Id: Int64): Int64;
+  begin
+    Result := (Imm and not Int64($FFFFFFFF)) or (NativeImageBytes(Id) and $FFFFFFFF);
   end;
 begin
   case OpCode of
     ssaRecordNew:
       if (Src3.Kind = svkConstInt) and TypeIdIsNative((Src3.ConstInt shr 32) and $FFFF) then
+      begin
         Src3.ConstInt := Src3.ConstInt or RECNEW_NATIVE;
+        if Src1.Kind = svkConstInt then Src1.ConstInt := NativeImageBytes((Src3.ConstInt shr 32) and $FFFF);
+      end;
     ssaRecordNewArray, ssaRecordNewArrayInd:
       if (Src2.Kind = svkConstInt) and TypeIdIsNative((Src2.ConstInt shr 48) and $FFFF) then
-        Src2.ConstInt := Src2.ConstInt or RECARR_NATIVE;
+        Src2.ConstInt := WithSize(Src2.ConstInt, (Src2.ConstInt shr 48) and $FFFF) or RECARR_NATIVE;
     ssaRecordNewBlock:
       if (Src2.Kind = svkConstInt) and TypeIdIsNative((Src2.ConstInt shr 48) and $7FFF) then
-        Src2.ConstInt := Src2.ConstInt or RECBLOCK_NATIVE;
+        Src2.ConstInt := WithSize(Src2.ConstInt, (Src2.ConstInt shr 48) and $7FFF) or RECBLOCK_NATIVE;
   else
     if (OpCode = ssaRecordReallocBlock) and (Src3.Kind = svkConstInt) and
        TypeIdIsNative((Src3.ConstInt shr 48) and $7FFF) then
-      Src3.ConstInt := Src3.ConstInt or RECBLOCK_NATIVE;
+      Src3.ConstInt := WithSize(Src3.ConstInt, (Src3.ConstInt shr 48) and $7FFF) or RECBLOCK_NATIVE;
   end;
 end;
 
 function TSSAGenerator.NativeRecordType(const TypeName: string): Boolean;
+// The memory in front of NativeRecordTypeCore (phase 3.7). The closure rule walks the TYPE GRAPH, and without memory a
+// header like libxml's - hundreds of types pointing at each other - was walked again for every question: exponential,
+// and "sb --no-exec" on libxslt did not end. A NO is final whenever it was reached: missing facts (a static member not yet
+// collected) and the optimistic answer for a type on the asking chain can only turn a no into a yes, never the reverse.
+// A YES is final only once the pre-passes are complete and the OUTERMOST question ended in yes - the yeses reached under
+// its optimistic assumption are kept provisionally until then.
+var
+  T: string;
+  Outer: Boolean;
+  k: Integer;
+begin
+  T := UpperFast(TypeName);
+  if FNativeNo.IndexOf(T) >= 0 then Exit(False);
+  if FNativeCacheReady and (FNativeYes.IndexOf(T) >= 0) then Exit(True);
+  Outer := FNativeRecAsking.Count = 0;
+  if Outer then FNativeProvisional.Clear;
+  Result := NativeRecordTypeCore(TypeName);
+  if not Result then
+  begin
+    // a no that depends on nothing optimistic... every no is final (see above)
+    if FNativeRecAsking.IndexOf(T) < 0 then FNativeNo.Add(T);
+  end
+  else if FNativeCacheReady then
+  begin
+    if Outer then
+    begin
+      FNativeYes.Add(T);
+      for k := 0 to FNativeProvisional.Count - 1 do FNativeYes.Add(FNativeProvisional[k]);
+      FNativeProvisional.Clear;
+    end
+    else if FNativeRecAsking.IndexOf(T) < 0 then
+      FNativeProvisional.Add(T);
+  end;
+end;
+
+function TSSAGenerator.NativeRecordTypeCore(const TypeName: string): Boolean;
 // Phase 3.2 of the pointer model (job/markdown/FASE3-INVENTARIO.md): in the fb memory mode a record of this TYPE is
 // C bytes, and EVERY value that names one - a variable, a "T Ptr", an element of an array, a block - is the machine
 // address of its image with FGNPTR_TAG, as in fbc. Its fields are read and written by the raw path, which already
@@ -39824,20 +39938,31 @@ var
   T: string;
   Offsets: TInt64Array;
   Total: Int64;
+
+  Lbs, Ubs: TInt64Array;
+  ACnt, AEB: Int64;
+
+  function No(const Why: string): Boolean;
+  begin
+    // NATIVE_DIAG=1: why a type is not native (phase 3.7) - the question the closure rule makes hard to answer by reading
+    if GetEnvironmentVariable('NATIVE_DIAG') = '1' then WriteLn(StdErr, '[NATIVE] ', T, ': ', Why);
+    Result := False;
+  end;
 begin
   Result := False;
   if not (FNativeMemory and FRecNativeKnob) then Exit;
   T := UpperFast(TypeName);
   Idx := FindUDT(T);
   if Idx < 0 then Exit;
-  if FUDTs[Idx].Parent <> '' then Exit;                      // a type id, a base
+  if FUDTs[Idx].Parent <> '' then Exit(No('has a base'));                      // a type id, a base
   // ...and an IMPLEMENTS clause is a base too: a call through the interface dispatches on the record's type id.
   if Assigned(FUDTs[Idx].Node) and (FUDTs[Idx].Node.Attributes.Values['IMPLEMENTS'] <> '') then Exit;
   for k := 0 to High(FUDTs) do                               // ...or a base OF another type: a cast would mix the two
-    if SameText(FUDTs[k].Parent, FUDTs[Idx].Name) then Exit;
-  if FUDTs[Idx].NStr <> 0 then Exit;                         // a String lives outside the image (phase 5)
+    if SameText(FUDTs[k].Parent, FUDTs[Idx].Name) then Exit(No('is a base'));
+  // A String lives outside the image (phase 5); a "ZString * n" field is C bytes, which the raw path reads and writes
+  // (phase 3.7) - asked per field below.
   // A constructor or destructor to run per element: native since phase 3.6b (SB_RECNATIVE_CTORS=0 keeps such types managed).
-  if UDTBlockIsManaged(T) and not (FRecNativeMethods and FRecNativeCtors) then Exit;
+  if UDTBlockIsManaged(T) and not (FRecNativeMethods and FRecNativeCtors) then Exit(No('ctor/dtor or no C image'));
   // ⭐ Phase 3.6: a METHOD takes the address as its THIS - "This" resolves to the owner type (VarRecordTypeName), so its
   // fields go the raw way like any other variable of the type. SB_RECNATIVE_METHODS=0 keeps such types managed (A/B).
   if (not FRecNativeMethods) and (TypeHasMemberProc(T) or (FMemberOwnerTypes.IndexOf(T) >= 0)) then Exit;
@@ -39847,8 +39972,8 @@ begin
     if SameText(Copy(FStaticMembers[k], 1, Length(T) + 1), T + '.') then Exit;
   for k := 0 to FStaticMemberProcs.Count - 1 do
     if SameText(Copy(FStaticMemberProcs[k], 1, Length(T) + 1), T + '.') then Exit;
-  if not UDTCLayoutRaw(Idx, Offsets, Total) then Exit;
-  if (Total <= 0) or (Total <> FUDTs[Idx].LiveBytes) then Exit;   // the live image IS the C image
+  if not UDTCLayoutRaw(Idx, Offsets, Total) then Exit(No('no C layout'));
+  if Total <= 0 then Exit;   // (phase 3.7: sized by its C image, NativeImageBytes - the live layout is the managed one's)
   // ⛔ A POINTER FIELD must name a native type too: the raw path writes a pointer field as C's address and reads it back
   // with C's mark, so a record HANDLE stored there came back as a machine address (m535: "a->b = CAllocate" with b a
   // pointer to a type holding a bit field). A type that points at itself - a list, a tree - is answered optimistically
@@ -39859,14 +39984,27 @@ begin
     for i := 0 to High(FUDTs[Idx].Fields) do
       with FUDTs[Idx].Fields[i] do
       begin
-        if (Bank = srtString) or (BitWidth > 0) or IsBoolean or IsCvaList or (DefaultExpr <> nil) then Exit;
-        // ⚠️ A PROCEDURE field: the managed store picks an overload of "@fun" from the field's signature, and the raw
-        // store does not yet (m708). Excluded until it does.
-        if FuncPtrSig <> '' then Exit;
-        if (NestedType <> '') and not (InlineNested and NativeRecordType(NestedType)) then Exit;
-        if IsArray and not (InlineArray and (ArrayElemType = '')) then Exit;
-        if (PtrPointee <> '') and not NativeRecordType(PtrPointee) then Exit;
-        if IsArray and (ArrayElemPtrPointee <> '') and not NativeRecordType(ArrayElemPtrPointee) then Exit;
+        // A "ZString * n" is C bytes, but nineteen managed string paths (aggregates, fb_memcopy, copies) do not know an
+        // address yet: admitted only inside a UNION (libjpeg's jpeg_error_mgr.msg_parm), where no program writes it whole.
+        if ((Bank = srtString) and not (IsZString and (not IsWString) and (StrCapacity > 0) and FRecNativeProcFields and
+                                        FUDTs[Idx].IsUnion)) or
+           (BitWidth > 0) or IsBoolean or IsCvaList or (DefaultExpr <> nil) then Exit(No('field ' + Name + ': string/bits/boolean/va/default'));
+        // A PROCEDURE field: the raw store picks the overload of "@fun" from the field's signature since phase 3.7, as the
+        // managed store does (m708). SB_RECNATIVE_PROCFIELDS=0 keeps such types managed (A/B).
+        if (FuncPtrSig <> '') and not FRecNativeProcFields then Exit(No('procedure field ' + Name));
+        // A member the managed layout keeps OUTSIDE the bytes (phase 3.7: a union holding a "ZString * n") only when it has
+        // nothing to construct or destroy - the destructor walk of a container still reads such a member by its side slot.
+        if (NestedType <> '') and not ((InlineNested or (FRecNativeProcFields and not UDTBlockIsManaged(NestedType))) and
+                                       NativeRecordType(NestedType)) then Exit(No('nested ' + Name + ' As ' + NestedType));
+        // ...and (phase 3.7) a one-dimensional array of scalars or POINTERS that the managed layout keeps outside its
+        // bytes: C's bytes all the same, and the raw path indexes it (RawMemberArrayElemAddr).
+        if IsArray and not ((ArrayElemType = '') and
+                            (InlineArray or (FRecNativeProcFields and (ArrayElemPtrPointee <> '') and
+                                             UDTFieldArrayShape(Idx, i, ACnt, AEB, True) and
+                                             (InlineArrayDims(Idx, i, Lbs, Ubs) = 1)))) then
+          Exit(No('array member ' + Name));
+        if (PtrPointee <> '') and not NativeRecordType(PtrPointee) then Exit(No('pointer ' + Name + ' to ' + PtrPointee));
+        if IsArray and (ArrayElemPtrPointee <> '') and not NativeRecordType(ArrayElemPtrPointee) then Exit(No('pointer array ' + Name));
       end;
     Result := True;
   finally
@@ -39942,7 +40080,7 @@ var
 begin
   Native := NativeRecordType(TypeName);
   Stride := 0;
-  if Native then Stride := FUDTs[FindUDT(TypeName)].LiveBytes;
+  if Native then Stride := NativeImageBytes(FindUDT(TypeName));
   if (CountVal.Kind = svkConstInt) and (CountVal.ConstInt <= UNROLL_MAX) then
   begin
     for k := 0 to CountVal.ConstInt - 1 do
@@ -49324,7 +49462,7 @@ begin
       CheckInstantiable(FUDTs[UDTIdx].Name);
       CountVal := EnsureIntRegister(CountVal);
       BytesVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaMulInt, BytesVal, CountVal, EnsureIntRegister(MakeSSAConstInt(FUDTs[UDTIdx].LiveBytes)),
+      EmitInstruction(ssaMulInt, BytesVal, CountVal, EnsureIntRegister(MakeSSAConstInt(NativeImageBytes(UDTIdx))),
                       MakeSSAValue(svkNone));
       ElemVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaAddInt, ElemVal, BytesVal, EnsureIntRegister(MakeSSAConstInt(8)), MakeSSAValue(svkNone));
@@ -50281,7 +50419,7 @@ begin
   // Record* ops, which leave the C hot loop on an address (26 M exits on job/tests/bench/oop_vec3.bas).
   if NativeRecordType(FUDTs[UDTIdx].Name) then
   begin
-    EmitNativeImageCopy(DestHandle, SrcHandle, FUDTs[UDTIdx].LiveBytes);
+    EmitNativeImageCopy(DestHandle, SrcHandle, NativeImageBytes(UDTIdx));
     Exit;
   end;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
@@ -54613,6 +54751,7 @@ begin
     begin
       T := BasicProcCallbackSig(ArgListNode.GetChild(i));
       // ...and one handed the address of a BASIC RECORD says so, for the runtime cannot (DIVERGENZE 245).
+      if T = '' then T := ForeignNativeRecSpec(ArgListNode.GetChild(i));   // phase 3.7: asked FIRST, a native record is an address
       if (T = '') and ForeignRecordArg(ArgListNode.GetChild(i)) then
         T := 'REC:' + Decl.ParamTypeNames[i] + ForeignRecPtrOffsets(ArgListNode.GetChild(i));
       // ...and one handed the address of a NARROW value writes the width it was declared with (247).
@@ -54912,7 +55051,55 @@ begin
   Result := 'FNPTR:' + Ret + ':' + T;
 end;
 
-function TSSAGenerator.ForeignRecPtrOffsets(ArgNode: TASTNode): string;
+function TSSAGenerator.ForeignNativeRecSpec(ArgNode: TASTNode): string;
+// The address of a NATIVE record handed to C, when its type has PROCEDURE fields: those hold BASIC entry PCs, and C calls
+// what it finds there (m964, libxml's SAX handler). The runtime makes them closures for the call. '' otherwise.
+var
+  A, IdxN: TASTNode;
+  TypeName, Offs: string;
+  Count, K, Lb: Int64;
+  ArrI: Integer;
+  Arr: TSSAArrayInfo;
+begin
+  Result := '';
+  if not (FNativeMemory and FRecNativeKnob) then Exit;
+  A := ArgNode;
+  while (A <> nil) and (A.NodeType = antParentheses) and (A.ChildCount >= 1) do A := A.GetChild(0);
+  if A = nil then Exit;
+  TypeName := '';
+  Count := 1;
+  if (A.NodeType = antProcAddress) and (A.ChildCount = 0) then TypeName := VarRecordTypeName(VarToStr(A.Value))
+  else if A.NodeType = antIdentifier then TypeName := PointerUDTType(VarToStr(A.Value))
+  // "@a(k)" of a one-dimensional array of native records with fixed bounds and a constant index: C may read every element
+  // from k on (mysql_stmt_bind_param reads the whole MYSQL_BIND array), so the spec says how many ("<size>*<count>").
+  else if (A.NodeType = antProcAddress) and (A.ChildCount >= 1) and (A.GetChild(0).NodeType = antArrayAccess) and
+          (A.GetChild(0).ChildCount >= 2) and (A.GetChild(0).GetChild(0).NodeType = antIdentifier) and
+          (ArrayIndexOf(A.GetChild(0).GetChild(0).ValueUpper) >= 0) then
+  begin
+    ArrI := ArrayIndexOf(A.GetChild(0).GetChild(0).ValueUpper);
+    TypeName := ArrayRecordTypeOf(A.GetChild(0).GetChild(0).ValueUpper);
+    Arr := FProgram.GetArray(ArrI);
+    if (TypeName = '') or (Length(Arr.Dimensions) <> 1) or (Arr.Dimensions[0] <= 0) then Exit;
+    IdxN := A.GetChild(0).GetChild(1);
+    if (IdxN <> nil) and (IdxN.NodeType in [antArgumentList, antExpressionList]) and (IdxN.ChildCount = 1) then
+      IdxN := IdxN.GetChild(0);
+    if not TryFoldConstIntExpr(IdxN, K) then Exit;
+    Lb := 0;
+    if Length(Arr.LowerBounds) > 0 then Lb := Arr.LowerBounds[0];
+    Count := Arr.Dimensions[0] - (K - Lb);
+    if GetEnvironmentVariable('NREC_DIAG') = '1' then
+      WriteLn(StdErr, '[NREC] ', TypeName, ' dims=', Arr.Dimensions[0], ' lb=', Lb, ' k=', K, ' count=', Count);
+    if (Count < 1) or (Count > 256) then Exit;
+  end;
+  if (TypeName = '') or (FindUDT(TypeName) < 0) or not NativeRecordType(TypeName) then Exit;
+  // ⚠️ not a "T Ptr Ptr" field: that is an array of pointers C reads through, and the in-place rule does not fit it
+  Offs := ForeignRecPtrOffsets(ArgNode, False, True);
+  if Offs = '' then Exit;
+  Result := 'NREC:' + IntToStr(NativeImageBytes(FindUDT(TypeName))) + '*' + IntToStr(Count) + ':' +
+            UpperFast(TypeName) + Offs;
+end;
+
+function TSSAGenerator.ForeignRecPtrOffsets(ArgNode: TASTNode; OnlyProcs: Boolean = False; SkipMulti: Boolean = False): string;
 // ⭐ The C offsets of the POINTER fields of the record an argument hands to C (DIVERGENZE 259 b), spelled
 // "@o1/o2/..." after the REC: parameter - no commas, which separate the parameters of an entry. The
 // runtime translates those fields on the way in and, after the call, gives an unchanged one back its
@@ -54959,8 +55146,10 @@ begin
       Sig := ForeignFieldClosureSig(FUDTs[UDTIdx].Fields[i].FuncPtrSig);
       if Sig <> '' then Result := Result + '/' + IntToStr(Offsets[i]) + '#' + Sig;
     end
-    else if (FUDTs[UDTIdx].Fields[i].PtrPointee <> '') or (FUDTs[UDTIdx].Fields[i].MultiPtrPointee <> '') or
-       (FUDTs[UDTIdx].Fields[i].RawPtrPointee <> '') then
+    else if (not OnlyProcs) and
+       ((FUDTs[UDTIdx].Fields[i].PtrPointee <> '') or
+        ((FUDTs[UDTIdx].Fields[i].MultiPtrPointee <> '') and not SkipMulti) or
+        (FUDTs[UDTIdx].Fields[i].RawPtrPointee <> '')) then
       Result := Result + '/' + IntToStr(Offsets[i]);
   end;
   if Result <> '' then Result := '@' + Copy(Result, 2, MaxInt);
@@ -58035,6 +58224,7 @@ begin
   FBlockManagedTypes.Clear;
   FMemberOwnerTypes.Clear;
   FNonPtrNames.Clear;
+  FNativeNo.Clear; FNativeYes.Clear; FNativeProvisional.Clear; FNativeCacheReady := False;
   FConstDeclSeen.Clear;
   FConstStrBytes.Clear;
   FArrayElemWidth.Clear;
@@ -58102,6 +58292,7 @@ begin
   // is what made PlotPixel's "p" raw. Scope the registry and that accident stops paying: the honest
   // propagation has to be alive first. Idempotent, and the later call is left where it was.
   PreMarkStart; PreCollectProcedures(AST); PreMarkEnd('PreCollectProcedures');
+  FNativeCacheReady := True;   // phase 3.7: every fact NativeRecordType reads is complete from here (static members, owners)
   FRawPtrRetFuncs.Clear;
   FRawScanProc := '';
   FRawScanning := True;    // ...so IsRawPtr answers in the scope the WALK is in, not the one being lowered
