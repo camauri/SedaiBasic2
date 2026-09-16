@@ -1161,6 +1161,7 @@ type
     function TypeDeclaresAllocOperator(const TypeName, OpName: string): Boolean;  // ...asked before FProcDecls exists
     function TypeHasMemberProc(const TypeName: string): Boolean;               // ...anything that takes a THIS
     procedure CheckPointerConstAssign(Decl: TASTNode);   // FB: a pointer assignment may not DROP a const
+    function TypeCtorReason(UDTIdx, Depth: Integer): string;
     procedure CheckAggregateInitArity(UDTIdx: Integer; ArgsNode: TASTNode);  // FB: too many values in a (...) init
     procedure CheckArrayByteSize(const ArrName, ElemTypeName: string; Elems, ElemBytes: Int64);  // FB error 50
     procedure CheckFieldArrayByteSize(const FieldName: string; Bounds: TASTNode; ElemSz: Int64);  // ...for a UDT FIELD array
@@ -49680,6 +49681,40 @@ begin
   CheckArrayByteSize(FieldName, IntToStr(ElemSz) + ' bytes', Count, ElemSz);
 end;
 
+function TSSAGenerator.TypeCtorReason(UDTIdx, Depth: Integer): string;
+// DIVERGENZE 499: why a record of this type has a CONSTRUCTOR in fbc - written, or implied by what it holds - or '' when it
+// has none. Measured against fbc: a field initialiser, a variable-length String, a dynamic array member, a member or a base
+// with a constructor, and "Extends Object" all give one; a destructor alone does not.
+var
+  i: Integer;
+  Cnt, EB: Int64;
+  R: string;
+begin
+  Result := '';
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) or (Depth > 16) then Exit;
+  if TypeDeclaresConstructor(FUDTs[UDTIdx].Name) then Exit('it declares a constructor');
+  if SameText(FUDTs[UDTIdx].Parent, 'OBJECT') then Exit('it extends Object');
+  if FUDTs[UDTIdx].Parent <> '' then
+  begin
+    R := TypeCtorReason(FindUDT(FUDTs[UDTIdx].Parent), Depth + 1);
+    if R <> '' then Exit('its base ' + FUDTs[UDTIdx].Parent + ' has a constructor');
+  end;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+    with FUDTs[UDTIdx].Fields[i] do
+    begin
+      if DefaultExpr <> nil then Exit('field ' + LowerCase(Name) + ' has an initialiser');
+      if (Bank = srtString) and (StrCapacity <= 0) and not IsArray then
+        Exit('field ' + LowerCase(Name) + ' is a variable-length string');
+      if IsArray and (DeclaredRedim or (ArrayBounds = nil) or not UDTFieldArrayShape(UDTIdx, i, Cnt, EB, True)) and
+         (ArrayElemType = '') and (ArrayElemBank <> srtString) then
+        Exit('field ' + LowerCase(Name) + ' is a dynamic array');
+      if (NestedType <> '') and (TypeCtorReason(FindUDT(NestedType), Depth + 1) <> '') then
+        Exit('member ' + LowerCase(Name) + ' has a constructor');
+      if IsArray and (ArrayElemType <> '') and (TypeCtorReason(FindUDT(ArrayElemType), Depth + 1) <> '') then
+        Exit('the elements of ' + LowerCase(Name) + ' have a constructor');
+    end;
+end;
+
 procedure TSSAGenerator.CheckAggregateInitArity(UDTIdx: Integer; ArgsNode: TASTNode);
 // FreeBASIC counts the values of an aggregate initialiser against the SLOTS the type actually has and
 // answers "error 67: Too many expressions" when there are more.
@@ -49702,6 +49737,7 @@ procedure TSSAGenerator.CheckAggregateInitArity(UDTIdx: Integer; ArgsNode: TASTN
 // ⚠️ Only TOO MANY is refused. Too few is legal everywhere - the rest keep their defaults.
 var
   i, Slots, Grp, SGrp: Integer;
+  Reason: string;
 
   function SameGroup(k: Integer): Boolean;
   // Is field k still in the group the walk is inside? For a whole-type union that is "any field".
@@ -49712,6 +49748,20 @@ var
 
 begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) or (ArgsNode = nil) then Exit;
+  // ⛔ DIVERGENZE 499: a type with a constructor - written or implied - is built by it, never by a list of values: fbc
+  // answers "error 7: Expected ')'" (or error 24) to "Dim v As T = (1, 2)", "Type(1, 2)", "Type<T>(1, 2)" and "New T(1, 2)"
+  // when no constructor takes those arguments. sb stored the values field by field.
+  // ⚠️ Only a real LIST: an empty one is the constructor itself ("a.Constructor()", "T()"), and a single operand may be a
+  // copy or a cast ("Cast(T, T)") - one LITERAL is still a list (fbc: error 24 on "= (1)").
+  if FModernMode and (GetEnvironmentVariable('SB_NO_AGGR_CTOR_CHECK') <> '1') and
+     ((ArgsNode.ChildCount >= 2) or
+      ((ArgsNode.ChildCount = 1) and (ArgsNode.GetChild(0) <> nil) and (ArgsNode.GetChild(0).NodeType = antLiteral))) then
+  begin
+    Reason := TypeCtorReason(UDTIdx, 0);
+    if Reason <> '' then
+      raise Exception.CreateFmt('Type %s cannot be initialised with a list of values: %s, so it is built by a ' +
+        'constructor (fbc: error 7, Expected '')'')', [FUDTs[UDTIdx].Name, Reason]);
+  end;
   Slots := 0;
   i := 0;
   while i <= High(FUDTs[UDTIdx].Fields) do
