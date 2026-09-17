@@ -949,6 +949,7 @@ type
     function EmitUDTTemporary(const TypeName: string; ArgsNode: TASTNode; out Handle: TSSAValue): Boolean;
     // FreeBASIC aggregate init "Dim As T v = (a,b,c)" / "Type<T>(a,b,c)": store args into fields in order.
     procedure EmitBraceArrayMemberInit(const HandleVal: TSSAValue; UDTIdx, FieldIdx: Integer; BraceNode: TASTNode);
+    function EmitNativeFieldInit(const HandleVal: TSSAValue; UDTIdx, FieldIdx: Integer; const Val: TSSAValue): Boolean;
     procedure EmitUDTAggregateInit(const HandleVal: TSSAValue; UDTIdx: Integer; ArgsNode: TASTNode);
     function UDTNeedsAggregateWalk(UDTIdx: Integer): Boolean;
     function AggregateArgsSpreadABase(UDTIdx: Integer; ArgsNode: TASTNode): Boolean;  // an element that is a BASE value
@@ -1949,10 +1950,9 @@ begin
   FRecNativeBits := GetEnvironmentVariable('SB_RECNATIVE_BITS') <> '0';                 // phase 3 exclusions: =0 is the A/B
   FRecNativeDefaults := GetEnvironmentVariable('SB_RECNATIVE_DEFAULTS') <> '0';         // phase 3 exclusions: =0 is the A/B
   FRecNativeRecArrays := GetEnvironmentVariable('SB_RECNATIVE_RECARRAYS') <> '0';     // phase 3 exclusions: =0 is the A/B
-  // ⛔ OFF by default (17 set 2026): with it on, the managed string paths that do not know an address yet broke - the aggregate
-  // initialiser (m249, m317, d252/agg_zstring), fb_memcopy over a native record (m518, the manual's array/memcopy) and the
-  // binary Get/Put of a record (fbc suite file/input, file/lof). SB_RECNATIVE_ZSTR=1 turns it on to work on them.
-  FRecNativeZStr := GetEnvironmentVariable('SB_RECNATIVE_ZSTR') = '1';
+  // ⭐ ON by default since the managed string paths learned the address (17 set 2026): the aggregate initialiser
+  // (EmitNativeFieldInit) and fb_memcopy into a field (the raw block copy). =0 is the A/B.
+  FRecNativeZStr := GetEnvironmentVariable('SB_RECNATIVE_ZSTR') <> '0';
   FBoolArrays := GetEnvironmentVariable('SB_BOOL_ARRAYS') <> '0';                        // DIVERGENZE 493: =0 is the A/B
   FProgram := nil;
   FCurrentBlock := nil;
@@ -40982,6 +40982,27 @@ begin
   end;
 end;
 
+function TSSAGenerator.EmitNativeFieldInit(const HandleVal: TSSAValue; UDTIdx, FieldIdx: Integer;
+  const Val: TSSAValue): Boolean;
+// A field of a NATIVE record written by an initialiser list: on the raw path at the field's C offset (phase 3). The record ops
+// the managed loop uses name a SLOT, and a string slot is no place in a C image ("A native record has no record storage").
+var
+  COfs: TInt64Array;
+  CTot: Int64;
+  Addr: TSSAValue;
+begin
+  Result := False;
+  if not (FRecNativeKnob and FNativeMemory) then Exit;
+  if not NativeRecordType(FUDTs[UDTIdx].Name) then Exit;
+  if not UDTCLayoutRaw(UDTIdx, COfs, CTot) then Exit;
+  if FieldIdx > High(COfs) then Exit;
+  Addr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, Addr, EnsureIntRegister(HandleVal), EnsureIntRegister(MakeSSAConstInt(COfs[FieldIdx])),
+                  MakeSSAValue(svkNone));
+  EmitRawFieldValueStore(Addr, UDTIdx, FieldIdx, Val);
+  Result := True;
+end;
+
 procedure TSSAGenerator.EmitUDTAggregateInit(const HandleVal: TSSAValue; UDTIdx: Integer; ArgsNode: TASTNode);
 // FreeBASIC aggregate initialization "Dim As T v = (a, b, c)" and "Type<T>(a, b, c)": a UDT with no
 // constructor is initialized field-by-field — store each value into the field at the same position (in
@@ -41134,6 +41155,12 @@ begin
     begin
       j := FindUDT(FUDTs[UDTIdx].Fields[FieldIdx].NestedType);
       EmitRecordCopy(NestedMemberHandle(HandleVal, UDTIdx, FieldIdx), EnsureIntRegister(ArgVal), j);
+      Inc(FieldIdx);
+      Continue;
+    end;
+    if (FUDTs[UDTIdx].Fields[FieldIdx].Bank = srtString) and
+       EmitNativeFieldInit(HandleVal, UDTIdx, FieldIdx, ArgVal) then
+    begin
       Inc(FieldIdx);
       Continue;
     end;
@@ -41336,6 +41363,8 @@ begin
           EmitBraceArrayMemberInit(HandleVal, AggUDT, i, ArgsNode.GetChild(i));
           Continue;
         end;
+        if (FUDTs[AggUDT].Fields[i].Bank = srtString) and EmitNativeFieldInit(HandleVal, AggUDT, i, ArgVals[i]) then
+          Continue;
         Slot := FUDTs[AggUDT].Fields[i].Slot;
         case FUDTs[AggUDT].Fields[i].Bank of
           srtFloat:  EmitInstruction(ssaRecordStoreFloat, MakeSSAValue(svkNone), HandleVal, EnsureFloatRegister(ArgVals[i]), MakeSSAConstInt(Slot));
@@ -47195,7 +47224,9 @@ begin
      ResolveRecordObject(ArgsNode.GetChild(0).GetChild(0), DstH, DstT) then
   begin
     DstUDT := FindUDT(DstT);
-    if (DstUDT >= 0) and UDTFieldBankSlot(DstUDT, VarToStr(ArgsNode.GetChild(0).Value), Bank, Slot, NestedT) and
+    // (a NATIVE record's string field is C bytes: the raw block copy below the caller already does it - phase 3)
+    if (DstUDT >= 0) and not NativeRecordType(FUDTs[DstUDT].Name) and
+       UDTFieldBankSlot(DstUDT, VarToStr(ArgsNode.GetChild(0).Value), Bank, Slot, NestedT) and
        (Bank = srtString) and IsStringSourceForField(ArgsNode.GetChild(1)) then
     begin
       ProcessStringExpression(ArgsNode.GetChild(1), SrcStr);
