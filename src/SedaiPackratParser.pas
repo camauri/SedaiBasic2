@@ -584,6 +584,14 @@ uses
   Math, StrUtils, TypInfo,
   SedaiPreprocessor;   // SourceDeclaresNonFbDialect: which -lang the source asked for
 
+// ⛔ A "#" that is a FILE-HANDLE PREFIX, never a STRING LITERAL whose text is "#": the tests below used to compare
+// the VALUE alone, so "Print ""#"";" read as "Print #" and was refused ("Expected file number after PRINT #"),
+// in both dialects (17 Sep 2026, found through bas/03_graphics/window.bas).
+function IsHashToken(T: TLexerToken): Boolean;
+begin
+  Result := (T <> nil) and (T.TokenType <> ttStringLiteral) and (VarToStr(T.Value) = '#');
+end;
+
 
 // The MODERN extensions that FreeBASIC does NOT reserve: a program may use any of them as the name
 // of its own procedure, and then that name is the program's, not ours.
@@ -2724,7 +2732,7 @@ begin
         // FreeBASIC "WRITE #n, ...": comma-separated, quoted-string CSV output (WRITE is a bare
         // identifier here; the `#` after it disambiguates from an assignment to a var named `write`).
         else if (UpperFast(Token.Value) = kWRITE) and Assigned(Context.PeekNext) and
-                ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
+                ((Context.PeekNext.TokenType = ttFileHandlePrefix) or IsHashToken(Context.PeekNext)) then
           Result := ParseWriteFileStatement
         // FreeBASIC console "WRITE v1, v2, ...": quoted-CSV to the screen. WRITE is a bare identifier, so
         // only treat it as the statement when a value follows (not "write = ...", an assignment, nor a
@@ -2745,7 +2753,7 @@ begin
         // FreeBASIC "SEEK #n, pos" statement (SEEK is also the SEEK(n) function — the `#` selects the
         // statement form). SEEK is a bare identifier here.
         else if (UpperFast(Token.Value) = kSEEK) and Assigned(Context.PeekNext) and
-                ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
+                ((Context.PeekNext.TokenType = ttFileHandlePrefix) or IsHashToken(Context.PeekNext)) then
           Result := ParseSeekStatement
         // The '#' is OPTIONAL in FreeBASIC: "Seek f, 100" is the same statement. In statement position
         // a bare file number (identifier or literal) can only be the statement form — the FUNCTION form
@@ -2761,7 +2769,7 @@ begin
           Result := ParseGfxPutStatement
         // FreeBASIC binary "PUT #n, [pos], var" — PUT is a bare identifier; the `#` selects it.
         else if (UpperFast(Token.Value) = kPUT) and Assigned(Context.PeekNext) and
-                ((Context.PeekNext.TokenType = ttFileHandlePrefix) or (Context.PeekNext.Value = '#')) then
+                ((Context.PeekNext.TokenType = ttFileHandlePrefix) or IsHashToken(Context.PeekNext)) then
         begin
           Context.Advance;   // consume PUT
           Result := ParseBinaryFileTail(False, Token);
@@ -3371,7 +3379,7 @@ begin
 
     // FreeBASIC file output: "PRINT #n, exprlist" -> antPrintFile (handle = child 0). The shared
     // print-list loop below appends the expressions/separators (same shape as PRINT#).
-    if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+    if Context.Check(ttFileHandlePrefix) or IsHashToken(Context.CurrentToken) then
     begin
       Result.Free;
       Result := TASTNode.Create(antPrintFile, Token);
@@ -3486,7 +3494,7 @@ begin
   Context.Advance; // Consume INPUT
 
   // FreeBASIC file input: "INPUT #n, varlist" -> antInputFile (handle = child 0, then variables).
-  if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+  if Context.Check(ttFileHandlePrefix) or IsHashToken(Context.CurrentToken) then
   begin
     Result.Free;
     Result := TASTNode.Create(antInputFile, Token);
@@ -3605,7 +3613,7 @@ begin
   if Assigned(SrcNode) then SrcNode.Free;   // not the graphics form after all: give the node back
 
   // FreeBASIC binary "GET #n, [pos], var" — read sizeof(var) bytes into a scalar.
-  if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+  if Context.Check(ttFileHandlePrefix) or IsHashToken(Context.CurrentToken) then
   begin
     Result.Free;
     Result := ParseBinaryFileTail(True, Token);
@@ -9501,7 +9509,7 @@ begin
         Context.Advance;
         Continue;
       end
-      else if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+      else if Context.Check(ttFileHandlePrefix) or IsHashToken(Context.CurrentToken) then
       begin
         MovsprMode := 3;  // Auto mode: angle#speed
         Result.Attributes.Values['movspr_mode'] := '3';
@@ -9646,7 +9654,7 @@ begin
   // optional arguments, emitting no code (Result is the empty antStatement from the case above).
   if CmdName = 'FILEFLUSH' then
   begin
-    if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+    if Context.Check(ttFileHandlePrefix) or IsHashToken(Context.CurrentToken) then
       Context.Advance;
     if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
     begin
@@ -9662,7 +9670,7 @@ begin
   // them, emitting no code (Result is the empty antStatement from the case above).
   if (CmdName = 'LOCK') or (CmdName = 'UNLOCK') then
   begin
-    if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+    if Context.Check(ttFileHandlePrefix) or IsHashToken(Context.CurrentToken) then
       Context.Advance;
     while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
     begin
@@ -9683,7 +9691,7 @@ begin
   // The file number is a bare expression (number or variable), optionally prefixed with '#'.
   if CmdName = 'FILESETEOF' then
   begin
-    if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+    if Context.Check(ttFileHandlePrefix) or IsHashToken(Context.CurrentToken) then
       Context.Advance;
     Param := ParseExpression;
     if Assigned(Param) then
@@ -9701,7 +9709,7 @@ begin
   // Detected when OPEN is NOT immediately followed by a '#handle' (that is the legacy C64/C128 form).
   // Built as the same antDopen node (child0=handle, child1=filename, child2=mode$) the legacy form uses.
   if ((CmdName = 'DOPEN') or (CmdName = 'OPEN')) and
-     not (Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#')) then
+     not (Context.Check(ttFileHandlePrefix) or IsHashToken(Context.CurrentToken)) then
   begin
     // FreeBASIC DEVICE names stand where a filename would: "Open Cons For Input As #1" is the standard
     // way to read stdin, and CLBG's reverse-complement / k-nucleotide / regex-redux are all built on it.
@@ -9875,7 +9883,7 @@ begin
     if (UpperFast(Context.CurrentToken.Value) = kAS) or Context.Check(ttAsType) then
       Context.Advance;            // AS
       SkipTypeQualifiers;                     // FB: "As Const <type>"
-    if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+    if Context.Check(ttFileHandlePrefix) or IsHashToken(Context.CurrentToken) then
       Context.Advance;            // optional '#'
     HandleNode := ParseFileNumberOperand;
     if not Assigned(HandleNode) then
@@ -9945,7 +9953,7 @@ begin
     // Expect # prefix
     if Context.Check(ttFileHandlePrefix) then
       Context.Advance  // Consume #
-    else if Context.CurrentToken.Value = '#' then
+    else if IsHashToken(Context.CurrentToken) then
       Context.Advance; // Handle # as separate token if needed
 
     // Parse handle (number or identifier)
@@ -9993,7 +10001,7 @@ begin
       begin
         Context.Advance;                              // ','
         if Context.Check(ttFileHandlePrefix) then Context.Advance
-        else if Context.CurrentToken.Value = '#' then Context.Advance;
+        else if IsHashToken(Context.CurrentToken) then Context.Advance;
         if Context.Check(ttNumber) or Context.Check(ttInteger) then
         begin
           Result.AddChild(TASTNode.CreateWithValue(antLiteral, StrToInt(Context.CurrentToken.Value),
@@ -10074,7 +10082,7 @@ begin
     // Expect # prefix
     if Context.Check(ttFileHandlePrefix) then
       Context.Advance
-    else if Context.CurrentToken.Value = '#' then
+    else if IsHashToken(Context.CurrentToken) then
       Context.Advance;
 
     // Parse handle
@@ -10129,7 +10137,7 @@ begin
     // Expect # prefix
     if Context.Check(ttFileHandlePrefix) then
       Context.Advance
-    else if Context.CurrentToken.Value = '#' then
+    else if IsHashToken(Context.CurrentToken) then
       Context.Advance;
 
     // Parse handle
@@ -10456,7 +10464,7 @@ begin
   CombinedHash := (UpperFast(Context.CurrentToken.Value) = kINPUTN);   // 'INPUT#' already carries the '#'
   Context.Advance;  // INPUT or INPUT#
   if (not CombinedHash) and
-     not (Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#')) then
+     not (Context.Check(ttFileHandlePrefix) or IsHashToken(Context.CurrentToken)) then
   begin
     // Console "LINE INPUT [;] [prompt ;|,] var" — read a whole line into a string variable. Reuses the
     // console string-input path (antInput); v1 shows INPUT's "? " prompt.
@@ -10704,7 +10712,7 @@ begin
   Context.Advance;  // WRITE
   Result := TASTNode.Create(antPrintFile, Tok);
   Result.Attributes.Values['WRITE'] := '1';
-  if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+  if Context.Check(ttFileHandlePrefix) or IsHashToken(Context.CurrentToken) then
     Context.Advance;  // '#'
   P := ParseFileNumberOperand;
   if Assigned(P) then
@@ -10737,7 +10745,7 @@ begin
     Result := TASTNode.Create(antPrintFile, Tok);
     Result.Attributes.Values['PUTBIN'] := '1';
   end;
-  if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+  if Context.Check(ttFileHandlePrefix) or IsHashToken(Context.CurrentToken) then
     Context.Advance;  // '#'
   H := ParseFileNumberOperand;
   if not Assigned(H) then
@@ -10810,7 +10818,7 @@ begin
   Context.Advance;  // SEEK
   Result := TASTNode.Create(antPrintFile, Tok);
   Result.Attributes.Values['SEEK'] := '1';
-  if Context.Check(ttFileHandlePrefix) or (Context.CurrentToken.Value = '#') then
+  if Context.Check(ttFileHandlePrefix) or IsHashToken(Context.CurrentToken) then
     Context.Advance;  // '#'
   P := ParseFileNumberOperand;
   if Assigned(P) then
