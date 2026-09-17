@@ -73,6 +73,7 @@ type
     FLastError: string;
     FSkipSuperinstructions: Boolean;
     FFreeBasicMode: Boolean;   // FreeBASIC/Modern dialect: no line numbers
+    FClassicOnly: Boolean;     // sbv: a MODERN program is refused (owner, 9 and 17 Sep 2026)
 
     function CompileSource(const SourceFile: string): TBytecodeProgram;
     function LoadBytecode(const BytecodeFile: string): TBytecodeProgram;
@@ -104,10 +105,16 @@ type
     // FreeBASIC/Modern dialect (no line numbers). Also auto-enabled by a .fb/.fbas
     // source extension. Default False = classic BASIC (line numbers optional).
     property FreeBasicMode: Boolean read FFreeBasicMode write FFreeBasicMode;
+    // ⛔ TWO ENVIRONMENTS, TWO DIALECTS (owner, 9 Sep 2026, restated 17 Sep): sbv runs CLASSIC only, sb MODERN only.
+    // Set by sbv; a source without line numbers, or a .basc compiled from one, is refused by name.
+    property ClassicOnly: Boolean read FClassicOnly write FClassicOnly;
   end;
 
   { Exception for runner errors }
   ESedaiRunnerError = class(Exception);
+
+const
+  CLASSIC_ONLY_REFUSAL = 'sbv runs CLASSIC programs only (Commodore BASIC 7.0, with line numbers): %s is a MODERN program - run it with sb';
 
 { PHASE_DIAG=1 - per-phase compile TIME, in milliseconds. See the bodies in the implementation. }
 procedure PhaseBegin;
@@ -420,6 +427,11 @@ begin
       // ⚠️ It is inside LoadBytecode rather than beside its two callers on purpose - `sbv` reaches
       // a .basc through here, and a third runner that learns to would otherwise run UNFUSED
       // bytecode and lose ~10% with nothing to report it.
+      if FClassicOnly and Result.ModernMode then
+      begin
+        FreeAndNil(Result);
+        raise ESedaiRunnerError.CreateFmt(CLASSIC_ONLY_REFUSAL, [ExtractFileName(BytecodeFile)]);
+      end;
       if not FSkipSuperinstructions then FuseAtLoad(Result);
       if FVerbose then
         WriteLn('Loaded ', Result.GetInstructionCount, ' instructions');
@@ -502,6 +514,11 @@ begin
     // classic; otherwise FreeBASIC/Modern (no line numbers). FreeBasicMode forces
     // Modern. Spaces-between-tokens and case-insensitivity hold in both dialects.
     UseFreeBasic := FFreeBasicMode or (not SourceHasLineNumbers(Source.Text));
+    if FClassicOnly and UseFreeBasic then
+    begin
+      FLastError := Format(CLASSIC_ONLY_REFUSAL, [ExtractFileName(SourceFile)]);
+      raise ESedaiRunnerError.Create(FLastError);
+    end;
     Lexer := TLexerFSM.Create;
     try
       Lexer.SetHasLineNumbers(not UseFreeBasic);

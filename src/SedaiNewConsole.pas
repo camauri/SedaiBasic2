@@ -328,6 +328,10 @@ type
     procedure GBDestroySurface(Surface: TGfxSurface);
     function  GBSurfaceWidth(Surface: TGfxSurface): Integer;
     function  GBSurfaceHeight(Surface: TGfxSurface): Integer;
+    function  GBSurfaceDepth(Surface: TGfxSurface): Integer;
+    function  GBSurfaceBytesPerPixel(Surface: TGfxSurface): Integer;
+    procedure GBSetSurfaceDepth(Surface: TGfxSurface; ADepth: Integer);
+    procedure GBSyncSurfaceToRGB(Surface: TGfxSurface);
     function  GBSurfaceData(Surface: TGfxSurface; out Data: PByte; out SizeBytes: Integer): Boolean;
     procedure GBSetPixel(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
     function  GBGetPixel(Surface: TGfxSurface; X, Y: Integer): TGfxColor;
@@ -358,6 +362,10 @@ type
     procedure IGraphicsBackend.DestroySurface = GBDestroySurface;
     function  IGraphicsBackend.SurfaceWidth = GBSurfaceWidth;
     function  IGraphicsBackend.SurfaceHeight = GBSurfaceHeight;
+    function  IGraphicsBackend.SurfaceDepth = GBSurfaceDepth;
+    function  IGraphicsBackend.SurfaceBytesPerPixel = GBSurfaceBytesPerPixel;
+    procedure IGraphicsBackend.SetSurfaceDepth = GBSetSurfaceDepth;
+    procedure IGraphicsBackend.SyncSurfaceToRGB = GBSyncSurfaceToRGB;
     function  IGraphicsBackend.SurfaceData = GBSurfaceData;
     procedure IGraphicsBackend.SetPixel = GBSetPixel;
     function  IGraphicsBackend.GetPixel = GBGetPixel;
@@ -984,7 +992,7 @@ type
     // Startup file support (passed via command line)
     procedure SetStartupFile(const AFileName: string; AAutoRun: Boolean);
     function SourceHasLineNumbers(const AFileName: string): Boolean;  // CLASSIC (true) vs FreeBASIC MODERN (false)
-    procedure LoadModernSource(const AFileName: string);              // compile a FreeBASIC source straight to bytecode
+    procedure RefuseModernProgram(const AFileName: string);           // sbv runs CLASSIC only: say so, load nothing
     // History file support
     procedure SetHistoryFile(const AFileName: string);
 
@@ -3920,6 +3928,37 @@ var M: TGraphicsMemory;
 begin
   M := GBImageMem(Surface);
   if Assigned(M) then Result := M.State.Height else Result := FViewportHeight;
+end;
+
+// ⛔ The surface DEPTH (8 Sep 2026, fbc's screen modes) reached IGraphicsBackend and the software backend but not
+// this console, and sbv stopped compiling. An image surface carries its depth in its memory, as there; the SDL
+// screen of the C128 shell is always 32 bpp and has nothing to set or to sync.
+function TVideoController.GBSurfaceDepth(Surface: TGfxSurface): Integer;
+var M: TGraphicsMemory;
+begin
+  M := GBImageMem(Surface);
+  if Assigned(M) then Result := M.Depth else Result := 32;
+end;
+
+function TVideoController.GBSurfaceBytesPerPixel(Surface: TGfxSurface): Integer;
+var M: TGraphicsMemory;
+begin
+  M := GBImageMem(Surface);
+  if Assigned(M) then Result := M.BytesPerPixel else Result := 4;
+end;
+
+procedure TVideoController.GBSetSurfaceDepth(Surface: TGfxSurface; ADepth: Integer);
+var M: TGraphicsMemory;
+begin
+  M := GBImageMem(Surface);
+  if Assigned(M) then M.SetDepth(ADepth);
+end;
+
+procedure TVideoController.GBSyncSurfaceToRGB(Surface: TGfxSurface);
+var M: TGraphicsMemory;
+begin
+  M := GBImageMem(Surface);
+  if Assigned(M) then M.SyncNativeToRGB;
 end;
 
 procedure TVideoController.GBSetPixel(Surface: TGfxSurface; X, Y: Integer; Color: TGfxColor);
@@ -8618,6 +8657,13 @@ begin
       end;
     end;
 
+    // ⛔ A MODERN source has no line numbers, so the loop below stored NOTHING and answered READY.
+    if not TSedaiRunner.SourceHasLineNumbers(FileContent.Text) then
+    begin
+      RefuseModernProgram(Filename);
+      Exit;
+    end;
+
     // Show loading message
     FTextBuffer.PutString('LOADING');
     FTextBuffer.NewLine;
@@ -9313,51 +9359,16 @@ begin
   end;
 end;
 
-procedure TSedaiNewConsole.LoadModernSource(const AFileName: string);
-// Compile a FreeBASIC (MODERN) source file straight to bytecode and switch to bytecode-run mode (the
-// line-keyed program store cannot hold a number-less source). RUN then executes FLoadedBytecode.
-var
-  Runner: TSedaiRunner;
+procedure TSedaiNewConsole.RefuseModernProgram(const AFileName: string);
+// The C128 answer to a file of the wrong kind, plus where the program belongs.
 begin
   FTextBuffer.NewLine;
-  FTextBuffer.PutString('LOADING ' + ExtractFileName(AFileName));
+  FTextBuffer.PutString('?FILE TYPE MISMATCH ERROR');
   FTextBuffer.NewLine;
-  RenderScreen;
-  Runner := TSedaiRunner.Create;
-  try
-    if Assigned(FLoadedBytecode) then FreeAndNil(FLoadedBytecode);
-    FProgramMemory.Clear;
-    try
-      FLoadedBytecode := Runner.LoadFromSource(AFileName);
-    except
-      on E: Exception do
-      begin
-        FLoadedBytecode := nil;
-        FBytecodeMode := False;
-        FTextBuffer.PutString('?COMPILE ERROR: ' + E.Message);
-        FTextBuffer.NewLine;
-        FTextBuffer.PutString('READY.'); FReadyPrinted := True;
-        FTextBuffer.NewLine;
-        Exit;
-      end;
-    end;
-    if Assigned(FLoadedBytecode) then
-    begin
-      FBytecodeMode := True;
-      FTextBuffer.PutString('READY.'); FReadyPrinted := True;
-      FTextBuffer.NewLine;
-    end
-    else
-    begin
-      FBytecodeMode := False;
-      FTextBuffer.PutString('?LOAD FAILED');
-      FTextBuffer.NewLine;
-      FTextBuffer.PutString('READY.'); FReadyPrinted := True;
-      FTextBuffer.NewLine;
-    end;
-  finally
-    Runner.Free;
-  end;
+  FTextBuffer.PutString(UpperCase(ExtractFileName(AFileName)) + ' IS A MODERN PROGRAM: RUN IT WITH SB');
+  FTextBuffer.NewLine;
+  FTextBuffer.PutString('READY.'); FReadyPrinted := True;
+  FTextBuffer.NewLine;
 end;
 
 procedure TSedaiNewConsole.ExecuteBLoad(const Filename: string);
@@ -9407,6 +9418,14 @@ begin
 
       // Load bytecode
       FLoadedBytecode := Serializer.LoadFromFile(Filename);
+      // ⛔ ...and a .basc compiled from a MODERN source is refused too: sbv runs CLASSIC only.
+      if FLoadedBytecode.ModernMode then
+      begin
+        FreeAndNil(FLoadedBytecode);
+        FBytecodeMode := False;
+        RefuseModernProgram(Filename);
+        Exit;
+      end;
       FBytecodeMode := True;
 
       FTextBuffer.PutString('READY.'); FReadyPrinted := True;
@@ -12010,11 +12029,11 @@ begin
     end
     else if not SourceHasLineNumbers(FStartupFile) then
     begin
-      // FreeBASIC (MODERN) source: no line numbers, so it cannot live in the line-keyed program store.
-      // Compile it straight to bytecode and run it via the bytecode path (like a precompiled .basc).
+      // ⛔ A MODERN source (no line numbers) is refused: sbv is the CLASSIC environment, sb the MODERN one
+      // (owner, 9 Sep 2026, restated 17 Sep). It used to be compiled straight to bytecode and run here.
       FTextBuffer.PutString('LOAD "' + FStartupFile + '"');
       FTextBuffer.NewLine;
-      LoadModernSource(FStartupFile);
+      RefuseModernProgram(FStartupFile);
     end
     else
     begin

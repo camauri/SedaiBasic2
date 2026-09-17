@@ -231,6 +231,7 @@ begin
   Runner := TSedaiRunner.Create;
   try
     Runner.Verbose := OptVerbose;
+    Runner.ClassicOnly := True;   // sbv is the CLASSIC environment: a MODERN program is refused (owner, 9 Sep 2026)
     // Skip superinstructions for --disasm-pre (show pre-fusion bytecode)
     Runner.SkipSuperinstructions := OptDisasmPre;
 
@@ -253,6 +254,7 @@ begin
           begin
             WriteLn('ERROR: Unknown file type: ', FileName);
             WriteLn('Supported extensions: .bas (source), .basc (bytecode)');
+            ExitCode := 1;
             Exit;
           end;
       end;
@@ -261,6 +263,7 @@ begin
       on E: Exception do
       begin
         WriteLn('ERROR: ', E.Message);
+        ExitCode := 1;   // a refused program must not report success
         Exit;
       end;
     end;
@@ -389,6 +392,7 @@ begin
             on E: Exception do
             begin
               WriteLn('ERROR during VM execution at PC=', VM.PC, ': ', E.Message);
+              ExitCode := 1;
               Exit;
             end;
           end;
