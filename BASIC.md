@@ -3292,8 +3292,8 @@ End Function
 | `FILEDATETIME` | ✓ | `FILEDATETIME(path)` -> the file's last-modified timestamp as a Date Serial (Double), or 0 if absent; cross-platform. |
 | `FILEEXISTS` | ✓ | `FILEEXISTS(path)` returns -1 if the file exists, else 0 (cross-platform). |
 | `FILELEN` | ✓ | `FILELEN(path)` -> file size in bytes (0 if the file does not exist); cross-platform. |
-| `FILESETEOF` | ✓ | `FILESETEOF filenum` sets an open file's length to the current 1-based position (truncates if before EOF, extends with zero bytes if beyond). Statement form. |
-| `FILEFLUSH` | ✓ | `FILEFLUSH [[#]filenum]` — accepted as a no-op (the VM's file streams are unbuffered, so buffered output is already written). |
+| `FILESETEOF` | ✓ | `FILESETEOF filenum` sets an open file's length to the current 1-based position (truncates if before EOF, extends with zero bytes if beyond). Statement form. ⚠️ Not yet usable as a FUNCTION (`Print FileSetEof(1)` is a syntax error; fbc returns 0), and accepted without `#include "file.bi"`, which fbc requires (DIVERGENZE 504). |
+| `FILEFLUSH` | ✓ | `FILEFLUSH [[#]filenum]` — accepted as a no-op (the VM's file streams are unbuffered, so buffered output is already written). ⚠️ Not yet usable as a FUNCTION (`Print FileFlush(1)` is a syntax error; fbc returns 0) (DIVERGENZE 504). |
 
 #### Working with Directories
 

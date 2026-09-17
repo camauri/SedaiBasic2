@@ -549,8 +549,8 @@ type
     FRawBitUnit, FRawBitOfs: TInt64Array; // ...the unit size and bit offset of each bit field in the LAST UDTCLayoutRaw walk
     FRecNativeDefaults: Boolean;         // phase 3 (exclusions): a type with field DEFAULTS can be native
     FRecNativeRecArrays: Boolean;        // phase 3 (exclusions): an inline array of native records
-    FRecNativeZStr: Boolean;
-    FRecNativeFixStr: Boolean;           // phase 3 (exclusions): a String * n field             // phase 3 (exclusions): a ZString * n field outside a union
+    FRecNativeZStr: Boolean;             // phase 3 (exclusions): a ZString * n field outside a union
+    FRecNativeFixStr: Boolean;           // phase 3 (exclusions): a String * n field
     FBoolArrays: Boolean;                // DIVERGENZE 493: a Boolean array is packed at one byte holding C's 0/1
     FNativeRecAsking: TStringList;       // phase 3.2: the types NativeRecordType is answering right now (a list's own pointer)
     // Phase 2.1a: the program's entry block, and where in it a raw module cell's allocation is hoisted (HoistToEntry) -
@@ -1954,7 +1954,7 @@ begin
   // ⭐ ON by default since the managed string paths learned the address (17 set 2026): the aggregate initialiser
   // (EmitNativeFieldInit) and fb_memcopy into a field (the raw block copy). =0 is the A/B.
   FRecNativeZStr := GetEnvironmentVariable('SB_RECNATIVE_ZSTR') <> '0';
-  FRecNativeFixStr := GetEnvironmentVariable('SB_RECNATIVE_FIXSTR') = '1';   // phase 3: OFF until the nets say so
+  FRecNativeFixStr := GetEnvironmentVariable('SB_RECNATIVE_FIXSTR') <> '0';   // phase 3: ON; =0 keeps such types managed (A/B)
   FBoolArrays := GetEnvironmentVariable('SB_BOOL_ARRAYS') <> '0';                        // DIVERGENZE 493: =0 is the A/B
   FProgram := nil;
   FCurrentBlock := nil;
@@ -30422,6 +30422,18 @@ begin
   if (RecType <> '') and (FindUDT(RecType) >= 0) then
   begin
     UIdx := FindUDT(RecType);
+    // ⭐ Phase 3: a NATIVE record IS its C image, so the transfer is its bytes in one piece. The field walk below names
+    // SLOTS, and a string slot is no place in a C image ("Put #f, , e" on a type holding a "String * n").
+    if FRecNativeKnob and FNativeMemory and NativeRecordType(FUDTs[UIdx].Name) and
+       (NativeImageBytes(UIdx) > 0) and ResolveRecordObject(ValueNode, RecHandle, RecType) then
+    begin
+      BytesReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, BytesReg, MakeSSAConstInt(NativeImageBytes(UIdx)), MakeSSAValue(svkNone),
+                      MakeSSAValue(svkNone));
+      if IsGet then Op := ssaGetBinMem else Op := ssaPutBinMem;
+      EmitInstruction(Op, MakeSSAValue(svkNone), HandleReg, EnsureIntRegister(RecHandle), BytesReg);
+      Exit(True);
+    end;
     if UDTCLayout(UIdx, Offsets, TotalSz) and ResolveRecordObject(ValueNode, RecHandle, RecType) then
     begin
       Cur := 0;
@@ -53846,7 +53858,14 @@ begin
     Exit;
   end;
   // "h->field" where h holds a RAW ADDRESS: the field lives at a byte offset, not in a record slot.
-  if TryEmitRawUDTField(Node.GetChild(0), VarToStr(Node.Value), Result) then Exit;
+  // ⛔ A "String * n" field read this way is its n bytes, and an ordinary read converts at the first NUL exactly as the
+  // managed read at the end of this routine does (phase 3: "u = r.f" answered "ab" plus four NULs).
+  if TryEmitRawUDTField(Node.GetChild(0), VarToStr(Node.Value), Result) then
+  begin
+    if (Result.Kind = svkRegister) and (Result.RegType = srtString) and AnyFixedLen then
+      Result := MaybeFixedLenRead(Node, Result);
+    Exit;
+  end;
   // ...and "a(i)->field" where the ELEMENT may hold a C address (DIVERGENZE 259): decided at run time.
   if TryEmitForeignElemField(Node, Result) then Exit;
   // ...and "b->g[i].f" where b is such a base, one indexed pointer field further down (DIVERGENZE 388).
