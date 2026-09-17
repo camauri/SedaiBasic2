@@ -6830,12 +6830,15 @@ function TBytecodeVM.ExecUtfConv(Ctx: TExecutionContext; Which: Integer): Int64;
 // domains - C's memory, the raw byte heap an @-taken scalar lives in, a packed array of the program, a
 // record field - so every byte goes through RB/WB, which ask the address which domain it is.
 //
-// ⛔⛔ fbc's UTF-16 DECODER TRUNCATES A SURROGATE PAIR TO SIXTEEN BITS, and that is reproduced here on
-// purpose. It computes ((hi-$D800) shl 10) + (lo-$DC00) + $10000 in a 16-bit intermediate, so U+1F4A9
-// comes back as $F4A9, U+10FFFF as $FFFF and U+10000 as ZERO - which the caller then reads as the
-// terminator. Measured on four pairs against the oracle; MODERN conforms to fbc, and the defect is
-// written up in job/fbc-upstream/ISSUES.md. The ENCODER (WCharToUTF) has no such bug: it emits a proper
-// surrogate pair, which is why a round trip above the BMP does not come home.
+// ⛔⛔ THE ONE PLACE THIS DOES NOT ANSWER WHAT fbc ANSWERS, and it is a decision of the owner's
+// (17 Sep 2026): "we copy everything, but not the defects". fbc's UTF-16 DECODER truncates a surrogate
+// pair to sixteen bits - it computes ((hi-$D800) shl 10) + (lo-$DC00) + $10000 in a 16-bit intermediate,
+// so U+1F4A9 comes back as $F4A9, U+10FFFF as $FFFF and U+10000 as ZERO, which the caller then reads as
+// the terminator and the string stops there. Measured on four pairs against the oracle. Here the pair
+// decodes WHOLE, so a round trip through UTF-16 comes home. DIVERGENZE 514, and the defect is written up
+// for the FreeBASIC developers in job/fbc-upstream/ISSUES.md n. 4.
+// ⚠️ On Windows fbc's wchar_t is two bytes wide, so there the truncation cannot be observed - which is
+// probably why the intermediate is that wide.
 const
   ENC_UTF8 = 1; ENC_UTF16 = 2; ENC_UTF32 = 3;
 var
@@ -6938,7 +6941,7 @@ var
     end;
   end;
 
-  // The next codepoint of the encoded source, advancing i. ⛔ The UTF-16 arm is fbc's, truncation and all.
+  // The next codepoint of the encoded source, advancing i.
   function DecCP: Int64;
   begin
     case Encod of
@@ -6965,7 +6968,13 @@ var
           begin
             Lo := RB(Src + i) or (RB(Src + i + 1) shl 8);
             Inc(i, 2);
-            Result := (((Result - $D800) shl 10) + (Lo - $DC00) + $10000) and $FFFF;   // fbc's 16-bit intermediate
+            // ⭐ The WHOLE codepoint (DIVERGENZE 514). fbc masks this to sixteen bits; we do not.
+            if (Lo >= $DC00) and (Lo <= $DFFF) then
+              Result := ((Result - $D800) shl 10) + (Lo - $DC00) + $10000
+            else
+              // A high surrogate NOT followed by a low one is not a pair: the unit stands for itself and
+              // the one that is not a low surrogate is left for the next round.
+              begin Result := Result; Dec(i, 2); end;
           end;
         end;
     else
