@@ -2060,16 +2060,21 @@ begin
     FConsoleBehavior.Free;
   if Assigned(FOwnedGraphics) then
     FreeAndNil(FOwnedGraphics);   // free a VM-owned graphics backend (e.g. the software backend on sb)
-  // ⛔ Le chiusure PRIMA di tutto cio' che il loro handler potrebbe raggiungere: una pagina eseguibile
-  // che C ha ancora in mano dopo che la VM e' morta e' esattamente la trappola che i worker documentano
-  // qui sopra. Ognuna possiede il proprio contesto, che va liberato con lei.
+  // ⛔⛔ LE CHIUSURE SI DISARMANO, NON SI LIBERANO. Una pagina eseguibile che C ha ancora in mano dopo che
+  // la VM e' morta e' la trappola che i worker documentano qui sopra - ma liberarla non la disinnesca: la
+  // rende un salto nel vuoto. `g_atexit(@bye)` consegna la procedura BASIC al runtime del C, che la chiama
+  // DOPO che main e' finito e la VM distrutta: liberare la pagina e la sua struttura faceva morire il
+  // processo in access violation a uscita gia' avvenuta, con un indirizzo nudo e nessun messaggio.
+  // ⇒ Si azzerano VM e contesto - il trampolino esce in silenzio su entrambi, ed e' un controllo che ha
+  // sempre avuto - e la pagina resta mappata. E' memoria che non si rende al sistema operativo un istante
+  // prima che sia lui a riprendersela: l'unico momento in cui un mancato rilascio non e' un difetto.
   if FClosures <> nil then
   begin
     for JitI := 0 to FClosures.Count - 1 do
       if FClosures.Objects[JitI] <> nil then
       begin
-        PSbClosureCtx(FClosures.Objects[JitI])^.Closure.Free;
-        Dispose(PSbClosureCtx(FClosures.Objects[JitI]));
+        PSbClosureCtx(FClosures.Objects[JitI])^.VM := nil;
+        PSbClosureCtx(FClosures.Objects[JitI])^.Ctx := nil;
       end;
     FreeAndNil(FClosures);
   end;
