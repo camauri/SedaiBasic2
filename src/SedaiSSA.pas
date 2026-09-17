@@ -549,6 +549,7 @@ type
     FRawBitUnit, FRawBitOfs: TInt64Array; // ...the unit size and bit offset of each bit field in the LAST UDTCLayoutRaw walk
     FRecNativeDefaults: Boolean;         // phase 3 (exclusions): a type with field DEFAULTS can be native
     FRecNativeRecArrays: Boolean;        // phase 3 (exclusions): an inline array of native records
+    FRecNativeZStr: Boolean;             // phase 3 (exclusions): a ZString * n field outside a union
     FBoolArrays: Boolean;                // DIVERGENZE 493: a Boolean array is packed at one byte holding C's 0/1
     FNativeRecAsking: TStringList;       // phase 3.2: the types NativeRecordType is answering right now (a list's own pointer)
     // Phase 2.1a: the program's entry block, and where in it a raw module cell's allocation is hoisted (HoistToEntry) -
@@ -1948,6 +1949,10 @@ begin
   FRecNativeBits := GetEnvironmentVariable('SB_RECNATIVE_BITS') <> '0';                 // phase 3 exclusions: =0 is the A/B
   FRecNativeDefaults := GetEnvironmentVariable('SB_RECNATIVE_DEFAULTS') <> '0';         // phase 3 exclusions: =0 is the A/B
   FRecNativeRecArrays := GetEnvironmentVariable('SB_RECNATIVE_RECARRAYS') <> '0';     // phase 3 exclusions: =0 is the A/B
+  // ⛔ OFF by default (17 set 2026): with it on, the managed string paths that do not know an address yet broke - the aggregate
+  // initialiser (m249, m317, d252/agg_zstring), fb_memcopy over a native record (m518, the manual's array/memcopy) and the
+  // binary Get/Put of a record (fbc suite file/input, file/lof). SB_RECNATIVE_ZSTR=1 turns it on to work on them.
+  FRecNativeZStr := GetEnvironmentVariable('SB_RECNATIVE_ZSTR') = '1';
   FBoolArrays := GetEnvironmentVariable('SB_BOOL_ARRAYS') <> '0';                        // DIVERGENZE 493: =0 is the A/B
   FProgram := nil;
   FCurrentBlock := nil;
@@ -28564,17 +28569,30 @@ procedure TSSAGenerator.EmitRawFieldValueStore(AddrVal: TSSAValue; UDTIdx, Field
 // DEFAULTS are written with (EmitRecordInit, phase 3).
 var
   Sz, Al: Int64;
-  Tmp1: TSSAValue;
+  Tmp1, CutS: TSSAValue;
   F: TUDTField;
   BitCode, BitOfsC: Integer;
 begin
   F := FUDTs[UDTIdx].Fields[FieldIdx];
   UDTFieldCShape(UDTIdx, FieldIdx, Sz, Al);
   if F.Bank = srtString then
+  begin
+    // ⛔ A "ZString * n" keeps n-1 characters - the nth byte is the terminator - and ends at its first NUL, the rule the
+    // scalar and the array element already follow (EmitFixedStrElemStore). The raw store writes whatever it is given, so
+    // "r.tag = "toolongtag"" on a ZString * 4 ran over the next field (phase 3, ZString fields outside a union).
+    if F.IsZString and (not F.IsWString) and (F.StrCapacity > 0) then
+    begin
+      Tmp1 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, Tmp1, MakeSSAConstInt(F.StrCapacity - 1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      CutS := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaStrLeft, CutS, EnsureStringRegister(ExprVal), Tmp1, MakeSSAValue(svkNone));
+      ExprVal := EmitFixedLenToVarLen(CutS, False);
+    end;
     // A fixed-length string field is its DECLARED width of bytes, terminator and all - the same
     // capacity code the load half passes.
     EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), AddrVal, EnsureStringRegister(ExprVal),
-                    MakeSSAConstInt(2 + F.StrCapacity))
+                    MakeSSAConstInt(2 + F.StrCapacity));
+  end
   else if F.Bank = srtFloat then
   begin
     if Sz = 4 then
@@ -40311,7 +40329,7 @@ begin
         // A "ZString * n" is C bytes, but nineteen managed string paths (aggregates, fb_memcopy, copies) do not know an
         // address yet: admitted only inside a UNION (libjpeg's jpeg_error_mgr.msg_parm), where no program writes it whole.
         if ((Bank = srtString) and not (IsZString and (not IsWString) and (StrCapacity > 0) and FRecNativeProcFields and
-                                        FUDTs[Idx].IsUnion)) or
+                                        (FUDTs[Idx].IsUnion or FRecNativeZStr))) or
            ((BitWidth > 0) and not FRecNativeBits) or (IsBoolean and not FRecNativeBool) or IsCvaList or ((DefaultExpr <> nil) and not (FRecNativeDefaults and (NestedType = '') and not IsArray)) then Exit(No('field ' + Name + ': string/bits/boolean/va/default'));
         // A PROCEDURE field: the raw store picks the overload of "@fun" from the field's signature since phase 3.7, as the
         // managed store does (m708). SB_RECNATIVE_PROCFIELDS=0 keeps such types managed (A/B).
@@ -54066,7 +54084,7 @@ procedure TSSAGenerator.ProcessMemberStore(MemberNode, ExprNode: TASTNode);
 var
   TypeName, NestedT, SMBack, AllocFn: string;
   UDTIdx, Slot, FixCap, BitIdx, FPSlot: Integer;
-  BitUnit: TSSAValue;
+  BitUnit, ZCut: TSSAValue;
   Bank: TSSARegisterType;
   FixWide: Boolean;
   HandleVal, ExprVal, DummyVal, NestSrcH, NestDstH: TSSAValue;
@@ -54221,6 +54239,19 @@ begin
                  // "As String * n" field: store padded/cut to exactly n, as fbc's buffer is.
                  FixCap := UDTFieldStrCapacity(UDTIdx, VarToStr(MemberNode.Value), FixWide);
                  if FixCap > 0 then ExprVal := EmitFixedLenPad(ExprVal, FixCap, FixWide);
+                 // ⛔ ...and a "ZString * n" keeps n-1 characters, ending at its first NUL (DIVERGENZE 503): the managed
+                 // store kept the whole value - "r.tag = "toolongtag"" on a ZString * 4 read back ten characters.
+                 BitIdx := UDTFieldIndex(UDTIdx, VarToStr(MemberNode.Value));
+                 if (BitIdx >= 0) and FUDTs[UDTIdx].Fields[BitIdx].IsZString and
+                    (not FUDTs[UDTIdx].Fields[BitIdx].IsWString) and (FUDTs[UDTIdx].Fields[BitIdx].StrCapacity > 0) then
+                 begin
+                   BitUnit := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+                   EmitInstruction(ssaLoadConstInt, BitUnit, MakeSSAConstInt(FUDTs[UDTIdx].Fields[BitIdx].StrCapacity - 1),
+                                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                   ZCut := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+                   EmitInstruction(ssaStrLeft, ZCut, ExprVal, BitUnit, MakeSSAValue(svkNone));
+                   ExprVal := EmitFixedLenToVarLen(ZCut, False);
+                 end;
                  Op := ssaRecordStoreString;
                end;
   else
