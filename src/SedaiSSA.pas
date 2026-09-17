@@ -9761,6 +9761,23 @@ begin
           Exit;
         end;
 
+        // utf_conv.bi: CharToUTF(encod, src, chars, dst, bytes) and UTFToChar(encod, src, dst, chars). Five and four
+        // arguments, so they travel in the int transfer slots; the VM does the conversion (DIVERGENZE 511).
+        if FModernMode and ((UpperFast(ArrName) = 'CHARTOUTF') or (UpperFast(ArrName) = 'UTFTOCHAR')) and
+           (ArrayIndexOf(ArrName) < 0) then
+        begin
+          if UpperFast(ArrName) = 'CHARTOUTF' then SelImm := 0 else SelImm := 1;
+          for i := 0 to Node.GetChild(1).ChildCount - 1 do
+          begin
+            if i > 4 then Break;
+            ProcessExpression(Node.GetChild(1).GetChild(i), ArgValue);
+            EmitXferStore(srtInt, i, ArgValue);
+          end;
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaUtfConv, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
+          Exit;
+        end;
+
         // FreeBASIC ISREDIRECTED(n): is the stream a pipe or a file rather than a console? A non-zero
         // argument asks about standard INPUT, zero (the default) about standard output.
         if FModernMode and (UpperFast(ArrName) = kISREDIRECTED) and (ArrayIndexOf(ArrName) < 0) then
@@ -56206,6 +56223,10 @@ var
 begin
   Result := False;
   ResultVal := MakeSSAValue(svkNone);
+  // ⛔ ...and never for a routine of fbc's OWN headers that this runtime provides itself: the declaration in
+  // `utf_conv.bi` names a libfb symbol we do not link, and taking it as a C call answered "fb_CharToUTF was not
+  // found" where the intercept below does the work (DIVERGENZE 511).
+  if (NameU = 'CHARTOUTF') or (NameU = 'UTFTOCHAR') then Exit;
   Idx := FProgram.IndexOfForeignDecl(NameU);
   if Idx < 0 then Exit;
   if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), Decl) then Exit;

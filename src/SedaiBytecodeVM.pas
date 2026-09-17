@@ -984,6 +984,7 @@ type
     function PackedFloatLoad(ArrayIdx: Integer; PtrOffset: Int64; TypeCode: Integer; PtrAddr: Int64): Double;
     procedure PackedFloatStore(ArrayIdx: Integer; PtrOffset: Int64; TypeCode: Integer; PtrAddr: Int64; V: Double);
     procedure PtrDomainStoreInt(Ctx: TExecutionContext; PtrAddr, Value: Int64);
+    function ExecUtfConv(Ctx: TExecutionContext; Which: Integer): Int64;   // utf_conv.bi (DIVERGENZE 511)
     procedure PtrDomainStoreFloat(Ctx: TExecutionContext; PtrAddr: Int64; Value: Double; TypeCode: Integer = 0);
     procedure CleanupSharedRecords;   // free the shared region (destructor)
     procedure UpdateScreenModelGate;          // decide whether the modelled screen must be kept
@@ -6817,6 +6818,113 @@ begin
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
 end;
 
+function TBytecodeVM.ExecUtfConv(Ctx: TExecutionContext; Which: Integer): Int64;
+// utf_conv.bi's CharToUTF (Which = 0) and UTFToChar (Which = 1), as fbc's runtime has them: a byte of the source
+// is ONE character, a codepoint above 255 comes back as "?", and the count travels through a pointer the program
+// owns. The five arguments arrive in the int transfer slots (an instruction has three operands).
+//
+// 🕳️ WCharToUTF and UTFToWChar are not here yet, and neither is the form that allocates its own buffer
+// (dst = 0): both are the rest of ledger entry 511.
+const
+  ENC_UTF8 = 1; ENC_UTF16 = 2; ENC_UTF32 = 3;
+var
+  Encod, Src, Chars, Dst, CountPtr, Bytes, i, c, Extra, Max, Written: Int64;
+
+  // One BYTE through whichever domain the pointer names: C's memory in the fb mode, a packed array or a
+  // record field in the VM's. Adding to the address advances by one byte in both.
+  function RB(A: Int64): Int64;
+  begin
+    Result := PtrDomainLoadInt(Ctx, A, RTC_U8) and $FF;
+  end;
+
+  procedure WB(A, V: Int64);
+  begin
+    if (A > 0) and ((A and FGNPTR_TAG) <> 0) then RawStoreInt(A, RTC_U8, V and $FF)
+    else PtrDomainStoreInt(Ctx, A, V and $FF);
+  end;
+
+begin
+  Encod := Ctx.XferInt[0];
+  Src := Ctx.XferInt[1];
+  if Which = 0 then
+  begin
+    Chars := Ctx.XferInt[2]; Dst := Ctx.XferInt[3]; CountPtr := Ctx.XferInt[4];
+    if (Encod < ENC_UTF8) or (Encod > ENC_UTF32) then Exit(0);        // ASCII and anything else: NULL, as fbc answers
+    if Dst = 0 then
+      raise ERangeError.Create('CharToUTF with no destination buffer is not supported yet (DIVERGENZE 511)');
+    Bytes := 0;
+    if Chars > 0 then
+      for i := 0 to Chars - 1 do
+      begin
+        c := RB(Src + i);
+        case Encod of
+          ENC_UTF8:
+            if c < $80 then begin WB(Dst + Bytes, c); Inc(Bytes); end
+            else
+            begin
+              WB(Dst + Bytes, $C0 or (c shr 6)); WB(Dst + Bytes + 1, $80 or (c and $3F));
+              Inc(Bytes, 2);
+            end;
+          ENC_UTF16:
+            begin WB(Dst + Bytes, c); WB(Dst + Bytes + 1, 0); Inc(Bytes, 2); end;
+        else
+          begin
+            WB(Dst + Bytes, c); WB(Dst + Bytes + 1, 0); WB(Dst + Bytes + 2, 0); WB(Dst + Bytes + 3, 0);
+            Inc(Bytes, 4);
+          end;
+        end;
+      end;
+    if CountPtr <> 0 then PtrDomainStoreInt(Ctx, CountPtr, Bytes);
+    Exit(Dst);
+  end;
+  // UTFToChar(encod, src, dst, chars): "chars" is the room in dst on the way in and the count on the way out.
+  Dst := Ctx.XferInt[2]; CountPtr := Ctx.XferInt[3];
+  if (Encod < ENC_UTF8) or (Encod > ENC_UTF32) then Exit(0);
+  if Dst = 0 then
+    raise ERangeError.Create('UTFToChar with no destination buffer is not supported yet (DIVERGENZE 511)');
+  Max := 0;
+  if CountPtr <> 0 then Max := PtrDomainLoadInt(Ctx, CountPtr);
+  Written := 0;
+  i := 0;
+  while Written < Max do
+  begin
+    case Encod of
+      ENC_UTF8:
+        begin
+          c := RB(Src + i);
+          Extra := 0;
+          if (c >= $C0) and (c < $E0) then Extra := 1
+          else if (c >= $E0) and (c < $F0) then Extra := 2
+          else if c >= $F0 then Extra := 3;
+          if Extra > 0 then c := c and ($3F shr Extra);
+          Inc(i);
+          while Extra > 0 do
+          begin
+            c := (c shl 6) or (RB(Src + i) and $3F);
+            Inc(i); Dec(Extra);
+          end;
+        end;
+      ENC_UTF16:
+        begin
+          c := RB(Src + i) or (RB(Src + i + 1) shl 8);
+          Inc(i, 2);
+          if (c >= $D800) and (c <= $DBFF) then Inc(i, 2);   // a surrogate pair is one "?" character
+        end;
+    else
+      begin
+        c := RB(Src + i) or (RB(Src + i + 1) shl 8) or (RB(Src + i + 2) shl 16) or (RB(Src + i + 3) shl 24);
+        Inc(i, 4);
+      end;
+    end;
+    if c > 255 then c := Ord('?');
+    if c = 0 then Break;              // the terminator is not written, and does not count
+    WB(Dst + Written, c);
+    Inc(Written);
+  end;
+  if CountPtr <> 0 then PtrDomainStoreInt(Ctx, CountPtr, Written);
+  Result := Dst;
+end;
+
 procedure TBytecodeVM.PtrDomainStoreInt(Ctx: TExecutionContext; PtrAddr, Value: Int64);
 var
   Rec: PRecordStorage;
@@ -9960,6 +10068,10 @@ begin
           if Instr.Dest > MaxFloatReg then MaxFloatReg := Instr.Dest;
           if Instr.Src1 > MaxStringReg then MaxStringReg := Instr.Src1;
         end;
+
+        // utf_conv.bi: int Dest (the answered pointer); the five arguments travel in the int transfer slots.
+        bcUtfConv:
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
 
         // INSTR/INSTRREV(haystack$, needle$[, start]) -> int Dest
         bcStrInstr, bcStrInstrRev, bcStrInstrRevAny, bcStrInstrAny, bcStrInstrW, bcStrInstrRevW,
@@ -16181,6 +16293,9 @@ begin
         SubStr := Ctx.StringRegs[Instr.Src2];
         Ctx.IntRegs[Instr.Dest] := Utf8FindAnyCP(S, SubStr, True);
       end;
+    55: // bcUtfConv - utf_conv.bi's converters. Immediate: 0 = CharToUTF, 1 = UTFToChar. The arguments are in the
+        // int transfer slots, because there are five of them and an instruction has three operands.
+      Ctx.IntRegs[Instr.Dest] := ExecUtfConv(Ctx, Instr.Immediate);
     31: // bcStrWChr - WCHR(n): UTF-8 byte sequence for Unicode codepoint n.
       Ctx.StringRegs[Instr.Dest] := Utf8EncodeCP(Ctx.IntRegs[Instr.Src1]);
     32: // bcStrWStringN - WSTRING(n,cp): n copies of the UTF-8 char for codepoint cp.

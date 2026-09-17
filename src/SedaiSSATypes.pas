@@ -844,6 +844,7 @@ type
                             //   Src1 that belongs to the set Src2 (0 if none). The byte twin compares
                             //   BYTES and so matches a UTF-8 continuation byte.
     ssaStrInstrRevAnyW,     // INSTRREV(wstring, Any set) -> the LAST such codepoint
+    ssaUtfConv,             // utf_conv.bi: CharToUTF / UTFToChar (arguments in the int transfer slots)
     // ⭐ FFI (DIVERGENZE 183): call a C function. Src3 const = index into the program's foreign
     // declaration table, Src1 const = how many arguments were staged into the transfer bank, Dest =
     // the result register. TWO opcodes, one per result bank - see bcForeignCall for why.
