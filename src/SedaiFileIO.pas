@@ -780,7 +780,13 @@ begin
     if (Handle >= 1) and (Handle <= MAX_FILE_HANDLE) and Assigned(FFileHandles[Handle]) then
       case RetType of
         2: Data := IntToStr(PtrInt(FFileHandles[Handle].Handle));  // OS file handle
-        3: Data := '0';   // Encoding: ASCII
+        // Encoding: the "~<bits>" marker the OPEN parser left on the mode (0 ascii, 1 utf8, 2 utf16, 3 utf32).
+        3: if Pos('~', FFileModes[Handle]) = 0 then Data := '0'
+           else case TextEncodingOf(Handle) of
+             16: Data := '2';
+             32: Data := '3';
+           else Data := '1';
+           end;
       else
         begin
           M := UpperCase(FFileModes[Handle]);
@@ -796,7 +802,12 @@ begin
           end;
           Data := IntToStr(V);
         end;
-      end;
+      end
+    // ⛔ fbc keeps a table entry for every number 1..255, open or not, and a closed one reads as mode 0 -
+    // which its map turns into BINARY: FileAttr(99) is 32, not 0 (measured, 17 Sep 2026).
+    else if (Handle >= 1) and (Handle <= MAX_FILE_HANDLE) and (FDeviceKind[Handle] = 0) and
+            not (RetType in [2, 3]) then
+      Data := '32';
     Exit;
   end;
 

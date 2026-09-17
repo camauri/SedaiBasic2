@@ -13032,6 +13032,16 @@ procedure TPackratParser.RejectUndeclaredHeaderRoutines(Root: TASTNode);
           if (W = '') and (N.Token <> nil) then W := UpperFast(VarToStr(N.Token.Value));
         end;
     end;
+    // ⛔ ...and the ADDRESS of one of them is refused by name even with its header (DIVERGENZE 508): here they are
+    // built-ins, not procedures, and "@Year" resolved to 0 - a call through it ran the program again from its
+    // first line.
+    if (N.NodeType = antProcAddress) and (Pos(' ' + N.ValueUpper + ' ', HEADER_ROUTINES) > 0) and
+       (FGatedDeclared.IndexOf(N.ValueUpper) < 0) then
+    begin
+      HandleError(Format('The address of %s is not supported yet: it is a built-in routine here, not a procedure',
+                         [N.ValueUpper]), N.Token);
+      Exit;
+    end;
     if (W <> '') and (Pos(' ' + W + ' ', HEADER_ROUTINES) > 0) and
        (FHeaderRoutines.IndexOf(W) < 0) and (FGatedDeclared.IndexOf(W) < 0) then
     begin

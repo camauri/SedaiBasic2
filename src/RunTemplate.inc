@@ -1268,6 +1268,10 @@ EventPollCounter := 0;
           begin
             // Indirect call: the entry PC is in the register, not the Immediate.
             NextPC := IntRegs[Instr^.Src1];            // read BEFORE the view can slide
+            // ⛔ The same check the slow path makes: a pointer that is 0 (never set, or an address that did not
+            // resolve) jumped to PC 0 and ran the program AGAIN from its first line, in silence (17 Sep 2026).
+            if (NextPC <= 0) or (NextPC >= FProgram.GetInstructionCount) then
+              raise ERangeError.Create('Call through an unset or invalid procedure pointer');
             FramePush(Ctx, NextPC, CurPC);
             IntRegs := Ctx.IntRegs;
             GrowCallStackIfNeeded(Ctx);

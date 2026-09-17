@@ -3121,16 +3121,16 @@ End Function
 | `MINUTE` | ✓ | `MINUTE(serial)` -> 0..59. |
 | `HOUR` | ✓ | `HOUR(serial)` -> 0..23. |
 | `DAY` | ✓ | `DAY(serial)` -> 1..31. Intercepted by name so `day` stays usable as a variable. |
-| `WEEKDAY` | ✓ | `WEEKDAY(serial)` -> 1=Sunday..7=Saturday. |
+| `WEEKDAY` | ✓ | `WEEKDAY(serial [, firstDayOfWeek])` -> 1..7 counted from the week's first day (default Sunday, as `fbUseSystem` is in fbc's runtime). |
 | `DATEPART("ww")` | ✓ | Week number by the **VB rule**, which is what `fbc` answers: week 1 is the week *containing* 1 January and weeks start on **Sunday**. ⚠️ Not ISO 8601 (Monday-based, week 1 = the week of the first Thursday); the two agree except on Sundays. Measured against `fbc` over 48 dates, 23 Aug 2026. |
 | `MONTH` | ✓ | `MONTH(serial)` -> 1..12. Intercepted by name (not a reserved word). |
 | `YEAR` | ✓ | `YEAR(serial)` -> integer. Intercepted by name (not a reserved word). |
-| `DATEPART` | ✓ | `DATEPART(interval$, serial)` -> component. Intervals: `yyyy q m y d w ww h n s`. |
-| `DATEADD` | ✓ | `DATEADD(interval$, number, serial)` -> serial with `number` interval units added. |
-| `DATEDIFF` | ✓ | `DATEDIFF(interval$, s1, s2)` -> integer count of intervals from s1 to s2. |
+| `DATEPART` | ✓ | `DATEPART(interval$, serial [, firstDayOfWeek [, firstDayOfYear]])` -> component. Intervals: `yyyy q m y d w ww h n s`, matched EXACTLY as fbc matches them (an unknown one, `YYYY` included, answers 0). |
+| `DATEADD` | ✓ | `DATEADD(interval$, number, serial)` -> serial with `number` interval units added; `number` is TRUNCATED, and a day past the end of a month saturates (31 Jan + 1 month = 29 Feb 2024). |
+| `DATEDIFF` | ✓ | `DATEDIFF(interval$, s1, s2 [, firstDayOfWeek [, firstDayOfYear]])` -> count of intervals from s1 to s2, as fbc counts them: `w` counts weekday crossings, `ww` week boundaries, and `h`/`n`/`s` floor the day part (so a negative difference is not the mirror of the positive one). |
 | `ISDATE` | ✓ | `ISDATE(str)` -> -1 if a valid date/time string, else 0. |
-| `MONTHNAME` | ✓ | `MONTHNAME(n)` -> English month name (1..12). |
-| `WEEKDAYNAME` | ✓ | `WEEKDAYNAME(n)` -> English weekday name (1=Sunday..7=Saturday). |
+| `MONTHNAME` | ✓ | `MONTHNAME(n [, abbreviate])` -> English month name (1..12), the first three letters when `abbreviate` is non-zero. |
+| `WEEKDAYNAME` | ✓ | `WEEKDAYNAME(n [, abbreviate [, firstDayOfWeek]])` -> English day name, abbreviated to three letters on request, with `n` counted from the week's first day. |
 
 #### Date and time procedures
 
@@ -3317,7 +3317,7 @@ End Function
 | `FRE` | ✓ | Gets the amount of free memory (in bytes) available. |
 | `COMMAND` | ✓ | `COMMAND$([index])` returns command-line arguments: bare / `-1` = all program args (space-separated), `0` = executable name, `n` = the n-th argument (`""` if out of range). On `sb`, arguments are the non-flag tokens after the script file (`sb prog.bas arg1 arg2`); sb's own flags are still recognised anywhere. |
 | `ENVIRON` | ✓ | `ENVIRON$(name)` -> the value of an environment variable ("" if unset). |
-| `ISREDIRECTED` | ✓ | Whether a standard stream is redirected — portable default 0 (not redirected). |
+| `ISREDIRECTED` | ✓ | `ISREDIRECTED(n)` -> -1 when the stream is a pipe or a file rather than a console, as in fbc. A non-zero argument asks about standard INPUT, zero (the default) about standard output. Needs `#include "fbio.bi"` (DIVERGENZE 509). |
 | `SETENVIRON` | ✓ | Sets an environment variable (a VM-internal override that ENVIRON$ reads back). |
 | `SHELL` | ✓ | Runs a command through the platform shell (cmd.exe / /bin/sh); returns the exit code. |
 | `SYSTEM` | ✓ | `SYSTEM [exitcode]` ends the program like `END` (an optional exit code is parsed and ignored). |
@@ -3357,7 +3357,7 @@ End Function
 | `WOCT` | ✓ | `WOCT(n)` — octal wide string of an integer. |
 | `STR` | ✓ | `STR(n)` (bare FB form) routed to `STR$`. |
 | `WSTR` | ✓ | Returns the WString representation of a numeric value (or widens a string). |
-| `FORMAT` | ✓ | `FORMAT(num [, mask])` / `FORMAT$` → formatted string. Numeric masks (`0`/`#`, `.`, `,` grouping, `%`, scientific `E±`, literals) **and** date/time masks (`d`/`dd`/`ddd`/`dddd`, `m`/`mm`/`mmm`/`mmmm` & minute-after-`h`, `n`, `y`/`yy`/`yyyy`, `h`/`hh`, `s`/`ss`, `ttttt`, `AM/PM`/`A/P`, `:` `/` separators). English month/day names. |
+| `FORMAT` | ✓ | `FORMAT(num [, mask])` / `FORMAT$` → formatted string. Numeric masks (`0`/`#`, `.`, `,` grouping, `%`, scientific `E±`, literals) **and** date/time masks (`d`/`dd`/`ddd`/`dddd`, `m`/`mm`/`mmm`/`mmmm` & minute-after-`h`, `n`, `y`/`yy`/`yyyy`, `h`/`hh`, `s`/`ss`, `ttttt`, `AM/PM`/`A/P`, `:` `/` separators). English month/day names. ⭐ Since 17 Sep 2026 this is fbc's own algorithm, ported (`src/SedaiFbFormat.pas`): measured over 400 generated masks x 17 values, every case fbc can answer agrees (DIVERGENZE 510). |
 
 #### String to Numeric Conversions
 

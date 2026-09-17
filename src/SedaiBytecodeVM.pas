@@ -115,6 +115,7 @@ const
   FQ_LOF      = 2;
   FQ_LOC      = 3;
   FQ_SEEK     = 4;
+  FQ_REDIRECTED = 5;   // fbio.bi's IsRedirected: Src1 <> 0 asks about stdin, 0 about stdout
 
 type
 
@@ -1164,6 +1165,8 @@ uses
   // TARGET, which is the same shape that let every Windows build die once before (see the PowerShell
   // scripts, 2 Sep). A diagnostic knob is not worth an unbuildable target.
   SedaiTerminalIO,
+  SedaiFbDate,          // DATEADD/DATEDIFF/DATEPART as fbc's runtime answers them
+  SedaiFbFormat,        // FORMAT, likewise
   // ⭐ The FFI, and it is named HERE and nowhere else in the VM: SedaiForeignRuntime is the one unit
   // that knows a provider exists, so the day the core is cut from its providers there is a single edge
   // to cut. In the implementation section for the same reason SedaiTerminalIO is. DIVERGENZE 183.
@@ -16217,7 +16220,12 @@ begin
       if GLegacyPaths or (FProgramDir = '') then Ctx.StringRegs[Instr.Dest] := FVmExeDir
       else Ctx.StringRegs[Instr.Dest] := FProgramDir;
     45: // bcStrFormat - FORMAT(num, mask): formatted number string. Value is in the Immediate float reg.
-      Ctx.StringRegs[Instr.Dest] := FormatNumber(Ctx.FloatRegs[Instr.Immediate], Ctx.StringRegs[Instr.Src1]);
+      // ⭐ fbc's own algorithm (SedaiFbFormat, 17 Sep 2026); the opt-in --date-locale keeps the older reader,
+      // which is the one that knows localised month and day names.
+      if DateLocaleMode then
+        Ctx.StringRegs[Instr.Dest] := FormatNumber(Ctx.FloatRegs[Instr.Immediate], Ctx.StringRegs[Instr.Src1])
+      else
+        Ctx.StringRegs[Instr.Dest] := FbFormat(Ctx.FloatRegs[Instr.Immediate], Ctx.StringRegs[Instr.Src1]);
     46: // bcCommand - COMMAND$(index): command-line argument(s) passed to the BASIC program.
       Ctx.StringRegs[Instr.Dest] := CommandLine(Ctx.IntRegs[Instr.Src1]);
     47: // bcFileDateTime - FILEDATETIME(path): last-modified date serial (Double), 0 if absent.
@@ -16660,32 +16668,14 @@ begin
   Result := True;
 end;
 
-function IntervalCode(const S: string): Integer;
-// FreeBASIC/VB date interval string -> internal code (used by DATEADD/DATEDIFF/DATEPART).
-// 0=yyyy 1=q 2=m 3=y(dayOfYear) 4=d 5=w(weekday) 6=ww(week) 7=h 8=n(minute) 9=s. Default = day.
-var
-  u: string;
-begin
-  u := LowerCase(Trim(S));
-  if u = 'yyyy' then Result := 0
-  else if u = 'q' then Result := 1
-  else if u = 'm' then Result := 2
-  else if u = 'y' then Result := 3
-  else if u = 'd' then Result := 4
-  else if u = 'w' then Result := 5
-  else if u = 'ww' then Result := 6
-  else if u = 'h' then Result := 7
-  else if u = 'n' then Result := 8
-  else if u = 's' then Result := 9
-  else Result := 4;
-end;
-
 procedure TBytecodeVM.ExecuteMathOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
 var
   SubOp: Word;
   dtVal, dt2: TDateTime;
   dY, dMo, dD, dH, dMi, dS, dMs: Word;
   iv, n: Integer;
+  FdW, FdY: Integer;   // DATEDIFF/DATEPART: first day of the week and of the year
+  iY, iMo, iD, iH, iMi, iSec: Integer;   // ...and the decoded serial (SedaiFbDate answers Integers)
   FloatTmpB: Double;   // the second operand of MIN/MAX
   PackInt: Int64;      // COPYSIGN assembles its answer from bits
   SngTmp: Single;      // the bit-casts work on the binary32 value, not on the double
@@ -16905,17 +16895,29 @@ begin
       end;
     21: // bcDateDecode - YEAR/MONTH/DAY/HOUR/MINUTE/SECOND/WEEKDAY(serial). Immediate selects the field.
       begin
+        // ⭐ fbc's own decoding (SedaiFbDate): FPC's agrees on ordinary dates and not on NEGATIVE serials, where
+        // fbc floors the day and mirrors the time (-1.25 is 28 Dec 1899 at 18:00, not 29 Dec at 06:00).
         dtVal := Ctx.FloatRegs[Instr.Src1];
-        DecodeDate(dtVal, dY, dMo, dD);
-        DecodeTime(dtVal, dH, dMi, dS, dMs);
         case Instr.Immediate of
-          0: Ctx.IntRegs[Instr.Dest] := dY;
-          1: Ctx.IntRegs[Instr.Dest] := dMo;
-          2: Ctx.IntRegs[Instr.Dest] := dD;
-          3: Ctx.IntRegs[Instr.Dest] := dH;
-          4: Ctx.IntRegs[Instr.Dest] := dMi;
-          5: Ctx.IntRegs[Instr.Dest] := dS;
-          6: Ctx.IntRegs[Instr.Dest] := DayOfWeek(dtVal);   // 1=Sunday .. 7=Saturday
+          0, 1, 2:
+            begin
+              FbDecodeDate(dtVal, iY, iMo, iD);
+              case Instr.Immediate of
+                0: Ctx.IntRegs[Instr.Dest] := iY;
+                1: Ctx.IntRegs[Instr.Dest] := iMo;
+              else Ctx.IntRegs[Instr.Dest] := iD;
+              end;
+            end;
+          3, 4, 5:
+            begin
+              FbDecodeTimeQB(dtVal, iH, iMi, iSec);
+              case Instr.Immediate of
+                3: Ctx.IntRegs[Instr.Dest] := iH;
+                4: Ctx.IntRegs[Instr.Dest] := iMi;
+              else Ctx.IntRegs[Instr.Dest] := iSec;
+              end;
+            end;
+          6: Ctx.IntRegs[Instr.Dest] := FbWeekday(dtVal, 0);   // 1=Sunday .. 7=Saturday
         else
           Ctx.IntRegs[Instr.Dest] := 0;
         end;
@@ -16968,74 +16970,21 @@ begin
         Ctx.IntRegs[Instr.Dest] := -1
       else
         Ctx.IntRegs[Instr.Dest] := 0;
+    // ⭐ DATEADD / DATEDIFF / DATEPART answer as fbc's runtime does (SedaiFbDate, 17 Sep 2026): the interval is
+    // matched exactly, the first day of the week and of the year travel after a #0 in the interval string when
+    // the program wrote them, and DATEDIFF counts weekday crossings for "w" and floors the day part for h/n/s.
     26: // bcDateAdd - DATEADD(interval$, number, serial) -> serial. Src1=interval, Src2=n, Immediate=serial reg.
-      begin
-        iv := IntervalCode(Ctx.StringRegs[Instr.Src1]);
-        n := Ctx.IntRegs[Instr.Src2];
-        dtVal := Ctx.FloatRegs[Instr.Immediate];
-        case iv of
-          0: dtVal := IncYear(dtVal, n);          // yyyy
-          1: dtVal := IncMonth(dtVal, n * 3);     // q (quarter)
-          2: dtVal := IncMonth(dtVal, n);         // m
-          6: dtVal := dtVal + n * 7;              // ww (week)
-          { ⛔ Double() for the reason spelled out at bcTimeSerial: n is an
-            INTEGER, so without the cast the division is done in SINGLE and only
-            then added to a Double. DateAdd("s", 30, x) was one ulp out. }
-          { ⛔ TYPED constants, not literals: dividing by a literal lets the
-            optimiser multiply by the reciprocal instead, and 1/24, 1/1440 and
-            1/86400 are none of them exact. See bcTimeSerial for the measurement. }
-          7: dtVal := dtVal + n / HOURS_PER_DAY_D;        // h
-          8: dtVal := dtVal + n / MINS_PER_DAY_D;         // n (minute)
-          9: dtVal := dtVal + n / SECS_PER_DAY_D;         // s
-        else
-          dtVal := dtVal + n;                     // y / d / w (whole days)
-        end;
-        Ctx.FloatRegs[Instr.Dest] := dtVal;
-      end;
+      Ctx.FloatRegs[Instr.Dest] := FbDateAdd(FbIntervalCode(Ctx.StringRegs[Instr.Src1]),
+                                             Ctx.IntRegs[Instr.Src2], Ctx.FloatRegs[Instr.Immediate]);
     27: // bcDateDiff - DATEDIFF(interval$, s1, s2) -> int count. Src1=interval, Src2=s1, Immediate=s2 reg.
       begin
-        iv := IntervalCode(Ctx.StringRegs[Instr.Src1]);
-        dtVal := Ctx.FloatRegs[Instr.Src2];                 // s1
-        dt2 := Ctx.FloatRegs[Instr.Immediate];              // s2
-        case iv of
-          0: Ctx.IntRegs[Instr.Dest] := YearOf(dt2) - YearOf(dtVal);
-          1: Ctx.IntRegs[Instr.Dest] := (YearOf(dt2) * 4 + (MonthOf(dt2) - 1) div 3) -
-                                        (YearOf(dtVal) * 4 + (MonthOf(dtVal) - 1) div 3);
-          2: Ctx.IntRegs[Instr.Dest] := (YearOf(dt2) * 12 + MonthOf(dt2)) -
-                                        (YearOf(dtVal) * 12 + MonthOf(dtVal));
-          6: Ctx.IntRegs[Instr.Dest] := (Trunc(dt2) - Trunc(dtVal)) div 7;
-          7: Ctx.IntRegs[Instr.Dest] := Round((dt2 - dtVal) * 24.0);
-          8: Ctx.IntRegs[Instr.Dest] := Round((dt2 - dtVal) * 1440.0);
-          9: Ctx.IntRegs[Instr.Dest] := Round((dt2 - dtVal) * 86400.0);
-        else
-          Ctx.IntRegs[Instr.Dest] := Trunc(dt2) - Trunc(dtVal);   // y / d / w (whole days)
-        end;
+        FbSplitIntervalArgs(Ctx.StringRegs[Instr.Src1], iv, FdW, FdY);
+        Ctx.IntRegs[Instr.Dest] := FbDateDiff(iv, Ctx.FloatRegs[Instr.Src2], Ctx.FloatRegs[Instr.Immediate], FdW, FdY);
       end;
     28: // bcDatePart - DATEPART(interval$, serial) -> int. Src1=interval, Src2=serial.
       begin
-        iv := IntervalCode(Ctx.StringRegs[Instr.Src1]);
-        dtVal := Ctx.FloatRegs[Instr.Src2];
-        case iv of
-          0: Ctx.IntRegs[Instr.Dest] := YearOf(dtVal);
-          1: Ctx.IntRegs[Instr.Dest] := (MonthOf(dtVal) - 1) div 3 + 1;
-          2: Ctx.IntRegs[Instr.Dest] := MonthOf(dtVal);
-          3: Ctx.IntRegs[Instr.Dest] := DayOfTheYear(dtVal);   // y (day of year)
-          4: Ctx.IntRegs[Instr.Dest] := DayOf(dtVal);          // d
-          5: Ctx.IntRegs[Instr.Dest] := DayOfWeek(dtVal);      // w (1=Sunday)
-          // ww - ⛔ NOT WeekOfTheYear. That is ISO 8601: weeks start on MONDAY and week 1 is the one
-          // holding the first Thursday. VB and fbc use a different definition entirely - week 1 is the
-          // week CONTAINING 1 January and weeks start on SUNDAY - and the two agree most of the time,
-          // which is why this survived: measured 23 Aug 2026 over 48 dates, 7 differed and every one
-          // of them was a SUNDAY, the day the VB week turns over and the ISO one does not.
-          //   offset from the Sunday that opens week 1 = (dayOfYear - 1) + (weekday(Jan 1) - 1)
-          6: Ctx.IntRegs[Instr.Dest] :=
-               ((DayOfTheYear(dtVal) - 1) + (DayOfWeek(EncodeDate(YearOf(dtVal), 1, 1)) - 1)) div 7 + 1;
-          7: Ctx.IntRegs[Instr.Dest] := HourOf(dtVal);
-          8: Ctx.IntRegs[Instr.Dest] := MinuteOf(dtVal);
-          9: Ctx.IntRegs[Instr.Dest] := SecondOf(dtVal);
-        else
-          Ctx.IntRegs[Instr.Dest] := 0;
-        end;
+        FbSplitIntervalArgs(Ctx.StringRegs[Instr.Src1], iv, FdW, FdY);
+        Ctx.IntRegs[Instr.Dest] := FbDatePart(iv, Ctx.FloatRegs[Instr.Src2], FdW, FdY);
       end;
     29: // bcSetClock - SETDATE/SETTIME str: adjust the VM clock offset. Immediate 0=SETDATE, 1=SETTIME.
       begin
@@ -21683,6 +21632,14 @@ begin
     16: // bcFileQuery - EOF/FREEFILE/LOF/LOC/SEEK(n) -> int (non-fatal; Src1=handle, Immediate=query code)
       begin
         HandleNum := Ctx.IntRegs[Instr.Src1];
+        // ⭐ IsRedirected asks the STREAM, not a file handle: -1 when it is not a terminal, as fbc answers
+        // (DIVERGENZE 509). It used to answer 0 always, so a program could not tell a pipe from a console.
+        if Instr.Immediate = FQ_REDIRECTED then
+        begin
+          QVal := Ord(not StdStreamIsTerminal(HandleNum <> 0));
+          if Instr.Dest >= 0 then Ctx.IntRegs[Instr.Dest] := -QVal;
+          Exit;
+        end;
         // Numeric fast path: the whole query answers in an Int64, with no string built, matched or
         // parsed anywhere. QVal is an Int64 local - unmanaged, so unlike the AnsiString locals of
         // this method it costs nothing to have. Falls back to the string protocol when the handler

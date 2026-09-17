@@ -1483,6 +1483,9 @@ type
     function EmitFixedLenPad(const Src: TSSAValue; Cap: Integer; Wide: Boolean): TSSAValue;
     function EmitFixedLenToVarLen(const Src: TSSAValue; Wide: Boolean): TSSAValue;
     function MaybeFixedLenRead(Node: TASTNode; const Src: TSSAValue): TSSAValue;
+    function EmitDateIntArg(Args: TASTNode; Idx: Integer): TSSAValue;           // datetime.bi: an optional Long argument, 0 when omitted
+    function EmitDateFirstDay(const FdReg: TSSAValue): TSSAValue;              // 0 ("system") reads as 1 (Sunday)
+    function EmitDateIntervalArgs(const IvReg: TSSAValue; Args: TASTNode; First: Integer): TSSAValue;
     procedure ProcessExprFixedRaw(Node: TASTNode; out Res: TSSAValue; KeepWide: Boolean = False);
     procedure ProcessStringExprFixedRaw(Node: TASTNode; out Res: TSSAValue; KeepWide: Boolean = False);
     procedure EmitFixedLenInit(const Dest: TSSAValue; Cap: Integer; Wide: Boolean);
@@ -9758,13 +9761,19 @@ begin
           Exit;
         end;
 
-        // FreeBASIC ISREDIRECTED(n): whether a standard stream is redirected. Portable default: not
-        // redirected (0). Evaluate and discard the argument.
+        // FreeBASIC ISREDIRECTED(n): is the stream a pipe or a file rather than a console? A non-zero
+        // argument asks about standard INPUT, zero (the default) about standard output.
         if FModernMode and (UpperFast(ArrName) = kISREDIRECTED) and (ArrayIndexOf(ArrName) < 0) then
         begin
-          if Node.GetChild(1).ChildCount >= 1 then ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+          if Node.GetChild(1).ChildCount >= 1 then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
+            ArgReg := EnsureIntRegister(ArgValue);
+          end
+          else
+            ArgReg := EnsureIntRegister(MakeSSAConstInt(0));
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          EmitInstruction(ssaLoadConstInt, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          EmitInstruction(ssaFileQuery, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(5));
           Exit;
         end;
 
@@ -9972,6 +9981,20 @@ begin
             ArgReg := EnsureFloatRegister(ArgValue);
             Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
             EmitInstruction(ssaDateDecode, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
+            // ⭐ WEEKDAY(serial, firstDayOfWeek) (DIVERGENZE 507): the day counted from the week's first day,
+            // ((dow - first) mod 7) + 1, with 0 ("system") read as Sunday as fbc's runtime does.
+            if (SelImm = 6) and (Node.GetChild(1).ChildCount >= 2) then
+            begin
+              Arg2Reg := EmitDateFirstDay(EmitDateIntArg(Node.GetChild(1), 1));
+              Arg3Reg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaSubInt, Arg3Reg, Result, Arg2Reg, MakeSSAValue(svkNone));
+              Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaAddInt, Result, Arg3Reg, EnsureIntRegister(MakeSSAConstInt(7)), MakeSSAValue(svkNone));
+              Arg3Reg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaModInt, Arg3Reg, Result, EnsureIntRegister(MakeSSAConstInt(7)), MakeSSAValue(svkNone));
+              Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaAddInt, Result, Arg3Reg, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+            end;
             Exit;
           end;
           // DATESERIAL(y,m,d) / TIMESERIAL(h,m,s) -> float serial. 3 int args: Src1, Src2, Src3-as-reg.
@@ -10014,9 +10037,38 @@ begin
           begin
             ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
             ArgReg := EnsureIntRegister(ArgValue);
-            Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
             if ArrNameU = kWEEKDAYNAME then SelImm := 1 else SelImm := 0;
+            // ⭐ WEEKDAYNAME(n, abbreviate, firstDayOfWeek) (DIVERGENZE 507): n counts from the week's first day,
+            // ((n - 1) + (first - 1)) mod 7 + 1, as fbc's runtime shifts it.
+            if (SelImm = 1) and (Node.GetChild(1).ChildCount >= 3) then
+            begin
+              Arg2Reg := EmitDateFirstDay(EmitDateIntArg(Node.GetChild(1), 2));
+              Arg3Reg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaAddInt, Arg3Reg, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
+              ArgReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaSubInt, ArgReg, Arg3Reg, EnsureIntRegister(MakeSSAConstInt(2)), MakeSSAValue(svkNone));
+              Arg3Reg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaModInt, Arg3Reg, ArgReg, EnsureIntRegister(MakeSSAConstInt(7)), MakeSSAValue(svkNone));
+              ArgReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaAddInt, ArgReg, Arg3Reg, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+            end;
+            Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
             EmitInstruction(ssaDateName, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAConstInt(SelImm));
+            // ...and ABBREVIATE (non-zero) keeps the first three letters, which is what fbc's English names are:
+            // Left(name, 1000 + 997 * (abbreviate <> 0)), the comparison answering -1 or 0.
+            if Node.GetChild(1).ChildCount >= 2 then
+            begin
+              Arg2Reg := EmitDateIntArg(Node.GetChild(1), 1);
+              Arg3Reg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaCmpNeInt, Arg3Reg, Arg2Reg, EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
+              Arg2Reg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaMulInt, Arg2Reg, Arg3Reg, EnsureIntRegister(MakeSSAConstInt(997)), MakeSSAValue(svkNone));
+              Arg3Reg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaAddInt, Arg3Reg, Arg2Reg, EnsureIntRegister(MakeSSAConstInt(1000)), MakeSSAValue(svkNone));
+              ArgReg := Result;
+              Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+              EmitInstruction(ssaStrLeft, Result, ArgReg, Arg3Reg, MakeSSAValue(svkNone));
+            end;
             Exit;
           end;
           // DATEADD(interval$, number, serial) -> float serial. Src1=string, Src2=int n, Src3=float serial reg.
@@ -10026,6 +10078,15 @@ begin
             ProcessExpression(Node.GetChild(1).GetChild(1), Arg2Value);
             ProcessExpression(Node.GetChild(1).GetChild(2), Arg3Value);
             ArgReg := EnsureStringRegister(ArgValue);
+            // fbc takes the number as a DOUBLE and TRUNCATES it (fb_FIXDouble); a plain conversion would round.
+            if (Arg2Value.Kind = svkRegister) and (Arg2Value.RegType = srtFloat) then
+            begin
+              Arg2Reg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+              EmitInstruction(ssaMathFix, Arg2Reg, Arg2Value, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              Arg2Value := Arg2Reg;
+            end
+            else if Arg2Value.Kind = svkConstFloat then
+              Arg2Value := MakeSSAConstInt(Trunc(Arg2Value.ConstFloat));
             Arg2Reg := EnsureIntRegister(Arg2Value);
             Arg3Reg := EnsureFloatRegister(Arg3Value);
             Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
@@ -10038,7 +10099,7 @@ begin
             ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
             ProcessExpression(Node.GetChild(1).GetChild(1), Arg2Value);
             ProcessExpression(Node.GetChild(1).GetChild(2), Arg3Value);
-            ArgReg := EnsureStringRegister(ArgValue);
+            ArgReg := EmitDateIntervalArgs(EnsureStringRegister(ArgValue), Node.GetChild(1), 3);
             Arg2Reg := EnsureFloatRegister(Arg2Value);
             Arg3Reg := EnsureFloatRegister(Arg3Value);
             Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -10050,7 +10111,7 @@ begin
           begin
             ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
             ProcessExpression(Node.GetChild(1).GetChild(1), Arg2Value);
-            ArgReg := EnsureStringRegister(ArgValue);
+            ArgReg := EmitDateIntervalArgs(EnsureStringRegister(ArgValue), Node.GetChild(1), 2);
             Arg2Reg := EnsureFloatRegister(Arg2Value);
             Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
             EmitInstruction(ssaDatePart, Result, ArgReg, Arg2Reg, MakeSSAValue(svkNone));
@@ -12551,6 +12612,63 @@ begin
   Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
   if Wide then EmitInstruction(ssaStrLeftW, Result, Src, CutV, NoneV)
   else EmitInstruction(ssaStrLeft, Result, Src, CutV, NoneV);
+end;
+
+function TSSAGenerator.EmitDateIntArg(Args: TASTNode; Idx: Integer): TSSAValue;
+// An optional Long argument of a datetime.bi routine: its value, or 0 when the program left it out.
+var
+  V: TSSAValue;
+begin
+  if (Args = nil) or (Idx >= Args.ChildCount) or (Args.GetChild(Idx) = nil) or
+     ((Args.GetChild(Idx).NodeType = antLiteral) and VarIsEmpty(Args.GetChild(Idx).Value)) then
+    Exit(EnsureIntRegister(MakeSSAConstInt(0)));
+  ProcessExpression(Args.GetChild(Idx), V);
+  if (V.Kind = svkRegister) and (V.RegType = srtFloat) then
+  begin
+    Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
+    EmitInstruction(ssaMathFix, Result, V, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    V := Result;
+  end;
+  Result := EnsureIntRegister(V);
+end;
+
+function TSSAGenerator.EmitDateFirstDay(const FdReg: TSSAValue): TSSAValue;
+// fbUseSystem (0) is Sunday in fbc's runtime: first = fd - (fd = 0), the comparison answering -1 or 0.
+var
+  Z: TSSAValue;
+begin
+  Z := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaCmpEqInt, Z, FdReg, EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAValue(svkNone));
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaSubInt, Result, FdReg, Z, MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.EmitDateIntervalArgs(const IvReg: TSSAValue; Args: TASTNode; First: Integer): TSSAValue;
+// DATEPART / DATEDIFF with the first day of the week and of the year (DIVERGENZE 507): the two values travel
+// after a #0 in the interval string, "ww"#0"2,3", which the VM splits (SedaiFbDate.FbSplitIntervalArgs).
+// Nothing is appended when the program wrote neither, so the ordinary call is unchanged.
+var
+  Parts: array[0..4] of TSSAValue;
+  Acc: TSSAValue;
+  i: Integer;
+begin
+  Result := IvReg;
+  if (Args = nil) or (Args.ChildCount <= First) then Exit;
+  Parts[0] := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaLoadConstString, Parts[0], MakeSSAConstString(#0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Parts[1] := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaIntToString, Parts[1], EmitDateIntArg(Args, First), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Parts[2] := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaLoadConstString, Parts[2], MakeSSAConstString(','), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Parts[3] := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+  EmitInstruction(ssaIntToString, Parts[3], EmitDateIntArg(Args, First + 1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Acc := IvReg;
+  for i := 0 to 3 do
+  begin
+    Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+    EmitInstruction(ssaStrConcat, Result, Acc, Parts[i], MakeSSAValue(svkNone));
+    Acc := Result;
+  end;
 end;
 
 function TSSAGenerator.MaybeFixedLenRead(Node: TASTNode; const Src: TSSAValue): TSSAValue;

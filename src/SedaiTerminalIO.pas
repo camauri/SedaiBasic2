@@ -26,7 +26,9 @@ unit SedaiTerminalIO;
 {$codepage UTF8}
 
 { ============================================================================
-  SedaiTerminalIO - Pure console I/O implementation (no SDL2 dependency)
+  SedaiTerminalIO - Pure console I/O 
+
+implementation (no SDL2 dependency)
 
   This unit provides IOutputDevice and IInputDevice implementations that
   use standard console I/O (WriteLn, ReadLn) without requiring SDL2.
@@ -276,6 +278,9 @@ function TerminalControllerOf(const Dev: IOutputDevice): TTerminalController;
 // "am" flag, stdin is a terminal too, /dev/tty opens, and the process is in the foreground. Answered here
 // without libtinfo - the entry is read from the terminfo database directly - and cached for the process.
 function FbConsoleInited: Boolean;
+
+// fbio.bi's IsRedirected asks these: is the stream a console, or a pipe/file? (DIVERGENZE 509)
+function StdStreamIsTerminal(IsInput: Boolean): Boolean;
 
 implementation
 
@@ -839,6 +844,11 @@ begin
   {$ELSE}
   Result := IsATTY(StdOutputHandle) <> 0;
   {$ENDIF}
+end;
+
+function StdStreamIsTerminal(IsInput: Boolean): Boolean;
+begin
+  if IsInput then Result := StdinIsTerminal else Result := StdoutIsTerminal;
 end;
 
 function TTerminalController.IsScreenVisible: Boolean;
