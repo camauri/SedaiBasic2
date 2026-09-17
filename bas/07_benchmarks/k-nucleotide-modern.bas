@@ -12,6 +12,8 @@
 '' That difference is worth stating plainly: on this benchmark the reference implementations are
 '' partly measuring their C hash map, and this one is measuring a hash map written in BASIC.
 
+#include once "string.bi"   ' Format, as in fbc
+
 Const TSIZE = 2097152          '' power of two, comfortably above the distinct 18-mers of the input
 Const TMASK = TSIZE - 1
 
@@ -130,25 +132,25 @@ code(Asc("G")) = 2 : code(Asc("g")) = 2
 code(Asc("T")) = 3 : code(Asc("t")) = 3
 
 '' --- read the THREE sequence from stdin ---
-Dim As String line
+Dim As String textLine
 Dim As Integer inThree = 0
 Dim As String parts = ""
 Open Cons For Input As #1
-'' ⚠️ Classified by Asc(line), not by Left(line, 1): Left() of one character ALLOCATES a one-byte
+'' ⚠️ Classified by Asc(textLine), not by Left(textLine, 1): Left() of one character ALLOCATES a one-byte
 '' string and then compares strings, 339 ns per line, and this runs once per input line. The
-'' Left(line, 6) below stays as it is - it runs once per sequence header, not per line.
+'' Left(textLine, 6) below stays as it is - it runs once per sequence header, not per line.
 Do While Not Eof(1)
-  Line Input #1, line
-  If Len(line) = 0 Then Continue Do
-  Dim As Integer c = Asc(line)        '' 62 = ">", 59 = ";"
+  Line Input #1, textLine
+  If Len(textLine) = 0 Then Continue Do
+  Dim As Integer c = Asc(textLine)        '' 62 = ">", 59 = ";"
   If c = 62 Then
-    If Left(line, 6) = ">THREE" Then
+    If Left(textLine, 6) = ">THREE" Then
       inThree = 1
     ElseIf inThree = 1 Then
       Exit Do
     End If
   ElseIf inThree = 1 Then
-    If c <> 59 Then parts += UCase(line)
+    If c <> 59 Then parts += UCase(textLine)
   End If
 Loop
 Close #1

@@ -48,7 +48,7 @@ Sub worker( ByVal id As Integer )
       Dim As Integer rowBase = y * bytesPerRow
       For bx As Integer = 0 To bytesPerRow - 1
         Dim As Integer pixel = 0
-        Dim As Integer bit = 128
+        Dim As Integer bitMask = 128
         '' The original walks the eight pixels of a byte by ADDING c1 each time, rather than by
         '' multiplying the pixel index. The two are the same in arithmetic and NOT the same in floating
         '' point: computing it the other way flipped exactly one pixel of the whole picture, right on
@@ -69,8 +69,8 @@ Sub worker( ByVal id As Integer )
               Exit For
             End If
           Next g
-          If inside <> 0 Then pixel += bit
-          bit \= 2
+          If inside <> 0 Then pixel += bitMask
+          bitMask \= 2
           cr += c1
         Next k
         bits(rowBase + bx) = pixel

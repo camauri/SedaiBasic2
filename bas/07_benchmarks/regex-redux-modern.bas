@@ -11,7 +11,7 @@
 ''
 '' Sequential: the replacements are applied one after another, each to the output of the last.
 
-Dim As String inp = ""
+Dim As String inputText = ""
 Dim As String chunk
 
 '' Read in BLOCKS, the way every reference implementation does - the Python one is a single
@@ -24,14 +24,14 @@ Open Cons For Input As #1
 Do While Not Eof(1)
   chunk = Input(65536, #1)
   If Len(chunk) = 0 Then Exit Do
-  inp += chunk
+  inputText += chunk
 Loop
 Close #1
 
-Dim As Integer inputLength = Len(inp)
+Dim As Integer inputLength = Len(inputText)
 
 '' Strip the sequence descriptions and the newlines.
-Dim As String seqs = RegexReplace(inp, ">.*" + Chr(10) + "|" + Chr(10), "")
+Dim As String seqs = RegexReplace(inputText, ">.*" + Chr(10) + "|" + Chr(10), "")
 Dim As Integer seqsLength = Len(seqs)
 
 Dim As String pat(0 To 8) = { _

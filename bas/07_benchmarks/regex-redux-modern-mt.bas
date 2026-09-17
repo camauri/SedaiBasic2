@@ -41,7 +41,7 @@ Sub rrWorker( ByVal id As Integer )
   End If
 End Sub
 
-Dim As String inp = ""
+Dim As String inputText = ""
 Dim As String chunk
 
 '' Read in BLOCKS, the way every reference implementation does - the Python one is a single
@@ -52,17 +52,17 @@ Open Cons For Input As #1
 Do While Not Eof(1)
   chunk = Input(65536, #1)
   If Len(chunk) = 0 Then Exit Do
-  inp += chunk
+  inputText += chunk
 Loop
 Close #1
 
-Dim As Integer inputLength = Len(inp)
+Dim As Integer inputLength = Len(inputText)
 
 '' Strip the sequence descriptions and the newlines. This one is on the critical path of everything
 '' else, so it stays where it is.
-gSeqs = RegexReplace(inp, ">.*" + Chr(10) + "|" + Chr(10), "")
+gSeqs = RegexReplace(inputText, ">.*" + Chr(10) + "|" + Chr(10), "")
 Dim As Integer seqsLength = Len(gSeqs)
-inp = ""
+inputText = ""
 
 gPat(0) = "agggtaaa|tttaccct"
 gPat(1) = "[cgt]gggtaaa|tttaccc[acg]"

@@ -107,7 +107,7 @@ Sub randWorker( ByVal id As Integer )
   Do While produced < hi
     Dim As Integer thisLine = 60
     If hi - produced < 60 Then thisLine = CInt(hi - produced)
-    Dim As String line = ""
+    Dim As String seqLine = ""
     For k As Integer = 1 To thisLine
       st = (st * RNG_A + RNG_C) Mod RNG_M
       Dim As Double r = st / 139968.0
@@ -118,9 +118,9 @@ Sub randWorker( ByVal id As Integer )
           Exit For
         End If
       Next j
-      line += ch(idx)
+      seqLine += ch(idx)
     Next k
-    outp += line + Chr(10)
+    outp += seqLine + Chr(10)
     produced += thisLine
   Loop
   gOut(id) = outp

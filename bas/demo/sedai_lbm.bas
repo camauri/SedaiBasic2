@@ -66,6 +66,9 @@
 ''  AOT compiles best - and the shape the CLBG benchmark corpus does not have.
 '' ============================================================================
 
+#include once "file.bi"       ' FileExists, as in fbc
+#include once "datetime.bi"   ' Now, as in fbc
+
 Const LIVE_NX = 320 : Const LIVE_NY = 180 : Const LIVE_SCALE = 4   '' 1280x720 window
 Const REC_NX  = 640 : Const REC_NY  = 360 : Const REC_SCALE  = 3   '' 1920x1080 in the file
 
@@ -267,7 +270,6 @@ End Sub
 
 '' ---------------------------------------------------------------- colour
 Sub BuildPalette(tsec As Double)
-Declare Sub BuildPalette(tsec As Double)
   '' Eight stops of hue x eight levels of BRIGHTNESS, in one table of 4096.
   ''
   '' The brightness axis does two jobs at once:
@@ -533,6 +535,7 @@ capFrames = ValInt(Environ("DEMO_FRAMES"))
 '' frame have to be separable or "it is slow" is all anyone can say.
 noRender = ValInt(Environ("DEMO_NORENDER"))
 Dim As Double tSolve, tDraw, tA, tB
+Dim As Double tFrame      '' when the last frame was shown (the pacing below)
 Dim As Integer ss, i0, j0
 Dim As Double dx, dy, sx, sy, phase
 Dim As Integer warm, lvl, lv2
@@ -694,7 +697,12 @@ Do
     Put #rawFile, , frameBuf
     If (fr Mod FPS) = 0 Then Print "  "; fr \ FPS; "s /"; totalFrames \ FPS; "s"
   Else
-    If capFrames = 0 Then Frame FPS
+    '' Paced to FPS with Timer and Sleep. FRAME is Commodore BASIC, which a MODERN program does not have.
+    If capFrames = 0 Then
+      Dim As Double waitMs = (1.0 / FPS - (Timer - tFrame)) * 1000
+      If waitMs >= 1 Then Sleep CInt(waitMs), 1
+      tFrame = Timer
+    End If
     key = InKey
   End If
 
