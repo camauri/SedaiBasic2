@@ -549,7 +549,8 @@ type
     FRawBitUnit, FRawBitOfs: TInt64Array; // ...the unit size and bit offset of each bit field in the LAST UDTCLayoutRaw walk
     FRecNativeDefaults: Boolean;         // phase 3 (exclusions): a type with field DEFAULTS can be native
     FRecNativeRecArrays: Boolean;        // phase 3 (exclusions): an inline array of native records
-    FRecNativeZStr: Boolean;             // phase 3 (exclusions): a ZString * n field outside a union
+    FRecNativeZStr: Boolean;
+    FRecNativeFixStr: Boolean;           // phase 3 (exclusions): a String * n field             // phase 3 (exclusions): a ZString * n field outside a union
     FBoolArrays: Boolean;                // DIVERGENZE 493: a Boolean array is packed at one byte holding C's 0/1
     FNativeRecAsking: TStringList;       // phase 3.2: the types NativeRecordType is answering right now (a list's own pointer)
     // Phase 2.1a: the program's entry block, and where in it a raw module cell's allocation is hoisted (HoistToEntry) -
@@ -1953,6 +1954,7 @@ begin
   // ⭐ ON by default since the managed string paths learned the address (17 set 2026): the aggregate initialiser
   // (EmitNativeFieldInit) and fb_memcopy into a field (the raw block copy). =0 is the A/B.
   FRecNativeZStr := GetEnvironmentVariable('SB_RECNATIVE_ZSTR') <> '0';
+  FRecNativeFixStr := GetEnvironmentVariable('SB_RECNATIVE_FIXSTR') = '1';   // phase 3: OFF until the nets say so
   FBoolArrays := GetEnvironmentVariable('SB_BOOL_ARRAYS') <> '0';                        // DIVERGENZE 493: =0 is the A/B
   FProgram := nil;
   FCurrentBlock := nil;
@@ -28587,7 +28589,10 @@ begin
       CutS := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
       EmitInstruction(ssaStrLeft, CutS, EnsureStringRegister(ExprVal), Tmp1, MakeSSAValue(svkNone));
       ExprVal := EmitFixedLenToVarLen(CutS, False);
-    end;
+    end
+    // ...and a "String * n" is padded with spaces to exactly n, as the managed store pads it (the raw store adds the NUL).
+    else if (not F.IsZString) and (not F.IsWString) and (F.StrCapacity > 0) then
+      ExprVal := EmitFixedLenPad(EnsureStringRegister(ExprVal), F.StrCapacity, False);
     // A fixed-length string field is its DECLARED width of bytes, terminator and all - the same
     // capacity code the load half passes.
     EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), AddrVal, EnsureStringRegister(ExprVal),
@@ -40329,7 +40334,10 @@ begin
         // A "ZString * n" is C bytes, but nineteen managed string paths (aggregates, fb_memcopy, copies) do not know an
         // address yet: admitted only inside a UNION (libjpeg's jpeg_error_mgr.msg_parm), where no program writes it whole.
         if ((Bank = srtString) and not (IsZString and (not IsWString) and (StrCapacity > 0) and FRecNativeProcFields and
-                                        (FUDTs[Idx].IsUnion or FRecNativeZStr))) or
+                                        (FUDTs[Idx].IsUnion or FRecNativeZStr)) and
+                                   // ...and a "String * n" (n characters, space-padded, then a NUL) since the raw store pads it too
+                                   not (FRecNativeFixStr and (not IsZString) and (not IsWString) and (StrCapacity > 0) and
+                                        not IsArray)) or
            ((BitWidth > 0) and not FRecNativeBits) or (IsBoolean and not FRecNativeBool) or IsCvaList or ((DefaultExpr <> nil) and not (FRecNativeDefaults and (NestedType = '') and not IsArray)) then Exit(No('field ' + Name + ': string/bits/boolean/va/default'));
         // A PROCEDURE field: the raw store picks the overload of "@fun" from the field's signature since phase 3.7, as the
         // managed store does (m708). SB_RECNATIVE_PROCFIELDS=0 keeps such types managed (A/B).
