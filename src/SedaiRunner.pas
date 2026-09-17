@@ -577,6 +577,8 @@ begin
         {$IFNDEF DISABLE_DBE}
         {$IFNDEF DISABLE_SUB_INLINING}
         try SSAProgram.RunSubInlining; except on E: Exception do OptPassFailed('SubInlining', E); end; PhaseMark('SubInlining');   // unification: before everything
+        // ...and argument-slot forwarding right after it, as sb's pipeline does (an inlined call keeps its Xfer pairs otherwise).
+        try SSAProgram.RunXferForwarding; except on E: Exception do OptPassFailed('XferForwarding', E); end; PhaseMark('XferForwarding');
         {$ENDIF}
         try SSAProgram.RunDBE; except on E: Exception do OptPassFailed('DBE', E); end; PhaseMark('DBE');
         {$ENDIF}
@@ -654,6 +656,8 @@ begin
         {$IFNDEF DISABLE_LICM}
         try SSAProgram.RunLICM; except on E: Exception do OptPassFailed('LICM', E); end; PhaseMark('LICM');
         {$ENDIF}
+        // ...and index reduction after it, as sb's pipeline does.
+        try SSAProgram.RunIndexReduction; except on E: Exception do OptPassFailed('IndexReduction', E); end; PhaseMark('IndexReduction');
 
         {$IFNDEF DISABLE_LOOP_UNROLL}
         try
@@ -723,6 +727,8 @@ begin
         finally
           RegAlloc.Free;
         end;
+        // "acc += tab[Asc(Mid(s,i,1))+1]" fused AFTER register allocation, as sb's pipeline does (see SedaiBasicVM.lpr).
+        try SSAProgram.RunAppendMappedFusion; except on E: Exception do OptPassFailed('AppendMappedFusion', E); end;
         {$ENDIF}
 
         // === BYTECODE COMPILATION ===

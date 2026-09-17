@@ -510,6 +510,7 @@ begin
         {$IFNDEF DISABLE_DBE}
         {$IFNDEF DISABLE_SUB_INLINING}
         SSAProgram.RunSubInlining;   // unification: before everything
+        SSAProgram.RunXferForwarding; // ...and its argument slots forwarded, as sb does
         {$ENDIF}
         SSAProgram.RunDBE;
         {$ENDIF}
@@ -556,6 +557,8 @@ begin
         finally
           RegAlloc.Free;
         end;
+        // "acc += tab[Asc(Mid(s,i,1))+1]" fused AFTER register allocation, as sb's pipeline does (see SedaiBasicVM.lpr).
+        try SSAProgram.RunAppendMappedFusion; except end;
         {$ENDIF}
       except
         on E: Exception do

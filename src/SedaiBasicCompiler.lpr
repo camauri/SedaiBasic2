@@ -342,6 +342,9 @@ begin
         try
           {$IFNDEF DISABLE_SUB_INLINING}
           try SSAProgram.RunSubInlining; except end;   // unification: before everything
+          // ⛔ ...and ARGUMENT-SLOT FORWARDING right after it, as `sb` does: without it an inlined call keeps its
+          // XferStore/XferLoad pairs, and spectral_1w ran 23.5 s from its .basc against 14.5 s from source.
+          try SSAProgram.RunXferForwarding; except end;
           {$ENDIF}
           SSAProgram.RunDBE;
         except
@@ -413,6 +416,8 @@ begin
         {$IFNDEF DISABLE_LICM}
         try SSAProgram.RunLICM; except end;
         {$ENDIF}
+        // ⛔ ...and INDEX REDUCTION after it, as sb does: the pipelines had drifted, and a .basc lost what sb keeps.
+        try SSAProgram.RunIndexReduction; except end;
 
         {$IFNDEF DISABLE_LOOP_UNROLL}
         try
@@ -478,6 +483,9 @@ begin
         finally
           RegAlloc.Free;
         end;
+        // "acc += tab[Asc(Mid(s,i,1))+1]" fused AFTER register allocation, as sb's pipeline does (see SedaiBasicVM.lpr):
+        // without it reverse-complement ran 2073 ms from its .basc against 981 ms from source.
+        try SSAProgram.RunAppendMappedFusion; except end;
         {$ENDIF}
 
         // === WASM BACKEND (--target wasm) ===
