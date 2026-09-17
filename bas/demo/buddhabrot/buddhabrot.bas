@@ -105,6 +105,8 @@
 ''  axis runs ACROSS it. This is not a stylistic flourish and it is not free: it is what stands the
 ''  figure upright. Drawn the other way it lies on its side and reads as nothing in particular.
 
+#include once "string.bi"   ' Format, as in fbc
+
 ''  The view is a SQUARE centred somewhere on the plane, so it needs three numbers rather than four.
 ''  The whole figure sits in a square 2.7 across centred at (-0.65, 0).
 Const HOME_CENTRE_REAL      = -0.65

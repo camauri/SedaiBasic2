@@ -1305,7 +1305,11 @@ EventPollCounter := 0;
           begin JoinWorker(Ctx.IntRegs[Instr^.Src1]); Inc(CurPC); end;
         bcThreadSelf:
           // THREADSELF(): the current thread's handle (0 on the main thread).
-          begin Ctx.IntRegs[Instr^.Dest] := GSelfHandle; Inc(CurPC); end;
+          begin
+            if GSelfHandle <> 0 then Ctx.IntRegs[Instr^.Dest] := GSelfHandle
+            else Ctx.IntRegs[Instr^.Dest] := MAIN_THREAD_HANDLE;   // DIVERGENZE 505
+            Inc(CurPC);
+          end;
         bcThreadDetach:
           // THREADDETACH h: detach the worker named by the handle in Src1.
           begin DetachWorker(Ctx.IntRegs[Instr^.Src1]); Inc(CurPC); end;

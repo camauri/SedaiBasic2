@@ -756,6 +756,27 @@ begin
   begin
     RetType := StrToIntDef(Data, 1);
     Data := '0';
+    // 100 is INTERNAL (FileFlush's function form, DIVERGENZE 504): "is this channel open?", a device
+    // included, and -1 - fbc's "every channel" - always is. fbc answers 1 to FileFlush(n) on a closed n.
+    // ...and a channel open FOR INPUT is not one fbc flushes: FileFlush answers 1 there too (measured per mode).
+    if RetType = 100 then
+    begin
+      if Handle = -1 then
+        Data := '1'
+      else if (Handle >= 1) and (Handle <= MAX_FILE_HANDLE) then
+      begin
+        if FDeviceKind[Handle] <> 0 then
+          Data := '1'
+        else if Assigned(FFileHandles[Handle]) then
+        begin
+          M := UpperCase(FFileModes[Handle]);
+          if not ((Pos('R', M) > 0) and (Pos('W', M) = 0) and (Pos('A', M) = 0) and (Pos('B', M) = 0) and
+                  not ((Length(M) >= 1) and (M[1] = 'L'))) then
+            Data := '1';
+        end;
+      end;
+      Exit;
+    end;
     if (Handle >= 1) and (Handle <= MAX_FILE_HANDLE) and Assigned(FFileHandles[Handle]) then
       case RetType of
         2: Data := IntToStr(PtrInt(FFileHandles[Handle].Handle));  // OS file handle
@@ -863,6 +884,7 @@ begin
   begin
     ErrorCode := 64;  // FILE NOT OPEN
     if (Command = 'EOF') then Data := '-1';   // EOF of a closed file = true
+    if (Command = 'FILESETEOF') then Data := '1';   // fbc's FileSetEof answers 1 on a closed channel (504)
     Exit;
   end;
   FS := FFileHandles[Handle];

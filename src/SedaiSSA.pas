@@ -28807,6 +28807,39 @@ begin
     EmitInstruction(ssaDirAttr, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Exit;
   end;
+  // FreeBASIC FileFlush([filenum [, systembuffers]]) / FileSetEof(filenum) (DIVERGENZE 504): 0, or 1 on a channel
+  // that is not open. Streams are unbuffered, so FileFlush only asks whether the channel is open - FileAttr's
+  // internal answer 100, where -1 (the default, "every channel") is always open.
+  if (FuncName = kFILEFLUSH) or (FuncName = kFILESETEOF) then
+  begin
+    if (Node.ChildCount >= 1) and (Node.GetChild(0) <> nil) and
+       not ((Node.GetChild(0).NodeType = antLiteral) and VarIsEmpty(Node.GetChild(0).Value)) then
+    begin
+      ProcessExpression(Node.GetChild(0), V1);
+      R1 := EnsureIntRegister(V1);
+    end
+    else if FuncName = kFILESETEOF then
+      raise Exception.Create('FILESETEOF() requires a file number')
+    else
+    begin
+      R1 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaLoadConstInt, R1, MakeSSAConstInt(-1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    end;
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    if FuncName = kFILESETEOF then
+    begin
+      EmitInstruction(ssaFileSetEof, Result, R1, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Exit;
+    end;
+    Flags := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, Flags, MakeSSAConstInt(100), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    R2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaFileAttr, R2, R1, Flags, MakeSSAValue(svkNone));
+    V2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaLoadConstInt, V2, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    EmitInstruction(ssaSubInt, Result, V2, R2, MakeSSAValue(svkNone));
+    Exit;
+  end;
   if (Node.ChildCount < 1) or (Node.GetChild(0) = nil) then
     raise Exception.CreateFmt('%s() requires an argument', [FuncName]);
 

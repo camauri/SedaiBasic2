@@ -3108,6 +3108,8 @@ End Function
 
 #### VisualBasic compatible procedures
 
+> ⚠️ As in fbc, these need `#include "datetime.bi"` (or `"vbcompat.bi"`); `FORMAT` needs `"string.bi"`. Without the header the program is refused (DIVERGENZE 504).
+
 | Keyword | Status | Description |
 |---|---|---|
 | `NOW` | ✓ | Date serial (Double, epoch 1899-12-30) of the current date and time. Bare (no parens). |
@@ -3285,6 +3287,8 @@ End Function
 
 #### File Properties
 
+> ⚠️ As in fbc, `FILELEN`, `FILEEXISTS`, `FILEDATETIME`, `FILEATTR`, `FILECOPY`, `FILEFLUSH` and `FILESETEOF` need `#include "file.bi"`; `ISREDIRECTED` needs `"fbio.bi"`. Without the header the program is refused (DIVERGENZE 504).
+
 | Keyword | Status | Description |
 |---|---|---|
 | `FILEATTR` | ✓ | `FILEATTR(filenum[,returntype])` -> info about an open file number: returntype 1 (default) = File Mode (Input=1/Output=2/Random=4/Append=8/Binary=32), 2 = OS handle, 3 = Encoding (0=ASCII). |
@@ -3292,8 +3296,8 @@ End Function
 | `FILEDATETIME` | ✓ | `FILEDATETIME(path)` -> the file's last-modified timestamp as a Date Serial (Double), or 0 if absent; cross-platform. |
 | `FILEEXISTS` | ✓ | `FILEEXISTS(path)` returns -1 if the file exists, else 0 (cross-platform). |
 | `FILELEN` | ✓ | `FILELEN(path)` -> file size in bytes (0 if the file does not exist); cross-platform. |
-| `FILESETEOF` | ✓ | `FILESETEOF filenum` sets an open file's length to the current 1-based position (truncates if before EOF, extends with zero bytes if beyond). Statement form. ⚠️ Not yet usable as a FUNCTION (`Print FileSetEof(1)` is a syntax error; fbc returns 0), and accepted without `#include "file.bi"`, which fbc requires (DIVERGENZE 504). |
-| `FILEFLUSH` | ✓ | `FILEFLUSH [[#]filenum]` — accepted as a no-op (the VM's file streams are unbuffered, so buffered output is already written). ⚠️ Not yet usable as a FUNCTION (`Print FileFlush(1)` is a syntax error; fbc returns 0) (DIVERGENZE 504). |
+| `FILESETEOF` | ✓ | `FILESETEOF filenum` sets an open file's length to the current 1-based position (truncates if before EOF, extends with zero bytes if beyond). Statement form. Also a FUNCTION: `FileSetEof(n)` answers 0, or 1 when n is not open. Needs `#include "file.bi"`, as in fbc (DIVERGENZE 504). |
+| `FILEFLUSH` | ✓ | `FILEFLUSH [[#]filenum]` — accepted as a no-op (the VM's file streams are unbuffered, so buffered output is already written). Also a FUNCTION: `FileFlush([n])` answers 0, or 1 when n is not open or open `For Input`. Needs `#include "file.bi"`, as in fbc (DIVERGENZE 504). |
 
 #### Working with Directories
 
@@ -3410,7 +3414,7 @@ End Function
 | `THREADCREATE` | ✓ | Starts a procedure in a separate thread of execution. `h = THREADCREATE(@sub [, param])` (M5.2; one param, any type; workers share global arrays + arrays of UDT). |
 | `THREADWAIT` | ✓ | Waits for a thread to finish and releases the thread handle. `THREADWAIT h` (M5.2). |
 | `THREADDETACH` | ✓ | Releases a thread handle without waiting for the thread to finish. `THREADDETACH h` (M5.5; v1: cleaned up at program end). |
-| `THREADSELF` | ✓ | Returns the thread handle of the current thread. `h = THREADSELF()` (0 on the main thread) (M5.5). |
+| `THREADSELF` | ✓ | Returns the thread handle of the current thread. `h = THREADSELF()`, never 0 - the main thread has a handle too, as in fbc (DIVERGENZE 505). Needs `#include "fbthread.bi"`, as in fbc (DIVERGENZE 504). |
 
 > **Worker limit.** At most **64 workers may be live at once**; a `THREADCREATE`/`THREADCALL` beyond that
 > fails with a runtime error rather than spawning. A worker counts as live from its creation until its

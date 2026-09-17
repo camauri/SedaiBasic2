@@ -94,6 +94,8 @@ type
     // in FreeBASIC ("error 119: Cannot modify a constant") and used to be silently accepted here,
     // because a module-level CONST lowers to a DIM and was therefore an ordinary variable.
     FConstNames: TStringList;
+    FHeaderRoutines: TStringList;     // header-gated routines a Declare ... Alias "fb_..." made available (504)
+    FGatedDeclared: TStringList;      // ...and those the program declares as names of its own
     // ...and what each one's inferred TYPE NAME is, so a CONST defined from another CONST can be
     // typed by its VALUE instead of falling back to the numeric default. See InferConstTypeName.
     FConstTypes: TStringList;
@@ -278,6 +280,7 @@ type
     procedure RejectReservedDeclNames(Node: TASTNode);   // MODERN: fbc's reserved words, per context (264)
     procedure RejectNonConstSharedRef(Root: TASTNode);   // MODERN: a Shared/Static reference on a constant address (260)
     procedure ShadowDeclaredBuiltins;                    // MODERN: a declared name wins over a builtin (267)
+    procedure RejectUndeclaredHeaderRoutines(Root: TASTNode);  // MODERN: file.bi & co. routines need their header (504)
     function MakeStaticRefDef(const DottedName, TypeName: string; InitExpr: TASTNode;
       Tok: TLexerToken): TASTNode;                       // "Static ByRef" member definition as a Shared reference (269)
     function InitReferencesModuleLocal(Node: TASTNode; out Which: string): Boolean;
@@ -798,6 +801,8 @@ begin
     FExpressionParser.Free;
 
   FForeignDecls.Free;
+  FHeaderRoutines.Free;
+  FGatedDeclared.Free;
   FForeignDataArrays.Free;
   FDeclTypeUses.Free;
   FForwardDeclNames.Free;
@@ -1805,6 +1810,8 @@ begin
   if FModernMode then RejectReservedDeclNames(Result);
   // ⛔ ...and a Shared or Static reference binds to a CONSTANT address, as in fbc (DIVERGENZE 260).
   if FModernMode then RejectNonConstSharedRef(Result);
+  // ⛔ ...and a routine of fbc's own headers (file.bi, datetime.bi, ...) exists only once its header declared it (504).
+  if FModernMode then RejectUndeclaredHeaderRoutines(Result);
 
  // The module-level FORWARD declarations, handed to the namespace pass on the root: a name the program
  // declares that way is one of its own and beats a "Using" import, and it emitted no node to say so.
@@ -12974,6 +12981,63 @@ begin
   DoNodeCreated(Result);
 end;
 
+const
+  // ⛔ THE ROUTINES fbc's OWN HEADERS DECLARE (DIVERGENZE 504, owner's decision on 17 Sep 2026: conform to fbc).
+  // They are builtins here, but in fbc they exist only once "file.bi", "datetime.bi", "string.bi",
+  // "utf_conv.bi", "fbthread.bi" or "fbio.bi" (or "vbcompat.bi", which includes the first three) declared
+  // them as "Declare ... Alias ""fb_..."": without the header fbc answers "error 42: Variable not declared".
+  HEADER_ROUTINES = ' FILECOPY FILEATTR FILELEN FILEEXISTS FILEDATETIME FILEFLUSH FILESETEOF' +
+    ' DATESERIAL DATEVALUE ISDATE YEAR MONTH DAY WEEKDAY TIMESERIAL TIMEVALUE HOUR MINUTE SECOND NOW' +
+    ' DATEADD DATEPART DATEDIFF MONTHNAME WEEKDAYNAME FORMAT CHARTOUTF WCHARTOUTF UTFTOCHAR UTFTOWCHAR' +
+    ' THREADDETACH THREADSELF ISREDIRECTED ';
+
+function HeaderOfRoutine(const W: string): string;
+begin
+  if Pos(' ' + W + ' ', ' FILECOPY FILEATTR FILELEN FILEEXISTS FILEDATETIME FILEFLUSH FILESETEOF ') > 0 then
+    Result := 'file.bi'
+  else if W = 'FORMAT' then Result := 'string.bi'
+  else if Pos(' ' + W + ' ', ' CHARTOUTF WCHARTOUTF UTFTOCHAR UTFTOWCHAR ') > 0 then Result := 'utf_conv.bi'
+  else if (W = 'THREADDETACH') or (W = 'THREADSELF') then Result := 'fbthread.bi'
+  else if W = 'ISREDIRECTED' then Result := 'fbio.bi'
+  else Result := 'datetime.bi';
+end;
+
+procedure TPackratParser.RejectUndeclaredHeaderRoutines(Root: TASTNode);
+// A use of a header routine whose header was not included is refused as fbc refuses it - unless the program
+// declares that name itself (a variable "second", a Function "Year"), which then is its own. The use takes
+// several shapes in the tree, so the NAME is asked of each: a call parsed as an array access, a call node,
+// the dedicated nodes of FileCopy / FileSetEof / ThreadSelf / ThreadDetach, and FileFlush's empty statement.
+  procedure Walk(N: TASTNode);
+  var
+    i: Integer;
+    W: string;
+  begin
+    if N = nil then Exit;
+    W := '';
+    case N.NodeType of
+      antArrayAccess:
+        if (N.ChildCount >= 1) and (N.GetChild(0) <> nil) and (N.GetChild(0).NodeType = antIdentifier) then
+          W := N.GetChild(0).ValueUpper;
+      antFunctionCall, antFsFunction, antCopy, antThreadSelf, antThreadDetach, antFileSetEof, antStatement:
+        begin
+          W := N.ValueUpper;
+          if (W = '') and (N.Token <> nil) then W := UpperFast(VarToStr(N.Token.Value));
+        end;
+    end;
+    if (W <> '') and (Pos(' ' + W + ' ', HEADER_ROUTINES) > 0) and
+       (FHeaderRoutines.IndexOf(W) < 0) and (FGatedDeclared.IndexOf(W) < 0) then
+    begin
+      HandleError(Format('Variable not declared: %s (it is declared by "%s", which the program does not include)',
+                         [W, HeaderOfRoutine(W)]), N.Token);
+      Exit;
+    end;
+    for i := 0 to N.ChildCount - 1 do Walk(N.GetChild(i));
+  end;
+begin
+  if (FHeaderRoutines = nil) or (FGatedDeclared = nil) then Exit;
+  Walk(Root);
+end;
+
 procedure TPackratParser.ShadowDeclaredBuiltins;
 // ⛔ A DECLARED NAME THAT SILENTLY READ THE BUILTIN (DIVERGENZE 267). "Dim now As Integer : now = 7 :
 // Print now" printed the DATE where fbc prints 7: the declaration passed and the use still reached the
@@ -13037,6 +13101,11 @@ var
     Result := (W <> '') and (Pos(' ' + W + ' ', CANDIDATES) > 0);
   end;
 
+  function IsGated(const W: string): Boolean;
+  begin
+    Result := (W <> '') and (Pos(' ' + W + ' ', HEADER_ROUTINES) > 0);
+  end;
+
   function StmtEnd(From: Integer): Integer;
   // The index of the token that ends the statement starting at From (EOL, ':' or EOF).
   var
@@ -13053,6 +13122,8 @@ var
 
   procedure Note(Lst: TStringList; const W: string);
   begin
+    // A header routine the program declares as a name of its own is not refused as a missing header (504).
+    if IsGated(W) and (FGatedDeclared.IndexOf(W) < 0) then FGatedDeclared.Add(W);
     if IsCandidate(W) and (Lst.IndexOf(W) < 0) then Lst.Add(W);
   end;
 
@@ -13087,7 +13158,7 @@ var
       if W = ',' then begin State := dsExpectName; Continue; end;
       case State of
         dsExpectName: begin Note(Lst, W); State := dsAfterName; end;
-        dsLeadType:   if IsCandidate(W) then begin Note(Lst, W); State := dsAfterName; end;
+        dsLeadType:   if IsCandidate(W) or IsGated(W) then begin Note(Lst, W); State := dsAfterName; end;
       end;
     end;
   end;
@@ -13208,10 +13279,16 @@ var
     // ⛔ A Declare aliased to fbc's RUNTIME ("Declare Function FileCopy Alias ""fb_FileCopy""", file.bi)
     // names the routine this compiler's builtin already IS - it is not a name of the program. Taking it
     // as one sent the manual's system/filecopy and system/fileseteof1 to a libfb symbol that is not there.
+    // ⭐ ...and it is what makes a header routine AVAILABLE: fbc knows FileLen only once file.bi declared it (504).
     if IsDeclare then
       for j := HeadIdx to EndIdx - 1 do
         if (TL.GetTokenDirect(j).TokenType = ttStringLiteral) and
-           SameText(Copy(VarToStr(TL.GetTokenDirect(j).Value), 1, 3), 'fb_') then Exit;
+           SameText(Copy(VarToStr(TL.GetTokenDirect(j).Value), 1, 3), 'fb_') then
+        begin
+          if IsGated(Up(HeadIdx + 1)) and (FHeaderRoutines.IndexOf(Up(HeadIdx + 1)) < 0) then
+            FHeaderRoutines.Add(Up(HeadIdx + 1));
+          Exit;
+        end;
     if InSet(BODY_KINDS,' ' + Up(HeadIdx) + ' ') and ((Up(HeadIdx) = 'SUB') or (Up(HeadIdx) = 'FUNCTION')) then
       Note(Glob, Up(HeadIdx + 1));
     if IsDeclare then Exit;
@@ -13250,6 +13327,8 @@ var
   end;
 
 begin
+  if FHeaderRoutines = nil then FHeaderRoutines := TStringList.Create else FHeaderRoutines.Clear;
+  if FGatedDeclared = nil then FGatedDeclared := TStringList.Create else FGatedDeclared.Clear;
   TL := Context.TokenList;
   if TL = nil then Exit;
   N := TL.Count;

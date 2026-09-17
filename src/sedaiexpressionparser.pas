@@ -1824,6 +1824,32 @@ var
 
 begin
   Result := nil;
+  // ⭐ FILEFLUSH AND FILESETEOF ARE FUNCTIONS in fbc (file.bi declares them so, DIVERGENZE 504): each answers
+  // 0, or 1 on a channel that is not open. They lex in this family, so "Print FileFlush(1)" was a syntax
+  // error. Built as the filesystem function node; FileFlush's arguments are both optional, and an omitted
+  // one is an empty literal as in Dir().
+  if ModernMode and ((UpperCase(Token.Value) = kFILEFLUSH) or (UpperCase(Token.Value) = kFILESETEOF)) and
+     Context.Check(ttDelimParOpen) then
+  begin
+    Result := TASTNode.CreateWithValue(antFsFunction, UpperCase(Token.Value), Token);
+    Context.Advance;                                // '('
+    while not Context.Check(ttDelimParClose) do
+    begin
+      if Context.Check(ttSeparParam) then
+        Result.AddChild(TASTNode.CreateWithValue(antLiteral, Unassigned, Context.CurrentToken))
+      else
+        Result.AddChild(ParseExpression);
+      if not Context.Check(ttSeparParam) then Break;
+      Context.Advance;                              // ','
+    end;
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError(Format('Expected ")" after %s arguments', [UpperCase(Token.Value)]), Context.CurrentToken);
+      Result.Free; Result := nil; Exit;
+    end;
+    DoNodeCreated(Result);
+    Exit;
+  end;
   // ⭐ CLOSE HAS A FUNCTION FORM TOO, and it shares this rule for the reason the rule exists: the whole
   // ttFileOperation family lexes as one token type, so an expression-position member needs a prefix
   // rule or it is a syntax error. fbc answers 0 when the channel was open and 1 (illegal function

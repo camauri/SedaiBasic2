@@ -1667,8 +1667,15 @@ threadvar
   // FCtx); set by WorkerThreadEntry to the worker's own context before it enters the run loop. Read
   // once per Run (RunTemplate.inc) so the hot path stays register-direct — the point of M5.2a.
   GActiveCtx: TExecutionContext;
-  // M5.5: the current thread's Threadcreate handle (THREADSELF reads it). 0 on the main thread.
+  // M5.5: the current thread's Threadcreate handle (THREADSELF reads it). 0 on the main thread, which
+  // THREADSELF answers as MAIN_THREAD_HANDLE.
   GSelfHandle: Int64;
+
+const
+  // ⛔ fbc's ThreadSelf() is a real handle on the MAIN thread too, never 0 (DIVERGENZE 505): a program that
+  // tests "ThreadSelf() <> 0" read false here. Worker handles are 1, 2, 3... (ThreadCreate order), so this
+  // is none of them, and ThreadWait / ThreadDetach ignore it as they ignore any handle that names no worker.
+  MAIN_THREAD_HANDLE = $7FFFFFFF;
 
 // B1.5 type-width narrowing: wrap/sign-extend an Int64 to a narrower integer width.
 // Width codes: 1=s8 2=u8 3=s16 4=u16 5=s32 6=u32. Anything else is a full-width no-op
@@ -11310,7 +11317,8 @@ begin
     bcThreadCreate:  Ctx.IntRegs[Instr.Dest] := SpawnWorker(Ctx.IntRegs[Instr.Src1], Ctx);
     bcThreadWait:    JoinWorker(Ctx.IntRegs[Instr.Src1]);
     bcThreadDetach:  DetachWorker(Ctx.IntRegs[Instr.Src1]);
-    bcThreadSelf:    Ctx.IntRegs[Instr.Dest] := GSelfHandle;
+    bcThreadSelf:    if GSelfHandle <> 0 then Ctx.IntRegs[Instr.Dest] := GSelfHandle
+                     else Ctx.IntRegs[Instr.Dest] := MAIN_THREAD_HANDLE;
     bcMutexCreate:   Ctx.IntRegs[Instr.Dest] := CreateMutex;
     bcMutexLock:     LockMutex(Ctx.IntRegs[Instr.Src1]);
     bcMutexUnlock:   UnlockMutex(Ctx.IntRegs[Instr.Src1]);
