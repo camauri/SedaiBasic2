@@ -198,6 +198,13 @@ type
     // worker re-ran the whole main program -- including its own THREADCREATE calls -- and the resulting
     // recursive thread explosion saturated the machine. A compiler bug must not be able to do that.
     FLiveWorkers: Integer;
+    // ⭐ DIVERGENZE 515: the contexts made for a callback C runs on a THREAD OF ITS OWN. A closure carries
+    // the context of whoever CREATED it, and until this existed the trampoline ran the BASIC procedure in
+    // that context whatever thread it was on - so a C thread and the main thread executed bytecode in the
+    // same registers, transfer slots, PC and call stack. One context per thread, made on first use, kept
+    // until the VM dies (a library may call back for the life of the program). Guarded by FWorkerLock.
+    FCallbackCtxs: array of TExecutionContext;
+    FMainThreadId: TThreadID;
     // M5.4: mutex table. Each entry is a heap-allocated TRTLCriticalSection (pointer kept stable so a
     // held lock survives table growth); a Mutexcreate handle is (index + 1), 0 = invalid, nil = destroyed.
     // FMutexTableLock guards only the table (lookup/append), never the user mutex itself.
@@ -829,6 +836,7 @@ type
     // SpawnWorker BeginThreads a worker (returns the handle); JoinWorker waits on it; RunWorker is the
     // worker-thread body (Spawn is a TWorkerSpawn) that primes a synthetic call frame and runs the loop.
     procedure SetupWorkerContext(WCtx: TExecutionContext);
+    function CallbackCtx(AModel: TExecutionContext): TExecutionContext;   // DIVERGENZE 515
     function SpawnWorker(EntryPC: Int64; SpawnerCtx: TExecutionContext): Int64;
     procedure JoinWorker(Handle: Int64);
     procedure DetachWorker(Handle: Int64);   // M5.5: mark a worker detached (not explicitly joined)
@@ -1674,6 +1682,9 @@ threadvar
   // M5.5: the current thread's Threadcreate handle (THREADSELF reads it). 0 on the main thread, which
   // THREADSELF answers as MAIN_THREAD_HANDLE.
   GSelfHandle: Int64;
+  // ⭐ DIVERGENZE 515: this thread's context for a callback C runs here. Only ever set on a thread C
+  // owns - the main thread uses the VM's FCtx and a BASIC worker uses GActiveCtx.
+  GCbCtx: TExecutionContext;
 
 const
   // ⛔ fbc's ThreadSelf() is a real handle on the MAIN thread too, never 0 (DIVERGENZE 505): a program that
@@ -1857,6 +1868,10 @@ begin
   FJoyButtons := 0;
   FIOStatus := 0;   // ST: no I/O yet -> clear (no EOF)
   // M5.1: the per-context execution state must exist before any field below is touched.
+  // ⭐ DIVERGENZE 515: the thread the VM was built on. The closure trampoline compares against it to tell
+  // "the caller is back" from "C is calling back on a thread of its own", and only the second needs a
+  // context of its own.
+  FMainThreadId := GetCurrentThreadId;
   FCtx := TExecutionContext.Create;
   // M5.3: render command queue + scratch replay context. Dormant until M5.2 sets FHasWorkers.
   FDrawQueue := TDrawCommandQueue.Create;
@@ -7965,13 +7980,28 @@ end;
 procedure SbClosureTrampoline(ARet: Pointer; AArgs: PPointer; AUser: Pointer);
 // ⛔ Una procedura SEMPLICE, non un metodo: e' la forma che TAbiClosureFun dichiara, e tutto cio' che
 // serve viaggia in AUser.
+//
+// ⭐⭐ E IL CONTESTO E' QUELLO DEL THREAD SU CUI SI STA GIRANDO, non quello di chi ha creato la closure
+// (DIVERGENZE 515). Un thread ha il suo contesto e non lo divide con nessuno:
+//   · un WORKER BASIC lo ha gia' in GActiveCtx;
+//   · il thread MAIN usa quello della VM, che e' anche quello che la closure porta nel caso normale, e
+//     allora questa e' la stessa riga di prima a costo zero;
+//   · un thread di C - quello che `SDL_CreateThread` avvia - non ne aveva NESSUNO, e usava quello del
+//     chiamante: due esecutori sugli stessi registri, gli stessi slot di trasferimento, lo stesso PC e
+//     la stessa pila di chiamate. CallbackCtx gliene da' uno suo.
 var
   C: PSbClosureCtx;
+  Ctx: TExecutionContext;
+  VM: TBytecodeVM;
 begin
   C := PSbClosureCtx(AUser);
   if (C = nil) or (C^.VM = nil) or (C^.Ctx = nil) then Exit;
-  TBytecodeVM(C^.VM).RunClosureBody(TExecutionContext(C^.Ctx), C^.EntryPC, ARet, AArgs,
-                                    C^.RetKind, C^.ArgKinds, C^.NArgs);
+  VM := TBytecodeVM(C^.VM);
+  if GActiveCtx <> nil then Ctx := GActiveCtx                    // inside a BASIC worker: its own context
+  else if GetCurrentThreadId = VM.FMainThreadId then Ctx := TExecutionContext(C^.Ctx)
+  else Ctx := VM.CallbackCtx(TExecutionContext(C^.Ctx));         // a thread C owns: one of its own
+  VM.RunClosureBody(Ctx, C^.EntryPC, ARet, AArgs,
+                    C^.RetKind, C^.ArgKinds, C^.NArgs);
 end;
 
 procedure TBytecodeVM.RunClosureBody(ACtx: TExecutionContext; AEntryPC: Int64;
@@ -9053,6 +9083,56 @@ begin
   WCtx.PC := 0;
 end;
 
+function TBytecodeVM.CallbackCtx(AModel: TExecutionContext): TExecutionContext;
+// ⭐⭐ DIVERGENZE 515: THE CONTEXT A CALLBACK RUNS IN, WHEN C CALLS BACK ON A THREAD OF ITS OWN.
+//
+// ⛔ What it replaces, and why it is not a marshalling patch. A closure carries the context of whoever
+// CREATED it (`C^.Ctx`), and the trampoline used to run the BASIC procedure in that context no matter
+// which thread was calling. So `SDL_CreateThread(@worker, "p", @tag)` had C's thread and the main thread
+// executing bytecode in the SAME registers, the SAME transfer slots, the SAME PC and the SAME call
+// stack. It PRESENTED as "the user data arrives wrong" - the callback read the pointer out of transfer
+// slots the main thread was refilling for its next foreign call - which is why five obvious hypotheses
+// all failed: the fault is not in the value, it is in who owns the machine that carries it.
+// 📊 Measured over 30 threads: with the main thread spinning in BASIC, the callback BODY was executed
+// 821 778 times instead of 30 - the main thread was executing it; with the main thread making foreign
+// calls, the user data was wrong 25 times out of 30.
+//
+// One context per thread, made on first use and kept until the VM dies: a library may call back for the
+// whole life of the program, and the cost is one TLS read per callback on every path that already worked.
+//
+// ⛔ AND IT MAKES THE VM MULTI-THREADED, so it says so. FHasWorkers is what turns on the array locks and
+// the deferred draw queue; a second thread executing bytecode without that flag is the race of entry 314
+// with nothing guarding it. It is set here and never cleared - the flag means "more than one executor has
+// existed", which is exactly what the locks need to know.
+var
+  i: Integer;
+begin
+  Result := GCbCtx;
+  if Result <> nil then Exit;
+  Result := TExecutionContext.Create;
+  Result.ModeSwitchPC := -1;   // no TRON/TROFF switch pending (0 would read as "resume at PC 0")
+  // The transfer slots are the callback's own: the trampoline fills them with C's arguments.
+  SetLength(Result.XferInt, Length(AModel.XferInt));
+  SetLength(Result.XferFloat, Length(AModel.XferFloat));
+  SetLength(Result.XferStr, Length(AModel.XferStr));
+  SetupWorkerContext(Result);   // banks, stacks, and this thread's own block of proc-local array slots
+  // ⛔ A FRESH CONTEXT IS NOT RUNNING, and the closure body's loop tests that flag: without this the
+  // callback was entered and left again without executing one instruction - the counting reproducer went
+  // from "the body ran 821 778 times" to "it never ran at all", which is a different wrong answer and
+  // just as silent. A worker gets this from RunFast; a callback has no RunFast to get it from.
+  Result.Running := True;
+  EnterCriticalSection(FWorkerLock);
+  try
+    i := Length(FCallbackCtxs);
+    SetLength(FCallbackCtxs, i + 1);
+    FCallbackCtxs[i] := Result;
+    FHasWorkers := True;
+  finally
+    LeaveCriticalSection(FWorkerLock);
+  end;
+  GCbCtx := Result;
+end;
+
 function TBytecodeVM.SpawnWorker(EntryPC: Int64; SpawnerCtx: TExecutionContext): Int64;
 // bcThreadCreate: register a worker (handle = index+1) and BeginThread it. The worker runs the SUB at
 // EntryPC on its own context; the SUB's arguments are snapshotted from SpawnerCtx's transfer slots (the
@@ -9184,6 +9264,16 @@ begin
     Spawn.Free;
   end;
   SetLength(FWorkerThreads, 0);
+  // ⭐ DIVERGENZE 515: and the contexts made for callbacks C ran on threads of its own. They are freed
+  // HERE, with the workers, for the same reason: nothing above this in the destructor may free anything a
+  // thread can still reach, and a library's thread is exactly such a thread.
+  for i := 0 to High(FCallbackCtxs) do
+    if FCallbackCtxs[i] <> nil then
+    begin
+      ReleaseArrayMap(FCallbackCtxs[i]);   // give its block of proc-local array slots back
+      FCallbackCtxs[i].Free;
+    end;
+  SetLength(FCallbackCtxs, 0);
 end;
 
 function TBytecodeVM.CreateMutex: Int64;
