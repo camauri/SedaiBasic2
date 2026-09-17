@@ -387,7 +387,7 @@ const
   bcStrInstrAnyW    = bcGroupString + 53;  // INSTR(wstring, Any set) - CODEPOINT position of the first codepoint of str
                                            //   that belongs to the set (Dest=int, Src1/Src2=string). The byte twin
                                            //   cannot answer it: it compares BYTES, so it matches a CONTINUATION byte.
-  bcUtfConv         = bcGroupString + 55;  // utf_conv.bi: CharToUTF / UTFToChar (Imm selects; the five arguments arrive in the int transfer slots)
+  bcUtfConv         = bcGroupString + 55;  // utf_conv.bi: CharToUTF / UTFToChar / WCharToUTF / UTFToWChar (Imm selects; the arguments arrive in the int transfer slots)
   bcStrInstrRevAnyW = bcGroupString + 54;  // INSTRREV(wstring, Any set) - the LAST such codepoint (same operands)
                                            // (Dest=int, Src1=string). bcStrAsc answers the first BYTE,
                                            // which for UTF-8 storage is the first byte of the sequence.

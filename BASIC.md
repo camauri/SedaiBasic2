@@ -3115,7 +3115,7 @@ End Function
 | `NOW` | ✓ | Date serial (Double, epoch 1899-12-30) of the current date and time. Bare (no parens). |
 | `DATESERIAL` | ✓ | `DATESERIAL(y, m, d)` -> serial, with VB-style month/day rollover. |
 | `TIMESERIAL` | ✓ | `TIMESERIAL(h, m, s)` -> serial fraction. |
-| `DATEVALUE` | ✓ | `DATEVALUE(str)` -> date-part serial (ISO `yyyy-mm-dd`/`yyyy/mm/dd` or locale; 0 on failure). |
+| `DATEVALUE` | ⚠️ | `DATEVALUE(str)` -> date-part serial, 0 on failure. **Two families are read** (owner's decision, 17 Sep 2026 — DIVERGENZE 512): fbc's own, which is the American order `m/d/y` and `m-d-y` plus `d Month y` and `Month d, y` (the month name is case-sensitive with one capital, the comma is required only in the second, and a two-digit year means 19xx except in `Month d, y`); **and** ISO `yyyy-mm-dd` / `yyyy/mm/dd`, which fbc on Linux REFUSES — there `ISDATE` answers -1 where fbc answers 0. A declared divergence, in that one direction. |
 | `TIMEVALUE` | ✓ | `TIMEVALUE(str)` -> time-part serial. |
 | `SECOND` | ✓ | `SECOND(serial)` -> 0..59. |
 | `MINUTE` | ✓ | `MINUTE(serial)` -> 0..59. |
@@ -3128,7 +3128,7 @@ End Function
 | `DATEPART` | ✓ | `DATEPART(interval$, serial [, firstDayOfWeek [, firstDayOfYear]])` -> component. Intervals: `yyyy q m y d w ww h n s`, matched EXACTLY as fbc matches them (an unknown one, `YYYY` included, answers 0). |
 | `DATEADD` | ✓ | `DATEADD(interval$, number, serial)` -> serial with `number` interval units added; `number` is TRUNCATED, and a day past the end of a month saturates (31 Jan + 1 month = 29 Feb 2024). |
 | `DATEDIFF` | ✓ | `DATEDIFF(interval$, s1, s2 [, firstDayOfWeek [, firstDayOfYear]])` -> count of intervals from s1 to s2, as fbc counts them: `w` counts weekday crossings, `ww` week boundaries, and `h`/`n`/`s` floor the day part (so a negative difference is not the mirror of the positive one). |
-| `ISDATE` | ✓ | `ISDATE(str)` -> -1 if a valid date/time string, else 0. |
+| `ISDATE` | ⚠️ | `ISDATE(str)` -> -1 if a valid date/time string, else 0. Reads exactly what `DATEVALUE` reads — see it for the two families and the declared divergence (DIVERGENZE 512). |
 | `MONTHNAME` | ✓ | `MONTHNAME(n [, abbreviate])` -> English month name (1..12), the first three letters when `abbreviate` is non-zero. |
 | `WEEKDAYNAME` | ✓ | `WEEKDAYNAME(n [, abbreviate [, firstDayOfWeek]])` -> English day name, abbreviated to three letters on request, with `n` counted from the week's first day. |
 
@@ -3344,6 +3344,10 @@ End Function
 | `ASC` | ✓ | Returns an Integer representation of an character. |
 | `CHR` | ✓ | `CHR(n)` (bare FB form) routed to `CHR$`. |
 | `WCHR` | ✓ | `WCHR(n)` — the wide (UTF-8) character for Unicode codepoint n (single-codepoint form). |
+| `CHARTOUTF` | ✓ | `CharToUTF(encod, src, chars, dst, bytes)` — a buffer of the program's bytes to UTF-8/16/32. `encod` is one of `UTF_ENCOD_UTF8/UTF16/UTF32`; anything else (`UTF_ENCOD_ASCII` included) answers NULL and leaves the count alone. One source byte is one character, so its codepoint is its value. `dst = 0` allocates the block (the program's own `Deallocate` gives it back) and it is **not** terminated — `bytes` is the only length there is. Needs `#include "utf_conv.bi"`, as in fbc (DIVERGENZE 504 · 511). |
+| `WCHARTOUTF` | ✓ | `WCharToUTF(encod, src, chars, dst, bytes)` — the same from four-byte wide cells, so a codepoint above the BMP is one character and UTF-16 carries it as a surrogate pair. Needs `#include "utf_conv.bi"` (DIVERGENZE 511). |
+| `UTFTOCHAR` | ✓ | `UTFToChar(encod, src, dst, chars)` — UTF-8/16/32 back to the program's bytes; a codepoint above 255 becomes `?`, and `chars` is the room in `dst` on the way in and the count on the way out. With `dst = 0` the block is allocated and a count of zero means "to the terminator". Needs `#include "utf_conv.bi"` (DIVERGENZE 511). |
+| `UTFTOWCHAR` | ⚠️ | `UTFToWChar(encod, src, dst, chars)` — the wide twin. ⛔ **A surrogate pair decodes truncated to sixteen bits**, because that is what fbc's runtime does and MODERN conforms to it: U+1F4A9 comes back as `&hF4A9`, U+10FFFF as `&hFFFF`, and U+10000 as **zero**, which reads as the terminator. Reported upstream (`job/fbc-upstream/ISSUES.md` n. 4); if fbc fixes it, this follows. Needs `#include "utf_conv.bi"` (DIVERGENZE 511). |
 
 #### Numeric/Boolean to String Conversions
 

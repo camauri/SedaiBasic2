@@ -579,6 +579,11 @@ const
     is the one the project already declared when it made the deterministic path
     the default (a parse that changes with the machine's regional settings is not
     diffable and its baselines are not reproducible). }
+  { ⛔ ...AND IT HAS NOT FOLLOWED THE INTERPRETER SINCE 17 Sep 2026 (DIVERGENZE 512): there DateValue now
+    reads fbc's American family as well - "m/d/y", "d Month y", "Month d, y", with a case-sensitive month
+    name and the two-digit year rule. This module still reads the ISO forms only. Closing it means emitting
+    that parser here by hand, in WebAssembly, which is a piece of work and not a line; it is written down in
+    job/libraries/datetime/DIFFERENCES.md so a user of `sbw` is told rather than surprised. }
   { A BOOLEAN prints as the word, so the module carries the two words. They sit
     in the gap under the calendar's cells and cost nine bytes of data segment
     only when a program actually prints a boolean. }

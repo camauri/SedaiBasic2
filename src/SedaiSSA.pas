@@ -1111,6 +1111,7 @@ type
                                   const ArrName: string): TSSAValue;            // row-major linear index (const or runtime)
     function InheritFixedStrCapacity(DeclNode: TASTNode; const DestName, SrcName: string): string;
     function IsWStringVar(const Name: string): Boolean;                         // declared WSTRING var (UTF-8, codepoint LEN)?
+    function DerefStringPointeeU(Node: TASTNode): string;
     function IsWStringExpr(Node: TASTNode): Boolean;                            // expression that yields a WSTRING value?
     function IsAllocCall(Node: TASTNode; out FuncU: string): Boolean;           // Node = ALLOCATE/CALLOCATE/REALLOCATE(...)?
     function IsScreenPtrExpr(Node: TASTNode): Boolean;                          // Node = SCREENPTR / SCREENPTR()?
@@ -1814,6 +1815,20 @@ type
 implementation
 
 function NativeCellScalarType(const CanonTypeU: string): Boolean; forward;   // phase 2 of the pointer model
+
+function IsUtfConvName(const NameU: string; out Sel: Integer): Boolean;
+// The four converters of fbc's `utf_conv.bi`, and which one (DIVERGENZE 511). ⛔ Asked in TWO places that
+// must never disagree: the call site that emits ssaUtfConv, and the foreign-call path, which has to step
+// aside - the header declares these as libfb symbols this runtime does not link, so taking one as a C call
+// answered "fb_CharToUTF was not found" where the intercept does the work.
+begin
+  Result := True;
+  if NameU = 'CHARTOUTF' then Sel := 0
+  else if NameU = 'UTFTOCHAR' then Sel := 1
+  else if NameU = 'WCHARTOUTF' then Sel := 2
+  else if NameU = 'UTFTOWCHAR' then Sel := 3
+  else begin Sel := -1; Result := False; end;
+end;
 
 function CRuntimeHint(const Name: string): string;
 // An extra sentence for an UNDECLARED name that is a well-known C standard-library function. The
@@ -9761,12 +9776,12 @@ begin
           Exit;
         end;
 
-        // utf_conv.bi: CharToUTF(encod, src, chars, dst, bytes) and UTFToChar(encod, src, dst, chars). Five and four
-        // arguments, so they travel in the int transfer slots; the VM does the conversion (DIVERGENZE 511).
-        if FModernMode and ((UpperFast(ArrName) = 'CHARTOUTF') or (UpperFast(ArrName) = 'UTFTOCHAR')) and
+        // utf_conv.bi: CharToUTF(encod, src, chars, dst, bytes) and UTFToChar(encod, src, dst, chars), plus their
+        // two WIDE twins. Five and four arguments, so they travel in the int transfer slots; the VM does the
+        // conversion (DIVERGENZE 511).
+        if FModernMode and IsUtfConvName(UpperFast(ArrName), SelImm) and
            (ArrayIndexOf(ArrName) < 0) then
         begin
-          if UpperFast(ArrName) = 'CHARTOUTF' then SelImm := 0 else SelImm := 1;
           for i := 0 to Node.GetChild(1).ChildCount - 1 do
           begin
             if i > 4 then Break;
@@ -48903,6 +48918,38 @@ begin
   Result := LinIdx;
 end;
 
+function TSSAGenerator.DerefStringPointeeU(Node: TASTNode): string;
+// The pointee TYPE NAME of a "*p" that yields a C string, uppercase, or '' if the dereference is not one.
+// ⛔ It asks exactly the questions the antDeref arm of ProcessExpression asks, in the same order, and it
+// exists because TWO readers needed the same answer: the arm, which reads the cells, and IsWStringExpr,
+// which decides whether the VALUE is wide. While only the arm knew, "*p" on a "WString Ptr" read its cells
+// correctly and then every question about the result counted BYTES - Len answered 3 where fbc answers 2,
+// and Asc(*p, 2) answered the second byte of a UTF-8 sequence (DIVERGENZE 513).
+var
+  T: TASTNode;
+begin
+  Result := '';
+  if (Node = nil) or (Node.NodeType <> antDeref) or (Node.ChildCount < 1) then Exit;
+  T := Node.GetChild(0);
+  while (T.NodeType = antParentheses) and (T.ChildCount >= 1) do T := T.GetChild(0);
+  if T.NodeType = antIdentifier then
+  begin
+    Result := UpperFast(PointeeTypeOf(VarToStr(T.Value)));
+    if Result = '' then Result := ParamPointeeType(VarToStr(T.Value));
+  end
+  else if (T.NodeType = antArrayAccess) and (T.ChildCount >= 1) and
+          (T.GetChild(0).NodeType = antIdentifier) and (ArrayIndexOf(VarToStr(T.GetChild(0).Value)) >= 0) then
+  begin
+    Result := UpperFast(FArrayScalarPointee.Values[ArrayFactKey(VarToStr(T.GetChild(0).Value))]);
+    if Result = '' then Result := UpperFast(ArrayPointerUDTType(VarToStr(T.GetChild(0).Value)));
+  end;
+  if (Result = 'ZSTRING') or (Result = 'WSTRING') then Exit;
+  Result := UpperFast(DerefedType(Node.GetChild(0)));
+  if (Result = 'ZSTRING') or (Result = 'WSTRING') then Exit;
+  Result := UpperFast(RawPtrExprPointee(Node.GetChild(0)));
+  if (Result <> 'ZSTRING') and (Result <> 'WSTRING') and (Result <> 'STRING') then Result := '';
+end;
+
 function TSSAGenerator.IsWStringExpr(Node: TASTNode): Boolean;
 // True if the expression yields a WSTRING value: a WSTRING variable, a WSTR(...) conversion, a
 // parenthesised WSTRING, or a string concatenation/expression with a WSTRING operand (the result of
@@ -48956,6 +49003,12 @@ begin
       Result := Assigned(Node.Token) and Node.Token.WideLiteral;
     antParentheses:
       Result := (Node.ChildCount >= 1) and IsWStringExpr(Node.GetChild(0));
+    antDeref:
+      // ⭐ "*p" WHERE p IS A "WSTRING PTR" IS A WIDE VALUE (DIVERGENZE 513). The dereference itself has
+      // always read the CELLS - ssaRawLoadZStr carries the wide flag - so only the question ABOUT the
+      // value was narrow, and it is the question every consumer asks: Len(*p) counted the UTF-8 bytes of
+      // the storage (3 where fbc answers 2) and Asc(*p, 2) answered the second BYTE of a sequence.
+      Result := DerefStringPointeeU(Node) = 'WSTRING';
     antMemberAccess:
       // obj.field where the field is declared AS WSTRING. Resolve the object's UDT type (no code
       // emitted) and look up the field. Value = field name, child 0 = the object expression.
@@ -56220,13 +56273,14 @@ var
   SValArg, ProcPtrOut: Boolean;
   SValUDT: Integer;
   SValSpec, SValWhy: string;
+  UtfSel: Integer;
 begin
   Result := False;
   ResultVal := MakeSSAValue(svkNone);
   // ⛔ ...and never for a routine of fbc's OWN headers that this runtime provides itself: the declaration in
   // `utf_conv.bi` names a libfb symbol we do not link, and taking it as a C call answered "fb_CharToUTF was not
   // found" where the intercept below does the work (DIVERGENZE 511).
-  if (NameU = 'CHARTOUTF') or (NameU = 'UTFTOCHAR') then Exit;
+  if IsUtfConvName(NameU, UtfSel) then Exit;
   Idx := FProgram.IndexOfForeignDecl(NameU);
   if Idx < 0 then Exit;
   if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), Decl) then Exit;

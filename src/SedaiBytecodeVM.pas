@@ -983,8 +983,8 @@ type
     // Phase 2.6: a float read or write through a VM pointer into a PACKED array (a Single array, or a byte view).
     function PackedFloatLoad(ArrayIdx: Integer; PtrOffset: Int64; TypeCode: Integer; PtrAddr: Int64): Double;
     procedure PackedFloatStore(ArrayIdx: Integer; PtrOffset: Int64; TypeCode: Integer; PtrAddr: Int64; V: Double);
-    procedure PtrDomainStoreInt(Ctx: TExecutionContext; PtrAddr, Value: Int64);
-    function ExecUtfConv(Ctx: TExecutionContext; Which: Integer): Int64;   // utf_conv.bi (DIVERGENZE 511)
+    procedure PtrDomainStoreInt(Ctx: TExecutionContext; PtrAddr, Value: Int64; WidthCode: Integer = 0);
+    function ExecUtfConv(Ctx: TExecutionContext; Which: Integer): Int64;   // utf_conv.bi's four converters (DIVERGENZE 511)
     procedure PtrDomainStoreFloat(Ctx: TExecutionContext; PtrAddr: Int64; Value: Double; TypeCode: Integer = 0);
     procedure CleanupSharedRecords;   // free the shared region (destructor)
     procedure UpdateScreenModelGate;          // decide whether the modelled screen must be kept
@@ -6819,113 +6819,247 @@ begin
 end;
 
 function TBytecodeVM.ExecUtfConv(Ctx: TExecutionContext; Which: Integer): Int64;
-// utf_conv.bi's CharToUTF (Which = 0) and UTFToChar (Which = 1), as fbc's runtime has them: a byte of the source
-// is ONE character, a codepoint above 255 comes back as "?", and the count travels through a pointer the program
-// owns. The five arguments arrive in the int transfer slots (an instruction has three operands).
+// utf_conv.bi's four converters, as fbc's runtime has them: CharToUTF (Which = 0), UTFToChar (1),
+// WCharToUTF (2) and UTFToWChar (3). The five arguments arrive in the int transfer slots, because an
+// instruction has three operands (DIVERGENZE 511).
 //
-// 🕳️ WCharToUTF and UTFToWChar are not here yet, and neither is the form that allocates its own buffer
-// (dst = 0): both are the rest of ledger entry 511.
+// ⭐ A WCHAR CELL IS FOUR BYTES, here as in fbc on this platform: the WSTRING is PORTABLE by decision
+// (one cell per character) and `SizeOf(WString)` answers 4 on both sides.
+//
+// ⭐ The source and the destination are named by POINTERS, and a pointer here can name any of the four
+// domains - C's memory, the raw byte heap an @-taken scalar lives in, a packed array of the program, a
+// record field - so every byte goes through RB/WB, which ask the address which domain it is.
+//
+// ⛔⛔ fbc's UTF-16 DECODER TRUNCATES A SURROGATE PAIR TO SIXTEEN BITS, and that is reproduced here on
+// purpose. It computes ((hi-$D800) shl 10) + (lo-$DC00) + $10000 in a 16-bit intermediate, so U+1F4A9
+// comes back as $F4A9, U+10FFFF as $FFFF and U+10000 as ZERO - which the caller then reads as the
+// terminator. Measured on four pairs against the oracle; MODERN conforms to fbc, and the defect is
+// written up in job/fbc-upstream/ISSUES.md. The ENCODER (WCharToUTF) has no such bug: it emits a proper
+// surrogate pair, which is why a round trip above the BMP does not come home.
 const
   ENC_UTF8 = 1; ENC_UTF16 = 2; ENC_UTF32 = 3;
 var
-  Encod, Src, Chars, Dst, CountPtr, Bytes, i, c, Extra, Max, Written: Int64;
+  Encod, Src, Chars, Dst, CountPtr, Bytes, i, c, Extra, Max, Written, Lo, Need: Int64;
+  Wide: Boolean;
 
-  // One BYTE through whichever domain the pointer names: C's memory in the fb mode, a packed array or a
-  // record field in the VM's. Adding to the address advances by one byte in both.
+  // ⭐ ONE BYTE through whichever domain the pointer names. Adding to the address advances by one byte in
+  // the raw heap and in C's memory; in the VM's own domain it advances by one ELEMENT, which is the same
+  // thing for the byte buffers these converters are given.
   function RB(A: Int64): Int64;
   begin
-    Result := PtrDomainLoadInt(Ctx, A, RTC_U8) and $FF;
+    if ((A and RAWPTR_TAG) <> 0) or ((A > 0) and ((A and FGNPTR_TAG) <> 0)) then
+      Result := RawLoadInt(A, RTC_U8) and $FF
+    else
+      Result := PtrDomainLoadInt(Ctx, A, RTC_U8) and $FF;
   end;
 
   procedure WB(A, V: Int64);
   begin
-    if (A > 0) and ((A and FGNPTR_TAG) <> 0) then RawStoreInt(A, RTC_U8, V and $FF)
-    else PtrDomainStoreInt(Ctx, A, V and $FF);
+    if ((A and RAWPTR_TAG) <> 0) or ((A > 0) and ((A and FGNPTR_TAG) <> 0)) then RawStoreInt(A, RTC_U8, V and $FF)
+    else PtrDomainStoreInt(Ctx, A, V and $FF, RTC_U8);
   end;
 
-begin
-  Encod := Ctx.XferInt[0];
-  Src := Ctx.XferInt[1];
-  if Which = 0 then
+  // The count travels through an `Integer Ptr` the program owns - eight bytes, through the same four domains.
+  function RCount(A: Int64): Int64;
   begin
-    Chars := Ctx.XferInt[2]; Dst := Ctx.XferInt[3]; CountPtr := Ctx.XferInt[4];
-    if (Encod < ENC_UTF8) or (Encod > ENC_UTF32) then Exit(0);        // ASCII and anything else: NULL, as fbc answers
-    if Dst = 0 then
-      raise ERangeError.Create('CharToUTF with no destination buffer is not supported yet (DIVERGENZE 511)');
-    Bytes := 0;
-    if Chars > 0 then
-      for i := 0 to Chars - 1 do
-      begin
-        c := RB(Src + i);
-        case Encod of
-          ENC_UTF8:
-            if c < $80 then begin WB(Dst + Bytes, c); Inc(Bytes); end
-            else
-            begin
-              WB(Dst + Bytes, $C0 or (c shr 6)); WB(Dst + Bytes + 1, $80 or (c and $3F));
-              Inc(Bytes, 2);
-            end;
-          ENC_UTF16:
-            begin WB(Dst + Bytes, c); WB(Dst + Bytes + 1, 0); Inc(Bytes, 2); end;
-        else
-          begin
-            WB(Dst + Bytes, c); WB(Dst + Bytes + 1, 0); WB(Dst + Bytes + 2, 0); WB(Dst + Bytes + 3, 0);
-            Inc(Bytes, 4);
-          end;
-        end;
-      end;
-    if CountPtr <> 0 then PtrDomainStoreInt(Ctx, CountPtr, Bytes);
-    Exit(Dst);
+    if (A and RAWPTR_TAG) <> 0 then Result := RawLoadInt(A, RTC_I64)
+    else Result := PtrDomainLoadInt(Ctx, A, RTC_I64);
   end;
-  // UTFToChar(encod, src, dst, chars): "chars" is the room in dst on the way in and the count on the way out.
-  Dst := Ctx.XferInt[2]; CountPtr := Ctx.XferInt[3];
-  if (Encod < ENC_UTF8) or (Encod > ENC_UTF32) then Exit(0);
-  if Dst = 0 then
-    raise ERangeError.Create('UTFToChar with no destination buffer is not supported yet (DIVERGENZE 511)');
-  Max := 0;
-  if CountPtr <> 0 then Max := PtrDomainLoadInt(Ctx, CountPtr);
-  Written := 0;
-  i := 0;
-  while Written < Max do
+
+  procedure WCount(A, V: Int64);
+  begin
+    if (A and RAWPTR_TAG) <> 0 then RawStoreInt(A, RTC_I64, V)
+    else PtrDomainStoreInt(Ctx, A, V, RTC_I64);
+  end;
+
+  // The codepoint of source character n: one byte for CharToUTF, one four-byte cell for WCharToUTF.
+  function SrcCP(n: Int64): Int64;
+  begin
+    if Wide then
+      Result := RB(Src + n * 4) or (RB(Src + n * 4 + 1) shl 8) or
+                (RB(Src + n * 4 + 2) shl 16) or (RB(Src + n * 4 + 3) shl 24)
+    else
+      Result := RB(Src + n);
+  end;
+
+  // How many bytes this codepoint takes in the target encoding.
+  function EncLen(cp: Int64): Int64;
+  begin
+    case Encod of
+      ENC_UTF8:
+        if cp < $80 then Result := 1
+        else if cp < $800 then Result := 2
+        else if cp < $10000 then Result := 3
+        else Result := 4;
+      ENC_UTF16: if cp >= $10000 then Result := 4 else Result := 2;
+    else
+      Result := 4;
+    end;
+  end;
+
+  // ...and writing it there, at byte At.
+  procedure EncPut(At, cp: Int64);
+  var
+    hi, lo: Int64;
+  begin
+    case Encod of
+      ENC_UTF8:
+        if cp < $80 then WB(At, cp)
+        else if cp < $800 then
+        begin
+          WB(At, $C0 or (cp shr 6)); WB(At + 1, $80 or (cp and $3F));
+        end
+        else if cp < $10000 then
+        begin
+          WB(At, $E0 or (cp shr 12)); WB(At + 1, $80 or ((cp shr 6) and $3F)); WB(At + 2, $80 or (cp and $3F));
+        end
+        else
+        begin
+          WB(At, $F0 or (cp shr 18)); WB(At + 1, $80 or ((cp shr 12) and $3F));
+          WB(At + 2, $80 or ((cp shr 6) and $3F)); WB(At + 3, $80 or (cp and $3F));
+        end;
+      ENC_UTF16:
+        if cp >= $10000 then
+        begin
+          hi := $D800 + ((cp - $10000) shr 10);
+          lo := $DC00 + ((cp - $10000) and $3FF);
+          WB(At, hi and $FF); WB(At + 1, (hi shr 8) and $FF);
+          WB(At + 2, lo and $FF); WB(At + 3, (lo shr 8) and $FF);
+        end
+        else
+        begin
+          WB(At, cp and $FF); WB(At + 1, (cp shr 8) and $FF);
+        end;
+    else
+      begin
+        WB(At, cp and $FF); WB(At + 1, (cp shr 8) and $FF);
+        WB(At + 2, (cp shr 16) and $FF); WB(At + 3, (cp shr 24) and $FF);
+      end;
+    end;
+  end;
+
+  // The next codepoint of the encoded source, advancing i. ⛔ The UTF-16 arm is fbc's, truncation and all.
+  function DecCP: Int64;
   begin
     case Encod of
       ENC_UTF8:
         begin
-          c := RB(Src + i);
+          Result := RB(Src + i);
           Extra := 0;
-          if (c >= $C0) and (c < $E0) then Extra := 1
-          else if (c >= $E0) and (c < $F0) then Extra := 2
-          else if c >= $F0 then Extra := 3;
-          if Extra > 0 then c := c and ($3F shr Extra);
+          if (Result >= $C0) and (Result < $E0) then Extra := 1
+          else if (Result >= $E0) and (Result < $F0) then Extra := 2
+          else if Result >= $F0 then Extra := 3;
+          if Extra > 0 then Result := Result and ($3F shr Extra);
           Inc(i);
           while Extra > 0 do
           begin
-            c := (c shl 6) or (RB(Src + i) and $3F);
+            Result := (Result shl 6) or (RB(Src + i) and $3F);
             Inc(i); Dec(Extra);
           end;
         end;
       ENC_UTF16:
         begin
-          c := RB(Src + i) or (RB(Src + i + 1) shl 8);
+          Result := RB(Src + i) or (RB(Src + i + 1) shl 8);
           Inc(i, 2);
-          if (c >= $D800) and (c <= $DBFF) then Inc(i, 2);   // a surrogate pair is one "?" character
+          if (Result >= $D800) and (Result <= $DBFF) then
+          begin
+            Lo := RB(Src + i) or (RB(Src + i + 1) shl 8);
+            Inc(i, 2);
+            Result := (((Result - $D800) shl 10) + (Lo - $DC00) + $10000) and $FFFF;   // fbc's 16-bit intermediate
+          end;
         end;
     else
       begin
-        c := RB(Src + i) or (RB(Src + i + 1) shl 8) or (RB(Src + i + 2) shl 16) or (RB(Src + i + 3) shl 24);
+        Result := RB(Src + i) or (RB(Src + i + 1) shl 8) or (RB(Src + i + 2) shl 16) or (RB(Src + i + 3) shl 24);
         Inc(i, 4);
       end;
     end;
-    if c > 255 then c := Ord('?');
+  end;
+
+  // A block the PROGRAM owns, for the form that is given no destination (dst = 0): from libc in the fb
+  // memory mode, from the raw heap otherwise, so the program's own Deallocate gives it back.
+  function AllocProgram(n: Int64): Int64;
+  begin
+    if n < 8 then n := 8;
+    if FNativeMemory then Result := NativeAlloc(PtrUInt(n), True)
+    else Result := RawAlloc(PtrUInt(n));
+  end;
+
+begin
+  Encod := Ctx.XferInt[0];
+  Src := Ctx.XferInt[1];
+  Wide := (Which = 2) or (Which = 3);
+  // ASCII and anything outside the three encodings: NULL, and the count is left alone - as fbc answers.
+  if (Encod < ENC_UTF8) or (Encod > ENC_UTF32) then Exit(0);
+
+  if (Which = 0) or (Which = 2) then   // CharToUTF / WCharToUTF (encod, src, chars, dst, bytes)
+  begin
+    Chars := Ctx.XferInt[2]; Dst := Ctx.XferInt[3]; CountPtr := Ctx.XferInt[4];
+    if Dst = 0 then
+    begin
+      // The worst case is four bytes per character in every one of the three encodings.
+      Need := Chars * 4 + 4; if Need < 8 then Need := 8;
+      Dst := AllocProgram(Need);
+    end;
+    Bytes := 0;
+    if Chars > 0 then
+      for i := 0 to Chars - 1 do
+      begin
+        c := SrcCP(i);
+        EncPut(Dst + Bytes, c);
+        Inc(Bytes, EncLen(c));
+      end;
+    if CountPtr <> 0 then WCount(CountPtr, Bytes);
+    Exit(Dst);
+  end;
+
+  // UTFToChar / UTFToWChar (encod, src, dst, chars): "chars" is the room in dst on the way in and the
+  // count on the way out. ⭐ With NO destination the count is a cap only when it is non-zero: zero means
+  // "until the terminator", which is what fbc does there.
+  Dst := Ctx.XferInt[2]; CountPtr := Ctx.XferInt[3];
+  Max := 0;
+  if CountPtr <> 0 then Max := RCount(CountPtr);
+  if Dst = 0 then
+  begin
+    // Count first, so the block is the size the answer needs; the same walk then runs again into it.
+    if Max <= 0 then Max := High(Int64) div 8;
+    Written := 0; i := 0;
+    while Written < Max do
+    begin
+      c := DecCP;
+      if (not Wide) and (c > 255) then c := Ord('?');
+      if c = 0 then Break;
+      Inc(Written);
+    end;
+    Max := Written;
+    if Wide then Dst := AllocProgram((Written + 1) * 4) else Dst := AllocProgram(Written + 1);
+  end;
+  Written := 0;
+  i := 0;
+  while Written < Max do
+  begin
+    c := DecCP;
+    if (not Wide) and (c > 255) then c := Ord('?');
     if c = 0 then Break;              // the terminator is not written, and does not count
-    WB(Dst + Written, c);
+    if Wide then
+    begin
+      WB(Dst + Written * 4, c and $FF); WB(Dst + Written * 4 + 1, (c shr 8) and $FF);
+      WB(Dst + Written * 4 + 2, (c shr 16) and $FF); WB(Dst + Written * 4 + 3, (c shr 24) and $FF);
+    end
+    else
+      WB(Dst + Written, c);
     Inc(Written);
   end;
-  if CountPtr <> 0 then PtrDomainStoreInt(Ctx, CountPtr, Written);
+  if CountPtr <> 0 then WCount(CountPtr, Written);
   Result := Dst;
 end;
 
-procedure TBytecodeVM.PtrDomainStoreInt(Ctx: TExecutionContext; PtrAddr, Value: Int64);
+procedure TBytecodeVM.PtrDomainStoreInt(Ctx: TExecutionContext; PtrAddr, Value: Int64; WidthCode: Integer = 0);
+// The write half of PtrDomainLoadInt, and WidthCode means there what it means here: the raw type code of the
+// WRITE, which decides how many contiguous bytes of a PACKED array the store fills. ⛔ The packed arm used to
+// be missing on this side alone, so a byte written through a pointer into a "Byte" array of the program - the
+// shape utf_conv's converters are given - raised "Null or invalid pointer dereference" where the READ worked:
+// a packed array keeps IntData empty on purpose, and the old code took that for an out-of-range offset.
 var
   Rec: PRecordStorage;
   RecSlot, ArrayIdx: Integer;
@@ -6946,7 +7080,13 @@ begin
   PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-  if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
+  if FArrays[ArrayIdx].ElemWidth > 0 then
+  begin
+    if PtrOffset >= FArrays[ArrayIdx].TotalSize then
+      raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+    WritePackedBytes(ArrayIdx, PtrOffset * FArrays[ArrayIdx].ElemWidth, WidthCode, Value);
+  end
+  else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
     ArrSetIntAt(ArrayIdx, PtrOffset, Value)
   else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
     PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^ := Value
@@ -16293,7 +16433,8 @@ begin
         SubStr := Ctx.StringRegs[Instr.Src2];
         Ctx.IntRegs[Instr.Dest] := Utf8FindAnyCP(S, SubStr, True);
       end;
-    55: // bcUtfConv - utf_conv.bi's converters. Immediate: 0 = CharToUTF, 1 = UTFToChar. The arguments are in the
+    55: // bcUtfConv - utf_conv.bi's converters. Immediate: 0 = CharToUTF, 1 = UTFToChar, 2 = WCharToUTF,
+        // 3 = UTFToWChar. The arguments are in the
         // int transfer slots, because there are five of them and an instruction has three operands.
       Ctx.IntRegs[Instr.Dest] := ExecUtfConv(Ctx, Instr.Immediate);
     31: // bcStrWChr - WCHR(n): UTF-8 byte sequence for Unicode codepoint n.
@@ -16688,10 +16829,143 @@ begin
   end;
 end;
 
+function FbcDateFields(const S: string; out Y, Mo, D: Integer): Boolean;
+// ⭐ THE FORMS fbc's OWN RUNTIME READS, measured against it on this machine (DIVERGENZE 512): the
+// AMERICAN numeric order "m/d/y" (separator "/" or "-", spaces allowed around it) and the two month-NAME
+// shapes, "<d> <Month> <y>" and "<Month> <d>, <y>".
+// ⛔ Measured, not assumed, and every rule below has a data point behind it:
+//   · the month name is CASE-SENSITIVE with one capital - "Sep" and "September" read, "SEP", "sep" and
+//     "Sept" do not;
+//   · in "<Month> <d>, <y>" the COMMA is required ("Sep 17 2026" is refused, "Sep 17 , 2026" is not),
+//     while in "<d> <Month> <y>" it is optional ("17 Sep, 2026" reads);
+//   · a year written with EXACTLY TWO DIGITS gets 1900 added - "9/17/26" and "17 Sep 26" are 1926, while
+//     "9/17/126" and "9/17/1" are the years 126 and 1. It is the DIGIT COUNT, not the value: "9/17/00" is
+//     1900 and "9/17/0" is the year 0.
+//   · ⚠️ ...and that windowing does NOT apply to "<Month> <d>, <y>": fbc answers the year 26 for
+//     "Sep 17, 26" and 1926 for "17 Sep 26". The asymmetry is theirs; it is copied because the point of
+//     this function is to answer what they answer.
+// ⚠️ It says nothing about whether the fields make a date: TryEncodeDate is the one that answers that.
+const
+  MonAbbr: array[1..12] of string =
+    ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec');
+  MonFull: array[1..12] of string =
+    ('January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September',
+     'October', 'November', 'December');
+var
+  w: string;
+  i, m, n, yd: Integer;
+
+  // The month name at position p (1-based), the FULL names first so "June" is not read as "Jun" then a
+  // stray "e"; answers its number and moves p past it, or 0.
+  function TakeMonth(var p: Integer): Integer;
+  var
+    k: Integer;
+  begin
+    Result := 0;
+    for k := 1 to 12 do
+      if Copy(w, p, Length(MonFull[k])) = MonFull[k] then
+      begin Inc(p, Length(MonFull[k])); Exit(k); end;
+    for k := 1 to 12 do
+      if Copy(w, p, 3) = MonAbbr[k] then
+      begin Inc(p, 3); Exit(k); end;
+  end;
+
+  // The run of digits at position p, or -1 if there is none; moves p past it and reports how many
+  // digits it took (the two-digit year rule is about the COUNT).
+  function TakeNum(var p: Integer; out Digits: Integer): Integer;
+  var
+    st: Integer;
+  begin
+    st := p;
+    while (p <= Length(w)) and (w[p] >= '0') and (w[p] <= '9') do Inc(p);
+    Digits := p - st;
+    if Digits = 0 then Exit(-1);
+    Result := StrToIntDef(Copy(w, st, Digits), -1);
+  end;
+
+  procedure Skip(var p: Integer; const Chars: string);
+  begin
+    while (p <= Length(w)) and (Pos(w[p], Chars) > 0) do Inc(p);
+  end;
+
+  function Take1(var p: Integer; C: Char): Boolean;
+  begin
+    Result := (p <= Length(w)) and (w[p] = C);
+    if Result then Inc(p);
+  end;
+
+begin
+  Result := False; Y := 0; Mo := 0; D := 0;
+  w := Trim(S);
+  if w = '' then Exit;
+  // "<d> <Month> [,] <y>"
+  i := 1;
+  D := TakeNum(i, n);
+  if D > 0 then
+  begin
+    Skip(i, ' ');
+    m := TakeMonth(i);
+    if m > 0 then
+    begin
+      Skip(i, ' ,');
+      Y := TakeNum(i, yd);
+      Skip(i, ' ');
+      if (Y >= 0) and (i > Length(w)) then
+      begin
+        if yd = 2 then Inc(Y, 1900);
+        Mo := m; Exit(True);
+      end;
+    end;
+  end;
+  // "<Month> <d> , <y>" - the comma is required here, and the year is taken LITERALLY
+  i := 1;
+  m := TakeMonth(i);
+  if m > 0 then
+  begin
+    Skip(i, ' ');
+    D := TakeNum(i, n);
+    Skip(i, ' ');
+    if Take1(i, ',') then
+    begin
+      Skip(i, ' ');
+      Y := TakeNum(i, yd);
+      Skip(i, ' ');
+      if (D > 0) and (Y >= 0) and (i > Length(w)) then begin Mo := m; Exit(True); end;
+    end;
+  end;
+  // "m/d/y" and "m-d-y": three numeric fields, ONE separator, spaces allowed around it
+  for n := 1 to 2 do
+  begin
+    i := 1;
+    Mo := TakeNum(i, yd); Skip(i, ' ');
+    if not Take1(i, ('/-')[n]) then Continue;
+    Skip(i, ' ');
+    D := TakeNum(i, yd); Skip(i, ' ');
+    if not Take1(i, ('/-')[n]) then Continue;
+    Skip(i, ' ');
+    Y := TakeNum(i, yd); Skip(i, ' ');
+    if (Mo >= 1) and (Mo <= 12) and (D > 0) and (Y >= 0) and (i > Length(w)) then
+    begin
+      if yd = 2 then Inc(Y, 1900);
+      Exit(True);
+    end;
+  end;
+  Y := 0; Mo := 0; D := 0;
+end;
+
 function ParseDateSerial(const S: string; out DT: TDateTime): Boolean;
 // Parse a date/time string into a TDateTime serial. Accepts ISO-ish forms deterministically across
-// platforms/locales: "yyyy-mm-dd", "yyyy/mm/dd", "hh:mm[:ss]", or "<date> <time>". Anything else falls
-// back to the locale parser. Used by DATEVALUE/TIMEVALUE/ISDATE.
+// platforms/locales: "yyyy-mm-dd", "yyyy/mm/dd", "hh:mm[:ss]", or "<date> <time>", AND the forms fbc's
+// own runtime reads (see FbcDateFields). Anything else falls back to the locale parser.
+// Used by DATEVALUE/TIMEVALUE/ISDATE.
+//
+// ⭐⭐ BOTH FAMILIES, by the owner's decision of 17 Sep 2026 (DIVERGENZE 512). fbc on this platform does
+// NOT look at the locale: it reads the American order and REFUSES the ISO one, and this product did the
+// opposite, for the 28 Jul 2026 rule that answers must be deterministic - a rule measured on Windows,
+// where fbc does follow the locale. Reading both keeps every program that passes an ISO date working and
+// makes every source written for fbc work. ⚠️ The price, stated: on a string fbc REFUSES ("2026-09-17")
+// this answers a date, so IsDate says -1 where fbc says 0. That is the declared direction of the
+// divergence, and it is the opposite of the one that used to be there.
 var
   ds, ts, w, up: string;
   sp, y, mo, d, hh, mi, ss: Integer;
@@ -16739,9 +17013,15 @@ begin
     begin isAM := True; w := Trim(Copy(w, 1, Length(w) - 2)); end;
     if w = '' then Exit;
   end;
-  sp := Pos(' ', w);
-  if sp > 0 then begin ds := Trim(Copy(w, 1, sp - 1)); ts := Trim(Copy(w, sp + 1, Length(w))); end
-  else if Pos(':', w) > 0 then begin ds := ''; ts := w; end
+  // ⛔ THE TIME IS THE TOKEN THAT CARRIES THE COLON, not "everything after the first space". Splitting
+  // on the space broke every month-NAME date the moment those were accepted: "17 Sep 2026" handed "17"
+  // to the date parser and "Sep 2026" to the time one. A time always has a colon and a date never does.
+  sp := Pos(':', w);
+  if sp > 0 then
+  begin
+    while (sp > 1) and (w[sp - 1] <> ' ') do Dec(sp);
+    ds := Trim(Copy(w, 1, sp - 1)); ts := Trim(Copy(w, sp, Length(w)));
+  end
   else begin ds := w; ts := ''; end;
   if ds <> '' then
   begin
@@ -16756,6 +17036,10 @@ begin
     else if (Pos('-', ds) > 0) and (SplitInts(ds, '-', y, mo, d) >= 3) and TryEncodeDate(y, mo, d, dpart) then
       haveD := True
     else if (Pos('/', ds) > 0) and (SplitInts(ds, '/', y, mo, d) >= 3) and TryEncodeDate(y, mo, d, dpart) then
+      haveD := True
+    // ...and then what fbc itself reads (DIVERGENZE 512). Asked AFTER the ISO forms, so a string both
+    // families claim keeps the reading it had: "2026/09/17" stays the 17th of September.
+    else if FbcDateFields(ds, y, mo, d) and TryEncodeDate(y, mo, d, dpart) then
       haveD := True
     else if TryStrToDate(ds, dpart) then
       haveD := True

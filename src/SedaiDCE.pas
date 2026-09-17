@@ -309,6 +309,11 @@ begin
     ssaArrayBind, ssaArrayBindInd, ssaArrayUnbind, ssaArrayBindApply,
     // SADD(s) allocates a fresh raw byte-heap copy each call — allocating, so never elide or CSE it.
     ssaStrSAdd,
+    // ⛔ utf_conv.bi's converters WRITE THROUGH POINTERS the program owns - the destination buffer and the
+    // count - so the Dest is beside the point: a program that ignores the returned pointer and reads the
+    // buffer is the ordinary shape (`utftochar(...)` then `print back`). Without this entry DCE deleted
+    // those calls in silence and the buffer stayed empty. Same rule as ssaForeignCall. DIVERGENZE 511.
+    ssaUtfConv,
     // ⛔⛔ A FOREIGN CALL LEAVES THE PROCESS, so nothing here can know what it did. Its Dest is unused
     // whenever the program calls it for effect - which is most of C - and without this entry DCE
     // deleted every such call in SILENCE: "memset(p, 65, 11)" then "strlen(p)" answered 0, because the
