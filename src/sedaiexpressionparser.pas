@@ -2697,6 +2697,15 @@ begin
       end;
       Result.Attributes.Values['ANYINIT'] := '1';
     end;
+    // ⛔ ...AND THE PLACEMENT ADDRESS OF "New(p) T[n]" (DIVERGENZE 454). This branch returned before the address was
+    // attached, so the vector form lost it - the node said nothing about p, and the block went to a fresh allocation.
+    // Last child, as in the scalar form below: child0 stays the element count.
+    if Assigned(PlaceExpr) then
+    begin
+      Result.Attributes.Values['PLACEMENT'] := '1';
+      Result.AddChild(PlaceExpr);
+      PlaceExpr := nil;
+    end;
     DoNodeCreated(Result);
     Exit;
   end;

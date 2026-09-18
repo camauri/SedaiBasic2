@@ -50721,6 +50721,25 @@ begin
     if Node.ChildCount < 1 then
       raise Exception.Create('NEW T[n] needs an element count');
     ProcessExpression(Node.GetChild(0), CountVal);
+    // ⭐ "New(p) T[n]" - PLACEMENT, built IN p's bytes (DIVERGENZE 454), for every element type that has a byte image:
+    // a builtin scalar, or a NATIVE record. Measured on fbc: the n elements are cleared, a record gets its field
+    // defaults and its constructor, and NO element count is written in front - not even for a type with a destructor
+    // ("no cookie should be written to p[-1]", its own pointers/new-delete). A managed record keeps the old answer.
+    if (Node.Attributes.Values['PLACEMENT'] = '1') and (Node.ChildCount >= 2) and
+       (((UDTIdx >= 0) and NativeRecordType(NewType)) or
+        ((UDTIdx < 0) and (TypeSizeBytes(NewType) > 0) and (UpperFast(NewType) <> 'STRING'))) then
+    begin
+      ProcessExpression(Node.GetChild(Node.ChildCount - 1), Result);
+      Result := EnsureIntRegister(Result);
+      if UDTIdx >= 0 then ElemVal := EnsureIntRegister(MakeSSAConstInt(NativeImageBytes(UDTIdx)))
+      else ElemVal := EnsureIntRegister(MakeSSAConstInt(TypeSizeBytes(NewType)));
+      BytesVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaMulInt, BytesVal, EnsureIntRegister(CountVal), ElemVal, MakeSSAValue(svkNone));
+      EmitInstruction(ssaRawClear, MakeSSAValue(svkNone), Result, EnsureIntRegister(MakeSSAConstInt(0)), BytesVal);
+      if UDTIdx >= 0 then
+        EmitRecordBlockCtorDtor(Result, EnsureIntRegister(CountVal), NewType, True);
+      Exit;
+    end;
     // ...unless the elements have a CONSTRUCTOR or a DESTRUCTOR to run. Then the block is n consecutive
     // MANAGED records - "handle + i" indexes the i-th just as "base + i*size" does, because the region
     // allocates them at consecutive slots - and each one gets its default constructor here and its
@@ -50790,8 +50809,19 @@ begin
     BytesVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaLoadConstInt, BytesVal, MakeSSAConstInt(TypeSizeBytes(NewType)),
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
-    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaRawAlloc, Result, BytesVal, MakeSSAValue(svkNone), MakeSSAConstInt(RAWALLOC_PROGRAM));   // New: the program's block
+    // ⭐ "New(p) Integer( 111 )" - PLACEMENT (DIVERGENZE 454): the value is written AT p, which is also the answer; with no
+    // value the cell is cleared, as fbc clears it. A String is not a byte image and keeps its own cell.
+    if (Node.Attributes.Values['PLACEMENT'] = '1') and (UpperFast(NewType) <> 'STRING') then
+    begin
+      ProcessExpression(Node.GetChild(Node.ChildCount - 1), Result);
+      Result := EnsureIntRegister(Result);
+      EmitInstruction(ssaRawClear, MakeSSAValue(svkNone), Result, EnsureIntRegister(MakeSSAConstInt(0)), BytesVal);
+    end
+    else
+    begin
+      Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaRawAlloc, Result, BytesVal, MakeSSAValue(svkNone), MakeSSAConstInt(RAWALLOC_PROGRAM));   // New: the program's block
+    end;
     // ⛔ E L'INIZIALIZZATORE VA SCRITTO (DIVERGENZE 525). "New Integer( 42 )" allocava e BUTTAVA VIA il
     // 42 - l'argomento non veniva nemmeno guardato - e "*i" rispondeva 0, per un locale come per un campo.
     // ⭐ La forma ad array con una scrittura esplicita era gia' giusta, ed e' cio' che dice che mancava
@@ -50825,6 +50855,22 @@ begin
   // expression (it may have side effects) and construct an ordinary instance. The program's own view is
   // right in everything except the ADDRESS - "Print ap, r" shows two different values where fbc shows
   // one - and that comparison is meaningless across runs anyway.
+  // ⭐ ...but a NATIVE record IS its bytes (phase 3), so there the object is built AT p (DIVERGENZE 454): cleared, its
+  // field defaults, its constructor - what fbc does, measured. The answer is p itself.
+  if (Node.Attributes.Values['PLACEMENT'] = '1') and NativeRecordType(NewType) then
+  begin
+    CheckInstantiable(FUDTs[UDTIdx].Name);
+    ProcessExpression(Node.GetChild(Node.ChildCount - 1), Result);
+    Result := EnsureIntRegister(Result);
+    EmitInstruction(ssaRawClear, MakeSSAValue(svkNone), Result, EnsureIntRegister(MakeSSAConstInt(0)),
+                    EnsureIntRegister(MakeSSAConstInt(NativeImageBytes(UDTIdx))));
+    EmitRecordInit(Result, UDTIdx, True);
+    if (Node.ChildCount > 1) and (Node.GetChild(0).NodeType = antArgumentList) then
+      EmitConstructorCall(Result, NewType, Node.GetChild(0))
+    else
+      EmitConstructorCall(Result, NewType);
+    Exit;
+  end;
   if Node.Attributes.Values['PLACEMENT'] = '1' then
     ProcessExpression(Node.GetChild(Node.ChildCount - 1), CountVal);
   CheckInstantiable(FUDTs[UDTIdx].Name);           // OOP: NEW of an abstract type refuses here
