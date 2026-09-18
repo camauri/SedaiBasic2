@@ -102,6 +102,42 @@ type
     function BuiltinVal(const Args: array of Variant): Variant;
   end;
 
+{$IFDEF UNIX}
+{ ⛔ CHI CHIAMA `exit` DECIDE SE UNA PROCEDURA REGISTRATA CON `atexit` PUO' GIRARE (DIVERGENZE 517).
+
+  Un programma puo' consegnare a C una procedura BASIC che C chiamera' alla fine (`g_atexit`, `on_exit`,
+  `__cxa_atexit`). Quelle procedure le chiama il runtime del C dentro `exit`, e fin qui non ci arrivavamo:
+  la RTL di Free Pascal termina per conto suo ESEGUENDO PRIMA LE PROPRIE FINALIZZAZIONI, e a quel punto il
+  gestore dei thread non c'e' piu' - il trampolino veniva entrato davvero e moriva su `GetCurrentThreadId`
+  con un `EThreadError` che nessuno vedeva. Non era «la VM non c'e' piu'»: la VM c'era, era la RTL a non
+  esserci.
+
+  ⇒ Quando una procedura BASIC e' finita in mano a C, l'uscita la chiama QUESTO programma: si va a
+  `exit` di libc con la RTL e la VM ancora intere, cosi' i gestori girano su un interprete vivo - ed e'
+  lo stesso ordine che `fbc` ottiene registrando il proprio `fb_End` per primo.
+
+  ⚠ Un `exit` di libc non torna e non fa girare le finalizzazioni della RTL, quindi cio' che DEVE
+  succedere DOPO i gestori si registra qui, per primo: `atexit` li chiama in ordine INVERSO, quindi il
+  primo registrato e' l'ultimo eseguito. Serve per svuotare `Output`, che ha un buffer suo di cui libc non
+  sa niente: senza, un `Print` dentro un gestore si perdeva.
+
+  🕳️ Su Windows resta il comportamento di prima: `exit` e `atexit` sono della CRT di quel sistema, e
+  la cosa va misurata la', non dedotta da qui. }
+function c_exit(code: LongInt): LongInt; cdecl; external 'c' name 'exit';
+function c_atexit(f: Pointer): LongInt; cdecl; external 'c' name 'atexit';
+
+procedure SbFlushLast; cdecl;
+begin
+  TerminalOutFlush;                        // ⛔ la console tiene 64 KB suoi: senza, si perde TUTTO l'output
+  RestoreConsoleCodePages;                 // no-op su Unix: il gemello della finalizzazione saltata
+  System.Flush(System.Output);
+  System.Flush(System.ErrOutput);
+end;
+{$ENDIF}
+
+var
+  GExitThroughLibc: Boolean = False;   // il programma ha dato una closure a C: si esce da libc (517)
+
 function TBuiltinFunctions.BuiltinSqr(const Args: array of Variant): Variant;
 begin
   if Length(Args) <> 1 then
@@ -2283,9 +2319,20 @@ begin
         {$IFDEF ENABLE_PROFILER}
         Profiler.Free;
         {$ENDIF}
+        {$IFDEF UNIX}
+        // ⛔ NIENTE SI SMONTA SE C PUO' ANCORA CHIAMARCI (DIVERGENZE 517): non la VM, e non il bytecode
+        // che il suo gestore eseguirebbe. Si esce da libc in fondo al programma e il sistema si riprende
+        // tutto un istante dopo - l'unico momento in cui un mancato rilascio non e' un difetto.
+        GExitThroughLibc := GExitThroughLibc or VM.GaveClosureToC;
+        if not GExitThroughLibc then
+        begin
+        {$ENDIF}
         VM.Free;
         BytecodeProgram.Free;
         SSAProgram.Free;
+        {$IFDEF UNIX}
+        end;
+        {$ENDIF}
         FreeAndNil(PassEffect);
       end;
 
@@ -2556,8 +2603,19 @@ begin
         {$IFDEF ENABLE_PROFILER}
         Profiler.Free;
         {$ENDIF}
+        {$IFDEF UNIX}
+        // ⛔ NIENTE SI SMONTA SE C PUO' ANCORA CHIAMARCI (DIVERGENZE 517): non la VM, e non il bytecode
+        // che il suo gestore eseguirebbe. Si esce da libc in fondo al programma e il sistema si riprende
+        // tutto un istante dopo - l'unico momento in cui un mancato rilascio non e' un difetto.
+        GExitThroughLibc := GExitThroughLibc or VM.GaveClosureToC;
+        if not GExitThroughLibc then
+        begin
+        {$ENDIF}
         VM.Free;
         BytecodeProgram.Free;
+        {$IFDEF UNIX}
+        end;
+        {$ENDIF}
       end;
     end;
 
@@ -2598,6 +2656,11 @@ begin
     // Naming the two code pages the same makes both take the byte path. Measured: concatenation 7.0x,
     // AnsiCompareText 3.5x (200k iterations, 98 -> 14 ms and 21 -> 6 ms).
     SetMultiByteConversionCodePage(CP_UTF8);
+  {$IFDEF UNIX}
+  // ⛔ PRIMO REGISTRATO = ULTIMO ESEGUITO (DIVERGENZE 517): `atexit` chiama in ordine inverso, e
+  // questo deve venire dopo ogni gestore che il programma registrera'. Vedi la nota su `c_exit`.
+  c_atexit(@SbFlushLast);
+  {$ENDIF}
   try
     // Mask the FPU/SSE exceptions so floating-point overflow/invalid/div-by-zero produce IEEE Inf/NaN
     // (FreeBASIC/C semantics) instead of raising a Pascal exception that would abort the program. FPC
@@ -2900,4 +2963,9 @@ begin
       ExitCode := 1;
     end;
   end;
+
+  {$IFDEF UNIX}
+  // ...e QUI, dopo ogni altra cosa che il programma stampa, si esce da libc (DIVERGENZE 517).
+  if GExitThroughLibc then c_exit(ExitCode);
+  {$ENDIF}
 end.

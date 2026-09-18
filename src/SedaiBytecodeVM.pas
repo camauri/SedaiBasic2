@@ -225,6 +225,7 @@ type
     // Le chiusure costruite per le procedure BASIC passate a C, in cache per (PC, firma) e possedute
     // qui: una pagina eseguibile per confronto di `qsort` sarebbe una syscall per confronto.
     FClosures: TStringList;
+    FGaveClosureToC: Boolean;   // una procedura BASIC e' stata consegnata a C (DIVERGENZE 517)
     // ⭐ MEMORY A FOREIGN CALL HANDED BACK (DIVERGENZE 239): base and length (0 = not known), sorted by
     // base. A machine address is dereferenceable only inside one of these - bounds-checked when the
     // length is known - and a region leaves when C's own free releases it.
@@ -1047,6 +1048,9 @@ type
     { A relative path that does not exist as given is looked up BESIDE THE PROGRAM. Answers the path
       to use. ⛔ READ-ONLY callers only - see the note at the implementation. }
     function ResolveReadPath(const APath: string): string;
+    // ⛔ Una procedura BASIC e' finita in mano a C, che puo' richiamarla DOPO la fine del programma
+    // (DIVERGENZE 517): il front end lo chiede per decidere come uscire.
+    property GaveClosureToC: Boolean read FGaveClosureToC;
     property ProgramFile: string read FProgramFile;
     property ProgramDir: string read FProgramDir;
     property InvokeDir: string read FInvokeDir;
@@ -8057,6 +8061,7 @@ procedure TBytecodeVM.RunClosureBody(ACtx: TExecutionContext; AEntryPC: Int64;
 // istruzione, e i salti scrivono "destinazione - 1".
 var
   i, SlotI, SlotF, SaveDepth: Integer;
+  SaveRunning: Boolean;
   SavePC: Int64;
   Instrs: PBytecodeInstruction;
   NInstr: Integer;
@@ -8115,6 +8120,13 @@ begin
   ACtx.PC := AEntryPC;
   Instrs := PBytecodeInstruction(FProgram.GetInstructionsPtr);
   NInstr := FProgram.GetInstructionCount;
+  // ⛔ IL CICLO PRINCIPALE PUO' ESSERE GIA' FERMO, E IL CORPO DEVE GIRARE LO STESSO (DIVERGENZE 517).
+  // `Running` dice se il PROGRAMMA sta girando, e una procedura registrata con `atexit` viene chiamata da C
+  // quando il programma e' gia' finito: con la guardia nuda il corpo non eseguiva una sola istruzione e la
+  // closure tornava in silenzio. Si forza per la durata del corpo e si rimette com'era - un `END` DENTRO il
+  // corpo la rimette a False da se' e ferma questo ciclo, che e' il comportamento voluto.
+  SaveRunning := ACtx.Running;
+  ACtx.Running := True;
   try
     while (ACtx.CallStackPtr > SaveDepth) and ACtx.Running and
           (ACtx.PC >= 0) and (ACtx.PC < NInstr) do
@@ -8123,6 +8135,7 @@ begin
       ACtx.PC := ACtx.PC + 1;
     end;
   finally
+    ACtx.Running := SaveRunning;
     ACtx.PC := SavePC;
     // ⛔ Se il corpo e' uscito per un'altra strada (un errore, un END), la pila va comunque rimessa
     // dove il chiamante esterno la lascera': altrimenti il ritorno da bcForeignCall salta nel vuoto.
@@ -8636,6 +8649,7 @@ begin
   end;
   C^.Closure := Cl;
   FClosures.AddObject(Key, TObject(C));
+  FGaveClosureToC := True;   // ⛔ da qui in poi C puo' richiamarci quando vuole, anche a programma finito (517)
   Result := Cl.Code;
 end;
 
