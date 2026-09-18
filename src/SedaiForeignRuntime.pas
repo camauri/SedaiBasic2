@@ -731,6 +731,17 @@ begin
   {$ENDIF}
   Result := FFISelfSymbol(B.Decl.Symbol);   // the process's own symbols, and everything it loaded
   if Result <> nil then Exit;
+  {$IFDEF LINUX}
+  // ⛔ ...AND LAST, THE ONE THING RTLD_DEFAULT CANNOT ANSWER: a libc name exported under a
+  // NON-DEFAULT version (DIVERGENZE 475, `pthread_atfork`). FFISymbol falls back to a versioned lookup,
+  // and that needs a real handle - RTLD_DEFAULT is the NIL handle and has no link_map to read the
+  // version out of. Tried only after every other road has failed, so it can add a symbol, never move one.
+  if GLibcHandle <> NilHandle then
+  begin
+    Result := FFISymbol(GLibcHandle, B.Decl.Symbol);
+    if Result <> nil then Exit;
+  end;
+  {$ENDIF}
   if Tried = '' then
     raise EForeignCallError.CreateFmt('%s: the symbol "%s" was not found, and no library was named ' +
       '(a "Lib" on the declaration or a "#inclib" says where to look)', [B.Decl.Name, B.Decl.Symbol])

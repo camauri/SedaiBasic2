@@ -347,10 +347,152 @@ begin
   Result := FFILoadLibraryDepth(AName, 0);
 end;
 
+{$IF DEFINED(LINUX) AND DEFINED(CPU64)}
+{ ⭐ A SYMBOL A LIBRARY EXPORTS UNDER A NON-DEFAULT VERSION (DIVERGENZE 475).
+
+  `dlsym` answers, by design, only the DEFAULT version of a name, and glibc exports a handful of
+  names with no default at all: `nm -D libc.so.6` prints `pthread_atfork@GLIBC_2.2.5` with ONE `@`,
+  and `dlsym(libc, "pthread_atfork")` is nil although the function is right there. `dlvsym` finds it
+  - but only if the VERSION STRING is known, and nothing outside the library says what it is.
+
+  So it is read out of the library the loader has already mapped: `dlinfo` hands back the `link_map`,
+  whose `l_ld` is the dynamic section, and the symbol, string, version-index and version-definition
+  tables are all named in it. The symbol is looked up by walking the hash chains, its version index
+  is `versym[i] and $7FFF`, and the matching `Verdef`'s first `Verdaux` names the version.
+
+  ⛔ TWO THINGS THIS PAID FOR IN THE PROTOTYPE, both of them a segfault:
+  (a) not every `d_un` is RELOCATED. `DT_SYMTAB` and `DT_STRTAB` came back as run-time addresses and
+      `DT_VERDEF` as the link-time one (0x25FF8), so a table pointer below the load bias needs the
+      bias added. There is no flag for it: the value being small IS the test.
+  (b) the walk must stay inside the dynamic symbol table, which is why it follows the hash chains
+      rather than guessing a count.
+
+  🕳️ What this does NOT reach: a name that is in no shared object at all. `atexit` is one -
+  it lives only in `libc_nonshared.a`, which fbc links and this VM cannot - and it stays out. }
+function VersionedSymbol(ALib: TLibHandle; const AName: string): Pointer;
+type
+  TElf64Dyn = record d_tag: Int64; d_val: QWord; end;
+  PElf64Dyn = ^TElf64Dyn;
+  TElf64Sym = record
+    st_name: LongWord; st_info, st_other: Byte; st_shndx: Word; st_value, st_size: QWord;
+  end;
+  PElf64Sym = ^TElf64Sym;
+  TElf64Verdef = record
+    vd_version, vd_flags, vd_ndx, vd_cnt: Word; vd_hash, vd_aux, vd_next: LongWord;
+  end;
+  PElf64Verdef = ^TElf64Verdef;
+  TElf64Verdaux = record vda_name, vda_next: LongWord; end;
+  PElf64Verdaux = ^TElf64Verdaux;
+  PWordArr = ^TWordArr;      TWordArr = array[0..0] of Word;
+  PDWordArr = ^TDWordArr;    TDWordArr = array[0..0] of LongWord;
+const
+  DT_HASH = 4; DT_STRTAB = 5; DT_SYMTAB = 6;
+  DT_GNU_HASH = QWord($6FFFFEF5); DT_VERSYM = QWord($6FFFFFF0); DT_VERDEF = QWord($6FFFFFFC);
+var
+  LM: plink_map;
+  Dyn: PElf64Dyn;
+  Bias: PtrUInt;
+  SymTab: PElf64Sym;
+  StrTab: PAnsiChar;
+  VerSym: PWordArr;
+  VerDef: PElf64Verdef;
+  GnuHash, SysVHash: PDWordArr;
+  NBuck, SymOff, BloomSz, b, i, NSym: LongWord;
+  Buckets, Chain: PDWordArr;
+  Found: LongInt;
+  VIdx: Word;
+  VD: PElf64Verdef;
+  VA: PElf64Verdaux;
+  Ver: string;
+
+  function Fix(P: Pointer): Pointer; inline;
+  // A table pointer the loader left at its link-time address needs the load bias; one it already
+  // relocated is at or above it. Both spellings occur in the SAME dynamic section.
+  begin
+    if PtrUInt(P) < Bias then Result := Pointer(PtrUInt(P) + Bias) else Result := P;
+  end;
+
+begin
+  Result := nil;
+  LM := nil;
+  if dlinfo(Pointer(ALib), RTLD_DI_LINKMAP, @LM) <> 0 then Exit;
+  if LM = nil then Exit;
+  Bias := PtrUInt(LM^.l_addr);
+  SymTab := nil; StrTab := nil; VerSym := nil; VerDef := nil; GnuHash := nil; SysVHash := nil;
+  Dyn := PElf64Dyn(LM^.l_ld);
+  if Dyn = nil then Exit;
+  while Dyn^.d_tag <> 0 do
+  begin
+    case QWord(Dyn^.d_tag) of
+      DT_SYMTAB:   SymTab   := PElf64Sym(Pointer(PtrUInt(Dyn^.d_val)));
+      DT_STRTAB:   StrTab   := PAnsiChar(Pointer(PtrUInt(Dyn^.d_val)));
+      DT_VERSYM:   VerSym   := PWordArr(Pointer(PtrUInt(Dyn^.d_val)));
+      DT_VERDEF:   VerDef   := PElf64Verdef(Pointer(PtrUInt(Dyn^.d_val)));
+      DT_GNU_HASH: GnuHash  := PDWordArr(Pointer(PtrUInt(Dyn^.d_val)));
+      DT_HASH:     SysVHash := PDWordArr(Pointer(PtrUInt(Dyn^.d_val)));
+    end;
+    Inc(Dyn);
+  end;
+  if (SymTab = nil) or (StrTab = nil) or (VerSym = nil) or (VerDef = nil) then Exit;
+  SymTab := Fix(SymTab); StrTab := Fix(StrTab); VerSym := Fix(VerSym); VerDef := Fix(VerDef);
+  if GnuHash <> nil then GnuHash := Fix(GnuHash);
+  if SysVHash <> nil then SysVHash := Fix(SysVHash);
+
+  Found := -1;
+  if GnuHash <> nil then
+  begin
+    NBuck := GnuHash^[0]; SymOff := GnuHash^[1]; BloomSz := GnuHash^[2];
+    Buckets := PDWordArr(PAnsiChar(GnuHash) + 16 + BloomSz * SizeOf(QWord));
+    Chain := PDWordArr(PAnsiChar(Buckets) + NBuck * SizeOf(LongWord));
+    b := 0;
+    while (b < NBuck) and (Found < 0) do
+    begin
+      i := Buckets^[b];
+      if i >= SymOff then
+        repeat
+          if StrComp(StrTab + SymTab[i].st_name, PAnsiChar(AName)) = 0 then begin Found := i; Break; end;
+          if (Chain^[i - SymOff] and 1) <> 0 then Break;
+          Inc(i);
+        until False;
+      Inc(b);
+    end;
+  end
+  else if SysVHash <> nil then
+  begin
+    NSym := SysVHash^[1];                     // nchain IS the dynamic symbol count
+    for i := 0 to NSym - 1 do
+      if StrComp(StrTab + SymTab[i].st_name, PAnsiChar(AName)) = 0 then begin Found := i; Break; end;
+  end;
+  if Found < 0 then Exit;
+
+  VIdx := VerSym^[Found] and $7FFF;
+  VD := VerDef;
+  Ver := '';
+  repeat
+    if VD^.vd_ndx = VIdx then
+    begin
+      VA := PElf64Verdaux(PAnsiChar(VD) + VD^.vd_aux);
+      Ver := StrTab + VA^.vda_name;
+      Break;
+    end;
+    if VD^.vd_next = 0 then Break;
+    VD := PElf64Verdef(PAnsiChar(VD) + VD^.vd_next);
+  until False;
+  if Ver = '' then Exit;
+  Result := dlvsym(Pointer(ALib), PAnsiChar(AName), PAnsiChar(Ver));
+end;
+{$ENDIF}
+
 function FFISymbol(ALib: TLibHandle; const AName: string): Pointer;
 begin
   if ALib = NilHandle then Exit(nil);
   Result := GetProcedureAddress(ALib, AName);
+{$IF DEFINED(LINUX) AND DEFINED(CPU64)}
+  // ⛔ dlsym ANSWERS ONLY THE DEFAULT VERSION OF A NAME, and a few libc names have none
+  // (DIVERGENZE 475). The versioned lookup runs only where the plain one already failed, so it can
+  // add a symbol and never change one.
+  if Result = nil then Result := VersionedSymbol(ALib, AName);
+{$ENDIF}
 end;
 
 function FFISelfSymbol(const AName: string): Pointer;
