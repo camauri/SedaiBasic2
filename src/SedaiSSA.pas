@@ -1308,6 +1308,9 @@ type
     function BinaryElemBytes(const VarName: string): Integer;           // byte width of a scalar for binary PUT/GET (from its width code)
     function EmitBinGetToLValue(const HandleReg: TSSAValue; Target: TASTNode): Boolean;  // Get # into a non-bare target
     function BinaryElemBytesOfNode(Node: TASTNode): Integer;   // ...and of any PUT/GET target shape
+    function BinPutGetWidthImm(Node: TASTNode): Integer;             // ...and the Immediate a scalar PUT/GET carries
+    function BinaryElemWidthCode(const VarName: string): Integer;   // DIVERGENZE 456: the CODE, not the bytes
+    function BinaryElemWidthCodeOfNode(Node: TASTNode): Integer;     // ...for any PUT/GET target shape
     function BinaryElemBytesOfWidthCode(W: Integer): Integer;           // width code (1..7) -> byte width
     procedure UDTFieldCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);   // one field's C size/alignment
     function FixedArrayMemberCShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64;
@@ -25239,7 +25242,7 @@ begin
     else
       // Read exactly the variable's declared width (BYTE=1, SHORT=2, LONG=4, else 8); Immediate = byte count.
       EmitInstruction(ssaGetBinInt, VarReg, HandleReg, MakeSSAValue(svkNone),
-                      MakeSSAConstInt(BinaryElemBytesOfNode(VarChild)));
+                      MakeSSAConstInt(BinPutGetWidthImm(VarChild)));
     PublishInputTarget(string(VarChild.Value), VarReg);
     Exit;
   end;
@@ -25633,8 +25636,12 @@ begin
         // Write exactly the value's declared width when it is a simple variable (BYTE=1, SHORT=2, LONG=4,
         // else 8); a non-variable expression's name is not in the width map, so it defaults to 8.
         // Immediate = byte count.
+        // ⛔ A BOOLEAN IS ONE BYTE AND IS NOT A BYTE (DIVERGENZE 456). The width alone cannot say so, and
+        // with it the VM wrote the VM's own truth - -1, so &hFF - where fbc writes 1, and read it back as
+        // 255 instead of -1. Immediate 9 means "one byte, normalised both ways"; every other value stays
+        // a plain byte count.
         EmitInstruction(ssaPutBinInt, MakeSSAValue(svkNone), HandleReg, EnsureIntRegister(ExprVal),
-                        MakeSSAConstInt(BinaryElemBytesOfNode(Node.GetChild(1))));
+                        MakeSSAConstInt(BinPutGetWidthImm(Node.GetChild(1))));
     end;
     Exit;
   end;
@@ -29858,6 +29865,17 @@ begin
   if (Result < 1) or (Result > 6) then Result := 0;
 end;
 
+function TSSAGenerator.BinaryElemWidthCode(const VarName: string): Integer;
+// The declared width code of a scalar (0 = nothing declared). BinaryElemBytes' twin, and the one a
+// question about the TYPE has to ask: 1 and 11 are both one byte and only one of them is a Boolean.
+var
+  idx: Integer;
+begin
+  Result := 0;
+  idx := FVarWidthCode.IndexOf(UpperFast(VarName));
+  if idx >= 0 then Result := PtrInt(FVarWidthCode.Objects[idx]);
+end;
+
 function TSSAGenerator.BinaryElemBytes(const VarName: string): Integer;
 // Byte width of a scalar variable for binary PUT/GET #n, from its narrow width code: Byte/UByte=1,
 // Short/UShort=2, Long/ULong=4; Integer/LongInt (and unknown) default to 8. Lets "Put #f, p, b" of a
@@ -30393,35 +30411,54 @@ function TSSAGenerator.BinaryElemBytesOfNode(Node: TASTNode): Integer;
 // surfaced - the encoding work would never have asked.
 // ⛔ ONE funnel, and both the PUT and the GET read it: a width taught to one of them alone writes a
 // file it then cannot read back.
+begin
+  Result := BinaryElemBytesOfWidthCode(BinaryElemWidthCodeOfNode(Node));
+end;
+
+function TSSAGenerator.BinaryElemWidthCodeOfNode(Node: TASTNode): Integer;
+// The declared WIDTH CODE of the target of a binary PUT/GET - the same walk over the same three node
+// shapes that BinaryElemBytesOfNode used to do inline, kept as ONE funnel now that two questions are
+// asked of it: how many bytes (that one), and is it a BOOLEAN (code 11, DIVERGENZE 456).
+// 0 = nothing declared, which BinaryElemBytesOfWidthCode reads as the eight-byte default.
 var
   UIdx: Integer;
   Nm: string;
 begin
-  Result := 8;
+  Result := 0;
   if Node = nil then Exit;
   case Node.NodeType of
     antIdentifier:
-      Result := BinaryElemBytes(VarToStr(Node.Value));
+      Result := BinaryElemWidthCode(VarToStr(Node.Value));
     antArrayAccess:
       if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
       begin
         Nm := ArrayFactKey(VarToStr(Node.GetChild(0).Value));
         UIdx := FArrayElemWidth.IndexOf(Nm);
         if UIdx >= 0 then
-          Result := BinaryElemBytesOfWidthCode(PtrInt(FArrayElemWidth.Objects[UIdx]))
+          Result := PtrInt(FArrayElemWidth.Objects[UIdx])
         else
           // Not a declared array: the same node shape a pointer index has, and a pointer's element
           // width is its POINTEE's.
-          Result := BinaryElemBytes(VarToStr(Node.GetChild(0).Value));
+          Result := BinaryElemWidthCode(VarToStr(Node.GetChild(0).Value));
       end;
     antMemberAccess:
       if Node.ChildCount >= 1 then
       begin
         UIdx := FindUDT(ObjectTypeName(Node.GetChild(0)));
         if UIdx >= 0 then
-          Result := BinaryElemBytesOfWidthCode(UDTFieldWidthCode(UIdx, VarToStr(Node.Value)));
+          Result := UDTFieldWidthCode(UIdx, VarToStr(Node.Value));
       end;
   end;
+end;
+
+function TSSAGenerator.BinPutGetWidthImm(Node: TASTNode): Integer;
+// The Immediate a binary PUT/GET of a SCALAR carries: the byte width, or 9 for a BOOLEAN.
+// ⛔ 9 and not "1 plus a flag" because the field is one integer and every other value in it is a
+// width; the VM's two arms turn 9 back into a width of one and a normalisation. Only the two scalar
+// sites use it - the block and record paths keep the plain byte count, which is what they lay out with.
+begin
+  if BinaryElemWidthCodeOfNode(Node) = 11 then Exit(9);
+  Result := BinaryElemBytesOfNode(Node);
 end;
 
 function TSSAGenerator.BinaryElemBytesOfWidthCode(W: Integer): Integer;

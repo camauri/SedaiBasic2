@@ -21726,6 +21726,7 @@ var
   HandleNum: Integer;
   HandleName, Filename, Mode, Data: string;
   PrintColText: string;  // the text BEFORE the file handler re-encodes it (see FilePrintColAdvance)
+  BinIsBool: Boolean;    // DIVERGENZE 456: the binary GET target is a Boolean (Immediate 9)
   DirSpec: string;     // the DIR() filespec, kept so the beside-the-program retry can reuse it
   QVal: Int64;         // bcFileQuery numeric fast path result (unmanaged: costs nothing to declare)
   BinI: Int64;
@@ -22257,6 +22258,11 @@ begin
         HandleNum := Ctx.IntRegs[Instr.Src1];
         BinI := Ctx.IntRegs[Instr.Src2];
         BinWidth := Instr.Immediate;
+        // ⛔ IMMEDIATE 9 = A BOOLEAN (DIVERGENZE 456): one byte, and its VALUE normalised to C's 0/1. The
+        // width alone could not say so - a Boolean and a Byte are both one - and the VM wrote its own
+        // truth, -1, so the file got &hFF where fbc writes 1. The call site spells it out because only it
+        // knows the declared type (BinPutGetWidthImm).
+        if BinWidth = 9 then begin BinWidth := 1; BinI := Ord(BinI <> 0); end;
         if (BinWidth < 1) or (BinWidth > 8) then BinWidth := 8;   // default: full 64-bit integer
         SetLength(Data, BinWidth); Move(BinI, Data[1], BinWidth);  // little-endian low bytes
         if Assigned(FOnFileData) then
@@ -22294,12 +22300,17 @@ begin
       begin
         HandleNum := Ctx.IntRegs[Instr.Src1];
         BinWidth := Instr.Immediate;
+        // Immediate 9 = a BOOLEAN: one byte on file, and C's 0/1 becomes the VM's 0/-1 on the way in.
+        // The two halves have to agree or the file cannot be read back the way it was written.
+        BinIsBool := BinWidth = 9;
+        if BinIsBool then BinWidth := 1;
         if (BinWidth < 1) or (BinWidth > 8) then BinWidth := 8;
         if Assigned(FOnFileData) then
         begin
           Data := IntToStr(BinWidth); FOnFileData(Self, 'GETBIN', HandleNum, Data, ErrorCode);
           BinI := 0;
           if Length(Data) >= BinWidth then Move(Data[1], BinI, BinWidth);   // little-endian, zero-extended
+          if BinIsBool then BinI := -Ord(BinI <> 0);
           if Instr.Dest >= 0 then Ctx.IntRegs[Instr.Dest] := BinI;
         end
         else raise Exception.Create('GET command not supported: no handler assigned');
