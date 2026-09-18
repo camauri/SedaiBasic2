@@ -1381,6 +1381,7 @@ type
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
     // FB implicit THIS: a bare field name in a method body -> synthesized "this.<field>" access.
+    function ImplicitThisFieldIsPointer(Node: TASTNode): Boolean;   // ...and was it a POINTER field? (522)
     function TryImplicitThisArrayNode(Node: TASTNode; out Rewritten: TASTNode): Boolean;
     function ArraySlotIsModuleFlat(ArrIdx: Integer; const ArrName: string): Boolean;  // resolved to the BARE module entry?
     function TryImplicitThisField(const VarName: string; const Tok: TLexerToken; out MemberNode: TASTNode): Boolean;
@@ -13791,7 +13792,16 @@ begin
       PropArgs := TASTNode.Create(antAssignment, Node.Token);
       PropArgs.AddChild(ThisFieldNode.Clone);
       PropArgs.AddChild(ExprNode.Clone);
-      try ProcessArrayStore(PropArgs); finally PropArgs.Free; end;
+      try
+        // ⛔ E UN CAMPO PUNTATORE RIENTRA UNA RUNGA PIU' SU (DIVERGENZE 522): "this.p[i] = v" non e'
+        // un elemento di array, e' una scrittura RAW, e quella la decide ProcessIndexedStore. Mandato
+        // all'archiviazione degli array, l'assegnamento non faceva niente - in silenzio - mentre la
+        // LETTURA dello stesso elemento era gia' giusta.
+        if ImplicitThisFieldIsPointer(TargetNode) then
+          ProcessIndexedStore(PropArgs, PropArgs.GetChild(0), PropArgs.GetChild(1))
+        else
+          ProcessArrayStore(PropArgs);
+      finally PropArgs.Free; end;
     finally
       ThisFieldNode.Free;
     end;
@@ -54377,8 +54387,31 @@ begin
             SameText(FProgram.GetArray(ArrIdx).Name, ArrName);
 end;
 
+function TSSAGenerator.ImplicitThisFieldIsPointer(Node: TASTNode): Boolean;
+// Of the node TryImplicitThisArrayNode has just accepted: was the field a POINTER rather than an array?
+// ⛔ The two need different lowerings on the WRITE side, and only that side (DIVERGENZE 522). A member
+// array store is ProcessArrayStore's own business; "this.p[i] = v" over a pointer field is a RAW element
+// write, which lives one rung up in ProcessIndexedStore - so handing the rewritten node to the array
+// store made the assignment quietly do nothing while the READ of the same element was already right.
+var
+  UDTIdx, FI: Integer;
+begin
+  Result := False;
+  if (FCurrentThisType = '') or (Node = nil) or (Node.ChildCount < 1) or
+     (Node.GetChild(0) = nil) or (Node.GetChild(0).NodeType <> antIdentifier) then Exit;
+  UDTIdx := FindUDT(FCurrentThisType);
+  if UDTIdx < 0 then Exit;
+  FI := UDTFieldIndex(UDTIdx, Node.GetChild(0).ValueUpper);
+  if FI < 0 then Exit;
+  Result := (not FUDTs[UDTIdx].Fields[FI].IsArray) and
+            ((FUDTs[UDTIdx].Fields[FI].PtrPointee <> '') or
+             (FUDTs[UDTIdx].Fields[FI].RawPtrPointee <> '') or
+             (FUDTs[UDTIdx].Fields[FI].MultiPtrPointee <> ''));
+end;
+
 function TSSAGenerator.TryImplicitThisArrayNode(Node: TASTNode; out Rewritten: TASTNode): Boolean;
-// FreeBASIC implicit THIS, for a member ARRAY: inside a method body "arr(i)" means "this.arr(i)".
+// FreeBASIC implicit THIS, for a member ARRAY - or a member POINTER: inside a method body "arr(i)"
+// means "this.arr(i)", and so does "p[i]" when p is a pointer FIELD.
 //
 // TryImplicitThisField below does this for a BARE NAME, and that is all it can see: an array element
 // arrives as antArrayAccess(identifier, indices), so the identifier is never asked about on its own and
@@ -54403,7 +54436,18 @@ begin
   UDTIdx := FindUDT(FCurrentThisType);
   if UDTIdx < 0 then Exit;
   FI := UDTFieldIndex(UDTIdx, NameU);
-  if (FI < 0) or (not FUDTs[UDTIdx].Fields[FI].IsArray) then Exit;
+  if FI < 0 then Exit;
+  // ⛔ E UN CAMPO PUNTATORE SI INDICIZZA COME UN ARRAY (DIVERGENZE 522). Questo cancello chiedeva
+  // `IsArray`, quindi dentro un metodo `p[0]` su un campo `Integer Ptr` non veniva riconosciuto e cadeva
+  // sulla scala degli array: «Array not declared: P». `This.p[0]` ha SEMPRE funzionato - ed e' cio' che dice
+  // che il difetto sta nella RISOLUZIONE del nome nudo, non nei campi puntatore.
+  // ⭐ Le tre grafie di un campo puntatore si chiedono tutte e tre: `T Ptr` (PtrPointee),
+  // `<scalare> Ptr` (RawPtrPointee) e `T Ptr Ptr` (MultiPtrPointee) - la terza esiste apposta perche' le
+  // prime due la lasciavano vuota, vedi la nota alla dichiarazione del campo.
+  if not (FUDTs[UDTIdx].Fields[FI].IsArray or
+          (FUDTs[UDTIdx].Fields[FI].PtrPointee <> '') or
+          (FUDTs[UDTIdx].Fields[FI].RawPtrPointee <> '') or
+          (FUDTs[UDTIdx].Fields[FI].MultiPtrPointee <> '')) then Exit;
   if ResolveExisting(NameU, tmp) then Exit;                    // a param / local DIM shadows the field
   Rewritten := Node.Clone;
   MemberNode := TASTNode.CreateWithValue(antMemberAccess, NameU, Node.Token);
