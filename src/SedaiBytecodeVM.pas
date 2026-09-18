@@ -1265,6 +1265,25 @@ function c_cos(x: Double): Double; cdecl; external 'msvcrt' name 'cos';
 function c_tan(x: Double): Double; cdecl; external 'msvcrt' name 'tan';
 {$ENDIF}
 
+{ ⭐ SETENVIRON HAS TO REACH THE PROCESS, NOT ONLY THE VM (DIVERGENZE 519). The override table this VM
+  keeps is what ENVIRON$ reads, and it was the whole of SETENVIRON - the note beside SetEnvOverride said
+  "portable, avoids OS-specific setenv". Portable it is, and it also means a C library called through the
+  FFI cannot be configured at all: `SetEnviron("CACA_DRIVER=null")` then `getenv("CACA_DRIVER")` from libc
+  answers NULL here and "null" under fbc, and libcaca opened a real ncurses display instead of the null
+  one. Under fbc, fb_SetEnviron goes through putenv, so the two views are the same view.
+  ⛔ Not a dependency: this is the C runtime FPC already links on every target, the same place c_sin
+  comes from. On wasm there is no process environment to change, and the override table stays the whole
+  answer - which is why the call is gated. }
+{$IFNDEF WEB_MODE}
+{$IFDEF WINDOWS}
+function os_setenv_(Name, Value: PAnsiChar): LongBool; stdcall;
+  external 'kernel32' name 'SetEnvironmentVariableA';
+{$ELSE}
+function os_setenv(Name, Value: PAnsiChar; Overwrite: LongInt): LongInt; cdecl; external 'c' name 'setenv';
+function os_unsetenv(Name: PAnsiChar): LongInt; cdecl; external 'c' name 'unsetenv';
+{$ENDIF}
+{$ENDIF}
+
 {$IFDEF HOT_C}
 { WINDOWS ONLY, and the gate is not tidiness. On win64 there is no libm to pull and FPC ships no
   msvcrt import library, so the C object cannot name "sin" itself - the link died on "Undefined
@@ -22802,19 +22821,46 @@ end;
 
 procedure TBytecodeVM.SetEnvOverride(const NameValue: string);
 // SETENVIRON "NAME=value": store a VM-internal environment override (consulted by ENVIRON$ before the OS
-// environment). A bare "NAME" with no '=' clears the value. Portable — avoids OS-specific setenv.
+// environment) AND set it in the PROCESS environment, so that a C library reached through the FFI, and a
+// child process started by SHELL, see the same thing the program does. A bare "NAME" with no '=' clears it.
+//
+// ⛔⛔ THE SECOND HALF IS NOT TIDINESS (DIVERGENZE 519). The note that stood here read "portable -
+// avoids OS-specific setenv", and the override table alone is indeed portable; it is also invisible to
+// everything outside this VM. Measured: `SetEnviron("SEDAI_PROVA=ciao")` then `getenv("SEDAI_PROVA")` from
+// crt answered `ciao` under fbc and NULL here - and the way it was found is worth keeping, because it did
+// not look like an environment problem at all: a caca probe asked for the `null` driver through the
+// environment, fbc obeyed and this VM opened a real ncurses display, filling the comparison with escape
+// sequences. Every library that is configured by an environment variable is behind this.
+// ⚠ The override table stays FIRST for ENVIRON$, so nothing a BASIC program can see changes: what
+// changes is what everybody ELSE sees.
 var
   eq: Integer;
-  nm: string;
+  nm, vl: string;
 begin
   eq := Pos('=', NameValue);
   if eq > 0 then
-    FEnvOverrides.Values[Copy(NameValue, 1, eq - 1)] := Copy(NameValue, eq + 1, MaxInt)
+  begin
+    nm := Copy(NameValue, 1, eq - 1);
+    vl := Copy(NameValue, eq + 1, MaxInt);
+  end
   else
   begin
     nm := NameValue;
-    FEnvOverrides.Values[nm] := '';
+    vl := '';
   end;
+  FEnvOverrides.Values[nm] := vl;
+  if nm = '' then Exit;
+  {$IFNDEF WEB_MODE}
+  {$IFDEF WINDOWS}
+  // On Windows an empty value REMOVES the variable, which is what fbc's putenv("NAME=") does too.
+  os_setenv_(PAnsiChar(AnsiString(nm)), PAnsiChar(AnsiString(vl)));
+  {$ELSE}
+  if (eq > 0) then
+    os_setenv(PAnsiChar(AnsiString(nm)), PAnsiChar(AnsiString(vl)), 1)
+  else
+    os_unsetenv(PAnsiChar(AnsiString(nm)));
+  {$ENDIF}
+  {$ENDIF}
 end;
 
 function TBytecodeVM.RunShellCommand(const Cmd: string): Integer;
