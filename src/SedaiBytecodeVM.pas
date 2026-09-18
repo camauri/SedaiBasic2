@@ -7302,6 +7302,18 @@ end;
 
 procedure TBytecodeVM.FilePrintColAdvance(Handle: Integer; const Data: string);
 // Advance the handle's column by the written text; a CR/LF inside resets to the tail length.
+//
+// ⛔⛔ THE TEXT, NOT WHAT WENT DOWN THE WIRE, and the difference is only visible on a file with an
+// ENCODING. `Data` is a VAR parameter of the file handler, and for a text write the handler REPLACES it
+// with the encoded units (`Data := EncodeTextUnits(Data, TextEncodingOf(Handle))` in SedaiFileIO): every
+// caller that then measured `Data` was measuring UTF-16, two bytes per character.
+// 📊 On `Open ... For Output Encoding "utf16"`, `Print #h, "false", "true", "ab", "c"` came out as
+// `false    true  ab        c` where fbc writes `false         true          ab            c` — the
+// 14-column print zones computed from a column that had counted twice. It is the fbc suite's
+// boolean/boolean_file, and it has nothing to do with Booleans: plain strings show it.
+// ⭐ And the column counts BYTES of the SOURCE text, which is measured, not assumed: `Print #h, "caff""e"`
+// with a UTF-8 file pads to 13 characters under fbc as well (the e-grave is two bytes and fbc counts them),
+// so taking Length of the string register is right for ASCII and for UTF-8 alike.
 var
   i, LastNL: Integer;
 begin
@@ -21713,6 +21725,7 @@ var
   OpenFbCode: Integer;   // the FreeBASIC status of an OPEN: delivered in Dest AND in Err
   HandleNum: Integer;
   HandleName, Filename, Mode, Data: string;
+  PrintColText: string;  // the text BEFORE the file handler re-encodes it (see FilePrintColAdvance)
   DirSpec: string;     // the DIR() filespec, kept so the beside-the-program retry can reuse it
   QVal: Int64;         // bcFileQuery numeric fast path result (unmanaged: costs nothing to declare)
   BinI: Int64;
@@ -21908,8 +21921,9 @@ begin
           Data := '';
         if Assigned(FOnFileData) then
         begin
+          PrintColText := Data;   // BEFORE the handler re-encodes it - see FilePrintColAdvance
           FOnFileData(Self, 'PRINT#', HandleNum, Data, ErrorCode);
-          FilePrintColAdvance(HandleNum, Data);
+          FilePrintColAdvance(HandleNum, PrintColText);
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('PRINT# error %d writing to file: %d', [ErrorCode, HandleNum]);
         end
@@ -21924,8 +21938,9 @@ begin
         Data := StringOfChar(' ', 14 - (FilePrintColGet(HandleNum) mod 14));
         if Assigned(FOnFileData) then
         begin
+          PrintColText := Data;   // BEFORE the handler re-encodes it - see FilePrintColAdvance
           FOnFileData(Self, 'PRINT#', HandleNum, Data, ErrorCode);
-          FilePrintColAdvance(HandleNum, Data);
+          FilePrintColAdvance(HandleNum, PrintColText);
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('PRINT# error %d writing to file: %d', [ErrorCode, HandleNum]);
         end;
@@ -22042,8 +22057,9 @@ begin
         Data := FConsoleBehavior.FormatNumber(Ctx.FloatRegs[Instr.Dest], Instr.Immediate = 3);
         if Assigned(FOnFileData) then
         begin
+          PrintColText := Data;   // BEFORE the handler re-encodes it - see FilePrintColAdvance
           FOnFileData(Self, 'PRINT#', HandleNum, Data, ErrorCode);
-          FilePrintColAdvance(HandleNum, Data);
+          FilePrintColAdvance(HandleNum, PrintColText);
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('PRINT# error %d writing float to file: %d', [ErrorCode, HandleNum]);
         end
@@ -22069,8 +22085,9 @@ begin
         end;
         if Assigned(FOnFileData) then
         begin
+          PrintColText := Data;   // BEFORE the handler re-encodes it - see FilePrintColAdvance
           FOnFileData(Self, 'PRINT#', HandleNum, Data, ErrorCode);
-          FilePrintColAdvance(HandleNum, Data);
+          FilePrintColAdvance(HandleNum, PrintColText);
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('PRINT# error %d writing int to file: %d', [ErrorCode, HandleNum]);
         end
