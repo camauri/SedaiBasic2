@@ -184,17 +184,23 @@ var
 procedure PhaseMark(const PhaseName: string);
 var
   Now_: QWord;
-  H: THeapStatus;
+  H: TFPCHeapStatus;
 begin
   if not (GPhaseDiag or GHeapDiag) then Exit;
   Now_ := GetTickCount64;
   if GHeapDiag then
   begin
-    H := GetHeapStatus;
-    WriteLn(ErrOutput, Format('[PHASE] %-22s %8d ms   (cum %8d ms)   heap %7d kB  (+%6d kB)',
+    // ⛔ TRE NUMERI, E IL PRIMO DA SOLO MENTE. `used` e' cio' che il programma TIENE; `held` e' cio' che
+    // l'allocatore ha preso dal sistema e non ha reso, cioe' quello che somiglia alla RSS; `peak` e' il massimo
+    // di `held` da inizio processo, che e' il numero che decide se sedici compilazioni in parallelo ci stanno.
+    // Misurato su functions/paraminit: `used` diceva **32 MB** mentre la RSS di picco era **504 MB** - la
+    // differenza e' tutta nelle liste libere dell'allocatore, cioe' RICICLO, non memoria viva.
+    H := GetFPCHeapStatus;
+    WriteLn(ErrOutput, Format('[PHASE] %-22s %8d ms   (cum %8d ms)   used %7d kB (+%6d kB)  held %7d kB  peak %7d kB',
             [PhaseName, Int64(Now_ - GPhaseLast), Int64(Now_ - GPhaseT0),
-             Int64(H.TotalAllocated div 1024), Int64((H.TotalAllocated div 1024) - GHeapLast)]));
-    GHeapLast := H.TotalAllocated div 1024;
+             Int64(H.CurrHeapUsed div 1024), Int64((H.CurrHeapUsed div 1024) - GHeapLast),
+             Int64(H.CurrHeapSize div 1024), Int64(H.MaxHeapSize div 1024)]));
+    GHeapLast := H.CurrHeapUsed div 1024;
   end
   else
     WriteLn(ErrOutput, Format('[PHASE] %-22s %8d ms   (cum %8d ms)',
