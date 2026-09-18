@@ -1164,7 +1164,8 @@ type
     function UDTFieldPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // pointee UDT of a "T PTR" field, else ''
     function UDTFieldMultiPtrPointee(UDTIdx: Integer; const FieldName: string): string;  // full pointee of a "T Ptr Ptr..." field ("T PTR"), else ''
     function UDTFieldRawPtrPointee(UDTIdx: Integer; const FieldName: string): string; // scalar pointee of a "<scalar> PTR" field, else ''
-    function MemberRawPtrPointee(Node: TASTNode): string;                          // "obj.field" raw scalar pointer -> pointee type, else ''
+    function MemberRawPtrPointee(Node: TASTNode): string;
+    function MemberPtrPtrPointee(Node: TASTNode): string;           // "obj.f" declared "X Ptr Ptr": "X PTR" (527)                          // "obj.field" raw scalar pointer -> pointee type, else ''
     function MemberArrayElemRawPtrPointee(Node: TASTNode): string;                 // "obj.m(i)" element is a raw scalar pointer -> pointee type, else ''
     function UDTFieldIsWString(UDTIdx: Integer; const FieldName: string): Boolean;  // field declared AS WSTRING?
     function DerefedType(Node: TASTNode): string;                               // FB type of *<expr> (multi-level aware)
@@ -1462,6 +1463,7 @@ type
     function UndefinedNameIsFunction(const NameU: string): Boolean; // "#undef" over a FUNCTION keeps the refusal (DIVERGENZE 73)
     procedure CollectProcPtrLocals(Proc: TASTNode);   // this proc's own "DIM x AS T PTR" locals
     procedure CollectProcDeclaredNames(Node: TASTNode);            // names this proc declares of its own
+    procedure ImplicitThisMemberBases(Node: TASTNode);             // "p[i].f" in a method is "this.p[i].f" (526)
     function CurrentProcParamType(const VarName: string; out UDTType: string): Boolean;  // is VarName a param of the current proc? UDTType = its UDT ('' if not a UDT)
     function CurrentProcLocalRecType(const VarName: string): string;  // UDT type of a DIM'd local UDT of the current proc (shadows the global map), else ''
     procedure EmitXferStore(RT: TSSARegisterType; Slot: Integer; const Val: TSSAValue);
@@ -5880,6 +5882,26 @@ begin
                 ssaCmpLeInt: OpCode := ssaCmpLeUInt;
                 ssaCmpGeInt: OpCode := ssaCmpGeUInt;
               end;
+            // ⛔ A POINTER COMPARED WITH A NUMBER is compared as its NUMBER (DIVERGENZE 528). Two pointers carry the
+            // same tag and compare as they are; but "p < &h1000000000000" with p from libc compared the TAGGED bits
+            // (2^61 + the address) and answered false where fbc answers true. Only the mixed case, and not the
+            // null test: "p = 0" / "p <> 0" is right either way, and it is the one written in hot loops.
+            if FModernMode and (Left.RegType = srtInt) and (Right.RegType = srtInt) and
+               not (((OpCode = ssaCmpEqInt) or (OpCode = ssaCmpNeInt)) and
+                    (((Left.Kind = svkConstInt) and (Left.ConstInt = 0)) or
+                     ((Right.Kind = svkConstInt) and (Right.ConstInt = 0)))) then
+            begin
+              // ⛔ BOTH sides lose the mark, not only the one recognised as a pointer. The recognition is not
+              // complete - "VarPtr(x) = q", "items(1).socket = s(1)" over an array of pointers - and stripping
+              // one side of two tagged addresses made four guards compare unequal (m115 · m572 · m907x · m967).
+              // On a real number the strip is a no-op: only the bit pattern 001 in 63..61 is touched.
+              if (ExprIsPointerTyped(Node.GetChild(0)) or (Node.GetChild(0).NodeType = antProcAddress)) <>
+                 (ExprIsPointerTyped(Node.GetChild(1)) or (Node.GetChild(1).NodeType = antProcAddress)) then
+              begin
+                Left := EmitStripForeignTag(Left);
+                Right := EmitStripForeignTag(Right);
+              end;
+            end;
           end;
 
           if ((Left.RegType = srtString) or (Right.RegType = srtString)) and
@@ -6854,6 +6876,14 @@ begin
                             MakeSSAValue(svkNone), MakeSSAValue(svkNone))
           else if ArgValue.RegType = srtString then
             Result := EnsureStringRegister(ArgValue)
+          // ⛔ ...and a POINTER renders its NUMBER, without the foreign-address tag - the rule DIVERGENZE 235 wrote for
+          // PRINT and for "Cast(Integer, p)", and Str is the third place a pointer becomes a number: "Str(New Integer)"
+          // answered 2305843010069654112 in the fb mode where fbc answers the address (DIVERGENZE 528).
+          else if (ArgValue.RegType = srtInt) and FModernMode and (ArgListNode <> nil) and
+                  (ArgListNode.ChildCount >= 1) and
+                  (ExprIsPointerTyped(ArgListNode.GetChild(0)) or
+                   (ArgListNode.GetChild(0).NodeType = antProcAddress)) then
+            EmitInstruction(ssaIntToString, Result, EmitStripForeignTag(ArgValue), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
           else if (ArgValue.RegType = srtInt) and FModernMode then
             EmitInstruction(ssaIntToString, Result, EnsureIntRegister(ArgValue), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
           else
@@ -11930,12 +11960,17 @@ begin
 
   // FreeBASIC RAW pointer FIELD indexing as an lvalue: "obj.field[i] = expr" where obj.field is a
   // "<scalar> PTR" field. Store SizeOf(pointee) bytes at (field value) + i*SizeOf(pointee) on the raw heap.
+  // ⛔ ...AND A FIELD DECLARED "<UDT> Ptr Ptr" IS THE SAME STORE, of one pointer (DIVERGENZE 527). Its pointee is
+  // filed in MultiPtrPointee, which MemberRawPtrPointee does not read, so "a.pp[1] = New L[2]" matched no rung, fell
+  // to the plain array store and was LOST IN SILENCE - while the same field declared "Integer Ptr Ptr" (pointee in
+  // RawPtrPointee) was written. A cell of a pointer block is eight bytes whatever it points at.
   if (VarNode.ChildCount >= 2) and
      (VarNode.GetChild(0).NodeType = antMemberAccess) and
      (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) and
-     (MemberRawPtrPointee(VarNode.GetChild(0)) <> '') then
+     ((MemberRawPtrPointee(VarNode.GetChild(0)) <> '') or (MemberPtrPtrPointee(VarNode.GetChild(0)) <> '')) then
   begin
     RawFieldPointee := MemberRawPtrPointee(VarNode.GetChild(0));
+    if RawFieldPointee = '' then RawFieldPointee := MemberPtrPtrPointee(VarNode.GetChild(0));
     VarReg := EmitRawFieldIndexAddress(VarNode.GetChild(0), VarNode.GetChild(1), RawFieldPointee);
     ProcessExpression(ExprNode, ExprValue);
     if (RawFieldPointee = 'SINGLE') or (RawFieldPointee = 'DOUBLE') then
@@ -27798,9 +27833,19 @@ begin
   if Node.GetChild(0).NodeType = antIdentifier then
   begin
     Nm := Node.GetChild(0).ValueUpper;
-    if RawChainNameIsArray(Nm) or (not IsRawPtr(Nm)) then Exit;
+    if RawChainNameIsArray(Nm) then Exit;
     Result := UpperFast(PointeeTypeOf(Nm));
+    // ⛔ ...AND THE SAME RULE RawChainAddr APPLIES (DIVERGENZE 372): in the fb mode a pointer to a POINTER is
+    // bytes whatever it was assigned from. The two answer ONE question - what is "<chain>[i]" - and this one
+    // still asked only the assignment scan, so "q = a.pp : q[0][1].v" had an ADDRESS RawChainAddr could
+    // build and no TYPE for the member access to read it by: it printed the address (DIVERGENZE 527).
+    if not (IsRawPtr(Nm) or
+            (FNativeMemory and (Length(Result) > 4) and (Copy(Result, Length(Result) - 3, 4) = ' PTR'))) then
+      Result := '';
   end
+  // ...and a FIELD declared "X Ptr Ptr" as the base, in the fb mode, for the same reason (527).
+  else if FNativeMemory and (Node.GetChild(0).NodeType = antMemberAccess) then
+    Result := MemberPtrPtrPointee(Node.GetChild(0))
   else if Node.GetChild(0).NodeType = antArrayAccess then
   begin
     Inner := RawChainElemType(Node.GetChild(0));
@@ -28082,6 +28127,15 @@ begin
   begin
     if not RawChainValue(Node.GetChild(0), BaseVal, BasePointee) then Exit;
   end
+  // ⭐ "a.pp[0][1]" - the base is a FIELD declared "X Ptr Ptr" (DIVERGENZE 527), in the fb mode, for the reason the
+  // name case above gives: a field is what no assignment scan ever sees, exactly like the parameter IsRawPtr
+  // calls raw by construction, and "a.pp[0] = New L[2]" followed by "a.pp[0][1].v" had no rung at all.
+  else if FNativeMemory and (Node.GetChild(0).NodeType = antMemberAccess) and
+          (MemberPtrPtrPointee(Node.GetChild(0)) <> '') then
+  begin
+    BasePointee := MemberPtrPtrPointee(Node.GetChild(0));
+    ProcessExpression(Node.GetChild(0), BaseVal);
+  end
   // ⭐ "(*pp)[0][1]" - the base is an EXPRESSION of pointer type (DIVERGENZE 372), in the fb mode only, for the reason
   // the name case above gives.
   else if FNativeMemory and (Node.GetChild(0).NodeType in [antParentheses, antDeref]) then
@@ -28126,6 +28180,7 @@ begin
   case Node.GetChild(0).NodeType of
     antIdentifier: Result := UpperFast(PointeeTypeOf(Node.GetChild(0).ValueUpper));
     antParentheses, antDeref: Result := UpperFast(Trim(DerefedType(Node.GetChild(0))));
+    antMemberAccess: if FNativeMemory then Result := MemberPtrPtrPointee(Node.GetChild(0));   // 527
     antArrayAccess:
       begin
         T := RawChainElemTypeStatic(Node.GetChild(0));
@@ -31752,10 +31807,17 @@ begin
       // a graphics function with no entry answers 0 exactly as before.
       Result := PrintKindOf(VarToStr(Node.Value));
     antArrayAccess:
+      // ⭐ "q[i]" WHERE THE ELEMENT IS ITSELF A POINTER ("Integer Ptr Ptr", "L Ptr Ptr", "Any Ptr Ptr") prints as
+      // the pointer it is: unsigned, no sign column, and without the foreign-address tag (the print arm strips it
+      // for kind 3 when ExprIsPointerTyped says yes, and that function already knows this element). No arm below
+      // asked, so "Print q[0]" printed " 2305843009899115584" where fbc prints the address (DIVERGENZE 528).
+      if FModernMode and (Node.ChildCount >= 2) and (Node.Attributes.Values['BRACKET'] = '1') and
+         (Node.GetChild(1).ChildCount = 1) and ExprIsPointerTyped(Node) then
+        Result := 3
       // "s[i]" on a STRING - a variable or a FIELD - is the BYTE at that index: a UByte, and an unsigned
       // value prints with NO leading sign space. Tested first, because a string FIELD also matches the
       // member-array branch below.
-      if FModernMode and (Node.ChildCount >= 2) and (Node.GetChild(1).ChildCount = 1) and
+      else if FModernMode and (Node.ChildCount >= 2) and (Node.GetChild(1).ChildCount = 1) and
          (((Node.GetChild(0).NodeType = antIdentifier) and
            (GetVariableType(Node.GetChild(0).ValueUpper) = srtString) and
            ((ArrayIndexOf(Node.GetChild(0).ValueUpper) < 0) or
@@ -33632,6 +33694,30 @@ begin
   UDTIdx := FindUDT(UDTName);
   if UDTIdx < 0 then Exit;
   Result := UDTFieldRawPtrPointee(UDTIdx, FieldName);
+end;
+
+function TSSAGenerator.MemberPtrPtrPointee(Node: TASTNode): string;
+// If Node is "obj.field" and the field is a POINTER TO A POINTER ("L Ptr Ptr", "Integer Ptr Ptr"), the
+// pointee spelled whole ("L PTR"), else ''. The two shapes are filed in different registries - a UDT
+// ultimate type in MultiPtrPointee, a scalar one in RawPtrPointee with its full spelling - and every
+// reader that wants "is this a pointer to pointers" has to ask both (DIVERGENZE 527).
+var
+  UDTName: string;
+  UDTIdx: Integer;
+begin
+  Result := '';
+  if (Node = nil) or (Node.NodeType <> antMemberAccess) or (Node.ChildCount < 1) then Exit;
+  if Node.ValueUpper = '' then Exit;
+  UDTName := ObjectTypeName(Node.GetChild(0));
+  if UDTName = '' then Exit;
+  UDTIdx := FindUDT(UDTName);
+  if UDTIdx < 0 then Exit;
+  Result := UpperFast(UDTFieldMultiPtrPointee(UDTIdx, Node.ValueUpper));
+  if Result = '' then
+  begin
+    Result := UpperFast(UDTFieldRawPtrPointee(UDTIdx, Node.ValueUpper));
+    if not ((Length(Result) > 4) and (Copy(Result, Length(Result) - 3, 4) = ' PTR')) then Result := '';
+  end;
 end;
 
 function TSSAGenerator.MemberArrayElemRawPtrPointee(Node: TASTNode): string;
@@ -39790,6 +39876,70 @@ begin
     end;
   for i := 0 to Node.ChildCount - 1 do
     CollectProcDeclaredNames(Node.GetChild(i));
+end;
+
+procedure TSSAGenerator.ImplicitThisMemberBases(Node: TASTNode);
+// FreeBASIC implicit THIS, for the BASE of a member access: inside a method "pq[i].v" means
+// "this.pq[i].v" when pq is a POINTER field, and "arr(i).v" means "this.arr(i).v" when arr is an ARRAY
+// field. Rewritten IN PLACE, once, before the body is lowered (DIVERGENZE 526).
+// ⛔ The element access alone ("pq[i]", "arr(i)") has had TryImplicitThisArrayNode since 522 - but a
+// member access whose base is that element never reaches it: the field is asked through ObjectTypeName,
+// ResolveRecordObject, the raw field paths and a dozen type queries, and none of them knew the rule.
+// Bare "pq[0].v" read the POINTER itself and a bare write went nowhere, while "This.pq[0].v" was right -
+// the matrix that says it is the RESOLUTION of the name and not the operation.
+// ⭐ Why here and not lazily, like the other sites: those queries arrive at different moments and some
+// before the scope frame exists, so a scope question would get a different answer depending on who
+// asked first. The shadow test is therefore STATIC - a parameter or a DIM of that name ANYWHERE in this
+// procedure keeps the old path (FCurrentProcDeclNames, filled just before) - which is conservative in
+// exactly one direction: a method that shadows the field somewhere is left as it was.
+// The spelling is checked as well: a pointer field is indexed with "[ ]", an array field with "( )".
+// Anything else - a procedure-pointer field called with parentheses - is not this shape.
+var
+  i, UDTIdx, FI: Integer;
+  Base, Id: TASTNode;
+  NameU: string;
+  IsPtr: Boolean;
+begin
+  if Node = nil then Exit;
+  // ...and a CHAIN of subscripts ("ip[1][2]" with ip an "Integer Ptr Ptr" field) is the same gap one level down:
+  // the outer subscript's base is the inner one, never a name, so TryImplicitThisArrayNode is never asked.
+  if (Node.NodeType in [antMemberAccess, antArrayAccess]) and (Node.ChildCount >= 1) and
+     (Node.GetChild(0) <> nil) and (Node.GetChild(0).NodeType = antArrayAccess) then
+  begin
+    Base := Node.GetChild(0);
+    while (Base.ChildCount >= 1) and (Base.GetChild(0) <> nil) and
+          (Base.GetChild(0).NodeType = antArrayAccess) do
+      Base := Base.GetChild(0);
+    Id := nil;
+    if (Base.ChildCount >= 2) and (Base.GetChild(0) <> nil) and
+       (Base.GetChild(0).NodeType = antIdentifier) and (Base.GetChild(0).ChildCount = 0) and
+       (Base.Attributes.Values['ARROWOP'] = '') then
+      Id := Base.GetChild(0);
+    if Id <> nil then
+    begin
+      NameU := Id.ValueUpper;
+      UDTIdx := FindUDT(FCurrentThisType);
+      FI := UDTFieldIndex(UDTIdx, NameU);
+      if (FI >= 0) and (FCurrentProcDeclNames.IndexOf(NameU) < 0) then
+      begin
+        IsPtr := (not FUDTs[UDTIdx].Fields[FI].IsArray) and
+                 ((FUDTs[UDTIdx].Fields[FI].PtrPointee <> '') or
+                  (FUDTs[UDTIdx].Fields[FI].RawPtrPointee <> '') or
+                  (FUDTs[UDTIdx].Fields[FI].MultiPtrPointee <> ''));
+        if (IsPtr and (Base.Attributes.Values['BRACKET'] = '1')) or
+           (FUDTs[UDTIdx].Fields[FI].IsArray and (Base.Attributes.Values['BRACKET'] = '')) then
+        begin
+          // The identifier node BECOMES "this.<name>": same object, so nothing that already holds it
+          // is left pointing at a freed node.
+          Id.NodeType := antMemberAccess;
+          Id.Value := NameU;
+          Id.AddChild(TASTNode.CreateWithValue(antIdentifier, 'THIS', Id.Token));
+        end;
+      end;
+    end;
+  end;
+  for i := 0 to Node.ChildCount - 1 do
+    ImplicitThisMemberBases(Node.GetChild(i));
 end;
 
 function TSSAGenerator.CurrentProcParamType(const VarName: string; out UDTType: string): Boolean;
@@ -57754,6 +57904,13 @@ begin
     // assignment was dropped - the method ran and wrote nothing. For an ordinary "TYPE.METHOD" the two
     // readings coincide, which is why it went unnoticed.
     FCurrentThisType := OwnerTypeOfLabel(Name);
+    // ...and "pq[i].v" / "arr(i).v" over a field of THIS, rewritten before anything asks (526). Only
+    // where there IS a THIS: a static method has none to offer.
+    if (FCurrentThisType <> '') and (Proc.ChildCount >= 3) and (Proc.GetChild(1) <> nil) and
+       (Proc.GetChild(1).NodeType = antParameterList) and (Proc.GetChild(1).ChildCount >= 1) and
+       SameText(Proc.GetChild(1).GetChild(0).ValueUpper, 'THIS') then
+      for j := 2 to Proc.ChildCount - 1 do
+        ImplicitThisMemberBases(Proc.GetChild(j));
 
     // FB lexical scope (MODERN): open the procedure-root scope frame. Parameters, THIS, the FUNCTION
     // result handle and the body's locals/implicit names bind here; resolution stops at this frame for
