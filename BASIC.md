@@ -3403,7 +3403,7 @@ End Function
 | `UCASE` | ✓ | Returns a copy of a string converted to uppercase. `UCASE(s)` / `UCASE$(s)` (B1.2). |
 | `LTRIM` | ✓ | `LTRIM(s)` / `LTRIM(s, set)` substring / `LTRIM(s, Any set)` character-set. |
 | `RTRIM` | ✓ | `RTRIM(s)` / `RTRIM(s, set)` substring / `RTRIM(s, Any set)` character-set. |
-| `TRIM` | ✓ | `TRIM(s)` / `TRIM(s, set)` substring / `TRIM(s, Any set)` character-set. |
+| `TRIM` | ✓ | `TRIM(s)` / `TRIM(s, set)` substring / `TRIM(s, Any set)` character-set. With no set, as in fbc, `LTRIM` removes spaces and `RTRIM` spaces and NULs - a tab or a CR stays (DIVERGENZE 547). |
 | `INSTR` | ✓ | Returns the first occurrence of a substring or character within a string. |
 | `INSTRREV` | ✓ | Position of the last occurrence. `INSTRREV(str, sub [, start])` and `INSTRREV(str, Any set [, start])`. |
 | `MID (Statement)` | ✓ | Copies a substring to a substring of a string. |

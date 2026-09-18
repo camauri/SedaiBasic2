@@ -1837,10 +1837,9 @@ begin
 
   { strTrim(s, mode) -> a new string with the padding removed. mode bit 0 trims the LEFT, bit 1 the
     RIGHT, so one helper serves LTRIM, RTRIM and TRIM - the same arrangement UCASE and LCASE share.
-    ⚠️ It removes every byte <= 32, not just the space, because that is what FPC's Trim/TrimLeft/
-    TrimRight do and the interpreter calls those. Trimming only #32 would make the module disagree
-    with sb on a string holding a tab or a newline, which is exactly the kind of quiet difference this
-    backend exists to avoid. }
+    ⭐ It removes SPACES on the left and spaces AND NULs on the right, as libfb does with no trim set (DIVERGENZE
+    547; fb_hStrSkipCharRev strips the NULs a fixed-length string is padded with): a tab or a CR stays. It used to remove every byte <= 32, copying FPC's Trim, which the interpreter called then - the two
+    changed together, so the module and sb still answer the same. }
   B := TWasmBuf.Create;
   try
     // locals: 2 = len, 3 = first, 4 = last (exclusive), 5 = base, 6 = handle, 7 = dst
@@ -1855,7 +1854,7 @@ begin
         B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
           B.LocalGet(3); B.LocalGet(4); B.Op(wopI32GeU); B.BrIf(1);
           B.LocalGet(5); B.LocalGet(3); B.Op(wopI32Add);
-          B.OpMem(wopI32Load8U, 0, 0); B.I32Const(32); B.Op(wopI32GtU); B.BrIf(1);
+          B.OpMem(wopI32Load8U, 0, 0); B.I32Const(32); B.Op(wopI32Ne); B.BrIf(1);
           B.LocalGet(3); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(3);
           B.Br(0);
         B.EndOp;
@@ -1868,7 +1867,7 @@ begin
         B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
           B.LocalGet(4); B.LocalGet(3); B.Op(wopI32LeU); B.BrIf(1);
           B.LocalGet(5); B.LocalGet(4); B.Op(wopI32Add); B.I32Const(1); B.Op(wopI32Sub);
-          B.OpMem(wopI32Load8U, 0, 0); B.I32Const(32); B.Op(wopI32GtU); B.BrIf(1);
+          B.OpMem(wopI32Load8U, 0, 0); B.I32Const(32); B.Op(wopI32Or); B.I32Const(32); B.Op(wopI32Ne); B.BrIf(1);   // a space OR a NUL on the right (547)
           B.LocalGet(4); B.I32Const(1); B.Op(wopI32Sub); B.LocalSet(4);
           B.Br(0);
         B.EndOp;

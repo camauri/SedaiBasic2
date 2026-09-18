@@ -2138,6 +2138,19 @@ begin
   inherited Destroy;
 end;
 
+function FbTrimSpaces(const S: string; Left, Right: Boolean): string;
+// LTRIM / RTRIM / TRIM with no trim set, as libfb answers them (DIVERGENZE 547): the LEFT side removes spaces, the
+// RIGHT side spaces AND NULs - fb_hStrSkipCharRev, "fixed-len's are filled with null's as in PB, strip them too".
+var
+  a, b: Integer;
+begin
+  a := 1;
+  b := Length(S);
+  if Left then while (a <= b) and (S[a] = ' ') do Inc(a);
+  if Right then while (b >= a) and ((S[b] = ' ') or (S[b] = #0)) do Dec(b);
+  if (a = 1) and (b = Length(S)) then Result := S else Result := Copy(S, a, b - a + 1);
+end;
+
 function TBytecodeVM.IsRenderOwner: Boolean;
 begin
   Result := GetCurrentThreadID = FRenderOwnerThreadId;
@@ -2451,7 +2464,9 @@ begin
   end
   else
   begin
-    Neg := Value < 0;
+    // ⭐ ...and a NEGATIVE ZERO is negative (DIVERGENZE 548): fbc prints "-0.0000" for -0.0, as C's printf does, and
+    // "Value < 0" is false for it - raymath's MatrixInvert produced one and the column lost its sign.
+    Neg := (Value < 0) or ((Value = 0) and ((PQWord(@Value)^ shr 63) = 1));
     AbsValue := Abs(Value);
   end;
 
@@ -6796,7 +6811,12 @@ begin
   end;
   // The vector that IS populated is the discriminator - see the note in bcRefLoadInt.
   if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
-    Result := ArrGetInt(FArrays[ArrayIdx], PtrOffset)
+  begin
+    Result := ArrGetInt(FArrays[ArrayIdx], PtrOffset);
+    // ⭐ DIVERGENZE 545: an element of an array of BARE pointers comes home or gets C's mark, as the element read does.
+    if FArrays[ArrayIdx].BarePtr and ((WidthCode = RTC_PTR64) or (WidthCode = RTC_NPTR)) then
+      Result := PtrLoadHome(Result);   // (a READ of the storage: the writers' census matches "FArrays[...] ... :=" by line)
+  end
   else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
     Result := PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^
   else
@@ -7142,7 +7162,12 @@ begin
     WritePackedBytes(ArrayIdx, PtrOffset * FArrays[ArrayIdx].ElemWidth, WidthCode, Value);
   end
   else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
-    ArrSetIntAt(ArrayIdx, PtrOffset, Value)
+  begin
+    // ...and goes in without the mark (545).
+    if FArrays[ArrayIdx].BarePtr and ((WidthCode = RTC_PTR64) or (WidthCode = RTC_NPTR)) and (Value > 0) and
+       ((Value shr 61) = 1) then Value := Value xor FGNPTR_TAG;
+    ArrSetIntAt(ArrayIdx, PtrOffset, Value);
+  end
   else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
     PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^ := Value
   else
@@ -16875,12 +16900,24 @@ begin
       end;
     6: // bcStrChr
       AssignChar(Ctx.StringRegs[Instr.Dest], Ctx.IntRegs[Instr.Src1] and $FF);
+    // ⛔ DIVERGENZE 547: with no trim set, fbc's LTRIM/RTRIM/TRIM remove SPACES and nothing else. FPC's Trim family
+    // removes every character up to #32 - a tab, a CR, a NUL - so "Trim(chr(9) & "a")" lost the tab here and kept it
+    // under fbc (found by the llvm-c deck: the disassembler writes "\tcallq\t..."). MODERN only; CLASSIC keeps its own.
     12: // bcStrLTrim - LTRIM(s)
-      Ctx.StringRegs[Instr.Dest] := TrimLeft(Ctx.StringRegs[Instr.Src1]);
+      if Assigned(FProgram) and FProgram.ModernMode then
+        Ctx.StringRegs[Instr.Dest] := FbTrimSpaces(Ctx.StringRegs[Instr.Src1], True, False)
+      else
+        Ctx.StringRegs[Instr.Dest] := TrimLeft(Ctx.StringRegs[Instr.Src1]);
     13: // bcStrRTrim - RTRIM(s)
-      Ctx.StringRegs[Instr.Dest] := TrimRight(Ctx.StringRegs[Instr.Src1]);
+      if Assigned(FProgram) and FProgram.ModernMode then
+        Ctx.StringRegs[Instr.Dest] := FbTrimSpaces(Ctx.StringRegs[Instr.Src1], False, True)
+      else
+        Ctx.StringRegs[Instr.Dest] := TrimRight(Ctx.StringRegs[Instr.Src1]);
     14: // bcStrTrim - TRIM(s)
-      Ctx.StringRegs[Instr.Dest] := Trim(Ctx.StringRegs[Instr.Src1]);
+      if Assigned(FProgram) and FProgram.ModernMode then
+        Ctx.StringRegs[Instr.Dest] := FbTrimSpaces(Ctx.StringRegs[Instr.Src1], True, True)
+      else
+        Ctx.StringRegs[Instr.Dest] := Trim(Ctx.StringRegs[Instr.Src1]);
     15: // bcStrUCase - UCASE(s)
       Ctx.StringRegs[Instr.Dest] := UpperCase(Ctx.StringRegs[Instr.Src1]);
     16: // bcStrLCase - LCASE(s)
@@ -17862,6 +17899,7 @@ begin
   Dst.RankStated  := Src.RankStated;
   Dst.DescDims    := Src.DescDims;
   Dst.AddrPublished := Src.AddrPublished;   // phase 2.3: see TArrayStorage.AddrPublished
+  Dst.BarePtr := Src.BarePtr;               // DIVERGENZE 545: see TArrayStorage.BarePtr
 end;
 
 procedure ReleaseArrayStorage(var A: TArrayStorage);
@@ -17955,6 +17993,7 @@ begin
   A.RankStated := False;   // an EMPTY array states nothing: FBC.ArrayDescriptorPtr reads these two
   A.DescDims := 0;
   A.AddrPublished := False;
+  A.BarePtr := False;
 end;
 
 procedure TBytecodeVM.ExecuteArrayDim(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -18031,6 +18070,7 @@ begin
         // ⭐ PHASE 2.3: published from the DIM, not only from bcArrayElemAddr - the C hot loop, the AOT and the
         // JIT compute "@a(i)" natively and cannot write this flag. The SSA decided (TSSAArrayInfo.AddrNative).
         FArrays[ArrayIdx].AddrPublished := FNativeMemory and ArrInfo.AddrNative;
+        FArrays[ArrayIdx].BarePtr := FNativeMemory and ArrInfo.BarePtr;   // DIVERGENZE 545
         // ⭐ ...and the two facts fbc's array DESCRIPTOR needs (see TArrayStorage.DescDims). A bare
         // "Dim a()" reports ZERO dimensions until a ReDim gives it some, which is why this is not
         // DimCount: both spellings register one runtime-sized dimension.
@@ -18370,7 +18410,11 @@ begin
                                            PtrOffset * FArrays[ArrayIdx].ElemWidth, Instr.Immediate);
             end
             else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
-              Ctx.IntRegs[Instr.Dest] := ArrGetInt(FArrays[ArrayIdx], PtrOffset)
+            begin
+              Ctx.IntRegs[Instr.Dest] := ArrGetInt(FArrays[ArrayIdx], PtrOffset);
+              if FArrays[ArrayIdx].BarePtr and ((Instr.Immediate = RTC_PTR64) or (Instr.Immediate = RTC_NPTR)) then   // 545
+                Ctx.IntRegs[Instr.Dest] := PtrLoadHome(Ctx.IntRegs[Instr.Dest]);
+            end
             else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
               Ctx.IntRegs[Instr.Dest] := PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^
             else
@@ -18465,7 +18509,13 @@ begin
                                Ctx.IntRegs[Instr.Src2]);
             end
             else if PtrOffset <= High(FArrays[ArrayIdx].IntData) then
-              ArrSetIntAt(ArrayIdx, PtrOffset, Ctx.IntRegs[Instr.Src2])
+            begin
+              if FArrays[ArrayIdx].BarePtr and ((Instr.Immediate = RTC_PTR64) or (Instr.Immediate = RTC_NPTR)) and
+                 (Ctx.IntRegs[Instr.Src2] > 0) and ((Ctx.IntRegs[Instr.Src2] shr 61) = 1) then
+                ArrSetIntAt(ArrayIdx, PtrOffset, Ctx.IntRegs[Instr.Src2] xor FGNPTR_TAG)   // DIVERGENZE 545
+              else
+                ArrSetIntAt(ArrayIdx, PtrOffset, Ctx.IntRegs[Instr.Src2]);
+            end
             else if PtrOffset <= High(FArrays[ArrayIdx].FloatData) then
               PInt64(@FArrays[ArrayIdx].FloatData[PtrOffset])^ := Ctx.IntRegs[Instr.Src2]
             else

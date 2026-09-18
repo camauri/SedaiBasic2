@@ -154,6 +154,9 @@ type
       (ArrayBufferAvail). ⚠️ It fits the padding, so ARRAY_STORAGE_FIELD_BYTES did not move: AliasArrayStorage
       and ClearArrayStorage were updated by hand, which is exactly what the tripwire exists to demand. }
     AddrPublished: Boolean;
+    { DIVERGENZE 545: the elements are BARE machine addresses (TSSAArrayInfo.BarePtr) - a read through a packed
+      "@a(i)" brings the mark back, a write through one takes it off. Fits the padding, like AddrPublished. }
+    BarePtr: Boolean;
   end;
 
 

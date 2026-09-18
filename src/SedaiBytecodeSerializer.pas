@@ -357,6 +357,7 @@ begin
       // v7: the second facts byte. Bit 0 = AddrNative; written HERE and read in the same change (DIVERGENZE 172).
       RegType := 0;
       if ArrInfo.AddrNative then RegType := RegType or 1;
+      if ArrInfo.BarePtr then RegType := RegType or 2;      // bit 1: bare pointers (DIVERGENZE 545)
       Stream.WriteBuffer(RegType, SizeOf(RegType));
     except
       on E: Exception do
@@ -551,10 +552,12 @@ begin
       // v7: the second facts byte. ⛔ Set on EVERY array, older files included: ArrInfo is reused across the
       // loop, and a True left from the previous array would be read as this one's.
       ArrInfo.AddrNative := False;
+      ArrInfo.BarePtr := False;
       if Header.Version >= 7 then
       begin
         Stream.ReadBuffer(RegType, SizeOf(RegType));
         ArrInfo.AddrNative := (RegType and 1) <> 0;
+        ArrInfo.BarePtr := (RegType and 2) <> 0;
       end;
       Result.AddArrayInfo(ArrInfo);
     end;

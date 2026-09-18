@@ -712,6 +712,7 @@ type
                                          // FROM THE ADDRESS at the shared string hook, so the value never
                                          // has to be in two banks at once.
     FArrayScalarPointee: TStringList;    // array of NON-UDT pointers ("DIM a(..) As ZString Ptr") -> the pointee type name.
+    FArrayHoldsPtr: TStringList;         // arrays whose ELEMENT is a data pointer, any spelling (DIVERGENZE 545)
     // ⛔ An array whose ELEMENTS hold a RAW address ("Dim a(10) As Integer Ptr : a(5) = Allocate(...)").
     // CollectRawPtrVars walks pointer VARIABLES, so nothing marked an element: "a(5)[3] = 777" never
     // reached the block and "a(5)[3]" answered 32 - the byte address, unloaded. Keyed by ArrayFactKey,
@@ -1263,6 +1264,8 @@ type
     function ScopedNameIndex(L: TStringList; const Name: string): Integer;  // IndexOfName over the live chain
     function FuncPtrTypeSig(const TypeName: string): string;
     function FuncPtrTypeDefaults(const TypeName: string): string;   // named funcptr TYPE -> its FPDEFAULTS (534)
+    function TypeIsDataPointer(const TypeName: string): Boolean;      // "T Ptr" through its typedef, not a procedure (545)
+    function ArrayHoldsCPointers(const ArrName: string): Boolean;     // fb: its elements are machine addresses (545)
     procedure ProcessPathArg(ArgNode: TASTNode; out Reg: TSSAValue);  // file.bi's path: a String or a ZString Ptr (536)  // named funcptr TYPE -> "FPPARAMS|FPRET", scope-aware ('' if none)
     function PrintKindOfTypeName(const TypeName: string): Integer;  // print form of a type name; a funcptr type is a pointer
     function IndexedFuncPtrSig(BaseNode: TASTNode): string;   // signature of the funcptr at "p[j]" / "a(i)[j]", '' if none
@@ -2049,6 +2052,7 @@ begin
   FArrayFuncPtrSig := TIndexedStringList.Create;
   FArrayFuncPtrSig.CaseSensitive := False;
   FArrayScalarPointee := TIndexedStringList.Create;
+  FArrayHoldsPtr := TIndexedStringList.Create;
   FZStrCharAddr := TIndexedStringList.Create;
   FZStrTextAddr := TIndexedStringList.Create;
   FRawElemArrays := TIndexedStringList.Create;
@@ -2275,6 +2279,7 @@ begin
   FArrayScalarType.Free;
   FArrayFuncPtrSig.Free;
   FArrayScalarPointee.Free;
+  FArrayHoldsPtr.Free;
   FZStrCharAddr.Free;
   FZStrTextAddr.Free;
   FRawElemArrays.Free;
@@ -10727,6 +10732,13 @@ begin
         // Emit ssaArrayLoad instruction with pre-computed linear index
         // Dest, ArrayRef, LinearIndex, None
         EmitInstruction(ssaArrayLoad, Result, ArrayRef, LinearIndex, MakeSSAValue(svkNone));
+        // DIVERGENZE 545: an element of a pointer array holds the bare machine address - the value gets its mark back.
+        if (ArrInfo.ElementType = srtInt) and ArrayHoldsCPointers(ArrName) then
+        begin
+          TempVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaPtrFromInt, TempVal, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Result := TempVal;
+        end;
         // DIVERGENZE 493: a Boolean element holds C's 0/1; the VM's true is -1.
         if (ArrInfo.ElementType = srtInt) and IsBoolArrayName(ArrName) then
         begin
@@ -14050,6 +14062,9 @@ begin
     Exit;
   end;
 
+  // DIVERGENZE 545: into a pointer array goes the bare machine address, the mark stays in the registers.
+  if (ArrInfo.ElementType = srtInt) and ArrayHoldsCPointers(ArrName) then
+    ExprValue := EmitStripForeignTag(ExprValue);
   // Emit ssaArrayStore instruction with pre-computed linear index
   // Dest = value to store
   // Src1 = ArrayRef
@@ -15191,6 +15206,14 @@ begin
        (PointeeOfPtrTypeName(ArrElemTypeName) = '') then
       FArrayScalarPointee.Values[DeclArrName] :=
         Trim(Copy(ArrElemTypeName, 1, Length(ArrElemTypeName) - 4));
+    // ⭐ ...and whether the element is a DATA POINTER at all, through its typedef (DIVERGENZE 545): llvm-c's
+    // "Dim params(0 To 1) As LLVMTypeRef" is an alias of "LLVMOpaqueType Ptr", which neither map above records.
+    if (RecArrUDTIdx < 0) and TypeIsDataPointer(ArrElemTypeName) then
+    begin
+      FArrayHoldsPtr.Add(DeclArrName);
+    end
+    else if FArrayHoldsPtr.IndexOf(DeclArrName) >= 0 then
+      FArrayHoldsPtr.Delete(FArrayHoldsPtr.IndexOf(DeclArrName));
 
     // B1.5: remember a narrow element width (DIM a(n) AS BYTE/.../SINGLE) so element stores wrap to it.
     if (RecArrUDTIdx < 0) and (ArrElemTypeName <> '') then
@@ -15650,6 +15673,9 @@ begin
               InitElemReg := BoolToCByte(InitElemVal)                  // DIVERGENZE 493
             else         InitElemReg := EnsureIntRegister(InitElemVal);
             end;
+            // ...and a pointer array's initialiser stores the bare address too (545)
+            if (ElementType = srtInt) and FNativeMemory and FModernMode and TypeIsDataPointer(ArrElemTypeName) then
+              InitElemReg := EmitStripForeignTag(InitElemReg);
           end;
           IdxReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaLoadConstInt, IdxReg, MakeSSAConstInt(k), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -32905,6 +32931,29 @@ begin
   else
     ProcessStringExpression(ArgNode, V);
   Reg := EnsureStringRegister(V);
+end;
+
+function TSSAGenerator.TypeIsDataPointer(const TypeName: string): Boolean;
+// A DATA pointer type, however it is spelled: "T Ptr", "Any Ptr", or a typedef of one (llvm-c's LLVMTypeRef is
+// "LLVMOpaqueType Ptr"). A procedure-pointer type is not one: its value is a BASIC entry, not memory C reads.
+var
+  C: string;
+begin
+  Result := False;
+  if (TypeName = '') or (FuncPtrTypeSig(TypeName) <> '') then Exit;
+  C := UpperFast(Trim(TypeName));
+  if (Length(C) >= 4) and (Copy(C, Length(C) - 3, 4) = ' PTR') then Exit(True);
+  C := UpperFast(Trim(CanonicalType(C)));
+  Result := (Length(C) >= 4) and (Copy(C, Length(C) - 3, 4) = ' PTR');
+end;
+
+function TSSAGenerator.ArrayHoldsCPointers(const ArrName: string): Boolean;
+// ⭐ DIVERGENZE 545 - in the fb memory mode an array of DATA POINTERS is C's array: its elements hold machine
+// ADDRESSES, as a record's pointer field and an Allocate'd block already do, and C reads them straight from the
+// buffer (llvm-c's LLVMFunctionType(ret, @params(0), n, 0), an argv). A pointer in a register carries FGNPTR_TAG;
+// the store takes it off and the load puts it back (ssaPtrFromInt), so the program sees the same value both ways.
+begin
+  Result := FNativeMemory and FModernMode and (FArrayHoldsPtr.IndexOf(ArrayFactKey(ArrName)) >= 0);
 end;
 
 function TSSAGenerator.FuncPtrTypeDefaults(const TypeName: string): string;
@@ -53670,6 +53719,11 @@ begin
   // (atk deck; the rule is DIVERGENZE 235's, this is one more spelling of its operand).
   if (Node.NodeType = antArrayAccess) and (Node.Attributes.Values['BRACKET'] = '1') and
      (Node.ChildCount >= 1) and EndsPtr(DerefedType(Node.GetChild(0))) then Exit(True);
+  // ⭐ ...and an ELEMENT of an array of pointers, "a(i)" (DIVERGENZE 545): "Cast(ULongInt, blocks(1))" kept the mark
+  // where the same cast of a pointer VARIABLE drops it.
+  if (Node.NodeType = antArrayAccess) and (Node.Attributes.Values['BRACKET'] <> '1') and (Node.ChildCount >= 1) and
+     (Node.GetChild(0).NodeType = antIdentifier) and (ArrayIndexOf(Node.GetChild(0).ValueUpper) >= 0) and
+     ArrayHoldsCPointers(Node.GetChild(0).ValueUpper) then Exit(True);
   // ⭐ ...and a FIELD declared as a pointer, at ANY level. The type-name question below knew "<UDT> Ptr"
   // and missed "<UDT> Ptr Ptr", whose pointee lives in its own registry: "Cast(Integer, face->charmaps)"
   // kept the C tag - 2^61 + the address, where fbc prints the address - once that field started coming
@@ -57670,6 +57724,9 @@ begin
   if ET <> srtInt then Exit;
   // An array of POINTERS says so: a cell handed to C may point into it (DIVERGENZE 257 B).
   if DeclTypeIsPointer(ArrElemTypeName) then FProgram.SetArrayElemIsPtr(ArrayIdx);
+  // ...and whether its elements are BARE machine addresses in fb (DIVERGENZE 545): the VM brings the mark back on a read
+  // through a packed "@a(i)" - the same arrays whose element stores strip it (ArrayHoldsCPointers).
+  if FNativeMemory and FModernMode and TypeIsDataPointer(ArrElemTypeName) then FProgram.SetArrayBarePtr(ArrayIdx);
   case TypeNameWidthCode(ArrElemTypeName) of
     1: FProgram.SetArrayElemWidth(ArrayIdx, 1, True);
     2: FProgram.SetArrayElemWidth(ArrayIdx, 1, False);
@@ -58106,6 +58163,8 @@ begin
              (PointeeOfPtrTypeName(TypeName) = '') then
             FArrayScalarPointee.Values[MangledName] :=
               Trim(Copy(TypeName, 1, Length(TypeName) - 4));
+          if TypeIsDataPointer(TypeName) and (FArrayHoldsPtr.IndexOf(MangledName) < 0) then
+            FArrayHoldsPtr.Add(MangledName);                  // (545)
           // An array of FUNCTION POINTERS: "f(i)(args)" is an indirect call through the element.
           if FuncPtrTypeSig(TypeName) <> '' then
             FArrayFuncPtrSig.Values[MangledName] := FuncPtrTypeSig(TypeName);

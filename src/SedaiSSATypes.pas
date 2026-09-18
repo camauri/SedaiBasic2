@@ -965,6 +965,10 @@ type
       or an enum from an Integer - and FBC.ArrayDescriptorPtr must answer base_ptr in the same domain as
       "@a(i)". Rides in the .basc from v7; a v6 file reads False, which is what its bytecode contains. }
     AddrNative: Boolean;
+    { DIVERGENZE 545: an array of DATA POINTERS whose elements hold the BARE machine address in the fb mode (the SSA
+      strips FGNPTR_TAG on the store) - read through a packed "@a(i)" the VM brings the mark back. Not ElemIsPtr, which a
+      pointer scalar's one-element backing also carries and whose cell keeps the mark. .basc v7, second facts byte bit 1. }
+    BarePtr: Boolean;
   end;
 
   TSSAProgram = class
@@ -1038,6 +1042,7 @@ type
     procedure SetArrayElemWidth(ArrayIdx, Width: Integer; Signed: Boolean);  // packed storage for a narrow type
     procedure SetArrayElemIsPtr(ArrayIdx: Integer);                          // its elements are pointers (257 B)
     procedure SetArrayAddrNative(ArrayIdx: Integer);                         // "@a(i)" is a machine address in fb (phase 2.3)
+    procedure SetArrayBarePtr(ArrayIdx: Integer);                            // its elements are bare machine addresses (545)
     procedure SetArrayPrivate(ArrayIdx: Integer);    // mark: proc-local, needs one storage PER THREAD
     procedure SetArrayDynamicShape(ArrayIdx: Integer; Dynamic: Boolean);  // mark: DYNAMIC slot (ERASE frees it)
     function GetArray(Index: Integer): TSSAArrayInfo;
@@ -2070,6 +2075,13 @@ procedure TSSAProgram.SetArrayElemIsPtr(ArrayIdx: Integer);
 begin
   if (ArrayIdx < 0) or (ArrayIdx >= FNextArrayIndex) then Exit;
   FArrays[ArrayIdx].ElemIsPtr := True;
+end;
+
+procedure TSSAProgram.SetArrayBarePtr(ArrayIdx: Integer);
+// The elements of this array hold bare machine addresses in the fb mode - see TSSAArrayInfo.BarePtr.
+begin
+  if (ArrayIdx < 0) or (ArrayIdx >= FNextArrayIndex) then Exit;
+  FArrays[ArrayIdx].BarePtr := True;
 end;
 
 procedure TSSAProgram.SetArrayAddrNative(ArrayIdx: Integer);
