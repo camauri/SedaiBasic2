@@ -3687,6 +3687,14 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   installed) resolves there, already filled. SedaiBasic looks in `libtinfo` after the libraries the program names
   and before its own process, and initialises terminfo as above when a symbol really comes from it. A C function
   that `libc` provides — `printf`, `errno` — does not count.
+- **`PRINT` writes into the C library's `stdout`** (Linux and the other Unix systems), the stream a C function the
+  program calls writes to, as FreeBASIC's runtime does. So `PRINT` and a C library's `printf`, `puts` or
+  `fputs(..., stdout)` share one stream, and their lines come out in the order the program wrote them. Before a call
+  into C, whatever `PRINT` left in that stream is flushed, so a C library's messages on `stderr` - which C does not
+  buffer - do not pass in front of it either (FreeBASIC flushes after every `PRINT`; here the flush happens only where
+  it can be seen). ⚠️ When standard output is not a terminal, the C library's buffer for it is set to 64 KB
+  (`setvbuf`) at start-up; a terminal keeps the C library's line buffering. Not on Windows yet, where the old order
+  remains.
 - **`errno` is 2 when a program starts, on Linux** — as in every FreeBASIC program, where it is what the
   system's dynamic loader leaves behind (it looks for `/etc/ld.so.preload` and does not find it). On a system
   where that file exists, both would start differently. ⚠️ Set by the `sb` command-line runner only, not by

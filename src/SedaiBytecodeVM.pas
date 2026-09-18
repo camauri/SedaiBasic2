@@ -1179,6 +1179,7 @@ uses
   // TARGET, which is the same shape that let every Windows build die once before (see the PowerShell
   // scripts, 2 Sep). A diagnostic knob is not worth an unbuildable target.
   SedaiTerminalIO,
+  SedaiCStdio,          // PRINT's bytes live in C's stdout: flushed before C runs (DIVERGENZE 434)
   SedaiFbDate,          // DATEADD/DATEDIFF/DATEPART as fbc's runtime answers them
   SedaiFbFormat,        // FORMAT, likewise
   // ⭐ The FFI, and it is named HERE and nowhere else in the VM: SedaiForeignRuntime is the one unit
@@ -8927,6 +8928,9 @@ end;
 procedure TBytecodeVM.ExecForeignCall(Ctx: TExecutionContext; TableIdx, NArgs: Integer;
   out ResInt: Int64; out ResFloat: Double);
 begin
+  // ⭐ DIVERGENZE 434: what PRINT left in C's stdout goes out BEFORE C runs, or a write of C to its unbuffered stderr
+  // passes in front of it - fbc flushes after every print. One flag test per call; the flush only when PRINT wrote.
+  CStdoutSync;
   TForeignTable(ForeignTable).Invoke(TableIdx, Ctx, Ctx.XferInt, Ctx.XferFloat, NArgs, ResInt, ResFloat);
 end;
 

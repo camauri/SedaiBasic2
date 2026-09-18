@@ -50,7 +50,8 @@ interface
 uses
   Classes, SysUtils, SedaiOutputInterface, SedaiGraphicsTypes,
   SedaiGraphicsMemory, SedaiGraphicsPrimitives, SedaiConsoleState, SedaiGraphicsBackend,
-  SedaiInputState                       // GWindowCharProvider: the keys typed into the graphics window
+  SedaiInputState,                      // GWindowCharProvider: the keys typed into the graphics window
+  SedaiCStdio                           // PRINT through C's stdout, one stream with C's (DIVERGENZE 434)
   {$IFDEF WINDOWS}
   , Windows
   {$ELSE}
@@ -306,6 +307,9 @@ var
     - reading input, so a prompt without a newline appears first
     - process exit, so nothing is lost on an abnormal end
   SB_OUTBUF=0 falls back to System.Write for A/B and as an escape hatch.
+  ⭐ Since DIVERGENZE 434 (18 Sep 2026) this buffer is the FALLBACK: on Unix the bytes go into C's own stdout
+  (SedaiCStdio), the stream a C function the program calls writes to, so PRINT and C's stdio keep the program's
+  order. The flush points above still apply and flush C's buffer too. SB_OUT_C=0 brings this buffer back.
   ============================================================================ }
 var
   GOutBuf: array[0..65535] of AnsiChar;
@@ -331,6 +335,7 @@ begin
     FileWrite(StdOutputHandle, GOutBuf[0], GOutLen);
     GOutLen := 0;
   end;
+  CStdoutFlush;   // ...and C's, which holds PRINT's bytes since DIVERGENZE 434 (and whatever C wrote itself)
   Flush(System.Output);
 end;
 
@@ -341,6 +346,9 @@ begin
     FileWrite(StdOutputHandle, GOutBuf[0], GOutLen);
     GOutLen := 0;
   end;
+  // ⛔ C's buffer too: Free Pascal ends the process without the C library's exit on the ordinary road, and what C
+  // held for stdout would be lost with it (DIVERGENZE 434; the reverse order is DIVERGENZE 517's).
+  CStdoutFlush;
 end;
 
 procedure OutWrite(const Text: string);
@@ -352,6 +360,12 @@ begin
   if not GOutBuffered then
   begin
     System.Write(Text);
+    Exit;
+  end;
+  // ⭐ DIVERGENZE 434: into C's stdout, the stream a C function the program calls writes to - see SedaiCStdio.
+  if GCStdioOn then
+  begin
+    CStdoutWrite(@Text[1], L);
     Exit;
   end;
   // Anything that cannot fit is written straight out: no point copying a megabyte through a 64 KB
@@ -584,6 +598,7 @@ begin
   GOutBuffered := SysUtils.GetEnvironmentVariable('SB_OUTBUF') <> '0';
   GOutIsTerminal := StdoutIsTerminal;
   GStdinIsTerminal := StdinIsTerminal;
+  if GOutBuffered then CStdioInit(GOutIsTerminal);   // DIVERGENZE 434 (SB_OUT_C=0: the own buffer, as before)
   GGfxTextMirror := SysUtils.GetEnvironmentVariable('GFXTEXT') <> '0';
   if not GOutExitRegistered then
   begin
