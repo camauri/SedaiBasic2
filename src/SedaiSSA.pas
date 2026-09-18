@@ -1463,6 +1463,7 @@ type
     function ParamDeclaredBank(ParamNode: TASTNode): TSSARegisterType;  // scalar param bank from its OWN decl (no global name collision)
     function ModuleTypeHiddenHere(const NameU: string): Boolean;   // a module DIM's TYPE, invisible in this proc?
     function UndefinedNameIsFunction(const NameU: string): Boolean; // "#undef" over a FUNCTION keeps the refusal (DIVERGENZE 73)
+    procedure DropRepeatedDeclNames(Proc: TASTNode; L: TStringList);   // 533
     procedure CollectProcPtrLocals(Proc: TASTNode);   // this proc's own "DIM x AS T PTR" locals
     procedure CollectProcDeclaredNames(Node: TASTNode);            // names this proc declares of its own
     procedure ImplicitThisMemberBases(Node: TASTNode);             // "p[i].f" in a method is "this.p[i].f" (526)
@@ -45880,6 +45881,49 @@ begin
     if Proc.GetChild(i).NodeType <> antProcedureDecl then Walk(Proc.GetChild(i));
 end;
 
+procedure TSSAGenerator.DropRepeatedDeclNames(Proc: TASTNode; L: TStringList);
+// Remove from L (NAME=value) every name declared more than once in Proc's body (DIM / VAR, nested procedures excluded).
+// DIVERGENZE 533: see CollectRawPtrVars.
+var
+  Counts: TStringList;
+  i, k: Integer;
+  procedure Walk(N: TASTNode);
+  var j: Integer; D: TASTNode; U: string;
+  begin
+    if N = nil then Exit;
+    if N.NodeType = antDim then
+      for j := 0 to N.ChildCount - 1 do
+      begin
+        D := N.GetChild(j);
+        if (D <> nil) and (D.NodeType = antArrayDecl) and (D.ChildCount >= 1) and
+           (D.GetChild(0).NodeType = antIdentifier) then
+        begin
+          U := D.GetChild(0).ValueUpper;
+          k := Counts.IndexOf(U);
+          if k < 0 then Counts.AddObject(U, TObject(PtrInt(1)))
+          else Counts.Objects[k] := TObject(PtrInt(Counts.Objects[k]) + 1);
+        end;
+      end;
+    for j := 0 to N.ChildCount - 1 do
+      if N.GetChild(j).NodeType <> antProcedureDecl then Walk(N.GetChild(j));
+  end;
+begin
+  if (Proc = nil) or (L = nil) or (L.Count = 0) then Exit;
+  Counts := TStringList.Create;
+  try
+    Counts.Sorted := True;
+    for i := 0 to Proc.ChildCount - 1 do
+      if Proc.GetChild(i).NodeType <> antProcedureDecl then Walk(Proc.GetChild(i));
+    for i := L.Count - 1 downto 0 do
+    begin
+      k := Counts.IndexOf(L.Names[i]);
+      if (k >= 0) and (PtrInt(Counts.Objects[k]) > 1) then L.Delete(i);
+    end;
+  finally
+    Counts.Free;
+  end;
+end;
+
 function TSSAGenerator.IsBuiltinNewType(NewNode: TASTNode): Boolean;
 // Does this "New <type>" allocate a BUILTIN scalar rather than a UDT? Such a pointer is RAW - a scalar
 // has no record to be a handle to - and the pre-scan has to know it, or "*p = 3.14" writes through the
@@ -48250,6 +48294,8 @@ procedure TSSAGenerator.CollectRawPtrVars(Node: TASTNode);
 var
   SavedTypePath: string;   // DIVERGENZE 95: the type scope to put back after the descent
   SavedScanProc: string;   // DIVERGENZE 96: ...and the procedure scope, for the same reason
+  SavedPtrLocals: TStringList;   // DIVERGENZE 533: the pointer DIMs of the procedure being scanned
+  DeclPointee: string;           // DIVERGENZE 533: the record type a DIM being scanned declares its pointer to
   i: Integer;
   Lhs, Rhs: TASTNode;
   LhsU, TU: string;
@@ -48362,13 +48408,20 @@ var
   var
     FU, TU: string;
     RhsU: TASTNode;
+    TargetUDT: string;   // DIVERGENZE 533: the record type the target points at
   begin
     if Rhs = nil then Exit;
+    // ⛔ A DIM SAYS WHAT IT DECLARES, and the name cannot (DIVERGENZE 533). PointerUDTType asks by NAME, and in this
+    // pre-scan a name declared twice in a procedure - two sibling Scopes - falls back to the flat map, i.e. to the
+    // first pointer of that name in the PROGRAM. fbc's pointers/new-delete: "Dim As Child Ptr p = New Child[5]" in a
+    // test whose file declared an "Integer Ptr p" earlier was marked a raw SCALAR pointer, "p[i].i" stepped 8 bytes
+    // over record handles, and the run died on an access violation. The Dim branch passes the declared pointee.
+    if DeclPointee <> '' then TargetUDT := DeclPointee else TargetUDT := PointerUDTType(TargetU);
     // Option B: a pointer to a UDT allocated with Allocate/Callocate holds a MANAGED record handle, not a
     // raw byte offset (ProcessAssignment allocates a record for it, "p->field" is managed access). So do
     // NOT mark such a var raw — that would (wrongly) route p[i]/*p onto the byte heap. Scalar/byte pointees
     // still go raw. (PointerUDTType reads FPointerVars, populated by CollectAddressTakenVars before this.)
-    if PointerUDTType(TargetU) <> '' then
+    if TargetUDT <> '' then
     begin
       // ...unless it is being pointed at RAW MEMORY. "Dim As hdr Ptr h = CPtr(hdr Ptr, @z)" lays the TYPE
       // over bytes that are not a record: the value is an ADDRESS, and reading a field means reading at
@@ -48409,7 +48462,7 @@ var
          IsRawPtrFieldExpr(Rhs) or IsImageCreateExpr(Rhs) or IsForeignPtrCall(Rhs) or
          IsArrayDescPtrCall(Rhs) or
          // ⭐ "two = v + 2" on a record pointer over raw memory is one too (DIVERGENZE 381).
-         ((Rhs.NodeType = antBinaryOp) and SameText(RawUDTArithType(Rhs), PointerUDTType(TargetU))) or
+         ((Rhs.NodeType = antBinaryOp) and SameText(RawUDTArithType(Rhs), TargetUDT)) or
          // ⭐ "ol = @slot->outline": the ADDRESS of a record nested by value inside raw memory is an address
          // into those bytes, and FreeType's own examples write exactly this before walking the points. Left
          // unmarked, "ol->n_points" still answered (the run-time tag test of 259 covers a plain field) and
@@ -48420,7 +48473,7 @@ var
          // to a record C owns. Nothing here asked about an indexed field (DIVERGENZE 374).
          ((Rhs.NodeType = antArrayAccess) and (Rhs.Attributes.Values['BRACKET'] = '1') and
           (Rhs.ChildCount >= 1) and (Rhs.GetChild(0) <> nil) and
-          (UpperFast(RawObjectPtrFieldMulti(Rhs.GetChild(0))) = UpperFast(PointerUDTType(TargetU)) + ' PTR')) or
+          (UpperFast(RawObjectPtrFieldMulti(Rhs.GetChild(0))) = UpperFast(TargetUDT) + ' PTR')) or
          // ⭐ DIVERGENZE 442 - "q = @s0[k]" and "q = @g->SavedImages[k]": the ADDRESS of an element of a record array
          // that lives in raw memory is an address into those bytes. The number was right, but q was left a record
          // handle of the program, and "q->ImageDesc.Width" died on "Invalid record handle" (giflib deck).
@@ -48428,21 +48481,21 @@ var
           (Rhs.GetChild(0).NodeType = antArrayAccess) and (Rhs.GetChild(0).Attributes.Values['BRACKET'] = '1') and
           (Rhs.GetChild(0).ChildCount >= 1) and (Rhs.GetChild(0).GetChild(0) <> nil) and
           (((Rhs.GetChild(0).GetChild(0).NodeType = antIdentifier) and
-            SameText(RawUDTPtrType(Rhs.GetChild(0).GetChild(0).ValueUpper), PointerUDTType(TargetU))) or
+            SameText(RawUDTPtrType(Rhs.GetChild(0).GetChild(0).ValueUpper), TargetUDT)) or
            IsRawPtrFieldExpr(Rhs.GetChild(0).GetChild(0)))) or
          ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] <> '1') and
-          TypeDeclaresAllocOperator(PointerUDTType(TargetU), 'OPERATORNEW') and
-          (not TypeHasMemberProc(PointerUDTType(TargetU)))) or
+          TypeDeclaresAllocOperator(TargetUDT, 'OPERATORNEW') and
+          (not TypeHasMemberProc(TargetUDT))) or
          ((Rhs.NodeType = antNew) and (Rhs.Attributes.Values['NEWARRAY'] = '1') and
-          (not UDTRecordsAreHandles(PointerUDTType(TargetU)))) then
-        if AddRawUDTPtr(FRawScanProc, TargetU, PointerUDTType(TargetU)) then
+          (not UDTRecordsAreHandles(TargetUDT))) then
+        if AddRawUDTPtr(FRawScanProc, TargetU, TargetUDT) then
         begin
           // ⛔ RAWPTRDIAG had a HOLE here: this is the busiest raw marking in the unit - every UDT
           // pointer laid over bytes - and it was the one that printed nothing, so "no RAWPTR line"
           // could not be read as "not marked". It cost a wrong diagnosis on 12 Sep 2026.
           if GetEnvironmentVariable('RAWPTRDIAG') <> '' then
             WriteLn(ErrOutput, 'RAWPTR udt   [', FRawScanProc, '] ', TargetU, ' -> ',
-                    PointerUDTType(TargetU), ' laid over bytes');
+                    TargetUDT, ' laid over bytes');
         end;
       Exit;
     end;
@@ -48580,7 +48633,20 @@ begin
     // i + 16 (fbc's dim/byref.bas, 127 where fbc says 113). A reference reads and writes through the
     // address it carries (IsRefVar, raw widths included); raw-ness is a question about POINTERS.
     if Node.Attributes.Values['BYREF'] <> '1' then
+    begin
+      DeclPointee := '';
+      if (Node.GetChild(1) <> nil) and (Node.GetChild(1).NodeType = antIdentifier) then
+      begin
+        TU := UpperFast(CanonicalType(Node.GetChild(1).ValueUpper));
+        if (Length(TU) > 4) and (Copy(TU, Length(TU) - 3, 4) = ' PTR') then
+        begin
+          TU := Trim(Copy(TU, 1, Length(TU) - 4));
+          if FindUDT(TU) >= 0 then DeclPointee := TU;
+        end;
+      end;
       ConsiderRaw(LhsU, Node.GetChild(2));
+      DeclPointee := '';
+    end;
     // ⭐ ...AND A REFERENCE TO A RECORD THAT LIES IN C's MEMORY (or raw memory). "Dim ByRef As tm g =
     // *gmtime(@t)" bound g to the pointer's value as if it were a record HANDLE, and the first "g.field"
     // took the managed path with a C address and died. The bind already carries the address; what was
@@ -48711,11 +48777,33 @@ begin
   // ...and the children's PROCEDURE scope, DIVERGENZE 96 - the same shape, one question lower: what is
   // raw HERE. Restored on the way out, so a nested declaration cannot leak its scope to its siblings.
   SavedScanProc := FRawScanProc;
+  SavedPtrLocals := nil;
   if (Node.NodeType = antProcedureDecl) and (Node.ChildCount >= 1) and
      (Node.GetChild(0).NodeType = antIdentifier) then
+  begin
     FRawScanProc := Node.GetChild(0).ValueUpper;   // same spelling as FCurrentProcName
+    // ⛔ ...AND THE PROCEDURE'S OWN POINTER DIMS, which the lowering reads before the flat map (ManagedPtrPointee) and
+    // this pre-scan did not have (DIVERGENZE 533). "Is this a record pointer?" was answered by the FIRST pointer of that
+    // NAME in the program: fbc's pointers/new-delete declares a "buffer" in six groups - an Integer Ptr first, then UDT
+    // pointers - so all six were marked raw SCALAR pointers, "buffer[i].i" read the wrong bytes and "Deallocate(buffer)"
+    // died on an access violation. Filled here exactly as the lowering fills it, and put back on the way out.
+    SavedPtrLocals := TStringList.Create;
+    SavedPtrLocals.Assign(FCurrentProcPtrLocals);
+    FCurrentProcPtrLocals.Clear;
+    CollectProcPtrLocals(Node);
+    // ⚠️ ...but only for a name the procedure declares ONCE. The lowering resolves a name per BLOCK first
+    // (BlockPtrPointeeIdx), so "Scope : Var p = New String : ... : End Scope" beside "Scope : Var p = New T" is two
+    // pointers there; this per-procedure map holds one of them, and answering with it made the String one a record
+    // pointer ("DELETE expects a UDT pointer"). Where the name is ambiguous the pre-scan keeps its old answer.
+    DropRepeatedDeclNames(Node, FCurrentProcPtrLocals);
+  end;
   for i := 0 to Node.ChildCount - 1 do
     CollectRawPtrVars(Node.GetChild(i));
+  if SavedPtrLocals <> nil then
+  begin
+    FCurrentProcPtrLocals.Assign(SavedPtrLocals);
+    SavedPtrLocals.Free;
+  end;
   FRawScanProc := SavedScanProc;
   FTypeScopePath := SavedTypePath;
 end;
