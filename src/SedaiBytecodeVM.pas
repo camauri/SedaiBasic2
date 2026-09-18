@@ -22311,7 +22311,7 @@ begin
         if Assigned(FOnFileData) then
         begin
           Data := '';
-          FOnFileData(Self, 'INPUT#', HandleNum, Data, ErrorCode);
+          if Assigned(FProgram) and FProgram.ModernMode then FOnFileData(Self, 'INPUT#N', HandleNum, Data, ErrorCode) else FOnFileData(Self, 'INPUT#', HandleNum, Data, ErrorCode);   // a NUMERIC field (DIVERGENZE 572), MODERN only
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('INPUT# error %d reading from file: %d', [ErrorCode, HandleNum]);
           // ⛔ THE SAME TEXT, READ BY TWO DIFFERENT PARSERS. VAL has known FreeBASIC's number
@@ -22336,7 +22336,7 @@ begin
         if Assigned(FOnFileData) then
         begin
           Data := '';
-          FOnFileData(Self, 'INPUT#', HandleNum, Data, ErrorCode);
+          if Assigned(FProgram) and FProgram.ModernMode then FOnFileData(Self, 'INPUT#N', HandleNum, Data, ErrorCode) else FOnFileData(Self, 'INPUT#', HandleNum, Data, ErrorCode);   // a NUMERIC field (DIVERGENZE 572), MODERN only
           if ErrorCode <> 0 then
             raise Exception.CreateFmt('INPUT# error %d reading from file: %d', [ErrorCode, HandleNum]);
           // Same grammar as VAL - see the float arm above. StrToIntDef is a 32-BIT conversion

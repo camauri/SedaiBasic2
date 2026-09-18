@@ -733,10 +733,17 @@ var
   LInQ: Boolean;      // INPUT#: inside a "..." field, where a comma is text
   LTail, LRawLen: Integer;   // INPUT#: units after a closing quote (the next field), raw field length
   LWant: Integer;      // INPUT(n [, #f]): bytes requested, carried in through Data
+  LCmd: string;        // Command, with 'INPUT#N' (a NUMERIC field, DIVERGENZE 572) read as 'INPUT#'
+  LNum, LSeen: Boolean; // ...a numeric field, and whether a non-blank of it has been read (a blank then ends it)
   Ch2: Char;
   EncBits, UW, UIdx, WCode: Integer;   // wide text encoding: bits per unit, its byte width, a unit's code
   WRaw, WUnit: string;                 // the line's raw units, and the one being examined
 begin
+  // ⭐ DIVERGENZE 572 - a NUMERIC field of INPUT# ends at a blank too, as libfb reads one: "Print #1, 64; 48" writes
+  // " 64  48" and "Input #1, w, h" reads 64 and 48, where the whole line went to w and h met the end of the file.
+  LNum := Command = 'INPUT#N';
+  if LNum then LCmd := 'INPUT#' else LCmd := Command;
+  LSeen := False;
   ErrorCode := 0;
 
   // The five QUERIES are computed by FileQuery, which is the single source of their rules; this arm
@@ -821,7 +828,7 @@ begin
       Data := IntToStr(QV);
       Exit;
     end;
-    if (Command = 'INPUT#') or (Command = 'LINEINPUT#') then
+    if (LCmd = 'INPUT#') or (LCmd = 'LINEINPUT#') then
     begin
       if FDeviceKind[Handle] = 4 then
       begin
@@ -953,7 +960,7 @@ begin
       SetLength(Data, LGot);
     end;
   end
-  else if (Command = 'INPUT#') or (Command = 'LINEINPUT#') then
+  else if (LCmd = 'INPUT#') or (LCmd = 'LINEINPUT#') then
   begin
     { Read a BLOCK, cut the line out of it, then put the stream back exactly where reading one byte
       at a time would have left it.
@@ -1020,12 +1027,12 @@ begin
           LTerm := True;
           Break;
         end;
-        if (Command = 'INPUT#') and (WCode = Ord('"')) then LInQ := not LInQ;
-        if (WCode = Ord(',')) and (Command = 'INPUT#') and (not LInQ) then begin LTerm := True; Break; end;
+        if (LCmd = 'INPUT#') and (WCode = Ord('"')) then LInQ := not LInQ;
+        if (WCode = Ord(',')) and (LCmd = 'INPUT#') and (not LInQ) then begin LTerm := True; Break; end;
         WRaw := WRaw + WUnit;
       end;
       FS.Position := LStart + LUsed;
-      if Command = 'INPUT#' then
+      if LCmd = 'INPUT#' then
       begin
         LRawLen := Length(WRaw);
         TrimInputField(WRaw, UW, LTail);
@@ -1051,12 +1058,20 @@ begin
       while LIdx < LGot do
       begin
         if (LBuf[LIdx] = 10) or (LBuf[LIdx] = 13) then Break;
+        if LNum then
+        begin
+          if (LBuf[LIdx] = 32) or (LBuf[LIdx] = 9) then
+          begin
+            if LSeen then Break;
+          end
+          else LSeen := True;
+        end;
         // ⛔ A COMMA INSIDE QUOTES IS TEXT, not a separator. INPUT# used to break on every comma and
         // keep the quotes, so `Write #1, "a,b", -1` read back as the two fields `"a` and (nothing),
         // where fbc reads `a,b` and `-1`. Measured against fbc 23 Aug 2026; the quotes themselves are
         // stripped below, once the whole field is in hand.
-        if (Command = 'INPUT#') and (LBuf[LIdx] = Ord('"')) then LInQ := not LInQ;
-        if (LBuf[LIdx] = Ord(',')) and (Command = 'INPUT#') and (not LInQ) then Break;
+        if (LCmd = 'INPUT#') and (LBuf[LIdx] = Ord('"')) then LInQ := not LInQ;
+        if (LBuf[LIdx] = Ord(',')) and (LCmd = 'INPUT#') and (not LInQ) then Break;
         Inc(LIdx);
       end;
       if LIdx > 0 then                   // the data before the terminator, appended in one Move
@@ -1074,6 +1089,14 @@ begin
       end;
       Ch := LBuf[LIdx];
       Inc(LUsed);                        // the terminator is consumed, as the old loop consumed it
+      // DIVERGENZE 572: a numeric field ended by a BLANK also takes the blanks after it and one comma, as libfb does -
+      // "10<tab>20 , 30" is three fields, not an empty one before the 30.
+      if LNum and ((Ch = 32) or (Ch = 9)) then
+      begin
+        FS.Position := LStart + LUsed;
+        while (FS.Read(Ch, 1) = 1) and ((Ch = 32) or (Ch = 9)) do Inc(LUsed);
+        if Ch = Ord(',') then Inc(LUsed);
+      end;
       if Ch = 13 then
       begin
         // CRLF counts as ONE terminator; a lone CR does not swallow the byte after it.
@@ -1094,7 +1117,7 @@ begin
     // A quoted field yields its CONTENT and leading blanks are not the field's: TrimInputField
     // holds the measured rule. LINE INPUT# keeps the line exactly as written, quotes included,
     // which is its whole point.
-    if Command = 'INPUT#' then
+    if LCmd = 'INPUT#' then
     begin
       LRawLen := Length(Line);
       TrimInputField(Line, 1, LTail);

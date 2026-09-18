@@ -434,7 +434,7 @@ var
     not ask. The default stays: the current directory is the shell's, as it is for fbc, and only a
     read-only lookup falls back beside the program.
     🕳️ The owner has asked that the mechanism be STUDIED FURTHER before it grows: see
-    NEXT_SESSION_PROMPT.md. It is a first, deliberately narrow step, not a settled design. }
+    RESTART.md. It is a first, deliberately narrow step, not a settled design. }
   OptHome: Boolean = False;
   // --jit: compile eligible hot loops to native code (JIT J2/J3).
   OptJit: Boolean = False;

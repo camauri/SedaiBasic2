@@ -50161,6 +50161,13 @@ begin
     end;
     Result := T;
   end
+  // ⭐ DIVERGENZE 588 - only "+" and "-" on a pointer make a pointer: a COMPARISON of two pointers is an integer, and
+  // taking the left operand's pointee made "5 + (q = 0)" pointer arithmetic (79 where fbc answers 4).
+  // ⛔ ...asked of the COMPARISON tokens, not "anything but + and -": the parser synthesises "*(p + i)" for "p[i]" with
+  // a token that is not ttOpAdd, and the wider test broke "pp[0]->i" and "(*pp)[0].i" (m686, m714, m723).
+  else if (Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) and Assigned(Node.Token) and
+          (Node.Token.TokenType in [ttOpEq, ttOpNeq, ttOpLt, ttOpGt, ttOpLe, ttOpGe]) then
+    Result := ''
   else if (Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) then
   begin
     // ⛔ ...AND THE POINTER OPERAND MAY BE A CAST, not only a name. "*(Cast(UByte Ptr, @i) + 1)" is the

@@ -5914,8 +5914,11 @@ begin
     // In the PLATFORM's spelling: the name arrives here however the caller wrote it, and on Windows a
     // program that prints __FILE__ got forward slashes where fbc gives backslashes. The path is the
     // same path; only the separator was ours rather than the system's.
+    // ⭐ DIVERGENZE 574 - ...and AS IT WAS WRITTEN: fbc answers "file_macro.bas" or "deck/file_macro.bas", the spelling on
+    // its command line, and ExpandFileName made it absolute (CUnit's assertion records carry __FILE__). Only the
+    // separator is the platform's.
     FileStr := FileName;
-    if FileStr <> '' then FileStr := ExpandFileName(FileStr);
+    if FileStr <> '' then FileStr := SetDirSeparators(FileStr);
     Defs.Values['__FILE__'] := '"' + FileStr + '"';
     // __FILE_NQ__: same file name WITHOUT the surrounding quotes (FreeBASIC "no quotes" form).
     Defs.Values['__FILE_NQ__'] := FileStr;

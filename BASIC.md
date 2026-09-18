@@ -3898,6 +3898,15 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
   are opened into the global symbol scope (Linux and other Unix systems).
 - **In a `PRINT USING` mask, a comma after the decimal point ends the field** and is printed: `"(##.##,##.##)"` is two
   fields, as in FreeBASIC. A comma before the point is still the thousands separator.
+- **Procedures reach C by every road a FreeBASIC program uses**: `@proc` evaluated inside a callback C is running, a
+  procedure-pointer variable or field passed as a callback, an `IIf` choosing between procedures, a callback that
+  makes C call the program back (nested), and a C routine reached through a procedure pointer. `Cast(ProcType, p)` of
+  an address C returned can be called. ⚠️ Still open: a procedure WRITTEN into a structure that C keeps and calls later.
+- **A record whose array member is declared through a type alias of a scalar** (`c(0 To 3) As dReal`) has C's layout.
+- **Inside a procedure, a pointer parameter `p` is `p`**, even when the module declares an array called `p`.
+- **`Input #` reads numbers separated by blanks**: `Print #1, 64; 48` then `Input #1, w, h` reads 64 and 48.
+- **Comparing two pointers gives an integer**: `5 + (q = 0)` is 4.
+- **`__FILE__` is the file name as written on the command line**, not an absolute path.
 - **A pointer field prints without a sign column**, like a pointer variable: `Print v.p` of an `As Any Ptr` field
   (or `T Ptr`, `ZString Ptr`, a procedure pointer, through `.` or `->`) prints `5`, not ` 5`.
 - ⚠️ **A variadic procedure called by C cannot read its variadic arguments yet.** A libxml error handler
