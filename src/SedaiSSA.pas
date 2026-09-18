@@ -50410,6 +50410,7 @@ procedure TSSAGenerator.EmitNewObject(Node: TASTNode; out Result: TSSAValue);
 // (immediate bit 48) so it is NOT reclaimed at the allocating frame's exit — the pointer keeps it
 // alive until DELETE. Member access through the pointer (p->field) routes via the handle as usual.
 var
+  InitVal: TSSAValue;           // "New Integer( 42 )": the value the block starts with (DIVERGENZE 525)
   NewType, OpLbl: string;
   UDTIdx: Integer;
   CountVal, ElemVal, BytesVal: TSSAValue;
@@ -50496,6 +50497,23 @@ begin
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaRawAlloc, Result, BytesVal, MakeSSAValue(svkNone), MakeSSAConstInt(RAWALLOC_PROGRAM));   // New: the program's block
+    // ⛔ E L'INIZIALIZZATORE VA SCRITTO (DIVERGENZE 525). "New Integer( 42 )" allocava e BUTTAVA VIA il
+    // 42 - l'argomento non veniva nemmeno guardato - e "*i" rispondeva 0, per un locale come per un campo.
+    // ⭐ La forma ad array con una scrittura esplicita era gia' giusta, ed e' cio' che dice che mancava
+    // QUESTO e non il blocco ne' il deref. Un solo argomento: e' l'unica forma che `fbc` accetta per un
+    // tipo builtin (per una UDT e' il costruttore, piu' sotto).
+    // ⚠ Larghezza e banca sono quelle del POINTEE, come in ogni altra scrittura grezza.
+    if (Node.ChildCount > 0) and (Node.GetChild(0).NodeType = antArgumentList) and
+       (Node.GetChild(0).ChildCount = 1) then
+    begin
+      ProcessExpression(Node.GetChild(0).GetChild(0), InitVal);
+      if (UpperFast(NewType) = 'SINGLE') or (UpperFast(NewType) = 'DOUBLE') then
+        EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), Result, EnsureFloatRegister(InitVal),
+                        MakeSSAConstInt(RawTypeCodeOfPointee(NewType)))
+      else
+        EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), Result, EnsureIntRegister(InitVal),
+                        MakeSSAConstInt(RawTypeCodeOfPointee(NewType)));
+    end;
     Exit;
   end;
   if UDTIdx < 0 then
