@@ -3725,6 +3725,7 @@ end;
 // Main implementation with destination hint
 procedure TSSAGenerator.ProcessExpressionFull(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
 var
+  ThisPtrFld: TASTNode;         // "*z" on a pointer FIELD asked by its bare name (DIVERGENZE 524)
   ZCharAddr: TSSAValue;         // the address behind a ZSTRING/WSTRING character read (DIVERGENZE 25)
   ZCharWide: Integer;
   DerefElemBytes: Integer;   // width of one element behind "(*p)[i]" - see DerefZStringByteAddr
@@ -4459,6 +4460,22 @@ begin
           // each had learnt a different number of rungs.
           TempStr := UpperFast(PointeeTypeOf(VarToStr(DerefTarget.Value)));
           if TempStr = '' then TempStr := ParamPointeeType(VarToStr(DerefTarget.Value));
+          // ⛔ ...E UN CAMPO DEL `This` CHIESTO COL NOME NUDO (DIVERGENZE 524). Le due domande sopra
+          // conoscono le variabili e i parametri, non i campi: dentro un metodo `*z` su un campo
+          // `ZString Ptr` non trovava nessun pointee, la runga declinava e il deref rispondeva
+          // l'INDIRIZZO. 📊 `*This.z` era gia' giusto, e le forme indicizzate dello stesso campo
+          // anche (voce 523): questo e' il terzo operatore della stessa famiglia.
+          // Si chiede solo se nessun altro sa il nome, quindi non puo' scavalcare un locale.
+          if TempStr = '' then
+          begin
+            ThisPtrFld := nil;
+            if TryImplicitThisField(VarToStr(DerefTarget.Value), DerefTarget.Token, ThisPtrFld) then
+            try
+              TempStr := UpperFast(MemberRawPtrPointee(ThisPtrFld));
+            finally
+              ThisPtrFld.Free;
+            end;
+          end;
         end
         else
         begin
