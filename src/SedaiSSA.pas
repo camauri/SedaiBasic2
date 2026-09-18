@@ -3220,6 +3220,8 @@ var
   Decl, ParamList, NameNode, prm: TASTNode;
   i: Integer;
   Nm, Params, Ret, T, CbPointee, CbParamName: string;
+  IifN: TASTNode;          // 570: the IIf's arguments
+  FpS, FpP: string;        // 561: a procedure-pointer variable's or field's signature, and its FNPTR parameter list
 begin
   Result := '';
   if Node = nil then Exit;
@@ -3229,6 +3231,50 @@ begin
   while ((Node.NodeType = antParentheses) or (Node.NodeType = antCast)) and (Node.ChildCount >= 1) do
     Node := Node.GetChild(0);
   // "@nome" porta il nome nel Value e non ha figli; "@espressione" ha un figlio e non e' una procedura.
+  // ⭐ DIVERGENZE 561 · 570 - A PROCEDURE THAT IS NOT WRITTEN "@proc" AT THE CALL is a callback too: a procedure-pointer
+  // VARIABLE ("qsort(..., fp2)"), a procedure-pointer FIELD, and an IIf choosing between procedures. Their value is an
+  // entry PC of the VM at run time, and C was handed it as it was - C jumped into the bytecode. The signature comes
+  // from the declaration of the variable / field (the IIf's from its branch), and the runtime builds the closure
+  // from the value it finds, whatever procedure it names.
+  if (Node.NodeType <> antProcAddress) then
+  begin
+    IifN := IifArgs(Node);
+    if IifN <> nil then Exit(BasicProcCallbackSig(IifN.GetChild(1)));
+    FpS := '';
+    if Node.NodeType = antIdentifier then
+    begin
+      FpS := FFuncPtrSigs.Values[Node.ValueUpper];
+      if FpS = '' then FpS := FModuleFuncPtrSigs.Values[Node.ValueUpper];
+    end
+    else if (Node.NodeType = antMemberAccess) and (Node.ChildCount >= 1) then
+      FpS := UDTFuncPtrFieldSig(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value), i);
+    if (FpS = '') or (Pos('|', FpS) = 0) then Exit;
+    Ret := Copy(FpS, Pos('|', FpS) + 1, MaxInt);
+    if Pos('|', Ret) > 0 then Exit;                     // "|BYREF": a reference return is not a C shape
+    Params := Copy(FpS, 1, Pos('|', FpS) - 1);
+    FpP := '';
+    while Params <> '' do
+    begin
+      if Pos(',', Params) > 0 then
+      begin
+        T := Trim(Copy(Params, 1, Pos(',', Params) - 1));
+        Delete(Params, 1, Pos(',', Params));
+      end
+      else
+      begin
+        T := Trim(Params);
+        Params := '';
+      end;
+      if T = '#P' then T := 'ANY PTR';                  // a procedure-pointer parameter
+      T := UpperFast(CanonicalType(UpperFast(T)));
+      if (T = '') or (ForeignKindOf(T) = fkUnknown) then Exit;
+      if FpP <> '' then FpP := FpP + '~';
+      FpP := FpP + T;
+    end;
+    Ret := UpperFast(CanonicalType(UpperFast(Trim(Ret))));
+    if (Ret <> '') and (ForeignKindOf(Ret) = fkUnknown) then Exit;
+    Exit('FNPTR:' + Ret + ':' + FpP);
+  end;
   if (Node.NodeType <> antProcAddress) or (Node.ChildCount <> 0) then Exit;
   Nm := UpperFast(VarToStr(Node.Value));
   if Nm = '' then Exit;
@@ -4402,7 +4448,15 @@ begin
         // every bit it has.
         // ...and "@expr" IS a pointer, whatever the expression's name says: "Cast(Integer, @acc[4]) - Cast(Integer, acc)"
         // stripped the mark from one side only once acc came from libc (fb memory mode), and answered 2^61 + 4.
-        if ExprIsPointerTyped(Node.GetChild(0)) or (Node.GetChild(0).NodeType = antProcAddress) then
+        // ⛔ DIVERGENZE 565 - ...but a cast to a PROCEDURE-POINTER type is a pointer cast, not a number: its canonical
+        // spelling is INTEGER, and "Cast(LPSTRLEN, dlsym(0, "strlen"))" lost C's mark, so the call through it took the
+        // address for a VM entry PC ("Call through an unset or invalid procedure pointer").
+        // ...and a procedure-pointer VARIABLE cast to a number is its address too, without C's mark (fbc prints it bare).
+        if (ExprIsPointerTyped(Node.GetChild(0)) or (Node.GetChild(0).NodeType = antProcAddress) or
+            ((Node.GetChild(0).NodeType = antIdentifier) and
+             ((FFuncPtrSigs.IndexOfName(Node.GetChild(0).ValueUpper) >= 0) or
+              (FModuleFuncPtrSigs.IndexOfName(Node.GetChild(0).ValueUpper) >= 0)))) and
+           (FuncPtrTypeSig(Node.ValueUpper) = '') then
           Result := ApplyNarrowCode(TypeNameWidthCode(ArrName2), EmitStripForeignTag(Left))
         else
         Result := ApplyNarrowCode(TypeNameWidthCode(ArrName2), EnsureIntRegister(Left));
@@ -34384,6 +34438,15 @@ begin
         // stays empty here, so the field knew its element's BANK and not its WIDTH. That is why the C
         // shape of a fixed member array could not be computed at all (see FixedArrayMemberCShape).
         if (NestedT = '') and (PtrPointeeT = '') then ArrElemScalarType := UpperFast(TypeName);
+        // ⭐ DIVERGENZE 581 - ...through an ALIAS of a builtin scalar: ode.bi's "c(0 To 3) As dReal" (dReal = Double) kept
+        // the spelling "DREAL", which no width ladder knows, so the member stayed out of the bytes and the whole record
+        // was not native (dMass 24 bytes against C's 136: what C wrote read 0, and C writing SizeOf bytes corrupted memory).
+        // An alias of a POINTER keeps its spelling: that shape has rules of its own.
+        if (ArrElemScalarType <> '') and (FindUDT(ArrElemScalarType) < 0) and
+           (Pos(' PTR', UpperFast(CanonicalType(ArrElemScalarType))) = 0) and
+           (UpperFast(CanonicalType(ArrElemScalarType)) <> ArrElemScalarType) and
+           (TypeNameWidthCode(UpperFast(CanonicalType(ArrElemScalarType))) >= 0) then
+          ArrElemScalarType := UpperFast(CanonicalType(ArrElemScalarType));
         // Array-of-UDT-POINTER member ("kids(Any) As N Ptr"): the elements are handles to records owned
         // elsewhere. Kept separate from ArrElemType so no record is allocated per element -- only the
         // pointee TYPE is needed, to resolve "obj.field(i)->x". PtrPointeeT is cleared just below.
@@ -52272,6 +52335,10 @@ begin
     Delete(Rest, 1, k);
     if T = '' then Continue;
     if T = '#P' then T := 'ANY PTR'                   // a procedure-pointer parameter is an address
+    // ⭐ DIVERGENZE 565 - ...and so is one declared through a procedure-pointer TYPE ("ByVal cmp As CMPFN"), which
+    // CanonicalType folds to INTEGER: "qs(@v(0), 5, 4, @cmpLong)" through a qsort taken from dlsym handed C the VM's
+    // entry PC as a number. As a pointer, the call site makes the argument a callback (VariadicCallSiteDecl).
+    else if FuncPtrTypeSig(T) <> '' then T := 'ANY PTR'
     else T := UpperFast(CanonicalType(T));
     if ForeignKindOf(T) in [fkUnknown, fkLongDouble] then Exit;
     if Params <> '' then Params := Params + ',';
@@ -58365,6 +58432,9 @@ begin
     // name (see ProcessDim); resolve it here first. Absent (the common case) this is a cheap miss.
     Result := FProgram.FindArray(LocalArrayMangle(FCurrentProcName, ArrName));
     if Result >= 0 then Exit;
+    // ⭐ DIVERGENZE 580 - a POINTER PARAMETER of this procedure is the name, not a module array spelled the same: "p[i]"
+    // with "ByVal p As Const Double Ptr" read the program's "Dim p(...)" (ode.bi's inline helpers take a, b, ma, res).
+    if (FCurrentProcPtrParams <> nil) and (FCurrentProcPtrParams.IndexOfName(UpperFast(ArrName)) >= 0) then Exit(-1);
   end;
   Result := FProgram.FindArray(ArrName);
 end;

@@ -11886,6 +11886,12 @@ begin
                                                         Instr.Immediate);
     bcRecordBlockLen:  // Delete[] p: how many records the block holds (1 when it is a lone record)
       Ctx.IntRegs[Instr.Dest] := SharedRecordBlockLen(Ctx.IntRegs[Instr.Src1]);
+    // ⭐ DIVERGENZE 560 - "@sub" (its entry PC, resolved into Immediate at link time). The main loop has it in
+    // RunTemplate.inc; THIS executor runs the body of a procedure C calls back (and every re-entry after it), and it had
+    // no arm: the register kept 0, so "@proc" inside a callback was NULL - a callback that re-registers itself, stores a
+    // procedure in a C record or returns one did nothing or crashed.
+    bcLoadProcAddr:
+      Ctx.IntRegs[Instr.Dest] := Instr.Immediate;
     // FFI: Immediate = index into the foreign declaration table, Src1 = staged argument count.
     bcForeignCall:
       begin
