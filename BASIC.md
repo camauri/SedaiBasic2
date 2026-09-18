@@ -2357,7 +2357,7 @@ in a record, or in the numeric builtins. Keep one in a plain `Dim` until those c
 | `@ (Address of)` | ✓ | Address-of a scalar, array element `@arr(i)`, or UDT field `@obj.field` (yields a packed int reference). `@sub` (procedure address) also supported |
 | `* (Value of)` | ✓ | Pointer dereference, read (`x = *p`) and write (`*p = v`); supports pointer arithmetic `*(p±n)` |
 | `VARPTR (Variable pointer)` | ✓ | Address of a variable (= @v). |
-| `PROCPTR (Procedure pointer and vtable index)` | ✓ | Address of a procedure (= @p). A MEMBER is named through its type — `ProcPtr( T.proc )`, `ProcPtr( T.constructor, Sub( ByVal As Integer ) )`, `ProcPtr( T.let )`, `ProcPtr( T.+= )`, `ProcPtr( T.[] )`, `ProcPtr( T.cast, Function() As Integer )`, and a property's getter/setter told apart by `Function`/`Sub` — and the optional signature picks the overload (its parameter count *and* its types); with no signature the first declared one wins. The result is a procedure whose FIRST parameter is the object, `Sub cdecl( ByRef As T, … )`, so it is called as `p( obj, … )`. ⚠️ The vtable-index form is refused by name. |
+| `PROCPTR (Procedure pointer and vtable index)` | ✓ | Address of a procedure (= @p). A MEMBER is named through its type — `ProcPtr( T.proc )`, `ProcPtr( T.constructor, Sub( ByVal As Integer ) )`, `ProcPtr( T.let )`, `ProcPtr( T.+= )`, `ProcPtr( T.[] )`, `ProcPtr( T.cast, Function() As Integer )`, and a property's getter/setter told apart by `Function`/`Sub` — and the optional signature picks the overload (its parameter count *and* its types); with no signature the first declared one wins. The result is a procedure whose FIRST parameter is the object, `Sub cdecl( ByRef As T, … )`, so it is called as `p( obj, … )`. ⚠️ The vtable-index form is refused by name. A call THROUGH the pointer works as a direct call: an argument left out takes the default the pointer's TYPE declares, and a `String` for a `ZString Ptr` parameter passes its address (DIVERGENZE 534, 535). |
 
 #### Type or Class Operators
 
@@ -3109,6 +3109,7 @@ End Function
 #### VisualBasic compatible procedures
 
 > ⚠️ As in fbc, these need `#include "datetime.bi"` (or `"vbcompat.bi"`); `FORMAT` needs `"string.bi"`. Without the header the program is refused (DIVERGENZE 504).
+> ⭐ With the header, their ADDRESS exists too, as in fbc: `@Year`, `ProcPtr(DateAdd)`, `@Format` (and the routines of `file.bi`, `utf_conv.bi`, `fbthread.bi`, `fbio.bi`) point at a procedure with the signature of the included `Declare`, which calls the built-in (DIVERGENZE 508).
 
 | Keyword | Status | Description |
 |---|---|---|
@@ -3288,6 +3289,7 @@ End Function
 #### File Properties
 
 > ⚠️ As in fbc, `FILELEN`, `FILEEXISTS`, `FILEDATETIME`, `FILEATTR`, `FILECOPY`, `FILEFLUSH` and `FILESETEOF` need `#include "file.bi"`; `ISREDIRECTED` needs `"fbio.bi"`. Without the header the program is refused (DIVERGENZE 504).
+> ⭐ Their path may be a `String` or a `ZString Ptr`, as `file.bi` declares it (`ByVal ... As ZString Ptr`): `FileLen(zp)` reads the text `zp` points at (DIVERGENZE 536).
 
 | Keyword | Status | Description |
 |---|---|---|

@@ -320,6 +320,10 @@ type
                                             //   pointee banks across procs don't collide. Filled in prologue, cleared per proc.
     FFuncPtrSigs: TStringList;              // FreeBASIC function pointers in scope: VARNAME -> "paramtypes|rettype"
     FModuleFuncPtrSigs: TStringList;        // ...of those, the MODULE-level ones: they survive every procedure prologue
+    FFuncPtrDefs: TStringList;              // ...and the DEFAULTS their TYPE declares: VARNAME -> FPDEFAULTS (534)
+    FModuleFuncPtrDefs: TStringList;        // ...the module-level ones (re-seeded in every prologue, as the sigs are)
+    FFuncPtrTypeDefs: TStringList;          // ...and those of a named funcptr TYPE: path+TYPENAME -> FPDEFAULTS (534)
+    FIndirectDefaults: string;              // the FPDEFAULTS of the pointer the NEXT indirect call goes through (534)
     FFuncPtrTypes: TStringList;             // FreeBASIC named funcptr TYPES ("Type X As Function(...)"): TYPENAME -> "paramtypes|rettype"
                                             //   (paramtypes = comma list; rettype '' for SUB). A "name(args)" on such a
                                             //   var is an indirect call (ssaCallSubIndirect) through its entry-PC value.
@@ -1256,7 +1260,9 @@ type
     function ScopePathParent(const P: string): string;        // "P3/B7/" -> "P3/" -> ''
     function PushTypeScope(Node: TASTNode): string;           // enter Node's children's type scope; returns the path to restore
     function ScopedNameIndex(L: TStringList; const Name: string): Integer;  // IndexOfName over the live chain
-    function FuncPtrTypeSig(const TypeName: string): string;  // named funcptr TYPE -> "FPPARAMS|FPRET", scope-aware ('' if none)
+    function FuncPtrTypeSig(const TypeName: string): string;
+    function FuncPtrTypeDefaults(const TypeName: string): string;   // named funcptr TYPE -> its FPDEFAULTS (534)
+    procedure ProcessPathArg(ArgNode: TASTNode; out Reg: TSSAValue);  // file.bi's path: a String or a ZString Ptr (536)  // named funcptr TYPE -> "FPPARAMS|FPRET", scope-aware ('' if none)
     function PrintKindOfTypeName(const TypeName: string): Integer;  // print form of a type name; a funcptr type is a pointer
     function IndexedFuncPtrSig(BaseNode: TASTNode): string;   // signature of the funcptr at "p[j]" / "a(i)[j]", '' if none
     function MemberAccessLevel(const TypeName, MemberName: string; out Owner: string): string;  // OOP: '', 'PRIVATE', 'PROTECTED'
@@ -2074,6 +2080,10 @@ begin
   FCurrentProcPtrParams := TIndexedStringList.Create;
   FFuncPtrSigs := TIndexedStringList.Create;
   FModuleFuncPtrSigs := TIndexedStringList.Create;
+  FFuncPtrDefs := TIndexedStringList.Create;
+  FModuleFuncPtrDefs := TIndexedStringList.Create;
+  FFuncPtrTypeDefs := TIndexedStringList.Create;
+  FFuncPtrTypeDefs.CaseSensitive := False;
   FFuncPtrTypes := TIndexedStringList.Create;
   FFuncPtrTypes.CaseSensitive := False;
   FModuleRecordVars := TIndexedStringList.Create;
@@ -2285,6 +2295,9 @@ begin
   FCurrentProcPtrParams.Free;
   FFuncPtrSigs.Free;
   FModuleFuncPtrSigs.Free;
+  FFuncPtrDefs.Free;
+  FModuleFuncPtrDefs.Free;
+  FFuncPtrTypeDefs.Free;
   FFuncPtrTypes.Free;
   FModuleRecordVars.Free;
   FModuleCtors.Free;
@@ -9645,8 +9658,7 @@ begin
         if FModernMode and (UpperFast(ArrName) = kFILEEXISTS) and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).ChildCount >= 1) then
         begin
-          ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
-          ArgReg := EnsureStringRegister(ArgValue);
+          ProcessPathArg(Node.GetChild(1).GetChild(0), ArgReg);   // a String or a ZString Ptr (536)
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaFileExists, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           Exit;
@@ -9789,8 +9801,7 @@ begin
         if FModernMode and (UpperFast(ArrName) = kFILELEN) and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).ChildCount >= 1) then
         begin
-          ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
-          ArgReg := EnsureStringRegister(ArgValue);
+          ProcessPathArg(Node.GetChild(1).GetChild(0), ArgReg);   // a String or a ZString Ptr (536)
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaFileLen, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           Exit;
@@ -9800,8 +9811,7 @@ begin
         if FModernMode and (UpperFast(ArrName) = kFILEDATETIME) and (ArrayIndexOf(ArrName) < 0) and
            (Node.GetChild(1).ChildCount >= 1) then
         begin
-          ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
-          ArgReg := EnsureStringRegister(ArgValue);
+          ProcessPathArg(Node.GetChild(1).GetChild(0), ArgReg);   // a String or a ZString Ptr (536)
           Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
           EmitInstruction(ssaFileDateTime, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           Exit;
@@ -13253,8 +13263,10 @@ begin
       DIVERGENZE 25. }
     if (ExprValue.RegType = srtInt) and ZStrCharAddrOf(ExprValue, ZCharAddr, ZCharWide) then
     begin
+      // ...and a WString pointee's text is WIDE, printed as libfb prints one (DIVERGENZE 537, 414): the read was
+      // right, and the item went out as UTF-8 where fbc writes cells.
       EmitInstruction(ssaPrintString, MakeSSAValue(svkNone), EnsureStringRegister(ExprValue),
-                      MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                      MakeSSAValue(svkNone), MakeSSAConstInt(Ord(ZCharWide)));
       Continue;
     end;
 
@@ -14232,6 +14244,10 @@ begin
       begin
         FFuncPtrSigs.Values[UpperFast(ArrName)] := FPSig;
         if not FInProcedure then FModuleFuncPtrSigs.Values[UpperFast(ArrName)] := FPSig;
+        // ...and the DEFAULTS its type declares (534): '' deletes a stale entry of the same name.
+        FFuncPtrDefs.Values[UpperFast(ArrName)] := ArrayDeclNode.Attributes.Values['FPDEFAULTS'];
+        if not FInProcedure then
+          FModuleFuncPtrDefs.Values[UpperFast(ArrName)] := ArrayDeclNode.Attributes.Values['FPDEFAULTS'];
       end;
       // ...and "Dim p As Function(ByRef As B) As T = @fun" tells @fun WHICH overload it wants.
       if ArrayDeclNode.ChildCount >= 3 then
@@ -14246,6 +14262,9 @@ begin
         FuncPtrTypeSig(VarToStr(DimsNode.Value));
       if not FInProcedure then
         FModuleFuncPtrSigs.Values[UpperFast(ArrName)] := FFuncPtrSigs.Values[UpperFast(ArrName)];
+      FFuncPtrDefs.Values[UpperFast(ArrName)] := FuncPtrTypeDefaults(VarToStr(DimsNode.Value));
+      if not FInProcedure then
+        FModuleFuncPtrDefs.Values[UpperFast(ArrName)] := FFuncPtrDefs.Values[UpperFast(ArrName)];
     end;
 
     // (VAR x = expr is rewritten to a typed-scalar DIM by RegisterRecordVars, so it arrives here as an
@@ -26660,13 +26679,19 @@ begin
     raise Exception.Create('COPY requires source and destination parameters');
   end;
 
-  // Process source path
-  ProcessStringExpression(Node.GetChild(0), SrcVal);
-  SrcReg := EnsureStringRegister(SrcVal);
-
-  // Process destination path
-  ProcessStringExpression(Node.GetChild(1), DstVal);
-  DstReg := EnsureStringRegister(DstVal);
+  // Process source and destination paths - FileCopy's are ZString Ptrs in file.bi, so a pointer is read as one (536)
+  if Node.ValueUpper = kFILECOPY then
+  begin
+    ProcessPathArg(Node.GetChild(0), SrcReg);
+    ProcessPathArg(Node.GetChild(1), DstReg);
+  end
+  else
+  begin
+    ProcessStringExpression(Node.GetChild(0), SrcVal);
+    SrcReg := EnsureStringRegister(SrcVal);
+    ProcessStringExpression(Node.GetChild(1), DstVal);
+    DstReg := EnsureStringRegister(DstVal);
+  end;
 
   // Process optional overwrite flag. The default is per-dialect: FreeBASIC's FILECOPY ALWAYS
   // overwrites an existing destination (fbc-verified), while the v7 COPY command defaults to
@@ -29182,8 +29207,13 @@ begin
     raise Exception.CreateFmt('%s() requires an argument', [FuncName]);
 
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  ProcessStringExpression(Node.GetChild(0), V1);
-  R1 := EnsureStringRegister(V1);
+  if FuncName = kFILECOPY then
+    ProcessPathArg(Node.GetChild(0), R1)                 // a ZString Ptr in file.bi (536)
+  else
+  begin
+    ProcessStringExpression(Node.GetChild(0), V1);
+    R1 := EnsureStringRegister(V1);
+  end;
 
   if FuncName = kCHDIR then
     EmitInstruction(ssaChdir, Result, R1, MakeSSAValue(svkNone), MakeSSAValue(svkNone))
@@ -29206,8 +29236,7 @@ begin
   begin
     if (Node.ChildCount < 2) or (Node.GetChild(1) = nil) then
       raise Exception.Create('FILECOPY() requires source and destination');
-    ProcessStringExpression(Node.GetChild(1), V2);
-    R2 := EnsureStringRegister(V2);
+    ProcessPathArg(Node.GetChild(1), R2);               // a ZString Ptr in file.bi (536)
     // No Src3 here: the statement form carries the overwrite flag REGISTER in Immediate, the
     // function form needs Immediate free for the -1 marker. FreeBASIC's FileCopy() always
     // overwrites, so the VM's function-form branch hardcodes it.
@@ -32834,6 +32863,40 @@ begin
   if Idx >= 0 then Result := FFuncPtrTypes.ValueFromIndex[Idx];
 end;
 
+procedure TSSAGenerator.ProcessPathArg(ArgNode: TASTNode; out Reg: TSSAValue);
+// ⭐ DIVERGENZE 536 - the PATH of a routine file.bi declares "ByVal ... As ZString Ptr" (FileLen, FileExists, FileDateTime,
+// FileCopy). fbc passes a String by its address and a ZString Ptr as it is; here they are builtins taking a String, so a
+// pointer arrived as its NUMBER and named no file: "FileLen(zp)" answered 0 where fbc answers the size. A NUMERIC argument
+// is therefore read as the pointer it is - "*zp" - and a string one as before.
+var
+  D: TASTNode;
+  V: TSSAValue;
+begin
+  if (ArgNode <> nil) and (InferExprBank(ArgNode) = srtInt) then
+  begin
+    D := TASTNode.Create(antDeref, ArgNode.Token);
+    try
+      D.AddChild(ArgNode.Clone);
+      ProcessStringExpression(D, V);
+    finally
+      D.Free;
+    end;
+  end
+  else
+    ProcessStringExpression(ArgNode, V);
+  Reg := EnsureStringRegister(V);
+end;
+
+function TSSAGenerator.FuncPtrTypeDefaults(const TypeName: string): string;
+// The DEFAULTS a named function-pointer type declares (DIVERGENZE 534), through the same scoped funnel as its signature.
+var
+  Idx: Integer;
+begin
+  Result := '';
+  Idx := ScopedNameIndex(FFuncPtrTypeDefs, UpperFast(TypeName));
+  if Idx >= 0 then Result := FFuncPtrTypeDefs.ValueFromIndex[Idx];
+end;
+
 function TSSAGenerator.PrintKindOfTypeName(const TypeName: string): Integer;
 // The print form of a declared TYPE NAME, through its typedef - and the one case CanonicalType cannot
 // answer: a PROCEDURE-POINTER type. "Type dtor As Sub(ByVal As Any Ptr)" is aliased to INTEGER so its
@@ -32905,6 +32968,31 @@ begin
       FIdentUses.Delete(V);
       FIdentUses.Add(V, '2');
     end;
+  end;
+  // ⛔ ...AND A NAME IN A PROCEDURE TYPE'S DEFAULT IS A USE (DIVERGENZE 534). That default travels as TEXT on the node
+  // (FPDEFAULTS, "I<name>"), not as a child, so the walk below never meets it: "Const K = 40" read by
+  // "Function(ByVal As Long = K)" alone was counted once, never materialised, and the default answered 0.
+  if Node.Attributes.Values['FPDEFAULTS'] <> '' then
+  begin
+    Cur := Node.Attributes.Values['FPDEFAULTS'] + #31;
+    V := '';
+    for i := 1 to Length(Cur) do
+      if Cur[i] = #31 then
+      begin
+        if (Length(V) > 1) and (V[1] = 'I') then
+        begin
+          V := UpperFast(Copy(V, 2, MaxInt));
+          if FIdentUses.Items[V] = '' then FIdentUses.Add(V, '1')
+          else if FIdentUses.Items[V] = '1' then
+          begin
+            FIdentUses.Delete(V);
+            FIdentUses.Add(V, '2');
+          end;
+        end;
+        V := '';
+      end
+      else
+        V := V + Cur[i];
   end;
   for i := 0 to Node.ChildCount - 1 do
     CountIdentifierUses(Node.GetChild(i));
@@ -33966,8 +34054,11 @@ begin
       // var/param declared "As X" becomes an int-banked function pointer (aliased to INTEGER above) whose
       // "f(args)" lowers to an indirect call. The signature is copied into the per-proc FFuncPtrSigs.
       if Node.Attributes.Values['FUNCPTR'] = '1' then
+      begin
         FFuncPtrTypes.Values[Path + Name] :=
           Node.Attributes.Values['FPPARAMS'] + '|' + Node.Attributes.Values['FPRET'];
+        FFuncPtrTypeDefs.Values[Path + Name] := Node.Attributes.Values['FPDEFAULTS'];   // (534)
+      end;
       // ⛔ ...AND THE REST OF A COMMA LIST STILL HAS TO BE READ. "Type a As Integer, d As UDT" carries
       // its extra aliases as ALIASLIST children, and the loop that descends into them is at the BOTTOM
       // of this branch's sibling - which this Exit never reaches, because the FIRST alias always sets
@@ -51993,6 +52084,7 @@ begin
   end
   else
     PCVal := GetOrAllocateVariable(UpperFast(FPName));
+  FIndirectDefaults := FFuncPtrDefs.Values[UpperFast(FPName)];   // the pointer TYPE's defaults (534)
   Result := EmitIndirectCall(EnsureIntRegister(PCVal), Sig, ArgListNode);
 end;
 
@@ -52071,7 +52163,12 @@ var
   Args2: TASTNode;
   PrevBlock, BF, BB, BD, EndF, EndB: TSSABasicBlock;
   k, NParams, Bar: Integer;
+  Defs: string;
 begin
+  // The pointer TYPE's defaults (534) belong to THIS call: taken now, so that an indirect call inside an argument
+  // cannot consume them, and handed back to the BASIC half below.
+  Defs := FIndirectDefaults;
+  FIndirectDefaults := '';
   DynName := '';
   if (FProgram.ForeignDeclCount > 0) and (not FInDispatcher) and Assigned(ArgListNode) and
      (ArgListNode.NodeType in [antArgumentList, antExpressionList]) then
@@ -52085,7 +52182,11 @@ begin
     if Trim(Copy(Sig, 1, Bar - 1)) <> '' then Inc(NParams);
     if ArgListNode.ChildCount <> NParams then DynName := '';
   end;
-  if DynName = '' then Exit(EmitIndirectCallVM(PCValIn, Sig, ArgListNode));
+  if DynName = '' then
+  begin
+    FIndirectDefaults := Defs;
+    Exit(EmitIndirectCallVM(PCValIn, Sig, ArgListNode));
+  end;
 
   RetPart := UpperFast(Trim(Copy(Sig, Pos('|', Sig) + 1, MaxInt)));
   RetRT := srtInt;
@@ -52140,6 +52241,7 @@ begin
   BB := FProgram.CreateBlock(LB);
   PrevBlock.AddSuccessor(BB); BB.AddPredecessor(PrevBlock);
   FCurrentBlock := BB;
+  FIndirectDefaults := Defs;
   V := EmitIndirectCallVM(GetOrAllocateVariable(PCName), Sig, ArgListNode);
   RVar := GetOrAllocateVariable(RVName);
   if RetPart <> '' then
@@ -52177,12 +52279,26 @@ var
   RetPart: string;
   RetIsByref: Boolean;
   RT, RetRT: TSSARegisterType;
-  ArgVal, PCVal, AddrVal: TSSAValue;
+  ArgVal, PCVal, AddrVal, SAddr: TSSAValue;
   WantAddr: Boolean;
+  Defs, D, PT: string;
+  DefList: TStringList;
+  DefNode, PNode: TASTNode;
+
+  // A parameter node shaped as a declaration's ("As <type>"), for the conversions that ask one (535).
+  function ParamOfType(const TypeName: string): TASTNode;
+  begin
+    Result := TASTNode.Create(antIdentifier, nil);
+    Result.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeName, nil));
+  end;
+
 begin
   // Taken and CLEARED at once: an argument may itself be an indirect ByRef call, whose VALUE is wanted.
   WantAddr := FWantByrefRetAddr;
   FWantByrefRetAddr := False;
+  // ...and the pointer TYPE's defaults (534), for the same reason.
+  Defs := FIndirectDefaults;
+  FIndirectDefaults := '';
   PCVal := PCValIn;
   Bar := Pos('|', Sig);
   RetPart := Copy(Sig, Bar + 1, MaxInt);
@@ -52213,8 +52329,85 @@ begin
         else
           begin Slot := cInt; Inc(cInt); end;
         end;
-        ProcessExpression(ArgListNode.GetChild(i), ArgVal);
+        // ⭐ DIVERGENZE 535 - a STRING given to a "ZString Ptr" (or byte / Any pointer) parameter is passed as its
+        // ADDRESS, and a "WString * n" to a "WString Ptr" as its buffer's: the conversions a DIRECT call makes
+        // (StageCallArgs). Staged by bank alone, the string register's index arrived as the pointer - NULL, or a
+        // small number - and "f(""Abc"")" answered as for no string at all.
+        PT := '';
+        if i < ParamList.Count then PT := UpperFast(Trim(ParamList[i]));
+        SAddr := MakeSSAValue(svkNone);
+        if (RT = srtInt) and ((PT = 'ZSTRING PTR') or (PT = 'BYTE PTR') or (PT = 'UBYTE PTR') or
+                              (PT = 'ANY PTR') or (PT = 'WSTRING PTR')) then
+        begin
+          PNode := ParamOfType(PT);
+          try
+            if TryEmitWStringPtrArg(PNode, ArgListNode.GetChild(i), ArgVal) then
+              SAddr := ArgVal
+            else if IsStringArgForBytePtrParam(PNode, ArgListNode.GetChild(i)) then
+            begin
+              ProcessStringExpression(ArgListNode.GetChild(i), ArgVal);
+              SAddr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+              EmitInstruction(ssaStrSAdd, SAddr, EnsureStringRegister(ArgVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            end;
+          finally
+            PNode.Free;
+          end;
+        end;
+        if SAddr.Kind <> svkNone then ArgVal := SAddr
+        else ProcessExpression(ArgListNode.GetChild(i), ArgVal);
         EmitXferStore(RT, Slot, ArgVal);
+      end;
+      // ⭐ DIVERGENZE 534 - an argument the call LEAVES OUT takes the default the pointer's TYPE declares, as in fbc
+      // ("Dim f As Function(ByVal As Long = 0) ..."): the parser carries it as text (N<number>, S<string>, I<name>).
+      // Without it the callee read whatever the last call had left in that transfer slot.
+      if (Defs <> '') and (NArgs < ParamList.Count) then
+      begin
+        DefList := TStringList.Create;
+        try
+          DefList.StrictDelimiter := True;
+          DefList.Delimiter := #31;
+          DefList.DelimitedText := Defs;
+          for i := NArgs to ParamList.Count - 1 do
+          begin
+            RT := TypeNameToBank(Trim(ParamList[i]), '');
+            case RT of
+              srtFloat:  begin Slot := cFloat; Inc(cFloat); end;
+              srtString: begin Slot := cStr;   Inc(cStr);   end;
+            else
+              begin Slot := cInt; Inc(cInt); end;
+            end;
+            D := '';
+            if i < DefList.Count then D := DefList[i];
+            if D = '' then Continue;                      // no default: an argument fbc would have demanded
+            case D[1] of
+              'N':
+                if RT = srtFloat then ArgVal := EnsureFloatRegister(MakeSSAConstFloat(StrToFloat(Copy(D, 2, MaxInt))))
+                else if (Pos('.', D) > 0) or (Pos('E', UpperFast(D)) > 0) then
+                  ArgVal := EnsureIntRegister(MakeSSAConstInt(Round(StrToFloat(Copy(D, 2, MaxInt)))))
+                else ArgVal := EnsureIntRegister(MakeSSAConstInt(StrToInt64(Copy(D, 2, MaxInt))));
+              'S': ArgVal := EnsureStringRegister(MakeSSAConstString(Copy(D, 2, MaxInt)));
+              'I':
+                begin
+                  DefNode := TASTNode.CreateWithValue(antIdentifier, Copy(D, 2, MaxInt), nil);
+                  try
+                    case RT of
+                      srtString: begin ProcessStringExpression(DefNode, ArgVal); ArgVal := EnsureStringRegister(ArgVal); end;
+                      srtFloat:  begin ProcessExpression(DefNode, ArgVal); ArgVal := EnsureFloatRegister(ArgVal); end;
+                    else         begin ProcessExpression(DefNode, ArgVal); ArgVal := EnsureIntRegister(ArgVal); end;
+                    end;
+                  finally
+                    DefNode.Free;
+                  end;
+                end;
+            else
+              raise Exception.CreateFmt('The default of parameter %d of this procedure pointer is not supported ' +
+                                        'yet (only a literal or a name); pass the argument explicitly', [i + 1]);
+            end;
+            EmitXferStore(RT, Slot, ArgVal);
+          end;
+        finally
+          DefList.Free;
+        end;
       end;
     end;
   finally
@@ -58170,6 +58363,7 @@ begin
     // silence. Re-seeded rather than cleared; a local or parameter of the same name overwrites its
     // entry, so it still shadows the module one exactly as before.
     FFuncPtrSigs.Assign(FModuleFuncPtrSigs);              // function-pointer params/locals of THIS proc, over the module's
+    FFuncPtrDefs.Assign(FModuleFuncPtrDefs);              // ...and their types' defaults (534)
     FAddrLocalVars.Clear;                                 // @-taken locals of THIS proc (filled by ProcessDim)
     CollectTopLevelLabels(Proc, 2);                       // GOTO-unwind: this proc's block-depth-0 labels (body starts at child 2)
     CollectLocalRecordVars(Proc);
@@ -58262,14 +58456,20 @@ begin
         // FreeBASIC function-pointer parameter: record its signature so "name(args)" in the body is
         // lowered as an indirect call through the parameter's entry-PC value (int).
         if ParamNodeJ.Attributes.Values['FUNCPTR'] = '1' then
+        begin
           FFuncPtrSigs.Values[ParamNodeJ.ValueUpper] :=
-            ParamNodeJ.Attributes.Values['FPPARAMS'] + '|' + ParamNodeJ.Attributes.Values['FPRET']
+            ParamNodeJ.Attributes.Values['FPPARAMS'] + '|' + ParamNodeJ.Attributes.Values['FPRET'];
+          FFuncPtrDefs.Values[ParamNodeJ.ValueUpper] := ParamNodeJ.Attributes.Values['FPDEFAULTS'];   // (534)
+        end
         // "param AS X" where X is a named function-pointer type ("Type X As Function(...)"): the param is
         // a funcptr with X's signature (X aliases to INTEGER, so ParamBankAndSlot already gave it int).
         else if (ParamNodeJ.ChildCount >= 1) and (ParamNodeJ.GetChild(0).NodeType = antIdentifier) and
                 (FuncPtrTypeSig(VarToStr(ParamNodeJ.GetChild(0).Value)) <> '') then
+        begin
           FFuncPtrSigs.Values[ParamNodeJ.ValueUpper] :=
             FuncPtrTypeSig(VarToStr(ParamNodeJ.GetChild(0).Value));
+          FFuncPtrDefs.Values[ParamNodeJ.ValueUpper] := FuncPtrTypeDefaults(VarToStr(ParamNodeJ.GetChild(0).Value));
+        end;
         // FreeBASIC pointer parameter ("param AS T PTR"): record its pointee type PER-PROC, so "p[i]"/"*p"
         // in the body index/dereference through the parameter's address value (like a DIM'd pointer). The
         // param register holds the caller's address; without this, "buf[i]" fell through to the array

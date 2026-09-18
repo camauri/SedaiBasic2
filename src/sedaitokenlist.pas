@@ -579,8 +579,9 @@ begin
   if (Index >= 0) and (Index < Count) then
   begin
     Result := GetTokenByIndex(Index);
-    Items[Index] := nil; // Don't free
-    Delete(Index);
+    // ⛔ NOT "Items[Index] := nil": on a list that owns its objects that assignment FREES the old one - an
+    // "extract" that handed back a freed token (found by SynthesizeHeaderThunks, the first caller, 18 Sep 2026).
+    inherited Extract(Result);   // removes without freeing
     DoTokenRemoved(Result, Index);
     IncModificationCount;
   end

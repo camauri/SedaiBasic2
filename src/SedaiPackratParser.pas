@@ -280,6 +280,7 @@ type
     procedure RejectReservedDeclNames(Node: TASTNode);   // MODERN: fbc's reserved words, per context (264)
     procedure RejectNonConstSharedRef(Root: TASTNode);   // MODERN: a Shared/Static reference on a constant address (260)
     procedure ShadowDeclaredBuiltins;                    // MODERN: a declared name wins over a builtin (267)
+    procedure SynthesizeHeaderThunks;                    // MODERN: "@Year" of a header routine gets a procedure (508)
     procedure RejectUndeclaredHeaderRoutines(Root: TASTNode);  // MODERN: file.bi & co. routines need their header (504)
     function MakeStaticRefDef(const DottedName, TypeName: string; InitExpr: TASTNode;
       Tok: TLexerToken): TASTNode;                       // "Static ByRef" member definition as a Shared reference (269)
@@ -582,6 +583,7 @@ implementation
 
 uses
   Math, StrUtils, TypInfo,
+  SedaiLexerFSM,       // SynthesizeHeaderThunks lexes the thunks it appends (508)
   SedaiPreprocessor;   // SourceDeclaresNonFbDialect: which -lang the source asked for
 
 // ⛔ A "#" that is a FILE-HANDLE PREFIX, never a STRING LITERAL whose text is "#": the tests below used to compare
@@ -1728,6 +1730,8 @@ begin
  // ⭐ A name the program declares wins over a builtin FreeBASIC lets it shadow (DIVERGENZE 267). Done
  // on the TOKENS, before any statement is parsed, because the builtins are dispatched by token type.
  if FModernMode then ShadowDeclaredBuiltins;
+ // ...and the ADDRESS of a routine fbc's own headers declare gets a real procedure to point at (DIVERGENZE 508).
+ if FModernMode then SynthesizeHeaderThunks;
 
  while not Context.IsAtEnd do
  begin
@@ -4962,6 +4966,7 @@ begin
         NameNode.Attributes.Values['FPPARAMS']    := ProcPtrRet.Attributes.Values['FPPARAMS'];
         NameNode.Attributes.Values['FPRET']       := ProcPtrRet.Attributes.Values['FPRET'];
         NameNode.Attributes.Values['FPRETBYREF']  := ProcPtrRet.Attributes.Values['FPRETBYREF'];
+        NameNode.Attributes.Values['FPDEFAULTS'] := ProcPtrRet.Attributes.Values['FPDEFAULTS'];   // (534)
       finally
         ProcPtrRet.Free;
       end;
@@ -5688,12 +5693,35 @@ function TPackratParser.TryParseProcPtrType(Node: TASTNode): Boolean;
 // holds a procedure entry PC), so no type child is attached. Returns False (consuming nothing) if the
 // current token is not FUNCTION/SUB.
 var
-  IsFunc: Boolean;
-  KindU, PT, ParamTypes: string;
+  IsFunc, AnyDefault: Boolean;
+  KindU, PT, ParamTypes, Defaults, Def: string;
   LoopMark, TypeOfMark: Integer;
-  NestedFp: TASTNode;
+  NestedFp, DefExpr: TASTNode;
+
+  // ⭐ DIVERGENZE 534 - a DEFAULT of the procedure TYPE ("Function(ByVal As Long = 0)") fills an argument a call through
+  // the pointer leaves out, as fbc does. The SSA never sees this type's parameter nodes, so the default travels as TEXT
+  // it can rebuild: N<number>, S<string>, I<name>. Anything else is X, and a call that omits it is refused by name.
+  function EncodeDefault(E: TASTNode): string;
+  begin
+    Result := 'X';
+    if E = nil then Exit;
+    if (E.NodeType = antLiteral) and Assigned(E.Token) then
+    begin
+      if E.Token.TokenType = ttStringLiteral then Result := 'S' + VarToStr(E.Value)
+      else if E.Token.TokenType in [ttNumber, ttInteger, ttFloat] then Result := 'N' + VarToStr(E.Value);
+    end
+    else if (E.NodeType = antUnaryOp) and Assigned(E.Token) and (VarToStr(E.Token.Value) = '-') and (E.ChildCount = 1) and
+            (E.GetChild(0).NodeType = antLiteral) and Assigned(E.GetChild(0).Token) and
+            (E.GetChild(0).Token.TokenType in [ttNumber, ttInteger, ttFloat]) then
+      Result := 'N-' + VarToStr(E.GetChild(0).Value)
+    else if E.NodeType = antIdentifier then
+      Result := 'I' + VarToStr(E.Value);
+  end;
+
 begin
   Result := False;
+  Defaults := '';
+  AnyDefault := False;
   // ⭐ "As TypeOf( Sub( ) ) Ptr": TypeOf of a PROCEDURE TYPE *is* that procedure type. Its operand is a
   // TYPE, not an expression, so the TypeOf readers elsewhere - which all parse an expression inside the
   // parentheses - cannot answer here; the parser stopped on the ')' of "Sub( )". The rule belongs in
@@ -5784,10 +5812,24 @@ begin
         while AtPointerSuffix do
         begin PT := PT + ' PTR'; Context.Advance; end;
       end;
+      Def := '';
+      if Context.Check(ttOpEq) then
+      begin
+        Context.Advance;                             // =
+        DefExpr := FExpressionParser.ParseExpression;
+        Def := EncodeDefault(DefExpr);
+        DefExpr.Free;
+        AnyDefault := True;
+      end;
       if PT <> '' then
       begin
-        if ParamTypes <> '' then ParamTypes := ParamTypes + ',';
+        if ParamTypes <> '' then
+        begin
+          ParamTypes := ParamTypes + ',';
+          Defaults := Defaults + #31;
+        end;
         ParamTypes := ParamTypes + PT;
+        Defaults := Defaults + Def;
       end;
       if Context.Check(ttSeparParam) then Context.Advance;   // ,
       // ...and the guarantee itself: nothing recognised this token, so step over it rather than spin.
@@ -5797,6 +5839,7 @@ begin
   end;
   Node.Attributes.Values['FUNCPTR'] := '1';
   Node.Attributes.Values['FPPARAMS'] := ParamTypes;
+  if AnyDefault then Node.Attributes.Values['FPDEFAULTS'] := Defaults;
   Node.Attributes.Values['FPRET'] := '';
   // "Function(...) ByRef As R": the RETURN may be a reference, and the word stands between the parameter
   // list and AS. Unread, the '(' of the signature was parsed and then BYREF met where a variable name was
@@ -13032,14 +13075,18 @@ procedure TPackratParser.RejectUndeclaredHeaderRoutines(Root: TASTNode);
           if (W = '') and (N.Token <> nil) then W := UpperFast(VarToStr(N.Token.Value));
         end;
     end;
-    // ⛔ ...and the ADDRESS of one of them is refused by name even with its header (DIVERGENZE 508): here they are
-    // built-ins, not procedures, and "@Year" resolved to 0 - a call through it ran the program again from its
-    // first line.
+    // ⭐ ...and their ADDRESS (DIVERGENZE 508): with the header, SynthesizeHeaderThunks has already renamed "@Year" to its
+    // thunk, so a name that is still here is either one the program did not include - refused below as fbc refuses it,
+    // "Variable not declared" - or a Declare whose parameters the thunk could not restate, refused by name.
     if (N.NodeType = antProcAddress) and (Pos(' ' + N.ValueUpper + ' ', HEADER_ROUTINES) > 0) and
        (FGatedDeclared.IndexOf(N.ValueUpper) < 0) then
     begin
-      HandleError(Format('The address of %s is not supported yet: it is a built-in routine here, not a procedure',
-                         [N.ValueUpper]), N.Token);
+      if FHeaderRoutines.IndexOf(N.ValueUpper) < 0 then
+        HandleError(Format('Variable not declared: %s (it is declared by "%s", which the program does not include)',
+                           [N.ValueUpper, HeaderOfRoutine(N.ValueUpper)]), N.Token)
+      else
+        HandleError(Format('The address of %s is not supported: its declaration has a parameter this compiler ' +
+                           'cannot restate as a procedure', [N.ValueUpper]), N.Token);
       Exit;
     end;
     if (W <> '') and (Pos(' ' + W + ' ', HEADER_ROUTINES) > 0) and
@@ -13508,6 +13555,238 @@ begin
     Bases.Free;
     for i := 0 to High(Bodies) do Bodies[i].Free;
     for i := 0 to High(BodyFields) do BodyFields[i].Free;
+  end;
+end;
+
+procedure TPackratParser.SynthesizeHeaderThunks;
+// ⭐ THE ADDRESS OF A ROUTINE fbc's OWN HEADERS DECLARE (DIVERGENZE 508). "Dim pf As Function(ByVal As Double) As
+// Long = @Year" is valid FreeBASIC once datetime.bi is included: there Year is a procedure of libfb, with an address.
+// Here the 33 routines of HEADER_ROUTINES are BUILTINS, so "@Year" had nothing to point at (it resolved to 0, and a
+// call through it ran the program again from its first line; since 17 Sep it was refused by name).
+// ⇒ For each routine whose address the program takes, a THUNK is appended to the program - a procedure of its own
+// with the signature of the Declare THE PROGRAM INCLUDED, whose body calls the builtin:
+//     Function __FBHDR_YEAR(ByVal __A1 As Double) As Long
+//     Return YEAR(__A1)
+//     End Function
+// and "@Year" / "ProcPtr(Year)" are retyped to name it.
+// ⛔ The signature is read from the Declare, never from a table written here: file.bi and datetime.bi declare
+// FileAttr, FileCopy, FileLen and DateDiff differently per platform and per -lang, and the preprocessor has already
+// kept the branch fbc would keep. That Declare is the same source fbc takes the procedure type from.
+// ⚠️ The thunk has a name of its OWN, so the call inside its body still resolves to the builtin and not to itself;
+// its parameters are renamed (__A1..) so that a header parameter called like a builtin ("year" in DateSerial)
+// cannot capture a word of the body.
+var
+  TL, SL: TTokenList;
+  N, s, e, k, i, j, q, Depth, EofIdx, Open_, Close_, NParam: Integer;
+  Decls, Used: TStringList;
+  Nm, H, Text, Params, Args, RetPart, Part: string;
+  T, DeclTok: TLexerToken;
+  Lx: TLexerFSM;
+  NewToks: array of TLexerToken;
+
+  function Up(Idx: Integer): string;
+  var
+    Tk: TLexerToken;
+  begin
+    Result := '';
+    if (Idx < 0) or (Idx >= N) then Exit;
+    Tk := TL.GetTokenDirect(Idx);
+    if (Tk <> nil) and (Tk.TokenType <> ttStringLiteral) then Result := UpperFast(VarToStr(Tk.Value));
+  end;
+
+  function StmtEnd(From: Integer): Integer;
+  var
+    Tk: TLexerToken;
+  begin
+    Result := From;
+    while Result < N do
+    begin
+      Tk := TL.GetTokenDirect(Result);
+      if (Tk = nil) or (Tk.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]) then Exit;
+      Inc(Result);
+    end;
+  end;
+
+  function TokText(Idx: Integer): string;
+  var
+    Tk: TLexerToken;
+  begin
+    Tk := TL.GetTokenDirect(Idx);
+    if Tk.TokenType = ttStringLiteral then
+      Result := '"' + StringReplace(VarToStr(Tk.Value), '"', '""', [rfReplaceAll]) + '"'
+    else
+      Result := VarToStr(Tk.Value);
+  end;
+
+  // One parameter of the Declare, tokens [A, B): "[ByVal|ByRef] [name] As <type> [= <default>]" with the name
+  // replaced by __A<n>.
+  function ParamText(A, B, NIdx: Integer): string;
+  var
+    p, r, AsAt: Integer;
+    Mods: string;
+  begin
+    Result := '';
+    Mods := '';
+    p := A;
+    while (p < B) and ((Up(p) = 'BYVAL') or (Up(p) = 'BYREF')) do
+    begin
+      Mods := Mods + TokText(p) + ' ';
+      Inc(p);
+    end;
+    AsAt := -1;
+    for r := p to B - 1 do
+      if Up(r) = 'AS' then begin AsAt := r; Break; end;
+    if AsAt < 0 then Exit('');                            // not a shape these headers use
+    Result := Mods + '__A' + IntToStr(NIdx);
+    for r := AsAt to B - 1 do Result := Result + ' ' + TokText(r);
+  end;
+
+begin
+  TL := Context.TokenList;
+  if (TL = nil) or (FGatedDeclared = nil) then Exit;
+  N := TL.Count;
+  Decls := TStringList.Create;
+  Used := TStringList.Create;
+  try
+    // ---- 1. The header routines the program's includes DECLARE, and the addresses it takes of them. ----
+    s := 0;
+    while s < N do
+    begin
+      e := StmtEnd(s);
+      H := Up(s);
+      if H = 'DECLARE' then
+      begin
+        k := s + 1;
+        while (k < e) and ((Up(k) = 'PRIVATE') or (Up(k) = 'PUBLIC') or (Up(k) = 'STATIC')) do Inc(k);
+        Nm := Up(k + 1);
+        if ((Up(k) = 'FUNCTION') or (Up(k) = 'SUB')) and (Nm <> '') and
+           (Pos(' ' + Nm + ' ', HEADER_ROUTINES) > 0) and (FGatedDeclared.IndexOf(Nm) < 0) and
+           (Decls.IndexOfName(Nm) < 0) then
+          for j := k + 2 to e - 1 do
+            if (TL.GetTokenDirect(j).TokenType = ttStringLiteral) and
+               SameText(Copy(VarToStr(TL.GetTokenDirect(j).Value), 1, 3), 'fb_') then
+            begin
+              Decls.Add(Nm + '=' + IntToStr(k) + ',' + IntToStr(e));
+              Break;
+            end;
+      end
+      else if Decls.Count > 0 then
+        for i := s to e - 1 do
+        begin
+          Nm := '';
+          q := -1;
+          if (Up(i) = '@') and (Up(i + 2) <> '(') then q := i + 1
+          else if (Up(i) = 'PROCPTR') and (Up(i + 1) = '(') then q := i + 2;
+          if q >= 0 then Nm := Up(q);
+          if (Nm = '') or (Decls.IndexOfName(Nm) < 0) then Continue;
+          T := TL.GetTokenDirect(q);
+          T.TokenType := ttIdentifier;
+          T.Value := '__FBHDR_' + Nm;
+          if Used.IndexOf(Nm) < 0 then Used.Add(Nm);
+        end;
+      s := e + 1;
+    end;
+    if Used.Count = 0 then Exit;
+
+    // ---- 2. One thunk per routine used, from its Declare's own tokens. ----
+    Text := '';
+    for i := 0 to Used.Count - 1 do
+    begin
+      Nm := Used[i];
+      Part := Decls.Values[Nm];
+      k := StrToInt(Copy(Part, 1, Pos(',', Part) - 1));
+      e := StrToInt(Copy(Part, Pos(',', Part) + 1, MaxInt));
+      Open_ := -1;
+      for j := k + 2 to e - 1 do
+        if Up(j) = '(' then begin Open_ := j; Break; end;
+      Params := '';
+      Args := '';
+      NParam := 0;
+      Close_ := k + 2;
+      if Open_ >= 0 then
+      begin
+        Depth := 0;
+        q := Open_ + 1;
+        j := Open_ + 1;
+        Close_ := e;
+        while j < e do
+        begin
+          H := Up(j);
+          if (H = '(') or (H = '[') then Inc(Depth)
+          else if ((H = ')') or (H = ']')) and (Depth > 0) then Dec(Depth)
+          else if (Depth = 0) and ((H = ',') or (H = ')')) then
+          begin
+            if j > q then
+            begin
+              Inc(NParam);
+              Part := ParamText(q, j, NParam);
+              if Part = '' then begin Params := #0; Break; end;
+              if Params <> '' then begin Params := Params + ', '; Args := Args + ', '; end;
+              Params := Params + Part;
+              Args := Args + '__A' + IntToStr(NParam);
+            end;
+            q := j + 1;
+            if H = ')' then begin Close_ := j; Break; end;
+          end;
+          Inc(j);
+        end;
+      end;
+      if Params = #0 then Continue;                       // a parameter shape the thunk cannot restate
+      RetPart := '';
+      for j := Close_ + 1 to e - 1 do RetPart := RetPart + ' ' + TokText(j);
+      if Up(k) = 'FUNCTION' then
+        Text := Text + LineEnding + 'Function __FBHDR_' + Nm + '(' + Params + ')' + RetPart + LineEnding +
+                'Return ' + Nm + '(' + Args + ')' + LineEnding + 'End Function' + LineEnding
+      else
+        Text := Text + LineEnding + 'Sub __FBHDR_' + Nm + '(' + Params + ')' + LineEnding +
+                Nm + '(' + Args + ')' + LineEnding + 'End Sub' + LineEnding;
+    end;
+    if Text = '' then Exit;
+    if GetEnvironmentVariable('THUNK_DIAG') = '1' then WriteLn(StdErr, '[THUNK]', Text);
+
+    // ---- 3. Lexed as the program was, and appended before its end. ----
+    EofIdx := -1;
+    for j := 0 to N - 1 do
+      if (TL.GetTokenDirect(j) <> nil) and (TL.GetTokenDirect(j).TokenType = ttEndOfFile) then
+      begin
+        EofIdx := j;
+        Break;
+      end;
+    if EofIdx < 0 then Exit;
+    DeclTok := TL.GetTokenDirect(StrToInt(Copy(Decls.Values[Used[0]], 1, Pos(',', Decls.Values[Used[0]]) - 1)));
+    Lx := TLexerFSM.Create;
+    try
+      Lx.SetHasLineNumbers(False);
+      Lx.SetRequireSpacesBetweenTokens(True);
+      Lx.SetCaseSensitive(False);
+      Lx.Source := Text;
+      SL := Lx.ScanAllTokensFast;
+      SetLength(NewToks, 0);
+      for j := 0 to SL.Count - 1 do
+      begin
+        T := SL.GetTokenDirect(j);
+        if (T = nil) or (T.TokenType = ttEndOfFile) then Break;
+        SetLength(NewToks, Length(NewToks) + 1);
+        NewToks[High(NewToks)] := T;
+      end;
+      // The tokens change hands: their text is read NOW (it is extracted lazily from this lexer's buffer), and
+      // nothing is left that points into the lexer freed below.
+      for j := 0 to High(NewToks) do
+      begin
+        T := NewToks[j];
+        T.Value := T.Value;
+        T.KeywordInfo := nil;
+        T.Line := DeclTok.Line;
+        T.SourceFile := DeclTok.SourceFile;
+        SL.ExtractToken(T);
+        TL.InsertToken(EofIdx + j, T);
+      end;
+    finally
+      Lx.Free;
+    end;
+  finally
+    Decls.Free;
+    Used.Free;
   end;
 end;
 
@@ -15237,6 +15516,7 @@ begin
         ArrayDecl.Attributes.Values['FPPARAMS'] := SharedFpNode.Attributes.Values['FPPARAMS'];
         ArrayDecl.Attributes.Values['FPRET'] := SharedFpNode.Attributes.Values['FPRET'];
         ArrayDecl.Attributes.Values['FPRETBYREF'] := SharedFpNode.Attributes.Values['FPRETBYREF'];
+        ArrayDecl.Attributes.Values['FPDEFAULTS'] := SharedFpNode.Attributes.Values['FPDEFAULTS'];   // (534)
       end;
       if IsShared then ArrayDecl.Attributes.Values['SHARED'] := '1';
       Result.AddChild(ArrayDecl);
@@ -15649,6 +15929,7 @@ begin
         // ...and WHETHER that return is a reference. Carried beside FPRET at BOTH copy sites, or
         // the trailing spelling honoured "ByRef As R" and the leading-AS one handed back the address.
         ArrayDecl.Attributes.Values['FPRETBYREF'] := FuncPtrSigNode.Attributes.Values['FPRETBYREF'];
+        ArrayDecl.Attributes.Values['FPDEFAULTS'] := FuncPtrSigNode.Attributes.Values['FPDEFAULTS'];   // (534)
         FuncPtrSigNode.Free; FuncPtrSigNode := nil;
       end
       else if LeadingAS and Assigned(SharedFpNode) then
@@ -15659,6 +15940,7 @@ begin
         // ...and WHETHER that return is a reference. Carried beside FPRET at BOTH copy sites, or
         // the trailing spelling honoured "ByRef As R" and the leading-AS one handed back the address.
         ArrayDecl.Attributes.Values['FPRETBYREF'] := SharedFpNode.Attributes.Values['FPRETBYREF'];
+        ArrayDecl.Attributes.Values['FPDEFAULTS'] := SharedFpNode.Attributes.Values['FPDEFAULTS'];   // (534)
       end;
       // FreeBASIC reference variable: "DIM BYREF r AS T = target". Require "= target" and store @target
       // as child[2] (an antProcAddress), so the SSA backs the target's stable address and binds r to it;
@@ -16179,6 +16461,7 @@ begin
         DeclNode.Attributes.Values['FPPARAMS'] := StaticFpNode.Attributes.Values['FPPARAMS'];
         DeclNode.Attributes.Values['FPRET'] := StaticFpNode.Attributes.Values['FPRET'];
         DeclNode.Attributes.Values['FPRETBYREF'] := StaticFpNode.Attributes.Values['FPRETBYREF'];
+        DeclNode.Attributes.Values['FPDEFAULTS'] := StaticFpNode.Attributes.Values['FPDEFAULTS'];   // (534)
       end;
       DoNodeCreated(DeclNode);
       Result.AddChild(DeclNode);
@@ -16310,6 +16593,7 @@ begin
       DeclNode.Attributes.Values['FPPARAMS'] := StaticFpNode.Attributes.Values['FPPARAMS'];
       DeclNode.Attributes.Values['FPRET'] := StaticFpNode.Attributes.Values['FPRET'];
       DeclNode.Attributes.Values['FPRETBYREF'] := StaticFpNode.Attributes.Values['FPRETBYREF'];
+      DeclNode.Attributes.Values['FPDEFAULTS'] := StaticFpNode.Attributes.Values['FPDEFAULTS'];   // (534)
       FreeAndNil(StaticFpNode);
     end;
     DoNodeCreated(DeclNode);
