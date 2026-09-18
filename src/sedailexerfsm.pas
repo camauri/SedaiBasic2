@@ -2012,12 +2012,25 @@ begin
 end;
 
 function TLexerFSM.HandleSpecialKeywords(Token: TLexerToken): TLexerToken;
+var
+  P: Integer;
 begin
   Result := Token;
 
   // Handle comment keywords that change state
   if Assigned(Token.KeywordInfo) and Token.KeywordInfo.IsCommentKeyword then
   begin
+    // ⭐ ...but NOT after a member access (DIVERGENZE 544): "it.rem" and "p->rem" name a FIELD, and every iterator of
+    // the xcb headers has one ("as long rem"). Read as REM, the rest of the line became a comment - "Print it.rem;
+    // it.index" ended at the dot. fbc takes the word after "." or "->" as a member name whatever it is.
+    P := FTokenStart - 1;
+    while (P >= 1) and (FSource[P] in [' ', #9]) do Dec(P);
+    if (P >= 1) and ((FSource[P] = '.') or ((FSource[P] = '>') and (P >= 2) and (FSource[P - 1] = '-'))) then
+    begin
+      Token.TokenType := ttIdentifier;
+      Token.KeywordInfo := nil;
+      Exit;
+    end;
     FCurrentState := lsInLineComment;
     FInComment := True;
     {$IFDEF DEBUG}
