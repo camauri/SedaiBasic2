@@ -2551,6 +2551,12 @@ begin
   // that .bas, and are not a figure to compare against today).
   if GetEnvironmentVariable('STRDEADSRC') <> '1' then Exit;
 
+  // ⛔ LA FALCATA E' DI UN BANCO SOLO (18 set 2026). Il censimento e' una matrice piatta
+  // (registro x VERSIONE), e la versione piu' alta va cercata NEL BANCO CHE SI INDICIZZA: presa su
+  // tutti i banchi, la versione massima di un banco gonfia la matrice dell'altro per niente.
+  // 📊 Misurato su functions/paraminit: qui la massima era **458** e quella del banco stringa **21**,
+  // cioe' una matrice 21 volte piu' grande del necessario - 376 MB allocati e subito resi, il salto di
+  // picco che HEAP_DIAG attribuiva alla passata DOPO.
   MaxVer := 0;
   for b := 0 to Blocks.Count - 1 do
   begin
@@ -2558,12 +2564,13 @@ begin
     for i := 0 to Blk.Instructions.Count - 1 do
     begin
       Ins := TSSAInstruction(Blk.Instructions[i]);
-      if (Ins.Dest.Kind = svkRegister) and (Ins.Dest.Version > MaxVer) then MaxVer := Ins.Dest.Version;
-      if (Ins.Src1.Kind = svkRegister) and (Ins.Src1.Version > MaxVer) then MaxVer := Ins.Src1.Version;
-      if (Ins.Src2.Kind = svkRegister) and (Ins.Src2.Version > MaxVer) then MaxVer := Ins.Src2.Version;
-      if (Ins.Src3.Kind = svkRegister) and (Ins.Src3.Version > MaxVer) then MaxVer := Ins.Src3.Version;
+      if (Ins.Dest.Kind = svkRegister) and (Ins.Dest.RegType = srtString) and (Ins.Dest.Version > MaxVer) then MaxVer := Ins.Dest.Version;
+      if (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtString) and (Ins.Src1.Version > MaxVer) then MaxVer := Ins.Src1.Version;
+      if (Ins.Src2.Kind = svkRegister) and (Ins.Src2.RegType = srtString) and (Ins.Src2.Version > MaxVer) then MaxVer := Ins.Src2.Version;
+      if (Ins.Src3.Kind = svkRegister) and (Ins.Src3.RegType = srtString) and (Ins.Src3.Version > MaxVer) then MaxVer := Ins.Src3.Version;
       for k := 0 to High(Ins.PhiSources) do
-        if (Ins.PhiSources[k].Value.Kind = svkRegister) and (Ins.PhiSources[k].Value.Version > MaxVer) then
+        if (Ins.PhiSources[k].Value.Kind = svkRegister) and (Ins.PhiSources[k].Value.RegType = srtString) and
+           (Ins.PhiSources[k].Value.Version > MaxVer) then
           MaxVer := Ins.PhiSources[k].Value.Version;
     end;
   end;
@@ -2674,15 +2681,16 @@ var
   Prod, Cons, Mid: TSSAInstruction;
   DefCount, UseCount: array of Integer;
   IntDefs: array of Integer;      // (int reg, version) -> count of definitions
-  IntConst: array of Int64;       // ...and the value, when that single definition is LoadConstInt
-  MaxVer, VStride: Integer;
+  IntIsOne: array of Boolean;     // ...and whether that single definition is `LoadConstInt 1` (a BIT, see below)
+  MaxVerStr, VStrideStr: Integer;   // ⛔ una falcata PER BANCO: vedi la nota al calcolo, sotto
+  MaxVerInt, VStrideInt: Integer;
   ForceFuse: string;              // STRCHARFUSE: '1' forces on, '0' forces off, empty follows the AOT
 
   function StrKey(const V: TSSAValue): Integer;
   begin
     if (V.Kind = svkRegister) and (V.RegType = srtString) and
-       (V.RegIndex >= 0) and (V.Version >= 0) and (V.Version <= MaxVer) then
-      Result := V.RegIndex * VStride + V.Version
+       (V.RegIndex >= 0) and (V.Version >= 0) and (V.Version <= MaxVerStr) then
+      Result := V.RegIndex * VStrideStr + V.Version
     else
       Result := -1;
   end;
@@ -2690,10 +2698,18 @@ var
   function IntKey(const V: TSSAValue): Integer;
   begin
     if (V.Kind = svkRegister) and (V.RegType = srtInt) and
-       (V.RegIndex >= 0) and (V.Version >= 0) and (V.Version <= MaxVer) then
-      Result := V.RegIndex * VStride + V.Version
+       (V.RegIndex >= 0) and (V.Version >= 0) and (V.Version <= MaxVerInt) then
+      Result := V.RegIndex * VStrideInt + V.Version
     else
       Result := -1;
+  end;
+
+  procedure NoteVer(const V: TSSAValue); inline;
+  // The widest version SEEN IN EACH BANK, for the two flat censuses below.
+  begin
+    if V.Kind <> svkRegister then Exit;
+    if (V.RegType = srtString) and (V.Version > MaxVerStr) then MaxVerStr := V.Version
+    else if (V.RegType = srtInt) and (V.Version > MaxVerInt) then MaxVerInt := V.Version;
   end;
 
   procedure BumpStr(var Arr: array of Integer; const V: TSSAValue);
@@ -2710,7 +2726,7 @@ var
   begin
     if V.Kind = svkConstInt then Exit(V.ConstInt = 1);
     Key := IntKey(V);
-    Result := (Key >= 0) and (Key <= High(IntDefs)) and (IntDefs[Key] = 1) and (IntConst[Key] = 1);
+    Result := (Key >= 0) and (Key <= High(IntDefs)) and (IntDefs[Key] = 1) and IntIsOne[Key];
   end;
 
 begin
@@ -2761,30 +2777,34 @@ begin
   // deliberately, with the number that justifies it.)
   //
   // STRCHARFUSE=0 still forces it off - that is the A/B, and it is how the numbers above were taken.
-  MaxVer := 0;
+  // ⛔ UNA FALCATA PER BANCO, E NON UNA SOLA PER TUTTI (18 set 2026). Il censimento e' una matrice
+  // piatta (registro x VERSIONE), e questa passata ne tiene DUE: una sulle stringhe e una sugli interi.
+  // Prendendo la versione piu' alta su TUTTI i banchi, la piu' versionata gonfiava anche la matrice
+  // dell'altra. 📊 Su `functions/paraminit`: massima globale **458**, massima del banco stringa **21**
+  // ⇒ una matrice 21 volte piu' grande del necessario. Le quattro insieme facevano **376 MB** allocati e
+  // resi subito, cioe' il salto di picco che `HEAP_DIAG` attribuiva alla passata dopo.
+  // ⚠ Le due massime si prendono nella STESSA passata sui blocchi: una seconda percorrenza
+  // costerebbe piu' della memoria che risparmia.
+  MaxVerStr := 0; MaxVerInt := 0;
   for b := 0 to Blocks.Count - 1 do
   begin
     Blk := TSSABasicBlock(Blocks[b]);
     for i := 0 to Blk.Instructions.Count - 1 do
     begin
       Prod := TSSAInstruction(Blk.Instructions[i]);
-      if (Prod.Dest.Kind = svkRegister) and (Prod.Dest.Version > MaxVer) then MaxVer := Prod.Dest.Version;
-      if (Prod.Src1.Kind = svkRegister) and (Prod.Src1.Version > MaxVer) then MaxVer := Prod.Src1.Version;
-      if (Prod.Src2.Kind = svkRegister) and (Prod.Src2.Version > MaxVer) then MaxVer := Prod.Src2.Version;
-      if (Prod.Src3.Kind = svkRegister) and (Prod.Src3.Version > MaxVer) then MaxVer := Prod.Src3.Version;
-      for k := 0 to High(Prod.PhiSources) do
-        if (Prod.PhiSources[k].Value.Kind = svkRegister) and (Prod.PhiSources[k].Value.Version > MaxVer) then
-          MaxVer := Prod.PhiSources[k].Value.Version;
+      NoteVer(Prod.Dest); NoteVer(Prod.Src1); NoteVer(Prod.Src2); NoteVer(Prod.Src3);
+      for k := 0 to High(Prod.PhiSources) do NoteVer(Prod.PhiSources[k].Value);
     end;
   end;
-  VStride := MaxVer + 1;
+  VStrideStr := MaxVerStr + 1;
+  VStrideInt := MaxVerInt + 1;
 
-  SetLength(DefCount, (FNextRegister[srtString] + 1) * VStride);
-  SetLength(UseCount, (FNextRegister[srtString] + 1) * VStride);
+  SetLength(DefCount, (FNextRegister[srtString] + 1) * VStrideStr);
+  SetLength(UseCount, (FNextRegister[srtString] + 1) * VStrideStr);
   for i := 0 to High(DefCount) do begin DefCount[i] := 0; UseCount[i] := 0; end;
-  SetLength(IntDefs, (FNextRegister[srtInt] + 1) * VStride);
-  SetLength(IntConst, Length(IntDefs));
-  for i := 0 to High(IntDefs) do begin IntDefs[i] := 0; IntConst[i] := 0; end;
+  SetLength(IntDefs, (FNextRegister[srtInt] + 1) * VStrideInt);
+  SetLength(IntIsOne, Length(IntDefs));
+  for i := 0 to High(IntDefs) do begin IntDefs[i] := 0; IntIsOne[i] := False; end;
 
   for b := 0 to Blocks.Count - 1 do
   begin
@@ -2808,11 +2828,13 @@ begin
       k2 := IntKey(Prod.Dest);
       if (k2 >= 0) and (k2 <= High(IntDefs)) then
       begin
+      // ⛔ UN BIT, NON UN Int64 (18 set 2026). L'unica domanda che si fa a questa tavola e'
+      // «definito una volta sola, e da `LoadConstInt 1`?» - il VALORE non lo legge nessuno. Tenerlo a
+      // 64 bit su una matrice (registro x versione) costava 8 byte per slot per una risposta booleana:
+      // 📊 su `functions/paraminit` sono 54 MB dei 504 di picco.
         Inc(IntDefs[k2]);
-        if (Prod.OpCode = ssaLoadConstInt) and (Prod.Src1.Kind = svkConstInt) then
-          IntConst[k2] := Prod.Src1.ConstInt
-        else
-          IntConst[k2] := MaxInt;   // defined by something else: never equal to 1
+        IntIsOne[k2] := (Prod.OpCode = ssaLoadConstInt) and (Prod.Src1.Kind = svkConstInt) and
+                        (Prod.Src1.ConstInt = 1);
       end;
     end;
   end;
@@ -2900,7 +2922,7 @@ var
   Blk: TSSABasicBlock;
   Ins, Add, Asc: TSSAInstruction;
   IntDefs, IntUses: array of Integer;   // (int reg, version) -> definitions / uses
-  IntConst: array of Int64;             // ...and the value when the single def is LoadConstInt
+  IntIsOne: array of Boolean;           // ...and whether that single def is `LoadConstInt 1` (a BIT, see below)
   AscAt, AddAt: Integer;
   Ok: Boolean;
 
@@ -2934,7 +2956,7 @@ var
   begin
     if V.Kind = svkConstInt then Exit(V.ConstInt = 1);
     Key := IntKey(V);
-    Result := (Key >= 0) and (Key <= High(IntDefs)) and (IntDefs[Key] = 1) and (IntConst[Key] = 1);
+    Result := (Key >= 0) and (Key <= High(IntDefs)) and (IntDefs[Key] = 1) and IntIsOne[Key];
   end;
 
   // Find, within this block and before position Before, the instruction defining V.
@@ -3114,6 +3136,9 @@ begin
   // So this one follows the same rule as its producer: on unless STRCHARFUSE=0 says otherwise.
   // (It used to read `if ... <> '1' and not GAotWillRun then Exit` - the AOT-only gate.)
 
+  // ⛔ La falcata e' di UN BANCO SOLO: qui si indicizza il banco INTERO, quindi la versione piu' alta
+  // si cerca li'. Presa su tutti i banchi gonfiava la matrice per la versione di un banco che questa
+  // passata non tocca nemmeno (vedi la nota in RunConcatCharFusion, dove costava 376 MB).
   MaxVer := 0;
   for b := 0 to Blocks.Count - 1 do
   begin
@@ -3121,12 +3146,13 @@ begin
     for i := 0 to Blk.Instructions.Count - 1 do
     begin
       Ins := TSSAInstruction(Blk.Instructions[i]);
-      if (Ins.Dest.Kind = svkRegister) and (Ins.Dest.Version > MaxVer) then MaxVer := Ins.Dest.Version;
-      if (Ins.Src1.Kind = svkRegister) and (Ins.Src1.Version > MaxVer) then MaxVer := Ins.Src1.Version;
-      if (Ins.Src2.Kind = svkRegister) and (Ins.Src2.Version > MaxVer) then MaxVer := Ins.Src2.Version;
-      if (Ins.Src3.Kind = svkRegister) and (Ins.Src3.Version > MaxVer) then MaxVer := Ins.Src3.Version;
+      if (Ins.Dest.Kind = svkRegister) and (Ins.Dest.RegType = srtInt) and (Ins.Dest.Version > MaxVer) then MaxVer := Ins.Dest.Version;
+      if (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt) and (Ins.Src1.Version > MaxVer) then MaxVer := Ins.Src1.Version;
+      if (Ins.Src2.Kind = svkRegister) and (Ins.Src2.RegType = srtInt) and (Ins.Src2.Version > MaxVer) then MaxVer := Ins.Src2.Version;
+      if (Ins.Src3.Kind = svkRegister) and (Ins.Src3.RegType = srtInt) and (Ins.Src3.Version > MaxVer) then MaxVer := Ins.Src3.Version;
       for k := 0 to High(Ins.PhiSources) do
-        if (Ins.PhiSources[k].Value.Kind = svkRegister) and (Ins.PhiSources[k].Value.Version > MaxVer) then
+        if (Ins.PhiSources[k].Value.Kind = svkRegister) and (Ins.PhiSources[k].Value.RegType = srtInt) and
+           (Ins.PhiSources[k].Value.Version > MaxVer) then
           MaxVer := Ins.PhiSources[k].Value.Version;
     end;
   end;
@@ -3134,8 +3160,8 @@ begin
 
   SetLength(IntDefs, (FNextRegister[srtInt] + 1) * VStride);
   SetLength(IntUses, Length(IntDefs));
-  SetLength(IntConst, Length(IntDefs));
-  for i := 0 to High(IntDefs) do begin IntDefs[i] := 0; IntUses[i] := 0; IntConst[i] := 0; end;
+  SetLength(IntIsOne, Length(IntDefs));
+  for i := 0 to High(IntDefs) do begin IntDefs[i] := 0; IntUses[i] := 0; IntIsOne[i] := False; end;
 
   for b := 0 to Blocks.Count - 1 do
   begin
@@ -3151,11 +3177,13 @@ begin
       k2 := IntKey(Ins.Dest);
       if (k2 >= 0) and (k2 <= High(IntDefs)) then
       begin
+      // ⛔ UN BIT, NON UN Int64 (18 set 2026). L'unica domanda che si fa a questa tavola e'
+      // «definito una volta sola, e da `LoadConstInt 1`?» - il VALORE non lo legge nessuno. Tenerlo a
+      // 64 bit su una matrice (registro x versione) costava 8 byte per slot per una risposta booleana:
+      // 📊 su `functions/paraminit` sono 54 MB dei 504 di picco.
         Inc(IntDefs[k2]);
-        if (Ins.OpCode = ssaLoadConstInt) and (Ins.Src1.Kind = svkConstInt) then
-          IntConst[k2] := Ins.Src1.ConstInt
-        else
-          IntConst[k2] := MaxInt;      // defined by something else: never equal to 1
+        IntIsOne[k2] := (Ins.OpCode = ssaLoadConstInt) and (Ins.Src1.Kind = svkConstInt) and
+                        (Ins.Src1.ConstInt = 1);
       end;
     end;
   end;

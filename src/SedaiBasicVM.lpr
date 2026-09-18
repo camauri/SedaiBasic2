@@ -1688,6 +1688,11 @@ begin
             WriteLn(ErrOutput, '[STRFUSE] EXCEPTION in RunConcatDeadSourceMark: ', E.Message);
         end;
       end;
+      // ⛔ IL SUO MARK. Senza, le cinque fusioni di stringa fatturavano tempo e memoria a `Reg Alloc`,
+      // che e' la passata DOPO - la stessa trappola gia' pagata da SubInlining e XferForwarding (vedi il
+      // commento al mark di SubInlining). Con HEAP_DIAG la differenza non e' accademica: la prima lettura
+      // attribuiva un picco di 366 MB a un allocatore che non lo alloca.
+      PassMark('Str Fusion');
 
       // REGISTER ALLOCATION - Allocate physical registers to virtual registers
       // Uses Linear Scan algorithm (O(n log n) complexity)
