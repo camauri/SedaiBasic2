@@ -1183,6 +1183,8 @@ type
     procedure CheckFieldArrayByteSize(const FieldName: string; Bounds: TASTNode; ElemSz: Int64);  // ...for a UDT FIELD array
     procedure CheckAllFieldArraySizes;   // ...over every type, once the module CONSTs are known
     procedure EmitDeleteObject(Node: TASTNode);                                 // DELETE p → run destructor on the pointee
+    procedure DeleteGuardOpen(const H: TSSAValue; out EndLabel: string; out GuardBlock: TSSABasicBlock);   // DELETE of NULL: skip (531)
+    procedure DeleteGuardClose(const EndLabel: string; GuardBlock: TSSABasicBlock);
     function EmitPointerIndexAddress(const PtrName: string; IndicesNode: TASTNode): TSSAValue; // p[i] → address (p + i)
     function EmitCastPointerIndexRead(CastNode, IndicesNode: TASTNode): TSSAValue;
     function EmitPointerValueIndexRead(BaseNode: TASTNode; const Pointee: string;
@@ -10411,7 +10413,16 @@ begin
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
         begin
           Left := EmitPointerIndexAddress(ArrName, Node.GetChild(1));   // raw-scaled (see helper)
-          if PointeeBankOf(ArrName) = srtFloat then
+          // ⛔ "p[i]" OVER A BLOCK OF STRINGS ("New String[n]") IS ONE STRING CELL, NOT A NUMBER (DIVERGENZE 529).
+          // The DEREF spelling "*p" has read the managed cell (mode -1) all along; the INDEX spelling took the
+          // numeric arm and answered the cell's bytes as an Integer - "Print p[0]" printed 0 and a comparison
+          // with the empty string was false, where fbc reads the string. The stride was already right (24 bytes).
+          if UpperFast(PointeeTypeOf(ArrName)) = 'STRING' then
+          begin
+            Result := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+            EmitInstruction(ssaRawLoadZStr, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawStrModeOf('STRING')));
+          end
+          else if PointeeBankOf(ArrName) = srtFloat then
           begin
             Result := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
             EmitInstruction(ssaRawLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOf(ArrName)));
@@ -12088,6 +12099,15 @@ begin
     // character code assigned through the pointer), which is the other half of the same rule and the
     // reason the test is on the VALUE and not on the pointee type alone.
     RawFieldPointee := UpperFast(PointeeTypeOf(VarName));
+    // ...and over a block of STRINGS every value is stored as a string, into the element's managed cell (DIVERGENZE
+    // 529): a text written there went through VAL and landed as 0 in the cell's bytes. (A NUMBER there is refused by fbc,
+    // "error 181: Invalid assignment/conversion"; here it converts - the general permissiveness, not a rule of this rung.)
+    if RawFieldPointee = 'STRING' then
+    begin
+      EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), VarReg, EnsureStringRegister(ExprValue),
+                      MakeSSAConstInt(RawStrModeOf(RawFieldPointee)));
+      Exit;
+    end;
     if ((RawFieldPointee = 'ZSTRING') or (RawFieldPointee = 'WSTRING')) and
        ((ExprValue.Kind = svkConstString) or
         ((ExprValue.Kind = svkRegister) and (ExprValue.RegType = srtString))) then
@@ -40864,6 +40884,13 @@ var
 begin
   H := EnsureIntRegister(FirstHandle);
   CountReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  // ...and a native block of a type with NOTHING TO DESTROY has no count in front (EmitNewObject, DIVERGENZE 532): there
+  // is no destructor to run per element, and the block is what malloc gave.
+  if NativeRecordType(TypeName) and not TypeNeedsDestruction(TypeName) then
+  begin
+    EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), H, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    Exit;
+  end;
   if NativeRecordType(TypeName) then
   begin
     BaseReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -50621,6 +50648,19 @@ begin
       BytesVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaMulInt, BytesVal, CountVal, EnsureIntRegister(MakeSSAConstInt(NativeImageBytes(UDTIdx))),
                       MakeSSAValue(svkNone));
+      // ⛔ ...BUT THE COUNT IS THERE ONLY FOR A TYPE WITH SOMETHING TO DESTROY (DIVERGENZE 532). fbc keeps it "because
+      // allocation of an array of UDT objects WITH DESTRUCTOR" - its own words, quoted at UDTBlockIsManaged - and
+      // measured: "New C[3]" of a type with only a constructor answers the pointer malloc gave (malloc_usable_size
+      // accepts it), one with a destructor has 3 in the UInteger in front. With the count always there, a
+      // constructor-only block was not what malloc gave, and fbc's own pointers/new-delete - "Delete p" on
+      // "New ClassUDT[1]" - handed free() an address 8 bytes into the block: "free(): invalid pointer", an abort.
+      if not TypeNeedsDestruction(NewType) then
+      begin
+        Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaRawAlloc, Result, BytesVal, MakeSSAValue(svkNone), MakeSSAConstInt(RAWALLOC_PROGRAM));
+        EmitRecordBlockCtorDtor(Result, CountVal, NewType, True);
+        Exit;
+      end;
       ElemVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaAddInt, ElemVal, BytesVal, EnsureIntRegister(MakeSSAConstInt(8)), MakeSSAValue(svkNone));
       BytesVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -50674,7 +50714,14 @@ begin
        (Node.GetChild(0).ChildCount = 1) then
     begin
       ProcessExpression(Node.GetChild(0).GetChild(0), InitVal);
-      if (UpperFast(NewType) = 'SINGLE') or (UpperFast(NewType) = 'DOUBLE') then
+      // ⛔ ...E UN POINTEE DI TESTO SI SCRIVE COME TESTO (DIVERGENZE 529). "New String( "abc" )" passava dal ramo
+      // intero qui sotto, cioe' da VAL("abc") = 0 scritto nei byte della cella, e "Len(*p)" rispondeva 0 dove fbc
+      // risponde 3. La scrittura giusta e' quella di "*p = "abc"": ssaRawStoreZStr nel modo del pointee (-1 = la
+      // cella di stringa GESTITA di una String, 0 = byte di C, 1 = celle larghe).
+      if (UpperFast(NewType) = 'STRING') or (UpperFast(NewType) = 'ZSTRING') or (UpperFast(NewType) = 'WSTRING') then
+        EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), Result, EnsureStringRegister(InitVal),
+                        MakeSSAConstInt(RawStrModeOf(NewType)))
+      else if (UpperFast(NewType) = 'SINGLE') or (UpperFast(NewType) = 'DOUBLE') then
         EmitInstruction(ssaRawStoreFloat, MakeSSAValue(svkNone), Result, EnsureFloatRegister(InitVal),
                         MakeSSAConstInt(RawTypeCodeOfPointee(NewType)))
       else
@@ -50725,6 +50772,36 @@ begin
     EmitConstructorCall(Result, NewType);
 end;
 
+procedure TSSAGenerator.DeleteGuardOpen(const H: TSSAValue; out EndLabel: string; out GuardBlock: TSSABasicBlock);
+// ⛔ "DELETE" OF A NULL POINTER DOES NOTHING (DIVERGENZE 531): fbc runs neither the destructor nor the release - its own
+// pointers/new-delete asserts it with a destructor that FAILS if it is ever called. Here the destructor ran on handle
+// 0 and "Delete[]" read the element count at 0 - 8 and aborted the process. Everything between the two halves is
+// skipped when the pointer is 0.
+var
+  BodyLabel: string;
+begin
+  EndLabel := GenerateUniqueLabel('del_null_end');
+  BodyLabel := GenerateUniqueLabel('del_nonnull');
+  EmitInstruction(ssaJumpIfZero, MakeSSALabel(EndLabel), EnsureIntRegister(H), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  GuardBlock := FCurrentBlock;
+  FCurrentBlock := FProgram.CreateBlock(BodyLabel);
+  if Assigned(GuardBlock) then begin GuardBlock.AddSuccessor(FCurrentBlock); FCurrentBlock.AddPredecessor(GuardBlock); end;
+end;
+
+procedure TSSAGenerator.DeleteGuardClose(const EndLabel: string; GuardBlock: TSSABasicBlock);
+// ...and the join. ⛔ The edge into it leaves from where the jump IS: a destructor call splits the body into more blocks,
+// and an edge from the stale one is the defect EmitRecordBlockCtorDtor records (a second latch, read by the passes).
+var
+  Last, EndB: TSSABasicBlock;
+begin
+  EmitInstruction(ssaJump, MakeSSALabel(EndLabel), MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  Last := FCurrentBlock;
+  EndB := FProgram.CreateBlock(EndLabel);
+  if Assigned(Last) then begin Last.AddSuccessor(EndB); EndB.AddPredecessor(Last); end;
+  if Assigned(GuardBlock) then begin GuardBlock.AddSuccessor(EndB); EndB.AddPredecessor(GuardBlock); end;
+  FCurrentBlock := EndB;
+end;
+
 procedure TSSAGenerator.EmitDeleteObject(Node: TASTNode);
 // FreeBASIC "DELETE p": run the pointee's destructor (if any), then release the heap record and
 // recycle its slot (ssaRecordFree). Node child0 = the pointer expression (must be a UDT pointer).
@@ -50742,6 +50819,8 @@ var
   PtrName, PtrType, OpLbl: string;
   HandleReg, CountReg: TSSAValue;
   Implicit, Rewritten: TASTNode;
+  GEnd: string;
+  GBlk: TSSABasicBlock;
 begin
   if Node.ChildCount < 1 then Exit;
   // ⛔ "Delete nxt" inside a method, nxt a FIELD of THIS: the bare name is the field, as it is for a read (DIVERGENZE 487).
@@ -50775,8 +50854,10 @@ begin
     PtrType := VarRecordTypeName(PtrName);
     ProcessExpression(Node.GetChild(0), HandleReg);   // see the note at the head: the VALUE, not the register
   HandleReg := EnsureIntRegister(HandleReg);
+    DeleteGuardOpen(HandleReg, GEnd, GBlk);   // Delete of NULL does nothing (531)
     EmitDestructorCall(HandleReg, PtrType);
     EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    DeleteGuardClose(GEnd, GBlk);
     Exit;
   end;
   // "Delete[] p[i]" where the CELL holds a managed block ("p[i] = New T[m]", T with a ctor/dtor):
@@ -50791,12 +50872,47 @@ begin
       if (FindUDT(PtrType) >= 0) and UDTBlockIsManaged(PtrType) then
       begin
         ProcessExpression(Node.GetChild(0), HandleReg);
+        DeleteGuardOpen(HandleReg, GEnd, GBlk);   // 531
         EmitRecordBlockDelete(HandleReg, PtrType);
+        DeleteGuardClose(GEnd, GBlk);
         Exit;
       end;
     end;
   end;
 
+  // ⛔ "Delete f( )" / "Delete[] f( )" - A CALL THAT RETURNS THE POINTER (DIVERGENZE 530). It parses as an array
+  // access, so it fell into the element arm just below, which found no array F and freed the value as RAW BYTES: the
+  // destructor never ran, and for "Delete[]" of a native block the address of the FIRST IMAGE went to free() instead
+  // of the block in front of it - "munmap_chunk(): invalid pointer", an abort. fbc's own pointers/new-delete writes it
+  // (deleteSideFx3 / 4), and that test's CUPASS was VACUOUS until PRINT stopped losing its output at an abort. The
+  // pointee comes from what the procedure RETURNS, the same question "f( )->field" asks (ObjectTypeName).
+  if (Node.GetChild(0).NodeType in [antArrayAccess, antFunctionCall]) and (Node.GetChild(0).ChildCount >= 1) and
+     (Node.GetChild(0).GetChild(0) <> nil) and (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) and
+     (ArrayIndexOf(Node.GetChild(0).GetChild(0).ValueUpper) < 0) and
+     (FProcedureNames.IndexOf(Node.GetChild(0).GetChild(0).ValueUpper) >= 0) and
+     (ProcReturnPtrUDT(Node.GetChild(0).GetChild(0).ValueUpper) <> '') then
+  begin
+    PtrType := UpperFast(ProcReturnPtrUDT(Node.GetChild(0).GetChild(0).ValueUpper));
+    ProcessExpression(Node.GetChild(0), HandleReg);   // the call runs ONCE, as fbc's count asserts
+    HandleReg := EnsureIntRegister(HandleReg);
+    if (Node.Attributes.Values['NEWARRAY'] = '1') and UDTBlockIsManaged(PtrType) then
+    begin
+      DeleteGuardOpen(HandleReg, GEnd, GBlk);   // 531
+      EmitRecordBlockDelete(HandleReg, PtrType);
+      DeleteGuardClose(GEnd, GBlk);
+      Exit;
+    end;
+    if Node.Attributes.Values['NEWARRAY'] = '1' then
+    begin
+      EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      Exit;
+    end;
+    DeleteGuardOpen(HandleReg, GEnd, GBlk);   // Delete of NULL does nothing (531)
+    EmitDestructorCall(HandleReg, PtrType);
+    EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    DeleteGuardClose(GEnd, GBlk);
+    Exit;
+  end;
   // "Delete a(i)": the element holds the record handle, so destroy and free THAT.
   if (Node.GetChild(0).NodeType = antArrayAccess) and (Node.GetChild(0).ChildCount >= 1) and
      (Node.GetChild(0).GetChild(0).NodeType = antIdentifier) then
@@ -50806,8 +50922,10 @@ begin
     HandleReg := EnsureIntRegister(HandleReg);
     if PtrType <> '' then
     begin
+      DeleteGuardOpen(HandleReg, GEnd, GBlk);   // Delete of NULL does nothing (531)
       EmitDestructorCall(HandleReg, PtrType);
       EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      DeleteGuardClose(GEnd, GBlk);
     end
     else
       // not a UDT pointer: a raw block, freed as "Delete[] p" frees one
@@ -50831,11 +50949,15 @@ begin
     begin
       if (Node.Attributes.Values['NEWARRAY'] = '1') and UDTBlockIsManaged(PtrType) then
       begin
+        DeleteGuardOpen(HandleReg, GEnd, GBlk);   // 531
         EmitRecordBlockDelete(HandleReg, PtrType);
+        DeleteGuardClose(GEnd, GBlk);
         Exit;
       end;
+      DeleteGuardOpen(HandleReg, GEnd, GBlk);   // Delete of NULL does nothing (531)
       EmitDestructorCall(HandleReg, PtrType);
       EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      DeleteGuardClose(GEnd, GBlk);
     end
     else
       EmitInstruction(ssaRawFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -50853,7 +50975,9 @@ begin
   begin
     PtrType := PointerUDTType(PtrName);
     ProcessExpression(Node.GetChild(0), HandleReg);   // see the note at the head: the VALUE, not the register
+    DeleteGuardOpen(HandleReg, GEnd, GBlk);   // 531
     EmitRecordBlockDelete(HandleReg, PtrType);
+    DeleteGuardClose(GEnd, GBlk);
     Exit;
   end;
 
@@ -50872,6 +50996,7 @@ begin
     raise Exception.CreateFmt('DELETE expects a UDT pointer, "%s" is not one', [PtrName]);
   ProcessExpression(Node.GetChild(0), HandleReg);   // see the note at the head: the VALUE, not the register
   HandleReg := EnsureIntRegister(HandleReg);
+  DeleteGuardOpen(HandleReg, GEnd, GBlk);   // 531: the destructor and the release both skip a NULL
   EmitDestructorCall(HandleReg, PtrType);
   // The type's OWN deallocator, if it declares one: fbc runs the destructor and then hands the POINTER
   // to "Operator T.Delete(p)", which owns the release. It must be the same pointer its "Operator New"
@@ -50885,9 +51010,11 @@ begin
   if (OpLbl <> '') and (not TypeHasMemberProc(PtrType)) then
   begin
     EmitIterOperatorCall(OpLbl, MakeSSAConstInt(0), HandleReg, MakeSSAValue(svkNone));
+    DeleteGuardClose(GEnd, GBlk);
     Exit;
   end;
   EmitInstruction(ssaRecordFree, MakeSSAValue(svkNone), HandleReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  DeleteGuardClose(GEnd, GBlk);
 end;
 
 procedure TSSAGenerator.EmitFieldAddress(MemberNode: TASTNode; out Result: TSSAValue);
