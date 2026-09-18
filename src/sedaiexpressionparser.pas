@@ -2409,6 +2409,9 @@ function TExpressionParser.ParseProcAddress(Token: TLexerToken): TASTNode;
 var
   Operand: TASTNode;
   CtorTok: TLexerToken;   // "@type<T>(...)": the TYPE token handed to the type-constructor parser
+  PostNode: TASTNode;     // DIVERGENZE 554: "@(x)[i]" - the parenthesised operand a postfix applies to
+  PostTok: TLexerToken;
+  PostRule: TParseRule;
 begin
   // '@' is already consumed. Parse the operand as a full postfix expression (precCall stops before
   // binary operators), so all of these are handled: @sub / @x (identifier), @arr(i) (array access),
@@ -2480,6 +2483,31 @@ begin
       if Assigned(Operand) then Operand.Free;
       Result := nil;
       Exit;
+    end;
+    // ⭐ DIVERGENZE 554 - "@(x)[i]", "@(x).f", "@(x)->f": a POSTFIX binds tighter than "@", so the operand is
+    // "(x)[i]" and not "(x)". fbc reads "@(__iob_func())[1]" - crt/win32/stdio.bi's stdout on win64 - as the address of
+    // element 1; the "@" closed at the parenthesis here and "[1]" indexed the ADDRESS, so every "@(expr)[i]" answered
+    // 0 and win64's stdout was stdin (a "printf" then "fflush(stdout)" hung). The parentheses stay around the
+    // operand, the shape "(x)[i]" already has when it is read.
+    if Context.CheckAny([ttDelimBrackOpen, ttOpDot]) then
+    begin
+      // ...but around a bare NAME they mean nothing, and "(p)[2]" is "p[2]" - the shape every reader of a pointer
+      // variable knows ("(@(pp)[2])->b" read 0 with the parentheses kept).
+      if Operand.NodeType <> antIdentifier then
+      begin
+        PostNode := TASTNode.Create(antParentheses, Token);
+        PostNode.AddChild(Operand);
+        Operand := PostNode;
+      end;
+      while Context.CheckAny([ttDelimBrackOpen, ttOpDot]) and not Context.IsAtEnd do
+      begin
+        PostTok := Context.CurrentToken;
+        PostRule := Context.GetParseRule(PostTok.TokenType);
+        if not Assigned(PostRule.Infix) then Break;
+        Context.Advance;
+        Operand := TASTNode(PostRule.Infix(Self, TObject(Operand), PostTok));
+        if not Assigned(Operand) then Exit(nil);
+      end;
     end;
     while (Operand.NodeType = antParentheses) and (Operand.ChildCount >= 1) do
       Operand := Operand.GetChild(0);

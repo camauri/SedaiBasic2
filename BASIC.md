@@ -586,6 +586,9 @@ raw bytes.
   repeated `Declare` of a name that a `#undef` retired anywhere in the program; and, because type
   aliases are resolved after this check, a body whose parameter types differ from its `Declare` only
   through a type that is not a builtin one.
+  ⚠️ A `Declare` of a name that SedaiBasic implements itself — `floor`, for one — does not replace the built-in
+  routine: `Declare Function floor Alias "ceil" (ByVal As Double) As Double : Print floor(1.5)` prints 1 where
+  FreeBASIC prints 2 (DIVERGENZE 553, open).
   ⛔ A pointer argument is matched by its *declared* type, so it has to be a variable or a parameter;
   an expression whose pointer type cannot be derived matches any pointer overload, and is taken only
   when exactly one fits.
@@ -3875,6 +3878,23 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
 - ⚠️ **A pointer that C hands back does not compare equal to the address of a `String` it was given.**
   `rs = memcpy(@s, @s, 0)` then `rs = @s` is false, although `Hex(rs)` and `Hex(@s)` print the same number; with the
   address of a numeric variable or of a record the comparison is right.
+- **A `cva_list` can be handed to a C routine that takes a `va_list`.** `vsnprintf(@buf, n, fmt, args)`,
+  `vprintf(fmt, args)` and `fastcgi/fcgiapp.bi`'s `FCGX_VFPrintF(stream, fmt, args)`, called from a variadic
+  procedure after `cva_start` (or `cva_copy`, or some `cva_arg`), read the arguments that follow: integers, doubles,
+  strings, addresses. It used to be refused at compile time ("parameter 3 is CVA_LIST, which has no C type here").
+- **An `Extern` array of records of a C library is addressed in the library.** `@_fcgi_sF(1)` (which is
+  `fcgi_stdio.bi`'s `stdout`), `_fcgi_sF(1).stdio_stream`, `(@_fcgi_sF(1))->stdio_stream`, a field written through
+  either, and `@v(1) - @v(0)` (one element) now behave as in FreeBASIC. `@` of such an element was refused, and a
+  field read 0.
+- **A procedure retired by `#undef` and declared again is the new procedure from that line on**, as in FreeBASIC:
+  `fcgi_stdio.bi` does `#undef printf` then `Declare Function printf Alias "FCGI_printf" (...)` after `crt.bi`, and
+  `printf` below it calls `FCGI_printf`, while a call written above it keeps the C `printf`. The calls went to the
+  first declaration, and `printf(...)` stopped the program inside glibc.
+- **`@(x)[i]`, `@(x).f` and `@(x)->f` take the address of the element or field**, as in FreeBASIC, where the index
+  binds tighter than `@`: `@(gmtime(@t))[1]`, `@(Cast(Long Ptr, p))[3]`. They answered 0, and on Windows `crt.bi`'s
+  `stdout` (`@(__iob_func())[1]`) was `stdin`, so `printf` followed by `fflush(stdout)` could hang.
+- **A pointer field prints without a sign column**, like a pointer variable: `Print v.p` of an `As Any Ptr` field
+  (or `T Ptr`, `ZString Ptr`, a procedure pointer, through `.` or `->`) prints `5`, not ` 5`.
 - ⚠️ **A variadic procedure called by C cannot read its variadic arguments yet.** A libxml error handler
   `Sub h Cdecl(ByVal ctx As Any Ptr, ByVal msg As Const ZString Ptr, ...)` is called and `msg` is right, but
   `cva_arg` reads 0 where FreeBASIC reads the formatted text.

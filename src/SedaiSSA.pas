@@ -681,6 +681,8 @@ type
     FForeignDataScalars: TStringList;    // DIVERGENZE 405: an Extern of a C library whose type is a SCALAR (its address is C's)
     FForeignProcExterns: TStringList;    // DIVERGENZE 422: ...whose type is a named PROCEDURE type (libxml's xmlFree)
     FForeignDataArrays: TStringList;     // DIVERGENZE 441: "NAME=symbol|T|lb:ub,..." - a C library's data ARRAY
+    FFgnRedeclNames: TStringList;        // DIVERGENZE 552: foreign names declared again after a #undef
+    FFgnRowLine: array of Integer;       // ...the source line each of their LATER rows was declared on (0 = none)
     FArrayScalarType: TStringList;
     FAddrNativeArrays: array of Boolean;  // phase 2.3: array id -> "@a(i)" is a machine address in the fb mode       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
     FArrayFuncPtrSig: TStringList;       // array-of-funcptr (DIM As <named funcptr type> a(..)) -> "params|ret" signature, so "a(i)(args)" is an indirect call
@@ -754,7 +756,10 @@ type
     function ForeignNarrowArg(Node: TASTNode; out TypeU: string): Integer;  // "@n" of a narrow value -> width code (DIVERGENZE 247)
     function EmitForeignDataAddr(const VarName, Symbol, TypeName: string;
       const LibName: string = ''): TSSAValue;  // an Extern of a C library: its address (DIVERGENZE 253)
-    function ForeignDataArrayElemAddr(Node: TASTNode; out Addr: TSSAValue; out ElemType: string): Boolean;  // 441
+    function ForeignDataArrayElemAddr(Node: TASTNode; out Addr: TSSAValue; out ElemType: string;
+      AllowRecord: Boolean = False): Boolean;  // 441, 549
+    function ForeignDataArrayRecordType(Node: TASTNode): string;   // "v(i)" of a C array of native records (549)
+    function ForeignDeclIndexAt(const NameU: string): Integer;      // the row a call HERE means (552)
     function TryForeignDataArrayRead(Node: TASTNode; out Value: TSSAValue): Boolean;   // "v(i)", v a C data array (441)
     function TryForeignDataArrayStore(Node, ExprNode: TASTNode): Boolean;             // "v(i) = x" (441)
     function TryForeignFuncAddr(const NameU: string; out V: TSSAValue): Boolean;  // "@f" of a declared C function (261)
@@ -2276,6 +2281,7 @@ begin
   FForeignDataScalars.Free;
   FForeignProcExterns.Free;
   FForeignDataArrays.Free;
+  FFgnRedeclNames.Free;
   FArrayScalarType.Free;
   FArrayFuncPtrSig.Free;
   FArrayScalarPointee.Free;
@@ -27413,7 +27419,7 @@ var
 begin
   Result := '';
   if not Assigned(FProgram) then Exit;
-  Idx := FProgram.IndexOfForeignDecl(UpperFast(NameU));
+  Idx := ForeignDeclIndexAt(UpperFast(NameU));
   if Idx < 0 then Exit;
   if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), D) then Exit;
   if ForeignKindOf(D.RetTypeName) <> fkUnknown then Exit;   // a scalar or a pointer: not this rung
@@ -27434,7 +27440,7 @@ var
 begin
   Result := '';
   if not Assigned(FProgram) then Exit;
-  Idx := FProgram.IndexOfForeignDecl(UpperFast(NameU));
+  Idx := ForeignDeclIndexAt(UpperFast(NameU));
   if Idx < 0 then Exit;
   if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), D) then Exit;
   T := UpperFast(CanonicalType(D.RetTypeName));
@@ -32104,6 +32110,14 @@ begin
         // like a conversion bug rather than a print one.
         else if AwCode = 8 then Result := 2
         else if AwCode = 11 then Result := 1;   // a Boolean pointee prints true/false (DIVERGENZE 493)
+        // ⭐ DIVERGENZE 550 - ...and a POINTER field prints unsigned, with no sign column, like a pointer variable
+        // (PrintKindOfType's kind 3): "Print v.p" of an "As Any Ptr" field wrote " 5" where fbc writes "5". Asked
+        // through ExprIsPointerTyped, which knows every pointer spelling of a field (DIVERGENZE 235).
+        if (Result = 0) and ExprIsPointerTyped(Node) then Result := 3;
+        // ...and a PROCEDURE-pointer field ("fp As Sub()"), which is a pointer too and prints as fbc prints one.
+        if (Result = 0) and
+           (UDTFuncPtrFieldSig(FindUDT(ObjectTypeName(Node.GetChild(0))), VarToStr(Node.Value), AwIdx) <> '') then
+          Result := 3;
       end;
     antParentheses:
       if Node.ChildCount >= 1 then Result := PrintKindOfExpr(Node.GetChild(0));
@@ -35654,6 +35668,17 @@ begin
   begin
     Result := UpperFast(DeclaredTypeNameOf(N.GetChild(0)));
     if Result = '' then Result := InlineArrayElemPointee(N.GetChild(0));
+    // ⭐ DIVERGENZE 549 - "@v(i)" of a C library's data ARRAY points at its declared element type: without it
+    // "@_fcgi_sF(1) - @_fcgi_sF(0)" subtracted two addresses as numbers (16 where fbc answers 1 element).
+    if (Result = '') and (N.GetChild(0).NodeType = antArrayAccess) and (N.GetChild(0).ChildCount >= 2) and
+       (N.GetChild(0).GetChild(0).NodeType = antIdentifier) and (FForeignDataArrays.Count > 0) and
+       (FForeignDataArrays.IndexOfName(N.GetChild(0).GetChild(0).ValueUpper) >= 0) and
+       (ArrayIndexOf(N.GetChild(0).GetChild(0).ValueUpper) < 0) then
+    begin
+      Result := FForeignDataArrays.Values[N.GetChild(0).GetChild(0).ValueUpper];
+      Result := Copy(Result, Pos('|', Result) + 1, MaxInt);
+      Result := UpperFast(Copy(Result, 1, Pos('|', Result) - 1));
+    end;
   end;
 end;
 
@@ -48302,7 +48327,7 @@ begin
   else
     NameU := Node.ValueUpper;
   if NameU = '' then Exit;
-  Idx := FProgram.IndexOfForeignDecl(NameU);
+  Idx := ForeignDeclIndexAt(NameU);
   if (Idx < 0) or not ParseForeignDecl(FProgram.GetForeignDecl(Idx), D) then Exit;
   if ForeignKindOf(D.RetTypeName) <> fkPointer then Exit;
   // ⭐ ...AND A POINTER TO A STRUCT is C's own object whatever the arguments are. The veto below exists
@@ -48396,7 +48421,7 @@ begin
       NameU := Node.ValueUpper;
     if NameU <> '' then
     begin
-      Idx := FProgram.IndexOfForeignDecl(NameU);
+      Idx := ForeignDeclIndexAt(NameU);
       if Idx >= 0 then
         for i := 0 to Node.ChildCount - 1 do
         begin
@@ -48761,7 +48786,7 @@ var
     NU: string;
   begin
     if (ArgListNode = nil) or (CalleeName = '') or not Assigned(FProgram) then Exit;
-    Idx := FProgram.IndexOfForeignDecl(UpperFast(CalleeName));
+    Idx := ForeignDeclIndexAt(UpperFast(CalleeName));
     if (Idx < 0) or not ParseForeignDecl(FProgram.GetForeignDecl(Idx), D) then Exit;
     for k := 0 to ArgListNode.ChildCount - 1 do
       if ArgIsProgramMemory(ArgListNode.GetChild(k)) then
@@ -50147,6 +50172,7 @@ var
   RawObjOfs442: TInt64Array;
   RawObjSz442: Int64;
   RawB442, RawI442, RawC442: TASTNode;
+  BaseCall554: TASTNode;       // DIVERGENZE 554: the base of "@(f())[i]", through its parentheses
 begin
   // ⭐ "@UDT.a(i)" / "@x.a(i)" where a is a STATIC ARRAY member: the element belongs to the backing
   // global array, so the whole ladder below works once the reference names it. Every rung here is
@@ -50182,6 +50208,12 @@ begin
     Result := EnsureIntRegister(Result);
     Exit;
   end;
+  // ⭐ DIVERGENZE 549 - "@v(i)" where v is a C library's data ARRAY (an Extern the parser registered as FGNDATAARRS):
+  // the element's address is the library's storage, scalar or native record alike. Every rung below is indexed by an
+  // array of the PROGRAM, so this fell off the end as "Cannot take address of element of undeclared array".
+  if (Node.GetChild(0).NodeType = antIdentifier) and (ArrayIndexOf(Node.GetChild(0).ValueUpper) < 0) and
+     ForeignDataArrayElemAddr(Node, Result, RawFieldPointee, True) then
+    Exit;
   // ⭐ "@x[1]" where x is a UDT with a BYREF index operator: the operator IS what names the place, and
   // it hands its address back already - the very protocol "x[1] = v" uses. Every rung of the ladder
   // below is indexed by an array NAME, so this fell off the end as "Cannot take address of element of
@@ -50424,7 +50456,17 @@ begin
        (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
     begin
       BaseTypeName := UpperFast(DeclaredTypeNameOf(Node.GetChild(0)));
-      if IsStrDataPtrExpr(Node.GetChild(0)) then
+      // ⭐ DIVERGENZE 554 - "@(f())[i]": the base is a CALL, whose type is what it RETURNS (CalleeRetTypeName, through
+      // the parentheses the operand keeps). win64's stdout is "@(__iob_func())[1]".
+      BaseCall554 := Node.GetChild(0);
+      while (BaseCall554.NodeType = antParentheses) and (BaseCall554.ChildCount >= 1) do
+        BaseCall554 := BaseCall554.GetChild(0);
+      if BaseTypeName = '' then BaseTypeName := UpperFast(CanonicalType(UpperFast(CalleeRetTypeName(BaseCall554))));
+      // ...and a pointer CAST names its own pointee: "@(cast(Long Ptr, b))[1]" steps by 4 whatever b points at (554).
+      if (BaseCall554.NodeType = antCast) and (Length(BaseTypeName) > 4) and
+         (Copy(BaseTypeName, Length(BaseTypeName) - 3, 4) = ' PTR') then
+        ElemSz := RawChainElemBytes(Trim(Copy(BaseTypeName, 1, Length(BaseTypeName) - 4)))
+      else if IsStrDataPtrExpr(Node.GetChild(0)) then
         ElemSz := 1                                  // a string's data pointer addresses BYTES
       else if RawPtrExprName(Node.GetChild(0)) <> '' then
         // "p ± n" over a raw pointer VARIABLE: the same name-based question the p[i] path asks.
@@ -50437,6 +50479,13 @@ begin
               (Node.GetChild(0).NodeType = antMemberAccess) and (Node.GetChild(0).ChildCount >= 1) and
               ResolveRawUDTBase(Node.GetChild(0).GetChild(0), RawObjT442, RawObjU442, RawObjOfs442, RawObjSz442,
                                 RawB442, RawI442, RawC442) then
+        ElemSz := RawChainElemBytes(Trim(Copy(BaseTypeName, 1, Length(BaseTypeName) - 4)))
+      // ...a RECORD pointee in C's layout (a native type, or memory a foreign call handed back) steps by its C size, as
+      // "@q[i]" through a variable does (554): the scalar ladder answers 8 for a name it does not know.
+      else if (Length(BaseTypeName) > 4) and (Copy(BaseTypeName, Length(BaseTypeName) - 3, 4) = ' PTR') and
+              (FindUDT(Trim(Copy(BaseTypeName, 1, Length(BaseTypeName) - 4))) >= 0) and
+              (NativeRecordType(Trim(Copy(BaseTypeName, 1, Length(BaseTypeName) - 4))) or
+               IsForeignPtrCall(BaseCall554)) then
         ElemSz := RawChainElemBytes(Trim(Copy(BaseTypeName, 1, Length(BaseTypeName) - 4)))
       else if (Length(BaseTypeName) > 4) and (Copy(BaseTypeName, Length(BaseTypeName) - 3, 4) = ' PTR') then
         ElemSz := RawElemSizeOfPointee(Trim(Copy(BaseTypeName, 1, Length(BaseTypeName) - 4)))
@@ -53063,6 +53112,11 @@ begin
   // The call of an overloaded "Operator ->" (RewriteArrowOperators, 285): the type it RETURNS.
   if ObjNode.Attributes.Values['ARROWOP'] <> '' then
     Exit(ProcRetTypeName(ObjNode.Attributes.Values['ARROWOP']));
+  // DIVERGENZE 549 - an element of a C library's array of native records, and its address.
+  Result := ForeignDataArrayRecordType(ObjNode);
+  if (Result = '') and (ObjNode.NodeType = antProcAddress) and (ObjNode.ChildCount >= 1) then
+    Result := ForeignDataArrayRecordType(ObjNode.GetChild(0));
+  if Result <> '' then Exit;
   // ⭐ "IIf(c, u, v)" NAMES A UDT WHEN BOTH ITS BRANCHES DO. An IIF parses as an array access, so this
   // answered '' for it, the call site's type tail came out empty, and "Dim As T x = IIf(c, u, v)"
   // resolved its constructor by BANK alone - where a UDT handle is an 'I' exactly like a pointer, and
@@ -53872,7 +53926,7 @@ var
   D: TForeignDecl;
 begin
   Result := '';
-  Idx := FProgram.IndexOfForeignDecl(NameU);
+  Idx := ForeignDeclIndexAt(NameU);
   if Idx < 0 then Exit;
   if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), D) then Exit;
   Result := UpperFast(Trim(D.RetTypeName));
@@ -54398,6 +54452,13 @@ begin
   while (ObjNode.NodeType = antParentheses) and (ObjNode.ChildCount >= 1) do
     ObjNode := ObjNode.GetChild(0);
   if ObjNode = nil then Exit;
+  // DIVERGENZE 549 - "v(i).f" and "(@v(i))->f", v a C library's array of NATIVE records: the element's address
+  // IS its handle, as for every value of a native type.
+  if (ObjNode.NodeType = antProcAddress) and (ObjNode.ChildCount >= 1) and
+     (ForeignDataArrayRecordType(ObjNode.GetChild(0)) <> '') then
+    ObjNode := ObjNode.GetChild(0);
+  if ForeignDataArrayRecordType(ObjNode) <> '' then
+    Exit(ForeignDataArrayElemAddr(ObjNode, HandleVal, TypeName, True));
   // The call of an overloaded "Operator ->" (RewriteArrowOperators, 285): calling it yields the handle
   // of the record it returns, and that record is the object of the access.
   if ObjNode.Attributes.Values['ARROWOP'] <> '' then
@@ -55962,6 +56023,14 @@ begin
         ProcessExpression(ArgListNode.GetChild(i), ArgVal);
         ArgVal := EnsureIntRegister(ArgVal);
         Op := ssaVarArgPushInt;
+        // ⭐ DIVERGENZE 551 - ...and an ADDRESS says so (Src3 = 1): CVA_ARG reads the number either way, but a
+        // va_list built for C from this frame resolves it to a machine address, which a slot cannot tell apart
+        // from an integer. "vsnprintf(buf, n, fmt, args)" with "@z" of a ZString * n in the tail faulted.
+        if VarArgIsAddress(ArgListNode.GetChild(i)) or ExprIsPointerTyped(ArgListNode.GetChild(i)) then
+        begin
+          EmitInstruction(Op, MakeSSAValue(svkNone), ArgVal, MakeSSAValue(svkNone), MakeSSAConstInt(1));
+          Continue;
+        end;
       end;
     end;
     EmitInstruction(Op, MakeSSAValue(svkNone), ArgVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -57003,7 +57072,7 @@ var
 begin
   Result := False;
   V := MakeSSAValue(svkNone);
-  Idx := FProgram.IndexOfForeignDecl(NameU);
+  Idx := ForeignDeclIndexAt(NameU);
   if Idx < 0 then Exit;
   if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), Decl) then Exit;
   V := EmitForeignDataAddr(NameU + '#FN', Decl.Symbol, 'ANY', Decl.LibName);
@@ -57092,7 +57161,8 @@ begin
   EmitInstruction(ssaForeignCall, Result, MakeSSAConstInt(0), MakeSSAValue(svkNone), MakeSSAConstInt(Idx));
 end;
 
-function TSSAGenerator.ForeignDataArrayElemAddr(Node: TASTNode; out Addr: TSSAValue; out ElemType: string): Boolean;
+function TSSAGenerator.ForeignDataArrayElemAddr(Node: TASTNode; out Addr: TSSAValue; out ElemType: string;
+  AllowRecord: Boolean): Boolean;
 // ⭐ DIVERGENZE 441 - THE ADDRESS OF AN ELEMENT OF A C LIBRARY'S DATA ARRAY. "extern gdbm_version_number(0 to 2) as
 // const long" names storage of libgdbm; the parser registers it (FGNDATAARRS) instead of making it an array of the
 // program, which is what it was - zeros, or "Array not declared" for the CONST form. The element is at
@@ -57100,6 +57170,10 @@ function TSSAGenerator.ForeignDataArrayElemAddr(Node: TASTNode; out Addr: TSSAVa
 // by the raw load that every other address C hands over goes through.
 // ⚠️ A RECORD element declines (its fields are reached through a different path); so does a subscript count that is
 // not the declared rank - the ordinary "Array not declared" then answers, as before.
+// ⭐ DIVERGENZE 549 - ...unless the caller asks for the ADDRESS (AllowRecord) and the record is NATIVE: then the
+// address of the element IS the record, as for every value of a native type. fcgi_stdio.bi's "stdout" is
+// "@_fcgi_sF(1)", an element of libfcgi's array of FCGI_FILE, and "@" of it refused ("undeclared array"). The stride
+// is the record's C size (RawChainElemBytes), which for a scalar answers what RawElemSizeOfPointee did.
 var
   Spec, Sym, Bounds, Piece, NameU: string;
   Lbs, Exts: array of Int64;
@@ -57136,13 +57210,13 @@ begin
   end;
   IdxList := Node.GetChild(1);
   if (n = 0) or (IdxList = nil) or (IdxList.NodeType <> antExpressionList) or (IdxList.ChildCount <> n) then Exit;
-  if FindUDT(ElemType) >= 0 then Exit;
+  if (FindUDT(ElemType) >= 0) and not (AllowRecord and NativeRecordType(ElemType)) then Exit;
   Lin := MakeSSAValue(svkNone);
   for k := 0 to n - 1 do
   begin
     ProcessExpression(IdxList.GetChild(k), IdxVal);
     IdxVal := EnsureIntRegister(IdxVal);
-    Stride := RawElemSizeOfPointee(ElemType);
+    Stride := RawChainElemBytes(ElemType);
     for j := k + 1 to n - 1 do Stride := Stride * Exts[j];
     // ⚠️ ssaSubInt / ssaMulInt / ssaAddInt take REGISTERS: every constant is materialised first.
     C := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -57165,6 +57239,48 @@ begin
   Addr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaAddInt, Addr, Base, Lin, MakeSSAValue(svkNone));
   Result := True;
+end;
+
+function TSSAGenerator.ForeignDeclIndexAt(const NameU: string): Integer;
+// DIVERGENZE 552 - the foreign-table row a call of NameU means at the statement being lowered. A name retired by
+// "#undef" and declared again has several rows, and fbc is positional: the last declaration ABOVE the call wins
+// (FCurrentLineNumber is the statement's source line, the numbering the parser stamped the declaration with). Every
+// other name answers its first row, as IndexOfForeignDecl always did.
+var
+  k, BestLine: Integer;
+  Row: string;
+begin
+  Result := FProgram.IndexOfForeignDecl(NameU);
+  if (Result < 0) or (FFgnRedeclNames = nil) or (FFgnRedeclNames.IndexOf(NameU) < 0) then Exit;
+  BestLine := 0;
+  for k := Result + 1 to FProgram.ForeignDeclCount - 1 do
+    if (k <= High(FFgnRowLine)) and (FFgnRowLine[k] > BestLine) and (FFgnRowLine[k] <= FCurrentLineNumber) then
+    begin
+      Row := FProgram.GetForeignDecl(k);
+      if Copy(Row, 1, Length(NameU) + 1) = NameU + '|' then
+      begin
+        Result := k;
+        BestLine := FFgnRowLine[k];
+      end;
+    end;
+end;
+
+function TSSAGenerator.ForeignDataArrayRecordType(Node: TASTNode): string;
+// DIVERGENZE 549 - the record type of "v(i)" when v is a C library's data ARRAY whose element is a NATIVE record
+// (its value is the address of its C image), '' otherwise. What makes "_fcgi_sF(1).stdio_stream" and
+// "(@_fcgi_sF(1))->stdio_stream" read the field fcgi's FCGI_Accept wrote: both answered 0, in silence.
+var
+  T: string;
+begin
+  Result := '';
+  if (Node = nil) or (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 2) or
+     (Node.GetChild(0).NodeType <> antIdentifier) or (FForeignDataArrays.Count = 0) or
+     (FForeignDataArrays.IndexOfName(Node.GetChild(0).ValueUpper) < 0) or
+     (ArrayIndexOf(Node.GetChild(0).ValueUpper) >= 0) then Exit;
+  T := FForeignDataArrays.Values[Node.GetChild(0).ValueUpper];
+  T := Copy(T, Pos('|', T) + 1, MaxInt);
+  T := UpperFast(Copy(T, 1, Pos('|', T) - 1));
+  if (FindUDT(T) >= 0) and NativeRecordType(T) then Result := T;
 end;
 
 function TSSAGenerator.TryForeignDataArrayRead(Node: TASTNode; out Value: TSSAValue): Boolean;
@@ -57250,7 +57366,7 @@ begin
   // `utf_conv.bi` names a libfb symbol we do not link, and taking it as a C call answered "fb_CharToUTF was not
   // found" where the intercept below does the work (DIVERGENZE 511).
   if IsUtfConvName(NameU, UtfSel) then Exit;
-  Idx := FProgram.IndexOfForeignDecl(NameU);
+  Idx := ForeignDeclIndexAt(NameU);
   if Idx < 0 then Exit;
   if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), Decl) then Exit;
 
@@ -57312,8 +57428,19 @@ begin
   DeclV := Decl;
   DeclV.ParamTypeNames := Copy(Decl.ParamTypeNames, 0, Length(Decl.ParamTypeNames));
   SValArg := False;
+  // ⭐ DIVERGENZE 551 - A "va_list" PARAMETER (fcgiapp.bi's FCGX_VFPrintF, crt's vprintf family) is handed a CVA_LIST of
+  // the program - a CURSOR into the VM's frame of variadic arguments, not C's structure. The entry spells it
+  // "VALIST:" and the runtime builds a real va_list from the frame at the call (TForeignVaList). It used to be refused
+  // by name: "parameter 3 is CVA_LIST, which has no C type here".
+  for i := 0 to High(Decl.ParamTypeNames) do
+    if UpperFast(CanonicalType(UpperFast(Decl.ParamTypeNames[i]))) = 'CVA_LIST' then
+    begin
+      DeclV.ParamTypeNames[i] := 'VALIST:' + Decl.ParamTypeNames[i];
+      SValArg := True;            // the call takes its own entry, where the spelling is written
+    end;
   for i := 0 to High(Decl.ParamTypeNames) do
     if (ForeignKindOf(Decl.ParamTypeNames[i]) = fkUnknown) and
+       (Copy(DeclV.ParamTypeNames[i], 1, 7) <> 'VALIST:') and
        (FEnumNames.IndexOf(UpperFast(Decl.ParamTypeNames[i])) < 0) then
     begin
       SValUDT := FindUDT(UpperFast(CanonicalType(Decl.ParamTypeNames[i])));
@@ -59887,6 +60014,7 @@ var
   FgnStart: Integer;
   FgnDecl: TForeignDecl; // ...and one of them, split, to read its return type's print kind
   FgnKind: Integer;
+  FgnK: Integer;         // DIVERGENZE 552: a row of a name declared again after #undef
   {$IFDEF DEBUG_SSAPROF}
   ProfT0, ProfFreq: Int64;
   ProfOn: Boolean;
@@ -59945,6 +60073,32 @@ begin
     if GetEnvironmentVariable('FGNDIAG') = '1' then
       for PsI := 0 to FProgram.ForeignDeclCount - 1 do
         WriteLn(ErrOutput, 'FGN[', PsI, '] ', FProgram.GetForeignDecl(PsI));
+  end;
+  // ⭐ DIVERGENZE 552 - the rows of a name declared AGAIN after a #undef, with the line each was declared on.
+  FreeAndNil(FFgnRedeclNames);
+  SetLength(FFgnRowLine, 0);
+  if AST.Attributes.Values['FGNREDECL'] <> '' then
+  begin
+    FFgnRedeclNames := TStringList.Create;
+    FFgnRedeclNames.Sorted := True;
+    FFgnRedeclNames.Duplicates := dupIgnore;
+    SetLength(FFgnRowLine, FProgram.ForeignDeclCount);
+    FgnText := AST.Attributes.Values['FGNREDECL'] + ';';
+    FgnStart := 1;
+    for PsI := 1 to Length(FgnText) do
+      if FgnText[PsI] = ';' then
+      begin
+        FgnLine := Trim(Copy(FgnText, FgnStart, PsI - FgnStart));
+        FgnStart := PsI + 1;
+        if Pos('=', FgnLine) <= 1 then Continue;
+        for FgnK := FProgram.ForeignDeclCount - 1 downto 0 do
+          if FProgram.GetForeignDecl(FgnK) = Copy(FgnLine, Pos('=', FgnLine) + 1, MaxInt) then
+          begin
+            FFgnRowLine[FgnK] := StrToIntDef(Copy(FgnLine, 1, Pos('=', FgnLine) - 1), 0);
+            FFgnRedeclNames.Add(Copy(FProgram.GetForeignDecl(FgnK), 1, Pos('|', FProgram.GetForeignDecl(FgnK)) - 1));
+            Break;
+          end;
+      end;
   end;
   // ⭐ DIVERGENZE 441 - the data ARRAYS of C libraries, read the same way: an element is addressed from the symbol.
   FForeignDataArrays.Clear;

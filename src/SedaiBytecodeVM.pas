@@ -546,8 +546,15 @@ type
     // an Integer, CVA_COPY to a copy and CVA_END to nothing. A slot carries its BANK because the
     // caller knows the type and the callee names it again in CVA_ARG - and the two may disagree, as
     // they may in C, so the read converts.
-    FVarArgs: array of record IntVal: Int64; FloatVal: Double; StrVal: string; Bank: Byte; end;
+    FVarArgs: array of record IntVal: Int64; FloatVal: Double; StrVal: string; Bank: Byte;
+                              IsPtr: Boolean;   // the call site knew the value is an ADDRESS (DIVERGENZE 551)
+                       end;
     FVarArgFrames: array of Integer;   // stack of frame bases; the top one is what CVA_START answers
+    // ⭐ DIVERGENZE 551: the C va_lists built from a CVA_LIST at a foreign call (ForeignVaList). A small RING, so a
+    // callback that builds one while C still reads the caller's does not overwrite it.
+    FVaSlots: array[0..7] of array of Int64;
+    FVaHdr: array[0..7] of record GpOffset, FpOffset: LongWord; Overflow, RegSave: Pointer; end;
+    FVaRing: Integer;
     FDirRec: TSearchRec;
     FDirOpen: Boolean;
     FDirMask: Integer;
@@ -908,6 +915,7 @@ type
     function ForeignRecBytes(ACtx: TObject; Value: Int64; out ALen: PtrUInt): Pointer;  // the C image of a record (DIVERGENZE 245)
     function ForeignRecRun(ACtx: TObject; Value: Int64; out ACount: Integer; out AStride: PtrUInt): Boolean;  // ...and how many follow it contiguously (336)
     function ForeignDeepCell(ACtx: TObject; Value: Int64; out ACells: PtrUInt): PInt64;  // the pointed RUN, if it holds pointers (257 B, 516)
+    function ForeignVaList(ACtx: TObject; Cursor: Int64): Pointer;   // a C va_list from a CVA_LIST cursor (551)
     function ForeignCellRun(ACtx: TObject; Value: Int64; out ACells: PtrUInt;
                             out AIsFloat: Boolean): Pointer;   // the 8-byte cells of a narrow value (DIVERGENZE 247)
     procedure ForeignNoteRegion(ACtx: TObject; ABase, ALen: PtrUInt; AAdd, AWide: Boolean);
@@ -8057,6 +8065,7 @@ begin
       T.RecRun := @ForeignRecRun;    // ...and how many records an "@arr(0)" hands over (DIVERGENZE 336)
       T.CellRun := @ForeignCellRun;
       T.DeepCell := @ForeignDeepCell;
+      T.VaList := @ForeignVaList;    // ...and a va_list parameter handed a CVA_LIST (DIVERGENZE 551)
       FForeignTable := T;
     finally
       LeaveCriticalSection(FWorkerLock);
@@ -8882,6 +8891,53 @@ begin
       Break;
     end;
   Result := ACount > 1;
+end;
+
+function TBytecodeVM.ForeignVaList(ACtx: TObject; Cursor: Int64): Pointer;
+// ⭐ DIVERGENZE 551 - A C va_list MADE FROM A CVA_LIST. The program's CVA_LIST is a cursor into FVarArgs; C wants the
+// ABI's va_list. Every argument from the cursor to the end of its frame goes into a run of 8-byte slots - an integer
+// as it is (a machine address without C's mark), a float as a DOUBLE (C's default promotion), a string as the address
+// of its bytes - and:
+//   SysV x86-64  the answer is a { gp_offset, fp_offset, overflow_arg_area, reg_save_area } whose register areas
+//                read as EXHAUSTED (48 = six integer registers, 176 = 48 + eight 16-byte SSE ones), so every va_arg,
+//                integer or double, reads the next 8-byte slot of the overflow area - which is these slots;
+//   Win64        a va_list IS a pointer to a run of 8-byte slots, so the answer is the slots themselves.
+// ⭐ An ADDRESS is resolved as a pointer parameter is (ForeignPtrArg) when the call site marked its slot (IsPtr); an
+// unmarked integer loses only C's mark, since a frame slot alone cannot tell a pointer from a number.
+var
+  Lo, Hi, f, k, n, Ring: Integer;
+  V: Int64;
+begin
+  Result := nil;
+  if (Cursor < 0) or (Cursor > Length(FVarArgs)) then Exit;
+  Lo := Integer(Cursor);
+  Hi := Length(FVarArgs);
+  for f := 0 to High(FVarArgFrames) do          // the frame ends where the next one (a nested call) begins
+    if (FVarArgFrames[f] > Lo) and (FVarArgFrames[f] < Hi) then Hi := FVarArgFrames[f];
+  Ring := FVaRing;
+  FVaRing := (FVaRing + 1) and 7;
+  n := Hi - Lo;
+  SetLength(FVaSlots[Ring], n + 1);            // one more: the area has an address even when it is empty
+  for k := 0 to n - 1 do
+    case FVarArgs[Lo + k].Bank of
+      1: PDouble(@FVaSlots[Ring][k])^ := FVarArgs[Lo + k].FloatVal;
+      2: FVaSlots[Ring][k] := Int64(PtrUInt(PChar(FVarArgs[Lo + k].StrVal)));
+    else
+      V := FVarArgs[Lo + k].IntVal;
+      if FVarArgs[Lo + k].IsPtr then V := Int64(PtrUInt(ForeignPtrArg(ACtx, V)))   // any domain, as a parameter is
+      else if (V and (Int64(7) shl 61)) = FGNPTR_TAG then V := V and not FGNPTR_TAG;
+      FVaSlots[Ring][k] := V;
+    end;
+  FVaSlots[Ring][n] := 0;
+  {$IFDEF WINDOWS}
+  Result := @FVaSlots[Ring][0];
+  {$ELSE}
+  FVaHdr[Ring].GpOffset := 48;
+  FVaHdr[Ring].FpOffset := 176;
+  FVaHdr[Ring].Overflow := @FVaSlots[Ring][0];
+  FVaHdr[Ring].RegSave := nil;
+  Result := @FVaHdr[Ring];
+  {$ENDIF}
 end;
 
 function TBytecodeVM.ForeignDeepCell(ACtx: TObject; Value: Int64; out ACells: PtrUInt): PInt64;
@@ -12202,11 +12258,11 @@ begin
         SetLength(FVarArgs, Length(FVarArgs) + 1);
         with FVarArgs[High(FVarArgs)] do
         begin
-          IntVal := 0; FloatVal := 0; StrVal := '';
+          IntVal := 0; FloatVal := 0; StrVal := ''; IsPtr := False;
           case Instr.OpCode of
             bcVarArgPushFloat: begin Bank := 1; FloatVal := Ctx.FloatRegs[Instr.Src1]; end;
             bcVarArgPushStr:   begin Bank := 2; StrVal := Ctx.StringRegs[Instr.Src1]; end;
-          else                 begin Bank := 0; IntVal := Ctx.IntRegs[Instr.Src1]; end;
+          else                 begin Bank := 0; IntVal := Ctx.IntRegs[Instr.Src1]; IsPtr := Instr.Immediate = 1; end;
           end;
         end;
       end;

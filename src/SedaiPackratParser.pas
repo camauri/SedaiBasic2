@@ -129,6 +129,7 @@ type
     // A DECLARE carrying an ALIAS is a FOREIGN procedure: NAME|SYMBOL|LIBRARY|RETURN|PARAMS, one per
     // line, handed to the SSA on the program node (DIVERGENZE 183).
     FForeignDecls: TStringList;
+    FForeignRedecls: TStringList;   // DIVERGENZE 552: "<line>=<row>" of a foreign name declared again after #undef
     FForeignDataArrays: TStringList;   // DIVERGENZE 441: "NAME=symbol|T|lb:ub,..." - the data ARRAYS of C libraries
     // ⛔ EVERY TYPE NAME A "DECLARE" NAMES, with the line it stands on. fbc's single pass refuses a
     // declaration whose return or parameter type has not been declared ("error 14: Expected
@@ -708,6 +709,7 @@ begin
   MemoizationThreshold := 3;  // Cache after 3 recursion levels
 
   FForeignDecls := TStringList.Create;
+  FForeignRedecls := TStringList.Create;
   FForeignDataArrays := TStringList.Create;
   FDeclTypeUses := TStringList.Create;
   FForwardDeclNames := TStringList.Create;
@@ -811,6 +813,7 @@ begin
     FExpressionParser.Free;
 
   FForeignDecls.Free;
+  FForeignRedecls.Free;
   FHeaderRoutines.Free;
   FGatedDeclared.Free;
   FForeignDataArrays.Free;
@@ -1838,6 +1841,9 @@ begin
  // knows what a CALL is, and it needs the symbol, the library and the signature to build the call.
  if FForeignDecls.Count > 0 then
    Result.Attributes.Values['FOREIGNDECLS'] := StringReplace(FForeignDecls.Text, sLineBreak, ';', [rfReplaceAll]);
+ // ...and where a name retired by #undef was declared AGAIN, so a call picks the declaration above it (552).
+ if FForeignRedecls.Count > 0 then
+   Result.Attributes.Values['FGNREDECL'] := StringReplace(FForeignRedecls.Text, sLineBreak, ';', [rfReplaceAll]);
  // ...and the data ARRAYS of C libraries (DIVERGENZE 441), which have no node either.
  if FForeignDataArrays.Count > 0 then
    Result.Attributes.Values['FGNDATAARRS'] := StringReplace(FForeignDataArrays.Text, sLineBreak, ';', [rfReplaceAll]);
@@ -1973,6 +1979,7 @@ var
   FgnDepth: Integer;
   FgnAfterAs, FgnIsFunc, FgnTypeOpen: Boolean;
   FgnVariadic: Boolean;     // "..." in the parameter list: the C tail (printf, sprintf, ...)
+  FgnK: Integer;            // DIVERGENZE 552: the earlier rows of a name a #undef retired
   FgnFnPtrRet: Boolean;     // ...e il RITORNO di un parametro "as function(...) as T" e' suo, non nostro
   FgnByVal: Boolean;        // the parameter's stated passing mode; unstated reads as BYREF
   FgnLastDecl: Integer;     // index in FDeclTypeUses of the type just recorded, so a PTR can mark it
@@ -2320,6 +2327,22 @@ begin
      // the mark and removes it before the table is built, so no loader ever sees it.
      if (FgnLib = '') and (FExternKinds <> '') and (FExternKinds[Length(FExternKinds)] = 'R') then
        FgnLib := '#rtlib';
+     // ⭐ DIVERGENZE 552 - A NAME RETIRED BY "#undef" AND DECLARED AGAIN IS A NEW DECLARATION FROM THAT POINT ON.
+     // fcgi_stdio.bi includes crt.bi, then "#undef printf : declare function printf alias "FCGI_printf" (...)" for
+     // thirty stdio names, and fbc calls FCGI_printf; the foreign table answered a name with its FIRST row, so every
+     // one of them called glibc with an FCGI_FILE: "glibc detected an invalid stdio handle". fbc is POSITIONAL - a
+     // call written before the #undef still means the old routine (measured: toupper before, "tolower" after) - so
+     // both rows stay, and the later one travels with the source LINE it was declared on (FGNREDECL); the SSA picks,
+     // for each call, the last declaration above it. Only a name a #undef retired: two rows of one name otherwise
+     // keep the first-row answer they always had.
+     if (GPPUndefNames <> nil) and (GPPUndefNames.IndexOf(FgnName) >= 0) then
+       for FgnK := 0 to FForeignDecls.Count - 1 do
+         if Copy(FForeignDecls[FgnK], 1, Length(FgnName) + 1) = FgnName + '|' then
+         begin
+           FForeignRedecls.Add(IntToStr(Context.CurrentToken.Line) + '=' +
+             FgnName + '|' + FgnAlias + '|' + FgnLib + '|' + FgnRet + '|' + FgnParams);
+           Break;
+         end;
      FForeignDecls.Add(FgnName + '|' + FgnAlias + '|' + FgnLib + '|' + FgnRet + '|' + FgnParams);
    end;
    Result := nil;

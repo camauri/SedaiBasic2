@@ -100,6 +100,13 @@ type
     one cell long left argv[1] outside the buffer (DIVERGENZE 516). }
   TForeignDeepCell = function(ACtx: TObject; Value: Int64; out ACells: PtrUInt): PInt64 of object;
 
+  { ⭐ A C va_list BUILT FROM THE PROGRAM'S CVA_LIST (DIVERGENZE 551). A variadic BASIC procedure keeps its surplus
+    arguments in a frame of the VM and its CVA_LIST is a cursor into it; C's "vfprintf(stream, fmt, ap)" wants the
+    ABI's va_list. This answers what the parameter slot must hold - on SysV the address of a 24-byte structure whose
+    register areas read as EXHAUSTED, so every va_arg reads the overflow area; on Win64 that same area, a run of
+    8-byte slots. The memory lives until the next call that builds one. nil when the value names no frame. }
+  TForeignVaList = function(ACtx: TObject; Cursor: Int64): Pointer of object;
+
   TForeignBinding = record
     Decl: TForeignDecl;
     ArgKinds: array of TForeignKind;
@@ -126,6 +133,7 @@ type
     FRecRun: TForeignRecRun;            // optional: without it C sees ONE element of an array of records
     FCellRun: TForeignCellResolver;     // optional: without it a narrow value's cells reach C at 8 bytes
     FDeepCell: TForeignDeepCell;        // optional: without it a pointer to a pointer reaches C one level deep
+    FVaList: TForeignVaList;            // optional: without it a va_list parameter is refused at the call (551)
     // ⛔⛔ ONE LOCK, AND IT COVERS PREPARATION ONLY. Two threads can reach the same foreign call for the
     // FIRST time at the same moment - a web request handler is exactly that shape - and preparation
     // opens libraries, resolves symbols and builds type descriptors, all of it writing shared state
@@ -172,6 +180,7 @@ type
     property RecRun: TForeignRecRun read FRecRun write FRecRun;
     property CellRun: TForeignCellResolver read FCellRun write FCellRun;
     property DeepCell: TForeignDeepCell read FDeepCell write FDeepCell;
+    property VaList: TForeignVaList read FVaList write FVaList;
   end;
 
 { La mappa dai nostri tipi a quelli della ABI. ⛔ Esportata perche' chi costruisce una CHIUSURA ha
@@ -1036,6 +1045,20 @@ begin
   for i := 0 to NArgs - 1 do
   begin
     Vals[i] := @Buf[i][0];
+    // ⭐ DIVERGENZE 551 - a va_list: the slot holds the program's CVA_LIST cursor, and C gets the structure built from it.
+    if (B^.ArgKinds[i] = fkPointer) and (i <= High(B^.Decl.ParamTypeNames)) and
+       (UpperCase(Copy(B^.Decl.ParamTypeNames[i], 1, 7)) = 'VALIST:') then
+    begin
+      if not Assigned(FVaList) then
+        raise EForeignCallError.CreateFmt('%s: argument %d is a va_list and this build cannot build one',
+                                          [B^.Decl.Name, i + 1]);
+      PPointer(Vals[i])^ := FVaList(ACtx, XferInt[SlotI]);
+      if PPointer(Vals[i])^ = nil then
+        raise EForeignCallError.CreateFmt('%s: argument %d is a va_list and the value names no variadic frame',
+                                          [B^.Decl.Name, i + 1]);
+      Inc(SlotI);
+      Continue;
+    end;
     case B^.ArgKinds[i] of
       fkFloat:  begin PSingle(Vals[i])^ := XferFloat[SlotF]; Inc(SlotF); end;
       fkDouble: begin PDouble(Vals[i])^ := XferFloat[SlotF]; Inc(SlotF); end;

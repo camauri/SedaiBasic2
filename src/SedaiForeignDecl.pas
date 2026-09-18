@@ -226,6 +226,9 @@ begin
   if Copy(T, 1, 4) = 'REC:' then Exit(fkPointer);
   // ...and "NREC:<type>" the address of a NATIVE record whose PROCEDURE fields are made callable for the call (phase 3.7).
   if Copy(T, 1, 5) = 'NREC:' then Exit(fkPointer);
+  // ...and "VALIST:<type>" a C va_list, which the runtime builds from the program's CVA_LIST cursor (DIVERGENZE 551):
+  // on SysV a pointer to the 24-byte structure (a va_list parameter decays to one), on Win64 the char* itself.
+  if Copy(T, 1, 7) = 'VALIST:' then Exit(fkPointer);
   // ...and "W<k>:<declared type>" one handed the address of a NARROW value (DIVERGENZE 247).
   if ForeignNarrowCode(T) > 0 then Exit(fkPointer);
   // ⭐ ...and a RETURN type "DATA:<T> PTR" marks an entry that is not a function at all but a DATA
