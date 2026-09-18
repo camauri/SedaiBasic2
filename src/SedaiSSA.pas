@@ -1381,6 +1381,7 @@ type
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
     // FB implicit THIS: a bare field name in a method body -> synthesized "this.<field>" access.
+    function NameBoundInThisProc(const NameU: string): Boolean;     // bound HERE, not in another proc (523)
     function ImplicitThisFieldIsPointer(Node: TASTNode): Boolean;   // ...and was it a POINTER field? (522)
     function TryImplicitThisArrayNode(Node: TASTNode; out Rewritten: TASTNode): Boolean;
     function ArraySlotIsModuleFlat(ArrIdx: Integer; const ArrName: string): Boolean;  // resolved to the BARE module entry?
@@ -2560,7 +2561,9 @@ begin
 
   if GetEnvironmentVariable('SCOPEDIAG') <> '' then
     WriteLn(ErrOutput, 'SCOPE bind    ', VarName, ' -> R', RegIndex,
-            ' decl=', Ord(IsExplicitDecl), ' depth=', Length(FScopeStack), ' target=', targetIdx);
+            ' decl=', Ord(IsExplicitDecl), ' depth=', Length(FScopeStack), ' target=', targetIdx,
+            ' line=', FCurrentLineNumber, ' from=', HexStr(PtrUInt(get_caller_addr(get_frame)), 16),
+            '/', HexStr(PtrUInt(get_caller_addr(get_caller_frame(get_frame))), 16));
   if targetIdx >= 0 then
   begin
     FScopeStack[targetIdx].Bindings.AddObject(nameU, TObject(pk));
@@ -10335,8 +10338,12 @@ begin
         // ⛔ ...and never on the SYNTHETIC element-0 access of a backing array (SHAREDELEM): that node
         // is how the backing is READ, so re-reading it as a pointer index recurses forever. The
         // marker exists for exactly this hazard on the string-byte branch - this is the second one.
+        // ⛔ ...e nemmeno quando quel nome e' un CAMPO del `This` (DIVERGENZE 523): la meta' LETTURA della
+        // stessa regola che la runga di scrittura porta. EmitPointerIndexAddress chiede l'indirizzo della
+        // VARIABILE, che qui non esiste e verrebbe CREATA - e da quel momento il nome scherma il campo.
         if (not NameIsRealArray(ArrName)) and IsRawPtr(ArrName) and
            (Node.Attributes.Values['SHAREDELEM'] <> '1') and
+           (not ImplicitThisFieldIsPointer(Node)) and
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
         begin
           Left := EmitPointerIndexAddress(ArrName, Node.GetChild(1));   // raw-scaled (see helper)
@@ -10366,8 +10373,10 @@ begin
         // ⛔ ...and never on the SYNTHETIC element-0 access of a backing array (SHAREDELEM): that node
         // is how the backing is READ, so re-reading it as a pointer index recurses forever. The
         // marker exists for exactly this hazard on the string-byte branch - this is the second one.
+        // ⛔ ...e non su un CAMPO del `This` (DIVERGENZE 523): la mappa dei puntatori e' PIATTA, per nome.
         if (not NameIsRealArray(ArrName)) and (ManagedPtrPointee(ArrName) <> '') and
            (Node.Attributes.Values['SHAREDELEM'] <> '1') and
+           (not ImplicitThisFieldIsPointer(Node)) and
            (Node.GetChild(1).NodeType = antExpressionList) and (Node.GetChild(1).ChildCount = 1) then
         begin
           // ⛔ THE BRACKETS ARE THE ONLY SPELLING (DIVERGENZE 101). fbc indexes a pointer with "p[i]"
@@ -11984,11 +11993,18 @@ begin
 
   // FreeBASIC RAW pointer indexing as an lvalue: "p[i] = expr" where p is Allocate'd. Store SizeOf(T)
   // bytes at p + i*SizeOf(T) into the raw heap.
+  // ⛔ ...MA NON SE QUEL NOME E' UN CAMPO DEL `This` (DIVERGENZE 523). `p = new integer[3]` dentro un
+  // metodo scrive il CAMPO e insegna alla marcatura che `P` e' un puntatore grezzo; poi `p[0] = 7` cadeva
+  // QUI, e `EmitPointerIndexAddress` chiede l'indirizzo della VARIABILE `P` - che non esiste, e quindi
+  // viene CREATA (`RecordHandleOfVar` ⇒ `GetOrAllocateVariable`), nulla. Da quel momento il nome e'
+  // legato, la regola del `This` implicito declina («un locale scherma il campo») e la scrittura va a zero.
+  // ⭐ Una DOMANDA che CREA: il difetto non era la runga, era che interrogarla lasciava un nome dietro.
   if (VarNode.ChildCount >= 2) and
      (VarNode.GetChild(0).NodeType = antIdentifier) and
      (not NameIsRealArray(VarToStr(VarNode.GetChild(0).Value))) and
      (VarNode.Attributes.Values['SHAREDELEM'] <> '1') and
      IsRawPtr(VarToStr(VarNode.GetChild(0).Value)) and
+     (not ImplicitThisFieldIsPointer(VarNode)) and
      (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) then
   begin
     VarName := VarToStr(VarNode.GetChild(0).Value);
@@ -12025,11 +12041,15 @@ begin
   end;
 
   // FreeBASIC pointer indexing as an lvalue: "p[i] = expr" (also "p(i) = expr") ≡ *(p + i) = expr.
+  // ⛔ ...e come la runga grezza sopra, non quando quel nome e' un CAMPO del `This` (DIVERGENZE 523):
+  // le due mappe dei puntatori sono PIATTE, per nome, quindi un `Dim As Integer Ptr p` in un'ALTRA
+  // procedura basta a far scattare questa su un campo che si chiama come lui.
   if (VarNode.ChildCount >= 2) and
      (VarNode.GetChild(0).NodeType = antIdentifier) and
      (not NameIsRealArray(VarToStr(VarNode.GetChild(0).Value))) and
      (VarNode.Attributes.Values['SHAREDELEM'] <> '1') and
      (ManagedPtrPointee(VarToStr(VarNode.GetChild(0).Value)) <> '') and
+     (not ImplicitThisFieldIsPointer(VarNode)) and
      (VarNode.GetChild(1).NodeType = antExpressionList) and (VarNode.GetChild(1).ChildCount = 1) then
   begin
     VarName := VarToStr(VarNode.GetChild(0).Value);
@@ -54387,6 +54407,24 @@ begin
             SameText(FProgram.GetArray(ArrIdx).Name, ArrName);
 end;
 
+// Is this name bound by a parameter or a local DIM OF THE PROCEDURE BEING LOWERED? The walk stops at the
+// proc root and never reaches the module namespace.
+// ⛔ ResolveExisting is the wrong question HERE, and the difference is measurable: a `Dim As Integer Ptr p`
+// in ANOTHER procedure made it answer yes inside this one, so the implicit-THIS guard declined and the
+// field access went to a null register. 📊 Measured: the same method works alone and faults as soon as
+// any other Sub in the file declares a local of that name (DIVERGENZE 523).
+function TSSAGenerator.NameBoundInThisProc(const NameU: string): Boolean;
+var
+  f: Integer;
+begin
+  Result := False;
+  for f := High(FScopeStack) downto 0 do
+  begin
+    if FScopeStack[f].Bindings.IndexOf(NameU) >= 0 then Exit(True);
+    if FScopeStack[f].Kind = skProcRoot then Exit;
+  end;
+end;
+
 function TSSAGenerator.ImplicitThisFieldIsPointer(Node: TASTNode): Boolean;
 // Of the node TryImplicitThisArrayNode has just accepted: was the field a POINTER rather than an array?
 // ⛔ The two need different lowerings on the WRITE side, and only that side (DIVERGENZE 522). A member
@@ -54407,6 +54445,10 @@ begin
             ((FUDTs[UDTIdx].Fields[FI].PtrPointee <> '') or
              (FUDTs[UDTIdx].Fields[FI].RawPtrPointee <> '') or
              (FUDTs[UDTIdx].Fields[FI].MultiPtrPointee <> ''));
+  // ⛔ ...e non se un parametro o un locale VERO porta quel nome: quella e' la regola di `fbc`, ed e' la
+  // stessa che TryImplicitThisArrayNode applica. Chiesto anche qui perche' questa risposta serve PRIMA di
+  // lui, alla runga del puntatore grezzo (DIVERGENZE 523).
+  if Result and NameBoundInThisProc(Node.GetChild(0).ValueUpper) then Result := False;
 end;
 
 function TSSAGenerator.TryImplicitThisArrayNode(Node: TASTNode; out Rewritten: TASTNode): Boolean;
