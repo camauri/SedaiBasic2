@@ -1104,6 +1104,8 @@ type
 
 { SSA string pool (see the TSSAValue comment). Interning an empty string is id 0; ids are
   append-only and process-wide (deduplicated, so REPL re-compiles do not grow it unboundedly). }
+{ The end (one past the last character) of a PRINT USING NUMERIC field starting at Start. DIVERGENZE 556. }
+function UsingNumFieldEnd(const S: string; Start: Integer; Modern: Boolean): Integer;
 function SSAPoolIntern(const S: string): Integer;
 function SSAPoolGet(Id: Integer): string;
 
@@ -4246,6 +4248,34 @@ begin
         Slot := (Slot + 1) and Mask;
       PoolBuckets[Slot] := Id;
     end;
+end;
+
+function UsingNumFieldEnd(const S: string; Start: Integer; Modern: Boolean): Integer;
+// ⭐ DIVERGENZE 556 - WHERE A NUMERIC FIELD OF PRINT USING ENDS, in ONE place for the compile-time splitter
+// (TSSAGenerator.EmitUsingFields) and its run-time twin (the VM's runtime-format engine). A comma BEFORE the decimal point
+// is part of the field (thousands, "#,###.##"); AFTER it, the field has ended and the comma is text: fbc prints
+// "(##.##,##.##)" as "( 1.50, 2.25)", two fields, where the greedy run made it one field of four decimals. After the
+// point only '#', the exponent '^' and a trailing sign continue a field; a second '.' starts text too.
+// CLASSIC keeps the greedy run it always had: nothing measured its C128 rule.
+var
+  SeenDot: Boolean;
+begin
+  Result := Start;
+  SeenDot := False;
+  while Result <= Length(S) do
+  begin
+    if not (S[Result] in ['#', '.', '$', '+', '-', '^', ',']) then Break;
+    if Modern then
+    begin
+      if S[Result] = '.' then
+      begin
+        if SeenDot then Break;
+        SeenDot := True;
+      end
+      else if SeenDot and not (S[Result] in ['#', '^', '+', '-']) then Break;
+    end;
+    Inc(Result);
+  end;
 end;
 
 function SSAPoolIntern(const S: string): Integer;

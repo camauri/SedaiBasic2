@@ -2930,8 +2930,7 @@ begin
       end
       else if IsNumFieldStart(fi) then
       begin
-        i := fi;
-        while (i <= fLen) and (FormatStr[i] in ['#', '.', '$', '+', '-', '^', ',']) do Inc(i);
+        i := UsingNumFieldEnd(FormatStr, fi, Assigned(FProgram) and FProgram.ModernMode);   // DIVERGENZE 556, the twin's rule
         FieldStr := Copy(FormatStr, fi, i - fi);
         fi := i;
         if vi < nVals then

@@ -24549,8 +24549,7 @@ begin
       end
       else if IsNumFieldStart(fi) then
       begin
-        i := fi;
-        while (i <= fLen) and (FmtStr[i] in ['#', '.', '$', '+', '-', '^', ',']) do Inc(i);
+        i := UsingNumFieldEnd(FmtStr, fi, FModernMode);   // DIVERGENZE 556: a comma after the point ends the field
         FieldStr := Copy(FmtStr, fi, i - fi);
         fi := i;
         if vi < nVals then

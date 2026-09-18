@@ -211,6 +211,20 @@ begin
 end;
 {$ENDIF}
 
+function OpenOne(const AFile: string): TLibHandle;
+// ⭐ DIVERGENZE 555 - A LIBRARY IS OPENED INTO THE GLOBAL SCOPE (RTLD_GLOBAL), as an fbc executable has every library it
+// links. The symbols of a library loaded earlier then answer the undefined references of one loaded later, in the
+// order the program opened them - exactly the link-order interposition an fbc program gets. With FPC's LoadLibrary
+// (RTLD_LAZY, local) libGLU resolved glMultMatrixd to libGL's dispatcher even with libOSMesa already loaded, so
+// gluPerspective changed nothing: the GL deck, where fbc's executable (linked -lOSMesa before -lGL) did.
+begin
+  {$IFDEF UNIX}
+  Result := TLibHandle(dlopen(PChar(AFile), RTLD_LAZY or RTLD_GLOBAL));
+  {$ELSE}
+  Result := LoadLibrary(AFile);
+  {$ENDIF}
+end;
+
 function TryOpen(const ASpelling: string; const APaths: TStringList; ADepth: Integer = 0): TLibHandle;
 // One spelling, asked of the loader first (no path: it searches where IT searches - LD_LIBRARY_PATH,
 // ld.so.cache, the standard directories) and then of every directory we were told about.
@@ -218,7 +232,7 @@ function TryOpen(const ASpelling: string; const APaths: TStringList; ADepth: Int
 var
   j: Integer;
 begin
-  Result := LoadLibrary(ASpelling);
+  Result := OpenOne(ASpelling);
   if Result <> NilHandle then Exit;
   {$IFNDEF WINDOWS}
   Result := OpenLinkerScript(GetLoadErrorStr, ADepth);
@@ -227,7 +241,7 @@ begin
   if APaths = nil then Exit;
   for j := 0 to APaths.Count - 1 do
   begin
-    Result := LoadLibrary(APaths[j] + ASpelling);
+    Result := OpenOne(APaths[j] + ASpelling);
     if Result <> NilHandle then Exit;
     {$IFNDEF WINDOWS}
     Result := OpenLinkerScript(GetLoadErrorStr, ADepth);
@@ -336,7 +350,7 @@ begin
     end;
     if BestName <> '' then
     begin
-      Result := LoadLibrary(Paths[i] + BestName);
+      Result := OpenOne(Paths[i] + BestName);
       if Result <> NilHandle then Exit;
     end;
   end;

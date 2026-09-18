@@ -3893,6 +3893,11 @@ reading the implementation. Everything here **matches FreeBASIC** unless it says
 - **`@(x)[i]`, `@(x).f` and `@(x)->f` take the address of the element or field**, as in FreeBASIC, where the index
   binds tighter than `@`: `@(gmtime(@t))[1]`, `@(Cast(Long Ptr, p))[3]`. They answered 0, and on Windows `crt.bi`'s
   `stdout` (`@(__iob_func())[1]`) was `stdin`, so `printf` followed by `fflush(stdout)` could hang.
+- **A library opened later sees the symbols of one opened earlier**, as in a FreeBASIC executable, which is linked to
+  all of them: GLU's `gluPerspective`, `gluLookAt`... reach the OpenGL of an OSMesa context opened first. Libraries
+  are opened into the global symbol scope (Linux and other Unix systems).
+- **In a `PRINT USING` mask, a comma after the decimal point ends the field** and is printed: `"(##.##,##.##)"` is two
+  fields, as in FreeBASIC. A comma before the point is still the thousands separator.
 - **A pointer field prints without a sign column**, like a pointer variable: `Print v.p` of an `As Any Ptr` field
   (or `T Ptr`, `ZString Ptr`, a procedure pointer, through `.` or `->`) prints `5`, not ` 5`.
 - ⚠️ **A variadic procedure called by C cannot read its variadic arguments yet.** A libxml error handler
