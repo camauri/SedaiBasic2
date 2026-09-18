@@ -850,6 +850,9 @@ type
     // the result register. TWO opcodes, one per result bank - see bcForeignCall for why.
     ssaForeignCall,         // Dest = int result (or unused, for a foreign SUB)
     ssaForeignCallF,        // Dest = float result
+    // DIVERGENZE 528: "Cast(T Ptr, <integer>)" in the fb memory mode. Dest = Src1 with the machine-address tag
+    // when the number is not a live packed VM name (the VM answers that: bcPtrFromInt).
+    ssaPtrFromInt,
     ssaDummy            // Placeholder to avoid trailing comma issues
   );
 

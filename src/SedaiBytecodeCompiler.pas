@@ -636,6 +636,7 @@ begin
     ssaArrayDescPtr: Result := bcArrayDescPtr;
     ssaArrayDescPtrInd: Result := bcArrayDescPtrInd;
     ssaArrayElemAddr: Result := bcArrayElemAddr;
+    ssaPtrFromInt: Result := bcPtrFromInt;   // DIVERGENZE 528
     ssaCopyFile: Result := bcCopyFile;
     ssaScratch: Result := bcScratch;
     ssaRenameFile: Result := bcRenameFile;

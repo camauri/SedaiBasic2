@@ -4311,6 +4311,23 @@ begin
       if (Length(ArrName2) >= 4) and (Copy(ArrName2, Length(ArrName2) - 3, 4) = ' PTR') then
       begin
         Result := EnsureIntRegister(Left);                  // pointer cast: value passthrough
+        // ⭐ ...AND A NUMBER BECOMES A POINTER, in the fb mode (DIVERGENZE 528). There a pointer IS its address, so
+        // "Cast(Integer Ptr, n)" with n = "Cast(Integer, p)" has to work as p did - FreeBASIC programs keep
+        // addresses in Integers and cast them back. The number has lost the machine-address tag on the way out
+        // (DIVERGENZE 235 strips it where a pointer becomes a number), and bcPtrFromInt puts it back unless the
+        // number is one of the VM's own packed names, which only the VM can tell. Only when the operand is an
+        // INTEGER that is not already a pointer: a pointer operand keeps its value and its domain untouched.
+        // SB_NO_PTRFROMINT=1 is the A/B knob on one binary: the cast goes back to a plain passthrough.
+        if FNativeMemory and FModernMode and (Left.RegType = srtInt) and
+           (GetEnvironmentVariable('SB_NO_PTRFROMINT') = '') and
+           not (ExprIsPointerTyped(Node.GetChild(0)) or (Node.GetChild(0).NodeType = antProcAddress)) and
+           (ObjectTypeName(Node.GetChild(0)) = '') and
+           not ((Left.Kind = svkConstInt) and (Left.ConstInt = 0)) then
+        begin
+          TempV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaPtrFromInt, TempV, Result, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          Result := TempV;
+        end;
         // ⛔ ...EXCEPT OVER A RECORD-FIELD POINTER, WHERE THE WIDTH IS PART OF THE VALUE. Such a
         // pointer is (handle, byteOffset<<4 | widthCode), and the width code is the FIELD's - so
         // "*Cast(Byte Ptr, @rec.l) = 0" wrote all eight bytes of a LongInt field where fbc writes one.

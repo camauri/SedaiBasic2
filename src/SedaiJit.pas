@@ -288,7 +288,9 @@ begin
       // Phase 2.5: a packed element - it reads or writes element bytes and moves no storage (ArrayOpMayReshape).
       bcArrayLoadNarrow, bcArrayStoreNarrow,
       // Phase 2.6: a packed Single element - the same, on the float bank.
-      bcArrayLoadSingle, bcArrayStoreSingle:
+      bcArrayLoadSingle, bcArrayStoreSingle,
+      // DIVERGENZE 528: a number made a pointer - reads where arrays are, moves nothing (ArrayOpMayReshape 59).
+      bcPtrFromInt:
         Result := True;
     else
       Result := False;
@@ -1482,6 +1484,7 @@ var
         bcRawStoreInt, bcRefStoreInt: begin T(J^.Src1); T(J^.Src2); end;   // Src1=address, Src2=stored value
         bcRawLoadFloat, bcRawStoreFloat, bcRefLoadFloat, bcRefStoreFloat: T(J^.Src1);  // Src1=address (int)
         bcArrayElemAddr: begin T(J^.Dest); T(J^.Src2); end;   // Dest=address, Src2=index; Src1 is the array id
+        bcPtrFromInt: begin T(J^.Dest); T(J^.Src1); end;      // DIVERGENZE 528: Dest=pointer, Src1=number
         bcArrayLoadNarrow, bcArrayStoreNarrow: begin T(J^.Dest); T(J^.Src2); end;   // phase 2.5: Dest=value, Src2=index
         bcCmpLtFloat, bcCmpLeFloat, bcCmpGtFloat, bcCmpGeFloat, bcCmpEqFloat, bcCmpNeFloat:
           T(J^.Dest);                                // float compare writes an int result reg
@@ -2061,6 +2064,29 @@ var
     E.EmitBytes([$0F, $84]); pCold := E.Len; E.Emit32(0);                    // jz cold
     E.EmitBytes([$48, $8D, $04, $C8]);                                       // lea rax, [rax + rcx*8]
     E.EmitBytes([$48, $0F, $BA, $E8, 61]);                                   // bts rax, 61
+    IStore(I^.Dest, RAX);
+    E.EmitBytes([$E9]); pDone := E.Len; E.Emit32(0);                         // jmp done
+    E.Patch32(pCold, LongWord(E.Len - (pCold + 4)));                         // @cold
+    EmitHelperCall(apc);
+    E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));                         // @done
+  end;
+  procedure EmitPtrFromIntJ(apc: Integer);
+  // DIVERGENZE 528, as the AOT's EmitPtrFromInt and the C hot loop's arm: outside [64 KiB, 2^47) the number is kept,
+  // below 4 GiB it takes C's mark, and a high word that may name one of the VM's arrays runs the helper.
+  var pKeep, pLow, pCold, pDone: Integer;
+  begin
+    ILoad(RAX, I^.Src1);
+    E.EmitBytes([$48, $89, $C2]);                                            // mov rdx, rax
+    E.EmitBytes([$48, $C1, $EA, 47]);                                        // shr rdx, 47
+    E.EmitBytes([$0F, $85]); pKeep := E.Len; E.Emit32(0);                    // jnz keep
+    E.EmitBytes([$48, $3D]); E.Emit32($10000);                               // cmp rax, 0x10000
+    E.EmitBytes([$0F, $82]); pLow := E.Len; E.Emit32(0);                     // jb keep
+    E.EmitBytes([$48, $89, $C2]);                                            // mov rdx, rax
+    E.EmitBytes([$48, $C1, $EA, 32]);                                        // shr rdx, 32
+    E.EmitBytes([$0F, $85]); pCold := E.Len; E.Emit32(0);                    // jnz cold
+    E.EmitBytes([$48, $0F, $BA, $E8, 61]);                                   // bts rax, 61
+    E.Patch32(pKeep, LongWord(E.Len - (pKeep + 4)));                         // @keep
+    E.Patch32(pLow, LongWord(E.Len - (pLow + 4)));
     IStore(I^.Dest, RAX);
     E.EmitBytes([$E9]); pDone := E.Len; E.Emit32(0);                         // jmp done
     E.Patch32(pCold, LongWord(E.Len - (pCold + 4)));                         // @cold
@@ -3149,6 +3175,8 @@ var
         else if UseHelper and not (InCallee or InGosub) then EmitHelperCall(apc) else Exit;
       bcArrayElemAddr:
         if UseHelper and not (InCallee or InGosub) then EmitArrElemAddrJ(apc) else Exit;
+      bcPtrFromInt:   // DIVERGENZE 528
+        if UseHelper and not (InCallee or InGosub) then EmitPtrFromIntJ(apc) else Exit;
       bcArrayLoadNarrow, bcArrayStoreNarrow:   // phase 2.5
         if UseHelper and not (InCallee or InGosub) then EmitNarrowJ(apc, I^.OpCode = bcArrayStoreNarrow) else Exit;
       bcArrayLoadSingle, bcArrayStoreSingle:   // phase 2.6

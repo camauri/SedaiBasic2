@@ -3638,10 +3638,10 @@ the limits listed under "Calling C libraries" below still apply to them (a recor
 address C hands back later).
 The block holding an array of plain records goes back to the C library when the array is erased, re-dimensioned, or
 leaves scope with its procedure; a pointer into it dangles then, as in FreeBASIC.
-⚠️ **An address that has been through an `Integer` does not come back as a pointer yet** (`fb` mode). `Cast(Integer, p)`,
-`Str(p)` and `Print p` give the machine address, as in FreeBASIC, but `Cast(T Ptr, n)` of that number is not recognised
-as one: dereferencing it stops the program ("Null or invalid pointer dereference"), and it compares unequal to a
-pointer to the same memory. Keep an address in a pointer variable (an `Any Ptr` will do) rather than in an `Integer`.
+**An address kept in an `Integer` comes back as a pointer**, as in FreeBASIC: `Cast(Integer, p)`, `Str(p)` and `Print p`
+give the machine address, and `Cast(T Ptr, n)` of that number (or of that number plus an offset) reads, writes and
+compares like `p`. The one exception is internal: a number that names an element of one of the arrays that still live
+in the VM (strings, `Boolean`, pointers - see above) is taken as that element again, which is what `@a(i)` gave.
 
 How the mode is chosen, most specific first:
 

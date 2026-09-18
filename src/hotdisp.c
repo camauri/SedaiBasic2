@@ -207,7 +207,8 @@ double tan(double);
   X(0x0339, ArrayLoadSingle       ) \
   X(0x033A, ArrayStoreSingle      ) \
   X(0x0081, NarrowInt             ) \
-  X(0x0082, NarrowSingle          )
+  X(0x0082, NarrowSingle          ) \
+  X(0x033B, PtrFromInt            )
 
 
 
@@ -260,6 +261,7 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
         [7] how many shared records there are: bit 62 is also a RAW address's tag
         [8] [9] the span [lo, hi] of the array buffers a machine address may come home to (phase 3.2)
         [10] [11] the VM's raw heap: base and capacity
+        [12] how many array ids a PACKED pointer may name (bcPtrFromInt, DIVERGENZE 528)
      A null recdesc disables all four arms. */
 #define RECPTR(h_, out_) do {                                                     \
     int64_t hh_ = (h_);                                                           \
@@ -660,6 +662,19 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
         uint64_t b_ = (uint64_t)((I->imm == 1) ? d[1] : d[0]);
         if (!b_) return pc;
         ireg[I->dest] = (int64_t)((b_ + (uint64_t)ireg[I->s2] * 8u) | (1ULL << 61)); }
+      pc++; NEXT;
+  L_PtrFromInt:   /* bcPtrFromInt (DIVERGENZE 528): "Cast(T Ptr, n)" in the fb mode - the Pascal arm's fast path */
+      /* A user-space address takes C's mark (bit 61) unless it may be one of the VM's PACKED names, (array + 1) << 32
+         | element. Only a value whose high word is 1..recdesc[12] (the number of array ids) can be one, and that case
+         goes back to the interpreter, which knows whether the array and the element exist. Everything else - 0, a
+         small number, a negative or already-tagged value - passes through unchanged, exactly as there. */
+      { int64_t v_ = ireg[I->s1];
+        if ((uint64_t)v_ >= 0x10000u && (uint64_t)v_ < 0x800000000000ULL) {
+          uint64_t t_ = (uint64_t)v_ >> 32;
+          if (t_ != 0 && (!recdesc || t_ <= (uint64_t)recdesc[12])) return pc;
+          v_ = (int64_t)((uint64_t)v_ | (1ULL << 61));
+        }
+        ireg[I->dest] = v_; }
       pc++; NEXT;
   L_ArrayStoreInt:   /* bcArrayStoreInt - the VALUE is in Dest, read not written */
       { const int64_t *d = arrdesc + 4*(int)I->s1; int64_t li = ireg[I->s2];

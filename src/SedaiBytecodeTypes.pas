@@ -590,6 +590,7 @@ const
   // carry what fbc's descriptor reports until DIVERGENZE 309-312 were closed, and three right fields
   // beside two wrong ones is not shippable. Now the storage says the same thing LBOUND/UBOUND say.
   bcArrayDescPtrInd    = bcGroupArray + 53;
+  bcPtrFromInt         = bcGroupArray + 59;  // DIVERGENZE 528: "Cast(T Ptr, n)" in the fb mode: Dest = Src1, tagged as a machine address unless it names a live VM array element
   bcArrayElemAddr      = bcGroupArray + 54;  // "@a(i)" in the fb mode: Src1 = array id (immediate), Src2 = linear index (int), Dest = tagged machine address
   // ⭐ PHASE 2.5 OF THE POINTER MODEL: an element of a PACKED array (Byte/UByte/Short/UShort/Long/ULong stored at its
   // true width in ByteData). Same operands as bcArrayLoadInt / bcArrayStoreInt (Dest = value, Src1 = array id,
@@ -2359,6 +2360,7 @@ begin
         52: Result := 'ArrayDescPtr';
         53: Result := 'ArrayDescPtrInd';
         54: Result := 'ArrayElemAddr';
+        59: Result := 'PtrFromInt';
         55: Result := 'ArrayLoadNarrow';
         56: Result := 'ArrayStoreNarrow';
         57: Result := 'ArrayLoadSingle';

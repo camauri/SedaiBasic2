@@ -82,7 +82,7 @@ var
   HotCOk: Boolean;      // may the C hot loop run? see the note at its call
   // The record-field descriptor handed to the C loop. It is built HERE, by the side that knows the
   // layout of TRecordStorage, so hotdisp.c holds no offset of its own and the two cannot drift.
-  HotRecDesc: array[0..11] of Int64;
+  HotRecDesc: array[0..12] of Int64;
   HotRecProbe: TRecordStorage;   // only ever used to take the offset of its Bytes field
   HotNewPC: LongInt;       // NEGATIVE means the back-edge budget ran out, with the PC as -(pc+1)
   HotBudget: LongInt;      // back edges this stay may take; High(LongInt) when nobody needs pumping
@@ -478,6 +478,9 @@ EventPollCounter := 0;
       HotRecDesc[8] := FHomeLo; HotRecDesc[9] := FHomeHi;
       HotRecDesc[10] := FRawLo;
       if FRawHi > FRawLo then HotRecDesc[11] := FRawHi - FRawLo else HotRecDesc[11] := 0;
+      // DIVERGENZE 528: the array ids a packed pointer may name - bcPtrFromInt hands such a value back to Pascal.
+      HotRecDesc[12] := Length(FArrays);
+      if Length(Ctx.ArrMap) > HotRecDesc[12] then HotRecDesc[12] := Length(Ctx.ArrMap);
       HotNewPC := sedai_hot_run(Instructions, IntRegs, PDouble(FloatRegs), CurPC, InstrCount, TrueVal,
                                 HotArrDesc, HotFlags, HotXferI, HotXferF, @FHotOp[0], @HotRecDesc[0],
                                 HotBudget, @HotGfxDesc[0]);
@@ -985,7 +988,8 @@ EventPollCounter := 0;
           Inc(CurPC);
         end;
       // ⛔ 9..54, not "9 .. SIZE - 1": 55 and 56 run inline above. A group-3 op added past 56 extends this range.
-      DENSE_ARRAY_BASE + 0 .. DENSE_ARRAY_BASE + 2, DENSE_ARRAY_BASE + 9 .. DENSE_ARRAY_BASE + 54:
+      DENSE_ARRAY_BASE + 0 .. DENSE_ARRAY_BASE + 2, DENSE_ARRAY_BASE + 9 .. DENSE_ARRAY_BASE + 54,
+      DENSE_ARRAY_BASE + 59:   // bcPtrFromInt (DIVERGENZE 528)
         // Cold array ops (DIM/REDIM/ERASE/BIND/...) may resize or move an array's backing store; the
         // descriptor rebuild is triggered inside ExecuteArrayOp itself (it has two callers now - here
         // and the AOT helper - so the flag lives with the op, not the call site).

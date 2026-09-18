@@ -172,6 +172,8 @@ type
     // and store was a helper call: binary-trees under --aot was 11x slower once its records were native.
     PtrHome: Pointer;      // offset 352: @AotPtrHome (VMSelf, value) -> Int64
     PtrStore: Pointer;     // offset 360: @AotPtrStore (VMSelf, value) -> Int64
+    // DIVERGENZE 528: bcPtrFromInt's slow half as a leaf - a number whose high word may name one of the VM's arrays.
+    PtrFromInt: Pointer;   // offset 368: @AotPtrFromInt (VMSelf, CtxObj, value) -> Int64
   end;
   PAotCtx = ^TAotCtx;
 
@@ -213,6 +215,7 @@ const
   AOTCTX_RAWALLOC    = 344;
   AOTCTX_PTRHOME     = 352;
   AOTCTX_PTRSTORE    = 360;
+  AOTCTX_PTRFROMINT  = 368;
 
   // C9 math table indices. ⛔ ONE list, two users: SedaiAot emits `call [table + INDEX*8]` and
   // SedaiBytecodeVM fills the table at those indices.
@@ -1320,6 +1323,8 @@ begin
     ssaRecordNew, ssaRecordFree,
     // C14: the allocation of a NATIVE cell as a leaf call (AotIsNative checks the gate and RAWALLOC_NATIVE_SLOT).
     ssaRawAlloc,
+    // DIVERGENZE 528: a number made a pointer - inline, with a leaf call only when the high word may name an array.
+    ssaPtrFromInt,
     // Phase 2 of the pointer model: raw memory through a machine address. A CONDITIONAL native form -
     // anything that is not an fb-mode address falls back to the helper - so it needs a PC.
     ssaRawLoadInt, ssaRawLoadFloat, ssaRawStoreInt, ssaRawStoreFloat,
@@ -1638,6 +1643,9 @@ begin
       Result := AotRecAllocNative and (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt);
     // C14: only a NATIVE cell - the flag exists only in the fb memory mode, where the arm is calloc and a push and nothing
     // raises. Every other allocation (the raw heap, a program block, a pointer cell) keeps the helper road.
+    ssaPtrFromInt:
+      Result := (Ins.Src1.Kind = svkRegister) and (Ins.Src1.RegType = srtInt) and
+                (Ins.Dest.Kind = svkRegister) and (Ins.Dest.RegType = srtInt);
     ssaRawAlloc:
       Result := AotRawAllocNative and (Ins.Src3.Kind = svkConstInt) and
                 ((Ins.Src3.ConstInt and RAWALLOC_NATIVE_SLOT) <> 0) and
@@ -3330,6 +3338,39 @@ var
     E.EmitBytes([$41, $FF, $D3]);                         // call r11
     StrCallEpilogue;
     IStore(d, RAX);                                       // rax = the cell's address -> int Dest
+  end;
+
+  // DIVERGENZE 528: IntRegs[dest] := bcPtrFromInt(IntRegs[src]) - the C hot loop's fast half inline, and
+  // AotPtrFromInt (TBytecodeVM.PtrFromIntValue, the interpreter's own rule) only when the high word is not zero, where the
+  // number could be one of the VM's packed names. Outside [64 KiB, 2^47) the value is kept; below 4 GiB it takes the mark.
+  // ⛔ arg2 is r8 on Win64, and r8 IS the context register: the value goes in last, through ILoadArgSpilled.
+  procedure EmitPtrFromInt;
+  var d, s, pKeep, pLow, pTag, pDone: Integer;
+  begin
+    d := IReg(Cur.Dest); s := IReg(Cur.Src1); if not OK then Exit;
+    ILoad(RAX, s);
+    E.EmitBytes([$48, $89, $C2]);                        // mov rdx, rax
+    E.EmitBytes([$48, $C1, $EA, 47]);                    // shr rdx, 47
+    E.EmitBytes([$0F, $85]); pKeep := E.Len; E.Emit32(0);   // jnz keep   (>= 2^47, or negative)
+    E.EmitBytes([$48, $3D]); E.Emit32($10000);           // cmp rax, 0x10000
+    E.EmitBytes([$0F, $82]); pLow := E.Len; E.Emit32(0);    // jb keep    (below 64 KiB, NULL included)
+    E.EmitBytes([$48, $89, $C2]);                        // mov rdx, rax
+    E.EmitBytes([$48, $C1, $EA, 32]);                    // shr rdx, 32
+    E.EmitBytes([$0F, $84]); pTag := E.Len; E.Emit32(0);    // jz tag     (below 4 GiB: no array id in it)
+    SpillVolatiles;                                      // the high word may name an array: the VM decides
+    E.MemOp([$4D, $8B], R11, R8, AOTCTX_PTRFROMINT);     // r11 = primitive
+    E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);    // arg0 = VMSelf
+    E.MemOp([$49, $8B], ABI_ARG1, R8, AOTCTX_CTXOBJ);    // arg1 = CtxObj
+    ILoadArgSpilled(ABI_ARG2, s);                        // arg2 = the number (last: may be r8)
+    E.EmitBytes([$41, $FF, $D3]);                        // call r11
+    StrCallEpilogue;
+    E.EmitBytes([$E9]); pDone := E.Len; E.Emit32(0);     // jmp done
+    E.Patch32(pTag, LongWord(E.Len - (pTag + 4)));       // @tag
+    E.EmitBytes([$48, $0F, $BA, $E8, 61]);               // bts rax, 61
+    E.Patch32(pKeep, LongWord(E.Len - (pKeep + 4)));     // @keep
+    E.Patch32(pLow, LongWord(E.Len - (pLow + 4)));
+    E.Patch32(pDone, LongWord(E.Len - (pDone + 4)));     // @done
+    IStore(d, RAX);
   end;
 
   // C6: AotRecordFree(VMSelf, IntRegs[src]) - DELETE p. The handle is read with the SPILLED
@@ -5806,6 +5847,17 @@ var
                 CountVal(Ins.Src1);                   // the handle to release
             end;
           end;
+          // DIVERGENZE 528: a number made a pointer. A leaf call on its cold half - a call-ready frame; it always completes.
+          ssaPtrFromInt:
+          begin
+            if not AotIsNative(SSAProg, Ins) then NoteHelperOp
+            else
+            begin
+              HasHelperCall := True;
+              CountVal(Ins.Dest);
+              CountVal(Ins.Src1);
+            end;
+          end;
           // C14: the allocation of a native cell as a leaf call - a call-ready frame, and it always completes natively.
           ssaRawAlloc:
           begin
@@ -7241,7 +7293,8 @@ var
         EmitRecordNew(apc);
       end;
       ssaRecordFree: EmitRecordFree;
-      ssaRawAlloc: EmitRawAllocNative;             // C14: only a native cell reaches here (AotIsNative)
+      ssaRawAlloc: EmitRawAllocNative;
+      ssaPtrFromInt: EmitPtrFromInt;               // DIVERGENZE 528             // C14: only a native cell reaches here (AotIsNative)
 
       // C7: PRINT's bookkeeping pair as leaf calls. No PC is needed - neither can deopt.
       ssaPrintSemicolon: EmitPrintSemi;

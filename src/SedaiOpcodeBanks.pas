@@ -204,6 +204,7 @@ begin
     // raw heap: Src1 = byte count (alloc) / raw pointer (free/realloc/load/store) — all int
     bcRawAlloc, bcRawFree, bcRawRealloc,
     bcRawLoadInt, bcRawLoadFloat, bcRawStoreInt, bcRawStoreFloat,
+    bcPtrFromInt,   // DIVERGENZE 528: Src1 = the number being made a pointer (int)
     bcRawLoadZStr, bcRawStoreZStr,   // C-string view: Src1 = raw pointer (int)
     // FB_MEMCOPY/FB_MEMMOVE/CLEAR: Src1 = destination raw pointer (int)
     bcRawMemCopy, bcRawMemMove, bcRawClear,
@@ -618,6 +619,7 @@ begin
     bcArrayLBound, bcArrayUBound,  // B1.4: LBOUND/UBOUND - Dest = int bound
     bcArrayDescPtr, bcArrayDescPtrInd,  // FBC.ArrayDescriptorPtr - Dest = a pointer into the descriptor region (int)
     bcArrayElemAddr,  // phase 2.3: "@a(i)" - Dest = the element's tagged machine address (int)
+    bcPtrFromInt,     // DIVERGENZE 528: Dest = the pointer (int)
     bcRefLoadInt,    // FreeBASIC pointer deref (int) - Dest = value loaded
     bcRefAddrField,  // @obj.field - Dest = packed record-field pointer (int)
     bcRawAlloc, bcRawRealloc,  // raw heap: Dest = raw pointer (int)

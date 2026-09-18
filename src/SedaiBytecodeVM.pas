@@ -900,6 +900,7 @@ type
                               out AAvail: PtrUInt; out AElemW: Integer): Boolean;   // ...e com'e' fatta
     function ForeignMakeClosure(ACtx: TObject; AEntryPC: Int64;
                                 const ASig: string): Pointer;       // una procedura BASIC che C puo' chiamare
+    function PtrFromIntValue(Ctx: TExecutionContext; V: Int64): Int64;   // bcPtrFromInt (DIVERGENZE 528)
     function VMPointerForMachineAddr(ACtx: TExecutionContext; A: PtrUInt): Int64;  // ...e la strada inversa
     function ArrayBufferAvail(A, NeedBytes: PtrUInt; out AAvail: PtrUInt): Boolean;  // phase 2.3, --bounds-check
     function ArraySlotOfAddr(A: PtrUInt; out Slot: Integer; out Elem: Int64): Boolean;   // phase 2.3
@@ -7235,6 +7236,38 @@ begin
   end;
 end;
 
+function TBytecodeVM.PtrFromIntValue(Ctx: TExecutionContext; V: Int64): Int64;
+// bcPtrFromInt (DIVERGENZE 528), ONCE for the interpreter's arm and the AOT's leaf (AotPtrFromInt); the C hot loop keeps
+// only the fast half and hands back the rest. A user-space address takes C's mark unless it names a live element of one
+// of the VM's arrays - the PACKED form "(array + 1) shl 32 or element" some arrays still hand out. Ctx may be nil (the
+// AOT leaf): then a private array id is taken as it is, which can only miss a name and mark it, never the other way.
+// ⚠️ It only READS FArrays. The id is tested against a count taken first, so arrdesc_writers_check (which reads a line
+// with FArrays before an assignment as a write) does not list a reader among the routines that move storage.
+var
+  A, N: Integer;
+  E: Int64;
+begin
+  Result := V;
+  if not ForeignIsMachineAddress(PtrUInt(V)) then Exit;
+  A := -1;
+  N := Length(FArrays);
+  if (V shr POINTER_ARRAY_SHIFT) >= 1 then
+  begin
+    if Ctx <> nil then A := MapArrDyn(Ctx, (V shr POINTER_ARRAY_SHIFT) - 1)
+    else if (V shr POINTER_ARRAY_SHIFT) <= N then A := Integer((V shr POINTER_ARRAY_SHIFT) - 1);
+  end;
+  E := V and POINTER_OFFSET_MASK;
+  if (A >= 0) and (A <= High(FArrays)) and
+     ((E < FArrays[A].TotalSize) or (E < Length(FArrays[A].IntData)) or (E < Length(FArrays[A].FloatData)) or
+      (E < Length(FArrays[A].StringData))) then Exit;
+  Result := V or FGNPTR_TAG;
+end;
+
+function AotPtrFromInt(VMSelf, CtxObj: Pointer; V: PtrInt): PtrInt; cdecl;
+begin
+  Result := PtrInt(TBytecodeVM(VMSelf).PtrFromIntValue(TExecutionContext(CtxObj), V));
+end;
+
 function AotPtrHome(VMSelf: Pointer; V: PtrInt): PtrInt; cdecl;
 begin
   Result := PtrInt(TBytecodeVM(VMSelf).PtrLoadHome(V));
@@ -10096,6 +10129,13 @@ begin
         end;
 
         // LBOUND/UBOUND: Dest = int bound, Src2 = int dim index (Src1 = array id, not a register)
+        // DIVERGENZE 528: Dest and Src1 both int (Cast(T Ptr, n) in the fb mode)
+        bcPtrFromInt:
+        begin
+          if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
+          if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+        end;
+
         bcArrayLBound, bcArrayUBound, bcArrayElemAddr:   // phase 2.3: Src2 = the linear element index
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
@@ -15064,6 +15104,7 @@ begin
   C.FloatRoundU := @AotFloatRoundU;
   C.RawAlloc := @AotRawAlloc;
   C.PtrHome := @AotPtrHome;
+  C.PtrFromInt := @AotPtrFromInt;   // DIVERGENZE 528
   AotSetHomeLayout(Integer(PtrUInt(@FHomeValid) - PtrUInt(Pointer(Self))),
                    Integer(PtrUInt(@FHomeLo) - PtrUInt(Pointer(Self))),
                    Integer(PtrUInt(@FHomeHi) - PtrUInt(Pointer(Self))),
@@ -18083,7 +18124,8 @@ begin
   case SubOp of
     9, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     29, 30, 31, 32, 33, 43, 45, 46, 50, 51, 52, 53, 54,
-    55, 56, 57, 58: Result := False;   // phase 2.5 / 2.6: a packed element read/write moves nothing (ArrayHotOps.inc)
+    55, 56, 57, 58,
+    59: Result := False;   // 59 bcPtrFromInt (528) only READS where arrays are   // phase 2.5 / 2.6: a packed element read/write moves nothing (ArrayHotOps.inc)
   else
     Result := True;
   end;
@@ -18631,6 +18673,23 @@ begin
             Ctx.IntRegs[Instr.Dest] := RAWPTR_TAG or RAWPTR_REGION_ADESC or
                                        (Int64(ArrayIdx) shl RAWPTR_ADESC_PHYS_SHIFT) or
                                        (Int64(LinearIdx) shl RAWPTR_ADESC_LOG_SHIFT);
+        end;
+      59: // bcPtrFromInt - "Cast(T Ptr, n)" in the fb memory mode (DIVERGENZE 528). Dest(int) = Src1(int), with the
+        begin  // machine-address tag added when the number is an ADDRESS and not one of the VM's own names.
+          // ⭐ In the fb mode a pointer IS its address, so a number cast to a pointer must work as one - FreeBASIC
+          // programs keep addresses in Integers (hashing, tables, C's intptr_t) and cast them back. The tag is what
+          // every arm that reads through a pointer keys on; without it "*Cast(Integer Ptr, Cast(Integer, p))" died on
+          // "Null or invalid pointer dereference" and compared unequal to p.
+          // ⛔ But an untagged number with bits 63..61 = 000 may also be a PACKED name ((array+1) shl 32 or element)
+          // that "Cast(Integer, @s(i))" left as it was - arrays of strings, Booleans or pointers still hand those out.
+          // Only the VM can tell the two apart: it is a name when the array exists and the element is inside it. A
+          // machine address would have to fall on a live array id AND an in-range element at once to be mistaken.
+          // Anything already tagged (C's memory, the raw heap, a record) or negative is left alone, and so is 0.
+          // ⛔ And only a USER-SPACE address takes the mark - the one rule every site that marks a value asks
+          // (ForeignIsMachineAddress, DIVERGENZE 451). A pointer read back out of C's memory is marked by it too,
+          // so "q[1] = Cast(Integer Ptr, 4096)" compares equal only if both sides answer the same question: marking
+          // 4096 here, and not on the load, made that comparison false (guard m1055).
+          Ctx.IntRegs[Instr.Dest] := PtrFromIntValue(Ctx, Ctx.IntRegs[Instr.Src1]);
         end;
       54: // bcArrayElemAddr - "@a(i)" in the fb memory mode (phase 2.3 of the pointer model). Dest(int) = the
         begin  // MACHINE ADDRESS of element Src2 (0-based linear index) of array Src1, tagged FGNPTR_TAG like
