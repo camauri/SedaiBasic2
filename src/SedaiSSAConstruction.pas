@@ -97,6 +97,17 @@ type
     // to make. WITH it - and this is the case the old shortcut missed - one definition block is
     // enough, as soon as that block is a loop body reading its own previous value ("s = s + i").
     UpwardExposed: Boolean;
+    // ⭐⭐ THE TEXTBOOK "GLOBALS" SET, and it is a DIFFERENT question from the one above. UpwardExposed
+    // asks "is there a block that reads this before writing it AND also writes it" - narrow on purpose,
+    // because widening it placed PHIs and cost n-body 53% (see the note at the single-def filter). This
+    // one asks only the first half: "is there a block that reads it before writing it", which is Briggs'
+    // definition of a name that lives across a block boundary.
+    // ⛔ IT DECIDES NOTHING: it is MEASURED and reported by PHIVAR_DIAG, and nothing reads it otherwise.
+    // It was added on 18 Sep 2026 to screen multi-def variables out of PHI placement, and the screen was
+    // removed the same hour because on the file it was written for it never fires - all 290 variables
+    // that reach PHI placement are upward-exposed somewhere. The field stays so the next attempt starts
+    // from a number instead of from the same guess. See the note above SingleDefNeedsPhi.
+    GlobalUse: Boolean;
     KilledStamp: Integer;      // block stamp of the last def seen while scanning a block
     VersionCounter: Integer;   // Next version number
     LastVersion: Integer;      // Last assigned version (fallback)
@@ -185,6 +196,47 @@ var
   // once: -1 unknown, 0 = PHIDF=0, the old unconditional skip (which MISCOMPILES an uninitialised
   // accumulator - kept only to price the fix on one binary), 1 = ask the dominance frontier.
   GSingleDefPhi: Integer = -1;
+
+var
+  GPhiVarDiag: Boolean = False;
+  GPhiReached: Integer = 0;
+  GPhiMulti: Integer = 0;
+  GPhiSingle: Integer = 0;
+  GPhiGlobal: Integer = 0;
+  GPhiVersionable: Integer = 0;
+  GPhiPlaced: Integer = 0;
+
+{ ⛔⛔ WHAT `functions/paraminit` OF THE fbc SUITE COSTS, AND WHY IT IS NOT WHAT THE NOTES SAID
+  (measured 18 Sep 2026, and the measurement is kept here because the cure is not).
+
+  It was in the notes as "the quadratic of paraminit": it times out at 16 jobs and passes at 8. Three
+  things turned out to be true, in this order, and each one killed the hypothesis before it:
+
+  1. It is NOT a quadratic in TIME. Cutting the input to 4 / 8 / 16 / 31 / 36 TEST_GROUPs, ssa-gen costs
+     ~65 microseconds per emitted instruction at EVERY size. Linear.
+  2. It is MEMORY. One compile of that 277-line file holds **503 MB** (`VmHWM`), and sixteen of them do
+     not fit on this machine. `--no-opt` holds 97 MB; of the difference, 100% needs the SUB INLINER to
+     have run (`OPTSKIP=SubInlining` puts it back to 97 MB) and 100% needs SSA CONSTRUCTION to have run
+     (`OPTSKIP=SSAConstruction` puts it to 62 MB). It is heap, not stack: `VmStk` is 0.
+  3. ⭐⭐ It is PHI FUNCTIONS, and a SINGLE inlined call site is enough. `--stats` on the same file:
+     SSA construction adds **+740** instructions with `INLINE_MAX=0` and **+144 757** with `INLINE_MAX=1`,
+     while the inliner itself adds 7 and DBE removes 7.
+
+  ⇒ And the census says it is not the number of variables. `PHIVAR_DIAG=1` prints the same line in
+  both cases — 290 variables reach PHI placement, 5841 blocks, 278 of them versionable — and a
+  different number of PHIs: **740 against 144 757**. What changes is the DOMINANCE FRONTIER: total
+  8 545 ⇒ 19 418, and the worst single block **5 ⇒ 87**. One spliced body reshapes the dominance
+  structure of the whole procedure, and the iterated frontier does the rest.
+
+  ⛔ A cure was written and REMOVED THE SAME HOUR, which is why this note exists instead of it. The
+  obvious screen is Briggs' "globals" set — a PHI is only needed for a name read, in some block, before
+  anything in that block writes it — applied to variables with more than one definition block, since the
+  single-def case already has it. It is sound and it NEVER FIRES here: the 290 variables are all
+  upward-exposed somewhere. Shipping a change to PHI placement that cannot be shown to help, on a pass
+  where being wrong is a silent miscompilation, is the wrong trade. The next person has the two
+  instruments (`HEAP_DIAG=1`, `PHIVAR_DIAG=1`) and the number to beat.
+  ⚠ Where to look next, on the evidence: not here. The frontier changes because of the CFG the
+  INLINER leaves behind, and `SedaiSubInlining.pas` is where the edges are made. }
 
 function SingleDefNeedsPhi: Boolean;
 begin
@@ -367,6 +419,7 @@ begin
   FVarInfo[Result].DefBlockCount := 0;
   FVarInfo[Result].UseBlockCount := 0;
   FVarInfo[Result].UpwardExposed := False;
+  FVarInfo[Result].GlobalUse := False;
   FVarInfo[Result].KilledStamp := -1;
   FVarInfo[Result].DefSeenBlock := Low(Integer);   // mai vista: nessun BlockIdx puo' valere questo
   FVarInfo[Result].UseSeenBlock := Low(Integer);
@@ -711,8 +764,14 @@ var
     // qui», perche' CollectDefinitions e' un'altra passata e il suo timbro non sopravvive. La
     // risponde la lista SPARSA, che per costruzione e' corta: la stessa DefBlocks che la passata
     // precedente ha riempito.
-    if (FVarInfo[Idx].KilledStamp <> BlockIdx) and DefinesInBlock(Idx, BlockIdx) then
-      FVarInfo[Idx].UpwardExposed := True;
+    if FVarInfo[Idx].KilledStamp <> BlockIdx then
+    begin
+      // Read in this block before anything in this block wrote it: the value came in from a
+      // predecessor, so this name lives across a block boundary. Briggs' "global" name.
+      FVarInfo[Idx].GlobalUse := True;
+      if DefinesInBlock(Idx, BlockIdx) then
+        FVarInfo[Idx].UpwardExposed := True;
+    end;
   end;
 
   procedure AddKill(const Val: TSSAValue);
@@ -775,6 +834,7 @@ end;
 procedure TSSAConstruction.InsertPhiFunctions;
 var
   i, j: Integer;
+  DFTotal, DFMax: Integer;
   PhiCount, SkippedCount: Integer;
   {$IFDEF DEBUG_SSA_TIMING}
   T1, T2, T3, T4: QWord;
@@ -794,6 +854,7 @@ begin
   T3 := GetTickCount64;
   {$ENDIF}
 
+  GPhiVarDiag := GetEnvironmentVariable('PHIVAR_DIAG') = '1';
   PhiCount := 0;
   SkippedCount := 0;
   {$IFDEF DEBUG_SSA_TIMING}
@@ -858,9 +919,40 @@ begin
       Continue;
     end;
 
+    // PHIVAR_DIAG=1: the census of what actually reaches PHI placement, by the three properties the
+    // filters above ask about. ⛔ It exists because a filter that does not fire looks exactly like a
+    // filter that fires and changes nothing: the first version of the multi-def screen above answered
+    // "+144757" both ways, and only counting said which of its three conditions was the one excluding
+    // the variables.
+    if GPhiVarDiag then
+    begin
+      if FVarInfo[i].DefBlockCount > 1 then Inc(GPhiMulti) else Inc(GPhiSingle);
+      if FVarInfo[i].GlobalUse then Inc(GPhiGlobal);
+      if FVarInfo[i].Versionable then Inc(GPhiVersionable);
+      Inc(GPhiReached);
+    end;
+
     // Use stored RegType/RegIndex for PHI placement
     PlacePhiForVariable(i, FVarInfo[i].RegType, FVarInfo[i].RegIndex);
     Inc(PhiCount);
+  end;
+
+  if GPhiVarDiag then
+  begin
+    DFTotal := 0; DFMax := 0;
+    for j := 0 to FBlockCount - 1 do
+      if FDomFrontier[j] <> nil then
+      begin
+        Inc(DFTotal, FDomFrontier[j].Count);
+        if FDomFrontier[j].Count > DFMax then DFMax := FDomFrontier[j].Count;
+      end;
+    WriteLn(ErrOutput, '[PHIVAR] vars=', FVarInfoCount, ' reached=', GPhiReached,
+            '  di cui multiDef=', GPhiMulti, ' singleDef=', GPhiSingle,
+            '  globalUse=', GPhiGlobal, ' versionable=', GPhiVersionable,
+            '  blocchi=', FBlockCount, '  PHI piazzate=', GPhiPlaced,
+            '  DF totale=', DFTotal, ' DF max=', DFMax);
+    Flush(ErrOutput);
+    GPhiReached := 0; GPhiMulti := 0; GPhiSingle := 0; GPhiGlobal := 0; GPhiVersionable := 0; GPhiPlaced := 0;
   end;
 
   {$IFDEF DEBUG_SSA_TIMING}
@@ -935,6 +1027,7 @@ begin
         FPhiBlockSet[YIdx] := FPhiBlockVersion;  // Mark as "in set" for this version
 
         // Create PHI instruction: dest = PHI(...)
+        if GPhiVarDiag then Inc(GPhiPlaced);
         PhiInstr := TSSAInstruction.Create(ssaPhi);
         PhiInstr.Dest := MakeSSARegister(VarRegType, VarRegIndex);
 

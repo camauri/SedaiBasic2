@@ -161,19 +161,44 @@ uses
   worse than no total: it is a number that invites the wrong conclusion. ⛔ And `perf` cannot fill
   the gap — an FPC release binary has no frame pointers, so its INCLUSIVE call graph is invalid and
   only self times are evidence. This prints one line per phase, and one total that covers them all. }
+{ HEAP_DIAG=1 — the same line, with the HEAP the compiler is holding at the end of each phase.
+  ⛔⛔ WHY IT EXISTS (18 Sep 2026). `functions/paraminit` of the fbc suite was in the notes as "a
+  quadratic": it times out at 16 jobs and passes at 8. It is not a quadratic — ssa-gen is linear, at
+  ~65 microseconds per emitted instruction at every input size — it is MEMORY: one compile of that 277-line
+  file holds **503 MB**, and sixteen of them do not fit on this machine. There was no instrument for
+  that at all: PHASE_DIAG answers "where does the time go" and nothing answered "where does the memory
+  go", so the first four hypotheses were bisected by running the whole compiler once per guess.
+  📊 What it says on that file, which is the shape of the answer: `--no-opt` holds 97 MB and the full
+  pipeline 503 MB, and skipping ONE pass (the SUB inliner) brings it back to 97 — while a SINGLE inlined
+  site already costs 116 MB, with the instruction count going DOWN.
+  ⚠ CurrHeapUsed is what the program has ASKED FOR, not the process's RSS: the two differ by the
+  allocator's own free lists, and a phase that frees can leave RSS untouched. Read it beside
+  /proc/<pid>/status VmHWM, never instead of it. }
 var
   GPhaseDiag: Boolean = False;
+  GHeapDiag: Boolean = False;
   GPhaseT0: QWord = 0;
   GPhaseLast: QWord = 0;
+  GHeapLast: Int64 = 0;
 
 procedure PhaseMark(const PhaseName: string);
 var
   Now_: QWord;
+  H: THeapStatus;
 begin
-  if not GPhaseDiag then Exit;
+  if not (GPhaseDiag or GHeapDiag) then Exit;
   Now_ := GetTickCount64;
-  WriteLn(ErrOutput, Format('[PHASE] %-22s %8d ms   (cum %8d ms)',
-          [PhaseName, Int64(Now_ - GPhaseLast), Int64(Now_ - GPhaseT0)]));
+  if GHeapDiag then
+  begin
+    H := GetHeapStatus;
+    WriteLn(ErrOutput, Format('[PHASE] %-22s %8d ms   (cum %8d ms)   heap %7d kB  (+%6d kB)',
+            [PhaseName, Int64(Now_ - GPhaseLast), Int64(Now_ - GPhaseT0),
+             Int64(H.TotalAllocated div 1024), Int64((H.TotalAllocated div 1024) - GHeapLast)]));
+    GHeapLast := H.TotalAllocated div 1024;
+  end
+  else
+    WriteLn(ErrOutput, Format('[PHASE] %-22s %8d ms   (cum %8d ms)',
+            [PhaseName, Int64(Now_ - GPhaseLast), Int64(Now_ - GPhaseT0)]));
   Flush(ErrOutput);
   GPhaseLast := Now_;
 end;
@@ -181,18 +206,20 @@ end;
 procedure PhaseBegin;
 begin
   GPhaseDiag := GetEnvironmentVariable('PHASE_DIAG') = '1';
+  GHeapDiag := GetEnvironmentVariable('HEAP_DIAG') = '1';
   GPhaseT0 := GetTickCount64;
   GPhaseLast := GPhaseT0;
+  GHeapLast := 0;
 end;
 
 function PhaseDiagOn: Boolean;
 begin
-  Result := GPhaseDiag;
+  Result := GPhaseDiag or GHeapDiag;
 end;
 
 procedure PhaseTotal(const InstructionCount: Integer);
 begin
-  if not GPhaseDiag then Exit;
+  if not (GPhaseDiag or GHeapDiag) then Exit;
   WriteLn(ErrOutput, Format('[PHASE] TOTAL %d ms, %d bytecode instructions',
           [Int64(GetTickCount64 - GPhaseT0), InstructionCount]));
   Flush(ErrOutput);
