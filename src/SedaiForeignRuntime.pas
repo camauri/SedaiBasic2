@@ -94,8 +94,11 @@ type
                                   out AIsFloat: Boolean): Pointer of object;
 
   { ⭐ The SECOND level of a pointer handed to C (DIVERGENZE 257, option B): for a cell of an array of
-    pointers, the program cell it points at when that cell's content is itself a pointer - nil otherwise. }
-  TForeignDeepCell = function(ACtx: TObject; Value: Int64): PInt64 of object;
+    pointers, the program cell it points at when that cell's content is itself a pointer - nil otherwise.
+    ⛔ ACells is how many cells FOLLOW that one to the end of its storage, and it is not decoration:
+    "g_test_init(@argc, @pargv)" hands C a "char ***" whose second level is the WHOLE of argv, and a copy
+    one cell long left argv[1] outside the buffer (DIVERGENZE 516). }
+  TForeignDeepCell = function(ACtx: TObject; Value: Int64; out ACells: PtrUInt): PInt64 of object;
 
   TForeignBinding = record
     Decl: TForeignDecl;
@@ -924,6 +927,11 @@ var
   NBase: PtrUInt;                        // the address C was actually given for a narrow copy
   RPS: string;
   DTgt: array[0..63] of array of PInt64; // W8: the program cell that copy stands for (nil = one level)
+  DCnt: array[0..63] of array of PtrUInt; // ...how many cells that run holds (516)
+  DOfs: array[0..63] of array of PtrUInt; // ...where its copy starts in the shadow area
+  DTot, DCells: PtrUInt;
+  u2: Integer;
+  ShV: Int64;
   NN, nwid: Integer;
   nk: PtrUInt;
   NIsF: Boolean;
@@ -1102,17 +1110,37 @@ begin
                         // POINTER (DIVERGENZE 257 B): libffi's "values(0) = @s", s a ZString Ptr, where C
                         // reads *values(0) and follows it. C gets the address of a translated COPY of s;
                         // what C changes there comes back after the call.
-                        W8B := W8Buffer(XferInt[SlotI], (2 * nk + 1) * 8);
-                        Sh := PInt64(W8B + (nk + 1) * 8);
-                        SetLength(DTgt[NN], nk);
+                        // ⛔⛔ AND THE SECOND LEVEL IS A RUN, NOT A CELL (DIVERGENZE 516). A copy one cell
+                        // long is right for "values(0) = @s" - s is a scalar - and wrong for the shape every
+                        // library uses to take argc/argv: "@pargv" of a "ZString Ptr Ptr" whose value names
+                        // argv(0), where C reads argv[1] and argv[2] as well. They landed PAST the buffer.
+                        // The run is measured, each run gets a spare zero word of its own (C reads argv[argc]),
+                        // and DOfs says where each one starts, because the runs are no longer all one cell.
+                        SetLength(DTgt[NN], nk); SetLength(DCnt[NN], nk); SetLength(DOfs[NN], nk);
+                        DTot := 0;
                         for r := 0 to Integer(nk) - 1 do
                         begin
-                          DTgt[NN][r] := nil;
-                          if Assigned(FDeepCell) then DTgt[NN][r] := FDeepCell(ACtx, PInt64(P)[r]);
+                          DTgt[NN][r] := nil; DCnt[NN][r] := 0; DOfs[NN][r] := 0; DCells := 0;
+                          if Assigned(FDeepCell) then DTgt[NN][r] := FDeepCell(ACtx, PInt64(P)[r], DCells);
                           if DTgt[NN][r] <> nil then
                           begin
-                            Sh[r] := Int64(PtrUInt(FResolvePtr(ACtx, DTgt[NN][r]^)));
-                            PInt64(W8B)[r] := Int64(PtrUInt(@Sh[r]));
+                            if DCells < 1 then DCells := 1;
+                            DCnt[NN][r] := DCells;
+                            DOfs[NN][r] := DTot;
+                            Inc(DTot, DCells + 1);
+                          end;
+                        end;
+                        W8B := W8Buffer(XferInt[SlotI], (nk + 1 + DTot) * 8);
+                        Sh := PInt64(W8B + (nk + 1) * 8);
+                        for r := 0 to Integer(nk) - 1 do
+                        begin
+                          if DTgt[NN][r] <> nil then
+                          begin
+                            for u2 := 0 to Integer(DCnt[NN][r]) - 1 do
+                              Sh[DOfs[NN][r] + PtrUInt(u2)] :=
+                                Int64(PtrUInt(FResolvePtr(ACtx, DTgt[NN][r][u2])));
+                            Sh[DOfs[NN][r] + DCnt[NN][r]] := 0;      // the terminator C reads one past the end
+                            PInt64(W8B)[r] := Int64(PtrUInt(@Sh[DOfs[NN][r]]));
                           end
                           else
                             PInt64(W8B)[r] := Int64(PtrUInt(FResolvePtr(ACtx, PInt64(P)[r])));
@@ -1503,19 +1531,23 @@ begin
              // program cell as a machine address the program can see; one C left alone keeps its value.
              if (r <= High(DTgt[nwid])) and (DTgt[nwid][r] <> nil) then
              begin
-               if Sh[r] <> Int64(PtrUInt(FResolvePtr(ACtx, DTgt[nwid][r]^))) then
+               for u2 := 0 to Integer(DCnt[nwid][r]) - 1 do
                begin
-                 if Sh[r] = 0 then
-                   DTgt[nwid][r]^ := 0
-                 else
+                 ShV := Sh[DOfs[nwid][r] + PtrUInt(u2)];
+                 if ShV <> Int64(PtrUInt(FResolvePtr(ACtx, DTgt[nwid][r][u2]))) then
                  begin
-                   if Assigned(FNoteRegion) then
-                     FNoteRegion(ACtx, PtrUInt(Sh[r]), 0, True, False);
-                   DTgt[nwid][r]^ := Sh[r] or FGNPTR_TAG;
+                   if ShV = 0 then
+                     DTgt[nwid][r][u2] := 0
+                   else
+                   begin
+                     if Assigned(FNoteRegion) then
+                       FNoteRegion(ACtx, PtrUInt(ShV), 0, True, False);
+                     DTgt[nwid][r][u2] := ShV or FGNPTR_TAG;
+                   end;
                  end;
                end;
                // ...and the cell itself still points at the copy, unless C rewrote it.
-               if PInt64(NBuf[nwid])[r] = Int64(PtrUInt(@Sh[r])) then Continue;
+               if PInt64(NBuf[nwid])[r] = Int64(PtrUInt(@Sh[DOfs[nwid][r]])) then Continue;
              end;
              if PInt64(NBuf[nwid])[r] <> Int64(PtrUInt(FResolvePtr(ACtx, PInt64(NCell[nwid])[r]))) then
              begin

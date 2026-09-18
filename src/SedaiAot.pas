@@ -8384,16 +8384,30 @@ end;
 //     <hex start> <hex size> <name>
 // in the same shape a perf map uses, so the file stays useful if perf ever is available.
 //
-// AOT_MAP=1 writes /tmp/sb-aot-<pid>.map; AOT_MAP=<path> writes there instead. Off by default: it
-// costs a file per run and says nothing to anyone not holding a sampler.
+// AOT_MAP=1 writes $SEDAI_TMP/sb-aot-<pid>.map; AOT_MAP=<path> writes there instead. Off by default:
+// it costs a file per run and says nothing to anyone not holding a sampler.
+// ⛔ SEDAI_TMP, and it falls back to $HOME/tmp, not to /tmp (18 Sep 2026, owner): a reboot empties
+// /tmp, and a map lost that way is a measurement that has to be taken again. Only a machine with
+// neither variable set writes to /tmp.
 procedure AotWriteMapLine(const Name: string; Base: Pointer; Size: PtrUInt);
 var
-  Where: string;
+  Where, Base_: string;
   F: TextFile;
 begin
   Where := GetEnvironmentVariable('AOT_MAP');
   if Where = '' then Exit;
-  if Where = '1' then Where := Format('/tmp/sb-aot-%d.map', [GetProcessID]);
+  if Where = '1' then
+  begin
+    Base_ := GetEnvironmentVariable('SEDAI_TMP');
+    if Base_ = '' then
+    begin
+      Base_ := GetEnvironmentVariable('HOME');
+      if Base_ <> '' then Base_ := Base_ + '/tmp';
+    end;
+    if Base_ = '' then Base_ := '/tmp';
+    ForceDirectories(Base_);
+    Where := Format('%s/sb-aot-%d.map', [Base_, GetProcessID]);
+  end;
   AssignFile(F, Where);
   try
     if FileExists(Where) then Append(F) else Rewrite(F);

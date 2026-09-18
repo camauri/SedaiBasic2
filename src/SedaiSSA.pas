@@ -3065,6 +3065,35 @@ begin
         5, 9: TypeU := 'LONG'; 6, 10: TypeU := 'ULONG';
         7: TypeU := 'SINGLE';
       end;
+      // ⭐ A POINTER SCALAR HAS NO WIDTH - IT HAS A DOMAIN (DIVERGENZE 516). "@pargv" of a
+      // "ZString Ptr Ptr" is what C reads as "char ***": the ONE cell backing the scalar holds a
+      // VM-domain pointer, and C follows it. Code 8 is the translation "@args(0)" of a pointer ARRAY
+      // already gets (253), plus the level below it (257 B) - the cell reaches C as a machine address,
+      // and one C changed comes home marked. Without it the packed value went over as it stood and
+      // "g_test_init(@argc, @pargv, 0)" died in an access violation on a program fbc runs.
+      // ⛔⛔ THE QUESTION IS ABOUT THE CELL, NOT ABOUT WHAT THE POINTER POINTS AT. Asking
+      // "IsRawPtr" here - the test every other rung of this function uses - answered TRUE for pargv,
+      // because it holds "@argv(0)", and the rule never fired: what its VALUE names says nothing about
+      // where the pointer itself LIVES. Only the runtime can answer that, and it does: ForeignCellRun
+      // returns nil for a raw slot and for C's own memory, so the announcement degrades to the path of
+      // before and never to a new one. Both domains translate the same way through FResolvePtr.
+      // ⛔⛔⛔ ...AND ONLY WHEN THE POINTEE IS ITSELF A POINTER. That is the line between C WRITING
+      // the cell and C READING THROUGH it, and the first version of this rule did not draw it - the crt
+      // deck took it in one run. "strtod(@s, @fine)", fine a "ZString Ptr": the cell is an OUT parameter,
+      // and the road it has taken since 219 brings the address C wrote HOME into the program's domain
+      // (FPtrHome), so "cast(integer, fine) - cast(integer, @s)" answers 3. Code 8 marks it as C's memory
+      // instead, and that subtraction answered -4611545451122917373. A pointer TO a pointer
+      // ("ZString Ptr Ptr") is the other case: C FOLLOWS the cell, and the level below has to be
+      // translated on the way IN - which only code 8 does.
+      if TypeU = '' then
+      begin
+        Nm := ManagedPtrPointee(Nm);
+        if (Length(Nm) >= 3) and SameText(Copy(Nm, Length(Nm) - 2, 3), 'PTR') then
+        begin
+          TypeU := 'ANY PTR';
+          Exit(8);
+        end;
+      end;
     end
     else
     begin
@@ -3111,7 +3140,10 @@ begin
   end;
   if GetEnvironmentVariable('FGNDIAG') = '1' then
     WriteLn(ErrOutput, 'FGN narrow? node=', Ord(Node.NodeType), ' children=', Node.ChildCount,
-            ' value=', VarToStr(Node.Value), ' type=', TypeU);
+            ' value=', VarToStr(Node.Value), ' type=', TypeU,
+            ' mptr=', ManagedPtrPointee(UpperFast(VarToStr(Node.Value))),
+            ' raw=', IsRawPtr(UpperFast(VarToStr(Node.Value))),
+            ' rawudt=', RawUDTPtrType(UpperFast(VarToStr(Node.Value))));
   if TypeU = '' then Exit;
   TypeU := UpperFast(CanonicalType(UpperFast(TypeU)));
   if TypeU = 'BYTE' then Result := 1
@@ -55609,17 +55641,20 @@ begin
       if T = '' then T := ForeignNativeRecSpec(ArgListNode.GetChild(i));   // phase 3.7: asked FIRST, a native record is an address
       if (T = '') and ForeignRecordArg(ArgListNode.GetChild(i)) then
         T := 'REC:' + Decl.ParamTypeNames[i] + ForeignRecPtrOffsets(ArgListNode.GetChild(i));
+      // ⭐ DIVERGENZE 450 - ...and a parameter DECLARED "Any Ptr" handed "@p" of a pointer is a cell C may fill, as the
+      // tail's is (443): "mysql_get_optionv(db, MYSQL_SET_CHARSET_NAME, @csn)" wrote C's address there, nothing brought
+      // it home, and "*csn" read it as the VM's ("Null or invalid pointer dereference").
+      // ⛔ ASKED BEFORE THE WIDTH, since DIVERGENZE 516: "@p" of a pointer scalar now HAS a width code (8),
+      // and the two rules describe the same shape. This one keeps the parameter the header declared "Any Ptr";
+      // code 8 is for a parameter that says how many levels deep it goes.
+      if (T = '') and SameText(Decl.ParamTypeNames[i], 'ANY PTR') and ForeignPtrCellArg(ArgListNode.GetChild(i)) then
+        T := 'ANY PTR PTR';
       // ...and one handed the address of a NARROW value writes the width it was declared with (247).
       if (T = '') then
       begin
         k := ForeignNarrowArg(ArgListNode.GetChild(i), NarrowT);
         if k > 0 then T := 'W' + IntToStr(k) + ':' + Decl.ParamTypeNames[i];
       end;
-      // ⭐ DIVERGENZE 450 - ...and a parameter DECLARED "Any Ptr" handed "@p" of a pointer is a cell C may fill, as the
-      // tail's is (443): "mysql_get_optionv(db, MYSQL_SET_CHARSET_NAME, @csn)" wrote C's address there, nothing brought
-      // it home, and "*csn" read it as the VM's ("Null or invalid pointer dereference").
-      if (T = '') and SameText(Decl.ParamTypeNames[i], 'ANY PTR') and ForeignPtrCellArg(ArgListNode.GetChild(i)) then
-        T := 'ANY PTR PTR';
     end;
     if T <> '' then Params := Params + T
     else Params := Params + Decl.ParamTypeNames[i];
@@ -55631,6 +55666,10 @@ begin
       // gia' pronta: la coda variadica puo' portare un callback quanto un parametro dichiarato
     else if ForeignRecordArg(ArgListNode.GetChild(i)) then
       T := 'REC:ANY PTR' + ForeignRecPtrOffsets(ArgListNode.GetChild(i))   // a record's address, in the tail as anywhere (245)
+    // ⛔ ASKED BEFORE THE WIDTH, since DIVERGENZE 516: "@p" of a pointer scalar now has a width code
+    // (8) too, and in the tail the cell comes home through "ANY PTR PTR" (443) - the road curl travels.
+    else if ForeignPtrCellArg(ArgListNode.GetChild(i)) then
+      T := 'ANY PTR PTR'
     else if ForeignNarrowArg(ArgListNode.GetChild(i), NarrowT) > 0 then
       // "sscanf(s, "%d", @n)": the tail is where C's out-parameters live (DIVERGENZE 247)
       T := 'W' + IntToStr(ForeignNarrowArg(ArgListNode.GetChild(i), NarrowT)) + ':ANY PTR'

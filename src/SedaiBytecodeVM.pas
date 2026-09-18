@@ -905,7 +905,7 @@ type
     function ForeignPtrHome(ACtx: TObject; A: PtrUInt): Int64;   // la stessa, per la FFI
     function ForeignRecBytes(ACtx: TObject; Value: Int64; out ALen: PtrUInt): Pointer;  // the C image of a record (DIVERGENZE 245)
     function ForeignRecRun(ACtx: TObject; Value: Int64; out ACount: Integer; out AStride: PtrUInt): Boolean;  // ...and how many follow it contiguously (336)
-    function ForeignDeepCell(ACtx: TObject; Value: Int64): PInt64;   // the pointed cell, if it holds a pointer (257 B)
+    function ForeignDeepCell(ACtx: TObject; Value: Int64; out ACells: PtrUInt): PInt64;  // the pointed RUN, if it holds pointers (257 B, 516)
     function ForeignCellRun(ACtx: TObject; Value: Int64; out ACells: PtrUInt;
                             out AIsFloat: Boolean): Pointer;   // the 8-byte cells of a narrow value (DIVERGENZE 247)
     procedure ForeignNoteRegion(ACtx: TObject; ABase, ALen: PtrUInt; AAdd, AWide: Boolean);
@@ -8779,7 +8779,7 @@ begin
   Result := ACount > 1;
 end;
 
-function TBytecodeVM.ForeignDeepCell(ACtx: TObject; Value: Int64): PInt64;
+function TBytecodeVM.ForeignDeepCell(ACtx: TObject; Value: Int64; out ACells: PtrUInt): PInt64;
 // ⭐ THE SECOND LEVEL (DIVERGENZE 257, option B). Value is a cell of an array of pointers handed to C -
 // libffi's "values(0) = @s". When it points at a program cell whose content is itself a POINTER (s is a
 // ZString Ptr), answer that cell, so the marshaller can hand C a translated copy of what it holds.
@@ -8791,7 +8791,7 @@ var
   Logical, ArrayIdx: Integer;
   Ofs64: Int64;
 begin
-  Result := nil;
+  Result := nil; ACells := 0;
   if (Value <= 0) or ((Value and FGNPTR_TAG) <> 0) then Exit;
   if (Value and RAWPTR_TAG) <> 0 then
   begin
@@ -8799,6 +8799,7 @@ begin
     ofs := PtrUInt(Value and RAWPTR_OFS_MASK);
     if (ofs < 8) or (ofs + 8 > FRawHeapCap) then Exit;
     if PtrUInt((@FRawHeap[ofs - 8])^) <> (PtrUInt(RAW_HDR_PTRFLAG) or 8) then Exit;
+    ACells := 1;                                        // the header says so: eight bytes, one pointer
     Exit(PInt64(@FRawHeap[ofs]));
   end;
   Logical := Integer((Value shr POINTER_ARRAY_SHIFT) - 1);
@@ -8809,6 +8810,7 @@ begin
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (Ofs64 < 0) then Exit;
   if (FArrays[ArrayIdx].ElemWidth <> 0) or (FArrays[ArrayIdx].ElementType <> 0) then Exit;
   if Ofs64 >= Length(FArrays[ArrayIdx].IntData) then Exit;
+  ACells := PtrUInt(Length(FArrays[ArrayIdx].IntData) - Ofs64);   // to the end of the storage, as ForeignCellRun counts
   Result := @FArrays[ArrayIdx].IntData[Ofs64];
 end;
 
