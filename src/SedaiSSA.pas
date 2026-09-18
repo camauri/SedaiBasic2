@@ -483,7 +483,16 @@ type
     // deve sottrarre niente: vedi UsesRuntimeLBound. Un array esce da qui appena UNA sola
     // dichiarazione usa un'altra forma - una costante diversa, un'espressione, LBOUND(altro).
     FZeroLbArrays: TStringList;
-    FZeroLbPoisoned: TStringList;   // nomi visti almeno una volta con un limite NON zero
+    // ⛔⛔ DIVERGENZE 464: DOES THIS PROGRAM REDIM AN ARRAY **PARAMETER** TO A NON-ZERO LOWER BOUND?
+    // The zero-lower-bound fast path below is decided per NAME, from every Dim/ReDim of that name - and a
+    // ReDim of a PARAMETER is written under the parameter's name, so it never reaches the caller's array.
+    // "Dim Shared v() : ReDim v(0 To 0)" then "Sub s(a()) : ReDim a(1 To 4)" left V in the zero set while
+    // its live lower bound was 1: LBound(v) answered 1 (the descriptor is shared and right) and v(3) read
+    // the wrong ELEMENT, because the index kept the compile-time zero. One flag for the whole program,
+    // because a parameter can be bound to any array and nothing here knows which.
+    FParamRedimNonZeroLb: Boolean;
+    FZeroLbPoisoned: TStringList;
+    FCurArrayParams: TStringList;   // DIVERGENZE 464: array parameters of the procedure being walked (nil outside one)   // nomi visti almeno una volta con un limite NON zero
                                          // target) → their lower bound can change at run time, so element access
                                          // subtracts the RUNTIME lower bound (bcArrayLBound) instead of the DIM one.
     FWStringVars: TStringList;           // FreeBASIC WSTRING vars (UPPER): share the srtString bank but hold UTF-8 bytes
@@ -48785,10 +48794,32 @@ procedure TSSAGenerator.CollectDynamicArrays(Node: TASTNode);
 // current lower bound rather than the one fixed at DIM time.
 var
   i, k, k2, RankIdx: Integer;
-  Decl, Dims: TASTNode;
+  Decl, Dims, PL, Prm: TASTNode;
   Nm, RankNm: string;
+  SavedParams: TStringList;
 begin
   if Node = nil then Exit;
+  // ⛔ DIVERGENZE 464 - the ARRAY PARAMETERS of the procedure this subtree belongs to, so a ReDim
+  // written inside it can be told from a ReDim of a module array. Kept as a field and restored on the way
+  // out: the walk is recursive and a procedure can hold another one's body in its subtree.
+  SavedParams := nil;
+  if Node.NodeType = antProcedureDecl then
+  begin
+    SavedParams := FCurArrayParams;
+    FCurArrayParams := TStringList.Create;
+    FCurArrayParams.CaseSensitive := False;
+    for k := 0 to Node.ChildCount - 1 do
+      if Node.GetChild(k).NodeType = antParameterList then
+      begin
+        PL := Node.GetChild(k);
+        for i := 0 to PL.ChildCount - 1 do
+        begin
+          Prm := PL.GetChild(i);
+          if (Prm <> nil) and (Prm.Attributes.Values['ARRAY'] = '1') then
+            FCurArrayParams.Add(Prm.ValueUpper);
+        end;
+      end;
+  end;
   if (Node.NodeType = antRedim) or (Node.NodeType = antDim) then
     for k := 0 to Node.ChildCount - 1 do
     begin
@@ -48830,6 +48861,13 @@ begin
       // LBOUND(altro) - e il nome esce dall'insieme e si torna al limite letto a run time.
       // ⛔ Conservativa per costruzione: si ENTRA solo dimostrando lo zero su OGNI dimensione, si
       // ESCE al primo dubbio, e chi non e' mai entrato non ci finisce.
+      // ⛔ DIVERGENZE 464: a ReDim of an array PARAMETER that does not prove zero reshapes the
+      // CALLER's array, under a name this census never sees. Nothing here knows which array is bound to
+      // that parameter, so the whole program loses the zero-lower-bound shortcut - and pays nothing when
+      // the shape is absent, which it is in 1279 corpus programs out of 1279.
+      if (Node.NodeType = antRedim) and (FCurArrayParams <> nil) and
+         (FCurArrayParams.IndexOf(Nm) >= 0) and (DeclLowerBoundKind(Decl) <> 1) then
+        FParamRedimNonZeroLb := True;
       case DeclLowerBoundKind(Decl) of
         1: if (FZeroLbArrays.IndexOf(Nm) < 0) and (FZeroLbPoisoned.IndexOf(Nm) < 0) then
              FZeroLbArrays.Add(Nm);
@@ -48843,6 +48881,11 @@ begin
     end;
   for i := 0 to Node.ChildCount - 1 do
     CollectDynamicArrays(Node.GetChild(i));
+  if Node.NodeType = antProcedureDecl then
+  begin
+    FCurArrayParams.Free;
+    FCurArrayParams := SavedParams;
+  end;
 end;
 
 function TSSAGenerator.UsesRuntimeLBound(ArrayIdx: Integer; const ArrName: string): Boolean;
@@ -48871,7 +48914,9 @@ begin
   // run time), cosi' l'A/B vive su UN binario solo.
   if FDynamicArrays.IndexOf(UpperFast(ArrName)) >= 0 then
   begin
-    Result := (FZeroLbArrays.IndexOf(UpperFast(ArrName)) < 0) or
+    // ⛔ ...and DIVERGENZE 464: the shortcut is off for the whole program as soon as some procedure
+    // ReDims an array PARAMETER to something other than a proven zero. See FParamRedimNonZeroLb.
+    Result := (FZeroLbArrays.IndexOf(UpperFast(ArrName)) < 0) or FParamRedimNonZeroLb or
               (GetEnvironmentVariable('SB_NO_ZEROLB') = '1');
     if Result then Exit;
   end;
