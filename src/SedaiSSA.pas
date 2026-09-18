@@ -180,6 +180,7 @@ type
                             // The SSA auto-sizes the member at construction from these bounds.
     DefaultExpr: TASTNode;  // FreeBASIC field default "field AS T = expr" (nil if none); applied on every
                             // instantiation before the constructor, overridden by aggregate "= (a,b,...)"
+    ArrayDefault: TASTNode; // ...and an ARRAY member's "= { a, b, ... }" (a BRACEINIT list, nil if none) (541)
     FuncPtrSig: string;     // funcptr field ("fn As Function(...) As R" or "fn As <named funcptr type>"):
                             // "paramtypes|rettype" signature; the field is an int handle holding a proc
                             // entry PC. Empty if the field is not a function pointer. "obj.fn(args)" is an
@@ -7801,6 +7802,11 @@ begin
             // If it's an argument list node, get first child
             if (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount > 0) then
               ProcessExpression(ArgListNode.GetChild(0), ArgValue)
+            // ⭐ "Rnd()" is "Rnd(1)" - fbc's "byval n as single = 1.0". The empty list was evaluated AS the argument and
+            // read 0, which Random ignored and fbc's generators answer with the PREVIOUS number (DIVERGENZE 542).
+            else if (FuncName = 'RND') and (ArgListNode.NodeType in [antArgumentList, antExpressionList]) and
+                    (ArgListNode.ChildCount = 0) then
+              ArgValue := MakeSSAConstFloat(1.0)
             else
               // Otherwise, the node itself is the argument
               ProcessExpression(ArgListNode, ArgValue);
@@ -9209,12 +9215,11 @@ begin
         if FModernMode and (ArrayIndexOf(ArrName) < 0) and (UpperFast(ArrName) = 'RND32') and
            (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) then
         begin
-          ArgReg := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
-          EmitInstruction(ssaMathRnd, ArgReg, EnsureFloatRegister(MakeSSAConstFloat(1.0)),
-                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          // ⭐ The generator's own 32 bits (DIVERGENZE 542): Immediate 1 asks the VM for RND32, which arrives exact
+          // in a Double; no longer "Rnd * 2^32", which was right for MTWIST and FAST only.
           ArgValue := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
-          EmitInstruction(ssaMulFloat, ArgValue, ArgReg,
-                          EnsureFloatRegister(MakeSSAConstFloat(4294967296.0)), MakeSSAValue(svkNone));
+          EmitInstruction(ssaMathRnd, ArgValue, EnsureFloatRegister(MakeSSAConstFloat(1.0)),
+                          MakeSSAValue(svkNone), MakeSSAConstInt(1));
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaFloatToInt, Result, ArgValue, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           Exit;
@@ -9222,16 +9227,24 @@ begin
         if FModernMode and (ArrayIndexOf(ArrName) < 0) and (UpperFast(ArrName) = 'RANDOMIZE') and
            (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) then
         begin
+          // "Randomize( seed, algorithm )" / "fbc.randomize( ... )": the statement's operands (DIVERGENZE 542)
+          if Node.GetChild(1).ChildCount >= 2 then
+          begin
+            ProcessExpression(Node.GetChild(1).GetChild(1), ArgReg);
+            ArgReg := EnsureIntRegister(ArgReg);
+          end
+          else
+            ArgReg := EnsureIntRegister(MakeSSAConstInt(0));
           if Node.GetChild(1).ChildCount >= 1 then
           begin
             ProcessExpression(Node.GetChild(1).GetChild(0), ArgValue);
-            EmitInstruction(ssaRandomize, MakeSSAValue(svkNone), EnsureIntRegister(ArgValue),
-                            MakeSSAValue(svkNone), MakeSSAConstInt(1));
+            EmitInstruction(ssaRandomize, MakeSSAValue(svkNone), EnsureFloatRegister(ArgValue),
+                            ArgReg, MakeSSAConstInt(3));
           end
           else
             EmitInstruction(ssaRandomize, MakeSSAValue(svkNone),
-                            EnsureIntRegister(MakeSSAConstInt(0)),
-                            MakeSSAValue(svkNone), MakeSSAConstInt(0));
+                            EnsureFloatRegister(MakeSSAConstFloat(-1.0)),
+                            ArgReg, MakeSSAConstInt(2));
           Result := MakeSSAValue(svkNone);
           Exit;
         end;
@@ -31956,7 +31969,14 @@ begin
         MNode := Node.GetChild(0);
         AwCode := UDTFieldArrayElemWidthCode(FindUDT(ObjectTypeName(MNode.GetChild(0))), VarToStr(MNode.Value));
         if (AwCode = 2) or (AwCode = 4) or (AwCode = 6) then Result := 3
-        else if (AwCode = 11) and FModernMode then Result := 1;   // DIVERGENZE 493
+        else if (AwCode = 8) and FModernMode then Result := 2   // a UInteger/ULongInt element: the wide unsigned form (539)
+        else if (AwCode = 11) and FModernMode then Result := 1   // DIVERGENZE 493
+        // ⭐ ...and "obj.m(...)" where m is a METHOD prints as what the method RETURNS (DIVERGENZE 539): a Function
+        // ... As ULong / ULongInt has no sign column, as a plain function's result has not. Its return type is
+        // recorded under the method's label, which this arm never asked - fbprng's generators printed " 984609631"
+        // where fbc prints "984609631", and a ULongInt above 2^63 printed NEGATIVE.
+        else if FModernMode and (AwCode = 0) and (ObjectTypeName(MNode.GetChild(0)) <> '') then
+          Result := PrintKindOf(UpperFast(ObjectTypeName(MNode.GetChild(0))) + '.' + MNode.ValueUpper);
       end
       else if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
       begin
@@ -34327,6 +34347,9 @@ begin
       // and marks HASDEFAULT. Kept for EmitRecordInit to apply on each instantiation (not for array/nested
       // members, which manage their own storage).
       FUDTs[Idx].Fields[n].DefaultExpr := nil;
+      FUDTs[Idx].Fields[n].ArrayDefault := nil;
+      if IsArrayField and (FieldNode.Attributes.Values['ARRAYDEFAULT'] = '1') and (FieldNode.ChildCount >= 2) then
+        FUDTs[Idx].Fields[n].ArrayDefault := FieldNode.GetChild(FieldNode.ChildCount - 1);   // (541)
       if (FieldNode.Attributes.Values['HASDEFAULT'] = '1') and (NestedT = '') and (not IsArrayField) and
          (FieldNode.ChildCount >= 2) then
         FUDTs[Idx].Fields[n].DefaultExpr := FieldNode.GetChild(FieldNode.ChildCount - 1)
@@ -34657,7 +34680,7 @@ begin
   if (UIdx < 0) or (UIdx > High(FUDTs)) or (Depth > 16) then Exit;
   for i := 0 to High(FUDTs[UIdx].Fields) do
   begin
-    if FUDTs[UIdx].Fields[i].DefaultExpr <> nil then Exit(True);
+    if (FUDTs[UIdx].Fields[i].DefaultExpr <> nil) or (FUDTs[UIdx].Fields[i].ArrayDefault <> nil) then Exit(True);
     if (FUDTs[UIdx].Fields[i].NestedType <> '') and
        RecordTypeHasFieldDefaults(FindUDT(FUDTs[UIdx].Fields[i].NestedType), Depth + 1) then Exit(True);
     if (FUDTs[UIdx].Fields[i].ArrayElemType <> '') and
@@ -39336,7 +39359,7 @@ var
   Decl, ParamList, ParamNode, RefTgt, RefTgtOwned, TypeOfOperand, InitNode: TASTNode;
   VarName, TypeName, NestedTypeName: string;
   SavedInProc: Boolean;
-  SavedProcName, SavedTypePath: string;
+  SavedProcName, SavedTypePath, SavedThisType: string;
 begin
   if Node = nil then Exit;
   // A typed FOR counter ("FOR i AS Integer") pre-registers its bank so a module-level counter is
@@ -39686,9 +39709,17 @@ begin
     // module variable that merely shares its name (see RegisterTypedVar).
     SavedInProc := FPreScanInProc;
     SavedProcName := FPreScanProcName;
+    SavedThisType := FCurrentThisType;
     FPreScanInProc := True;
     if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+    begin
       FPreScanProcName := Node.GetChild(0).ValueUpper;
+      // ⭐ ...and THIS is the owner's (DIVERGENZE 540). "Var old = this.state" is typed HERE, by asking the
+      // initialiser's type, and with THIS unknown the answer depended on what else the program declared: alone
+      // in the program it was right, beside another type with methods (fbprng.bi's six generators) "old" became
+      // a DOUBLE and the ULongInt arithmetic of PCG32 was done in floating point.
+      FCurrentThisType := OwnerTypeOfLabel(FPreScanProcName);
+    end;
     // FUNCTION return type (M3.2): the name node (child 0) may carry a type child
     // ("FUNCTION f(...) AS rettype") — type the function name so its result slot is correct.
     if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) and
@@ -39807,6 +39838,7 @@ begin
     FTypeScopePath := SavedTypePath;
     FPreScanInProc := SavedInProc;
     FPreScanProcName := SavedProcName;
+    FCurrentThisType := SavedThisType;
     Exit;
   end;
   // ⭐ ONE LEXICAL FRAME PER LEVEL, and the declarations of a node go into the frame of the list that
@@ -40518,6 +40550,11 @@ begin
           ProcessExpression(FUDTs[UDTIdx].Fields[i].DefaultExpr, DefVal);
           EmitRawFieldValueStore(NestedHandle, UDTIdx, i, DefVal);
         end;
+    // ...and an ARRAY member's "= { ... }" (DIVERGENZE 541), through the routine the aggregate "( { ... } )" uses.
+    if WithDefaults then
+      for i := 0 to High(FUDTs[UDTIdx].Fields) do
+        if FUDTs[UDTIdx].Fields[i].ArrayDefault <> nil then
+          EmitBraceArrayMemberInit(HandleVal, UDTIdx, i, FUDTs[UDTIdx].Fields[i].ArrayDefault);
     Exit;
   end;
   // "As String * n" fields start as n NULs: the buffer exists at full capacity from construction, so a
@@ -40692,6 +40729,11 @@ begin
                      EnsureIntRegister(DefVal), MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
       end;
     end;
+  // ...and an ARRAY member's "= { ... }" (DIVERGENZE 541): its backing was allocated above, so the elements go in now.
+  if WithDefaults then
+    for i := 0 to High(FUDTs[UDTIdx].Fields) do
+      if FUDTs[UDTIdx].Fields[i].ArrayDefault <> nil then
+        EmitBraceArrayMemberInit(HandleVal, UDTIdx, i, FUDTs[UDTIdx].Fields[i].ArrayDefault);
 end;
 
 function TSSAGenerator.TypeNeedsRecordInit(UDTIdx: Integer): Boolean;
@@ -40713,7 +40755,7 @@ begin
     if (FUDTs[UDTIdx].Fields[i].NestedType <> '') or
        (FUDTs[UDTIdx].Fields[i].IsArray and (FUDTs[UDTIdx].Fields[i].ArrayBounds <> nil) and
         not FUDTs[UDTIdx].Fields[i].InlineArray) or
-       (FUDTs[UDTIdx].Fields[i].DefaultExpr <> nil) or
+       (FUDTs[UDTIdx].Fields[i].DefaultExpr <> nil) or (FUDTs[UDTIdx].Fields[i].ArrayDefault <> nil) or
        ((FUDTs[UDTIdx].Fields[i].Bank = srtString) and (FUDTs[UDTIdx].Fields[i].StrCapacity > 0) and
         (not FUDTs[UDTIdx].Fields[i].IsArray)) then
       Exit(True);
@@ -40771,7 +40813,7 @@ begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) or (Depth > 16) then Exit;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
   begin
-    if FUDTs[UDTIdx].Fields[i].DefaultExpr <> nil then Exit(True);
+    if (FUDTs[UDTIdx].Fields[i].DefaultExpr <> nil) or (FUDTs[UDTIdx].Fields[i].ArrayDefault <> nil) then Exit(True);
     if (FUDTs[UDTIdx].Fields[i].NestedType <> '') and
        TypeHasFieldDefaults(FindUDT(FUDTs[UDTIdx].Fields[i].NestedType), Depth + 1) then Exit(True);
   end;
@@ -52795,6 +52837,16 @@ begin
                 ((Node.GetChild(0).ValueUpper = kARRAYLEN) or
                  (Node.GetChild(0).ValueUpper = kARRAYSIZE)) then
           Exit(True)
+        // ⭐ "obj.m(...)" - a METHOD returning UInteger/ULongInt - or "obj.a(i)" - an element of such an array member
+        // (DIVERGENZE 539): unsigned too, so "shr" is logical and "/" and the comparisons are unsigned. fbprng.bi's
+        // xoroshiro128 computes "Cdbl(This.rnd64() shr 11)", which came out NEGATIVE with an arithmetic shift.
+        else if FModernMode and (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) and
+                (Node.GetChild(0).NodeType = antMemberAccess) and (Node.GetChild(0).ChildCount >= 1) and
+                (ObjectTypeName(Node.GetChild(0).GetChild(0)) <> '') then
+          Exit((UDTFieldArrayElemWidthCode(FindUDT(ObjectTypeName(Node.GetChild(0).GetChild(0))),
+                                           Node.GetChild(0).ValueUpper) = 8) or
+               (PrintKindOf(UpperFast(ObjectTypeName(Node.GetChild(0).GetChild(0))) + '.' +
+                            Node.GetChild(0).ValueUpper) = 2))
         else
           U := '';
         // ⛔ ...AND THE QUALIFIED PAIR MAY ARRIVE FLAT. Once "Namespace FB" is a REAL namespace -
@@ -58877,19 +58929,30 @@ begin
       // RANDOMIZE [seed] — seed the RNG. With a seed expression: Src1 = seed reg, Immediate = 1.
       // Without: seed from the system timer (Immediate = 0); Src1 holds a dummy 0 register so
       // register compaction always sees a valid Src1.
-      if Node.ChildCount >= 1 then
+      // ⭐ DIVERGENZE 542: the seed travels as a DOUBLE (fbc's QB generator reads its bits) and the ALGORITHM as Src2;
+      // Immediate bit0 = a seed was written, bit1 = fbc's generators (MODERN). CLASSIC keeps its own generator and the
+      // integer seed it always had, converted to a float and back exactly.
+      if (Node.ChildCount >= 1) and (Node.Attributes.Values['NOSEED'] <> '1') then
       begin
         ProcessExpression(Node.GetChild(0), ExprResult);
-        ExprResult := EnsureIntRegister(ExprResult);
-        EmitInstruction(ssaRandomize, MakeSSAValue(svkNone), ExprResult,
-                        MakeSSAValue(svkNone), MakeSSAConstInt(1));
+        if not FModernMode then ExprResult := EnsureIntRegister(ExprResult);
+        ExprResult := EnsureFloatRegister(ExprResult);
+        SelImm := 1;
       end
       else
       begin
-        ExprResult := EnsureIntRegister(MakeSSAConstInt(0));
-        EmitInstruction(ssaRandomize, MakeSSAValue(svkNone), ExprResult,
-                        MakeSSAValue(svkNone), MakeSSAConstInt(0));
+        ExprResult := EnsureFloatRegister(MakeSSAConstFloat(-1.0));
+        SelImm := 0;
       end;
+      if Node.ChildCount >= 2 then
+      begin
+        ProcessExpression(Node.GetChild(1), AddrVal);
+        AddrVal := EnsureIntRegister(AddrVal);
+      end
+      else
+        AddrVal := EnsureIntRegister(MakeSSAConstInt(0));
+      if FModernMode then SelImm := SelImm or 2;
+      EmitInstruction(ssaRandomize, MakeSSAValue(svkNone), ExprResult, AddrVal, MakeSSAConstInt(SelImm));
     end;
 
     antMutexLock, antMutexUnlock, antMutexDestroy:

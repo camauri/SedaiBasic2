@@ -1503,7 +1503,13 @@ EventPollCounter := 0;
           end;
         bcRandomize:  // RANDOMIZE: seed the RNG (Immediate=1 -> explicit seed in Src1; 0 -> time-based)
           begin
-            if Instr^.Immediate <> 0 then RandSeed := Cardinal(IntRegs[Instr^.Src1]) else Randomize;
+            // Src1 = seed (float), Src2 = algorithm; Immediate bit0 = seed given, bit1 = fbc's generators (542)
+            if (Instr^.Immediate and 2) <> 0 then
+              FbRandomize(FloatRegs[Instr^.Src1], IntRegs[Instr^.Src2])
+            else if (Instr^.Immediate and 1) <> 0 then
+              RandSeed := Cardinal(Int64(Trunc(FloatRegs[Instr^.Src1])))
+            else
+              Randomize;
             Inc(CurPC);
           end;
 

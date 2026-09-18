@@ -273,7 +273,7 @@ begin
     bcMutexDestroy:
       Line := Format('%4d: %-20s R%d', [Index, 'MutexDestroy', Instr.Src1]);
     bcRandomize:
-      Line := Format('%4d: %-20s seed=R%d imm=%d', [Index, 'Randomize', Instr.Src1, Instr.Immediate]);
+      Line := Format('%4d: %-20s seed=F%d alg=R%d imm=%d', [Index, 'Randomize', Instr.Src1, Instr.Src2, Instr.Immediate]);
     bcCondCreate:
       Line := Format('%4d: %-20s R%d = cond()', [Index, 'CondCreate', Instr.Dest]);
     bcCondWait:

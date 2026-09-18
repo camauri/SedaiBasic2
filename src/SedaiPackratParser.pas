@@ -7087,6 +7087,26 @@ begin
         // Keep the dimension list (the SSA auto-sizes a fixed-bound member at construction; an "Any"
         // member has no concrete bound and is left for an explicit REDIM).
         FieldNode.AddChild(ArrDimNode);
+        // ⭐ ...AND ITS DEFAULT, "As ULongInt s(0 To 1) = { 1, 0 }" (DIVERGENZE 541): fbc initialises the member on
+        // every instantiation, as it does a scalar field's "= expr". It was skipped here - "array members take no
+        // default" - and fbprng.bi's xoroshiro128 started from an all-zero state, so every number it drew was 0.
+        // Parsed by the brace reader every other array initialiser uses, and marked as the tuple path marks a brace
+        // element (BRACEINIT), so the SSA fills it with the same routine.
+        if Context.Check(ttOpEq) and Assigned(Context.PeekNext) and
+           ((Context.PeekNext.TokenType = ttDelimBraceOpen) or (Context.PeekNext.TokenType = ttOpGt)) then
+        begin
+          Context.Advance;                              // '='
+          if Context.Check(ttOpGt) then Context.Advance;  // the "=>" spelling
+          if Context.Check(ttDelimBraceOpen) then
+          begin
+            FieldDefault := TASTNode.Create(antArgumentList, Context.CurrentToken);
+            FieldDefault.Attributes.Values['BRACEINIT'] := '1';
+            SetLength(FInitLevelSizes, 0);
+            ParseArrayInitBraceGroup(FieldDefault, ConstDimSizes(ArrDimNode), 0);
+            FieldNode.AddChild(FieldDefault);
+            FieldNode.Attributes.Values['ARRAYDEFAULT'] := '1';
+          end;
+        end;
       end
       // FreeBASIC field default value: "field AS T = expr". Attach the expression as the last child and
       // mark HASDEFAULT so the SSA applies it on every instantiation (array members take no default).
@@ -7189,14 +7209,24 @@ begin
   // A seed expression may follow on the same statement; stop at end-of-line/statement separator.
   if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
   begin
-    SeedExpr := FExpressionParser.ParseExpression;
+    SeedExpr := nil;
+    if not Context.Check(ttSeparParam) then SeedExpr := FExpressionParser.ParseExpression;
     if Assigned(SeedExpr) then Result.AddChild(SeedExpr);
-    // Optional ", algorithm" — parse and discard (single RNG, no algorithm selection).
+    // ⭐ ", algorithm" (FB.FB_RND_*) is KEPT since the engine has fbc's five generators (DIVERGENZE 542). It is child 1;
+    // with the seed left out ("Randomize , FB_RND_REAL") child 0 is fbc's own default seed, -1.0 (the clock).
     if Context.Check(ttSeparParam) then
     begin
       Context.Advance;                              // ','
       if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) then
-        FExpressionParser.ParseExpression.Free;     // algorithm operand (discarded)
+      begin
+        if Result.ChildCount = 0 then
+        begin
+          Result.AddChild(TASTNode.CreateWithValue(antLiteral, -1.0, Token));
+          Result.Attributes.Values['NOSEED'] := '1';
+        end;
+        SeedExpr := FExpressionParser.ParseExpression;
+        if Assigned(SeedExpr) then Result.AddChild(SeedExpr);
+      end;
     end;
   end;
   DoNodeCreated(Result);

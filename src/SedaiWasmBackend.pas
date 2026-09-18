@@ -863,7 +863,7 @@ begin
         ssaRandomize:
           begin
             FUsesRnd := True; FUsesHeap := True;
-            if not ((Ins.Src3.Kind = svkConstInt) and (Ins.Src3.ConstInt <> 0)) then
+            if not ((Ins.Src3.Kind = svkConstInt) and ((Ins.Src3.ConstInt and 1) <> 0)) then
               FUsesClock := True;
           end;
         ssaArrayErase:
@@ -3731,7 +3731,10 @@ begin
   end;
 end;
 
-{ RND and RANDOMIZE: MT19937, transcribed.
+{ RND and RANDOMIZE: MT19937, transcribed - with fbc's SEEDING since DIVERGENZE 542: the state is filled by the
+  FAST LCG (hRnd_FillFAST32), and an unseeded program is seeded 0, so sb and this module agree with fbc on
+  every run, seeded or not. fbc's other four generators (RANDOMIZE's algorithm argument) are the interpreter's.
+  The notes below describe the generator this used to transcribe, FPC's init_genrand.
 
   ⭐ WHICH generator was MEASURED rather than read out of the RTL: seeding 42 and
   asking for numbers gives 1608637542 and 0.37454011430963874, which is
@@ -3768,12 +3771,11 @@ begin
     B.BlockStart(wopBlock, WASM_BLOCKTYPE_EMPTY);
       B.BlockStart(wopLoop, WASM_BLOCKTYPE_EMPTY);
         B.LocalGet(2); B.I32Const(MT_N); B.Op(wopI32GeU); B.BrIf(1);
-        // mt[i] = 1812433253 * (mt[i-1] xor (mt[i-1] >>> 30)) + i
+        // mt[i] = mt[i-1] * 1664525 + 1013904223 - fbc's hRnd_FillFAST32, not init_genrand (DIVERGENZE 542)
         B.LocalGet(1); B.LocalGet(2); B.I32Const(4); B.Op(wopI32Mul); B.Op(wopI32Add);
         B.LocalGet(3);
-        B.LocalGet(3); B.I32Const(30); B.Op(wopI32ShrU); B.Op(wopI32Xor);
-        B.I32Const(1812433253); B.Op(wopI32Mul);
-        B.LocalGet(2); B.Op(wopI32Add);
+        B.I32Const(1664525); B.Op(wopI32Mul);
+        B.I32Const(1013904223); B.Op(wopI32Add);
         B.LocalTee(3);
         B.OpMem(wopI32Store, 2, 0);
         B.LocalGet(2); B.I32Const(1); B.Op(wopI32Add); B.LocalSet(2);
@@ -3798,7 +3800,7 @@ begin
         asking anything: a module that answers the same on every run is the
         honest behaviour for a sandbox, and it cannot match sb's clock-derived
         seed whatever it does. RANDOMIZE overrides it. }
-      B.I64Const(1); B.Call(FMtSeedFunc);
+      B.I64Const(0); B.Call(FMtSeedFunc);   // fbc: a draw before any RANDOMIZE is RANDOMIZE 0 (542)
     B.EndOp;
     B.GlobalGet(FMtBaseG); B.LocalSet(0);
     B.LocalGet(0); B.OpMem(wopI32Load, 2, MT_IDX); B.LocalTee(1);
@@ -8519,8 +8521,13 @@ begin
       reproducible then, which is the point of seeding in a guard. }
     ssaRandomize:
       begin
-        if (Instr.Src3.Kind = svkConstInt) and (Instr.Src3.ConstInt <> 0) then
-          LoadReg(B, Instr.Src1)
+        // The seed arrives as a DOUBLE since DIVERGENZE 542 (bit0 of the Immediate: a seed was written). The
+        // module keeps its one generator: fbc's five are the interpreter's, and the algorithm is not read here.
+        if (Instr.Src3.Kind = svkConstInt) and ((Instr.Src3.ConstInt and 1) <> 0) then
+        begin
+          LoadReg(B, Instr.Src1);
+          B.TruncSat(wopfcI64TruncSatF64S);
+        end
         else
         begin
           B.Call(FNowFunc);

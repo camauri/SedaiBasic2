@@ -175,8 +175,6 @@ begin
     bcMutexLock, bcMutexUnlock, bcMutexDestroy,
     // Condition variables (M5.4): Wait/Signal/Broadcast/Destroy Src1 = cond handle reg.
     bcCondWait, bcCondSignal, bcCondBroadcast, bcCondDestroy,
-    // RANDOMIZE: Src1 = seed reg (Immediate flags seed vs time-based).
-    bcRandomize,
 
     // === GROUP 0: Core VM operations ===
     // Int arithmetic
@@ -314,6 +312,8 @@ begin
     // SUB/FUNCTION transfer-register store (M2): Src1 is the float register read.
     bcXferStoreFloat,
     bcVarArgPushFloat,   // staging a surplus argument: Src1 = the float value
+    // RANDOMIZE: Src1 = the seed, a DOUBLE as fbc takes it (its QB algorithm reads the bits) (DIVERGENZE 542).
+    bcRandomize,
     // === GROUP 0: Core VM operations ===
     // Float arithmetic
     bcCopyFloat, bcAddFloat, bcSubFloat, bcMulFloat, bcDivFloat, bcModFloat, bcNegFloat, bcPowFloat,
@@ -365,6 +365,8 @@ function Src2IsIntReg(OpCode: TBytecodeOp): Boolean;
 begin
   // Using case statement instead of set because opcodes are now Word (>255)
   case OpCode of
+    // RANDOMIZE: Src2 = the ALGORITHM, FB.FB_RND_* (DIVERGENZE 542).
+    bcRandomize,
     // === GROUP 12: BigInt === Src2 is the RIGHT operand's handle (an int register).
     bcBigAdd, bcBigSub, bcBigMul, bcBigCmp, bcBigMulSmall, bcBigDiv, bcBigMod,
     // UDT/record (M3): RecordStoreInt's Src2 is the int value being written.

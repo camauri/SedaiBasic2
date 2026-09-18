@@ -3248,8 +3248,8 @@ End Function
 
 | Keyword | Status | Description |
 |---|---|---|
-| `RANDOMIZE` | ✓ | Seeds the RNG used by `RND`: `RANDOMIZE seed` sets a deterministic seed (same seed reproduces the same sequence); bare `RANDOMIZE` seeds from the system timer. A trailing algorithm argument is accepted and ignored. |
-| `RND` | ✓ | Returns a random Double in the range [0, 1). Bare `RND` (no parentheses) is accepted, equivalent to `RND(1)`. |
+| `RANDOMIZE` | ✓ | `RANDOMIZE [seed] [, algorithm]` seeds the generator `RND` draws from, with fbc's five generators and fbc's numbers (DIVERGENZE 542): `FB.FB_RND_MTWIST` (the default, `AUTO`), `CRT` (the C library's `rand`), `FAST`, `QB` and `REAL` (system entropy), all from `fbprng.bi`. The same seed and algorithm give fbc's sequence; with no seed (or `-1`) the clock seeds it, and a program that draws before any `RANDOMIZE` gets `RANDOMIZE 0`, so it answers the same on every run, as under fbc. ⚠️ In a program compiled to WebAssembly (`sbw`) only the default generator exists. |
+| `RND` | ✓ | Returns a random Double in the range [0, 1), fbc's number for the current generator and seed (DIVERGENZE 542). `RND(0)` answers the previous number again; under the `QB` generator a negative argument reseeds. Bare `RND` (no parentheses) is accepted, equivalent to `RND(1)`. `fbc.rnd32()` (`fbc-int/math.bi`) is the raw 32-bit draw. |
 
 ### Memory Functions
 

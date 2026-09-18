@@ -1182,6 +1182,7 @@ uses
   SedaiCStdio,          // PRINT's bytes live in C's stdout: flushed before C runs (DIVERGENZE 434)
   SedaiFbDate,          // DATEADD/DATEDIFF/DATEPART as fbc's runtime answers them
   SedaiFbFormat,        // FORMAT, likewise
+  SedaiFbRnd,           // RND / RANDOMIZE, likewise (DIVERGENZE 542)
   // ⭐ The FFI, and it is named HERE and nowhere else in the VM: SedaiForeignRuntime is the one unit
   // that knows a provider exists, so the day the core is cut from its providers there is a single edge
   // to cut. In the implementation section for the same reason SedaiTerminalIO is. DIVERGENZE 183.
@@ -10066,11 +10067,17 @@ begin
         bcBitwiseAnd, bcBitwiseOr, bcBitwiseXor, bcBitwiseNot, bcShl, bcShr, bcShrUInt,
         // Bit intrinsics: all three operands are integer registers (Src2 unused = 0 for the counts,
         // which register 0 already covers).
-        bcBitClz, bcBitCtz, bcBitPopcnt, bcBitRotl, bcBitRotr,
-        bcRandomize:  // RANDOMIZE: Src1 = seed reg (Dest unused = 0)
+        bcBitClz, bcBitCtz, bcBitPopcnt, bcBitRotl, bcBitRotr:
         begin
           if Instr.Dest > MaxIntReg then MaxIntReg := Instr.Dest;
           if Instr.Src1 > MaxIntReg then MaxIntReg := Instr.Src1;
+          if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
+        end;
+
+        // RANDOMIZE: Src1 = the seed (FLOAT, fbc takes a Double), Src2 = the algorithm (INT) - DIVERGENZE 542
+        bcRandomize:
+        begin
+          if Instr.Src1 > MaxFloatReg then MaxFloatReg := Instr.Src1;
           if Instr.Src2 > MaxIntReg then MaxIntReg := Instr.Src2;
         end;
 
@@ -11678,8 +11685,13 @@ begin
     bcBitPopcnt: Ctx.IntRegs[Instr.Dest] := BitPopcnt(Ctx.IntRegs[Instr.Src1], Instr.Immediate);
     bcBitRotl:   Ctx.IntRegs[Instr.Dest] := BitRotl(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], Instr.Immediate);
     bcBitRotr:   Ctx.IntRegs[Instr.Dest] := BitRotr(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2], Instr.Immediate);
-    bcRandomize:  // RANDOMIZE: seed the RNG (Immediate=1 -> explicit seed in Src1; 0 -> time-based)
-      if Instr.Immediate <> 0 then RandSeed := Cardinal(Ctx.IntRegs[Instr.Src1]) else Randomize;
+    bcRandomize:  // RANDOMIZE: Src1 = seed (float), Src2 = algorithm; Immediate bit0 = seed given, bit1 = fbc's generators
+      if (Instr.Immediate and 2) <> 0 then
+        FbRandomize(Ctx.FloatRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2])      // DIVERGENZE 542
+      else if (Instr.Immediate and 1) <> 0 then
+        RandSeed := Cardinal(Int64(Trunc(Ctx.FloatRegs[Instr.Src1])))
+      else
+        Randomize;
     // Control flow
     bcJump: Ctx.PC := Instr.Immediate - 1;
     bcJumpIfZero:
@@ -17302,8 +17314,14 @@ begin
         Ctx.FloatRegs[Instr.Dest] := 0;
     9: // bcMathInt
       Ctx.FloatRegs[Instr.Dest] := FloorDouble(Ctx.FloatRegs[Instr.Src1]);
-    10: // bcMathRnd
-      Ctx.FloatRegs[Instr.Dest] := Random;
+    10: // bcMathRnd: MODERN draws from fbc's generators (DIVERGENZE 542) - Immediate 1 is RND32, the raw 32 bits
+      if Assigned(FProgram) and FProgram.ModernMode then
+      begin
+        if Instr.Immediate = 1 then Ctx.FloatRegs[Instr.Dest] := FbRnd32
+        else Ctx.FloatRegs[Instr.Dest] := FbRnd(Ctx.FloatRegs[Instr.Src1]);
+      end
+      else
+        Ctx.FloatRegs[Instr.Dest] := Random;
     11: // bcMathLog10
       if Ctx.FloatRegs[Instr.Src1] > 0 then
         Ctx.FloatRegs[Instr.Dest] := Log10(Ctx.FloatRegs[Instr.Src1])
