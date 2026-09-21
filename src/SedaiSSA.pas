@@ -768,8 +768,12 @@ type
     function ForeignElemObject(Node: TASTNode; out Obj: TASTNode; out TypeName: string): Boolean;  // the shape both ask
     function EmitForeignElemTemps(Obj: TASTNode; const TypeName: string): string;      // the temporaries both use
     function ForeignRecPtrOffsets(ArgNode: TASTNode; OnlyProcs: Boolean = False; SkipMulti: Boolean = False): string;   // "@o1/o2": a REC's pointer fields (259 b)
-    function ForeignNativeRecSpec(ArgNode: TASTNode): string;   // phase 3.7: "NREC:<size>:<type>@o#sig" or ''
+    function ForeignNativeRecSpec(ArgNode: TASTNode): string;
+    function ForeignNativeRecSpecOnce(ArgNode: TASTNode; out Spec: string): Boolean;   // ...asked once (591)   // phase 3.7: "NREC:<size>:<type>@o#sig" or ''
     function ForeignFieldClosureSig(const FieldSig: string): string;                   // "p,p|r" -> "FNPTR:r:p~p" for a procedure field (423)
+    function FieldWantsValueForC(UDTIdx, FieldIdx: Integer): Boolean;                  // 561 · 576: does this field hold something C must be able to USE?
+    function FieldPointeeIsUDT(UDTIdx, FieldIdx: Integer): Boolean;                    // ...and which of the two pointer roads it takes
+    function FieldValueForC(UDTIdx, FieldIdx: Integer; const V: TSSAValue): TSSAValue;  // ...and the value it must hold
     function ForeignDynEntry(const Sig: string): string;                               // the "*" entry calling a C address with Sig
     function EmitIndirectCallVM(const PCValIn: TSSAValue; const Sig: string; ArgListNode: TASTNode): TSSAValue;
     function DeclTypeIsPointer(const T: string): Boolean;                              // "T Ptr" / "T Pointer", aliases resolved
@@ -29035,6 +29039,7 @@ var
   Tmp1, CutS: TSSAValue;
   F: TUDTField;
   BitCode, BitOfsC: Integer;
+  ForC: Boolean;               // 561 · 576: this field holds something C must be able to USE - converted, and written BARE
 begin
   F := FUDTs[UDTIdx].Fields[FieldIdx];
   UDTFieldCShape(UDTIdx, FieldIdx, Sz, Al);
@@ -29102,14 +29107,31 @@ begin
     end;
     ExprVal := ApplyNarrowCode(F.WidthCode, ExprVal);
     ExprVal := EnsureIntRegister(ExprVal);
+    // ⭐ DIVERGENZE 561 - A PROCEDURE FIELD IS WRITTEN AS THE MACHINE ADDRESS C CAN JUMP TO, AND STAYS ONE.
+    // The argument path (FNPTR:, 218 · 423) makes a closure for the DURATION OF ONE CALL, from the record the call
+    // site names; a library that KEEPS what it was given - chipmunk's cpCollisionHandler, CUnit's CU_TestInfo,
+    // allegro's ALLEGRO_FILE_INTERFACE - calls the field later, from its own code, and found a BASIC entry PC there
+    // (a small integer) and jumped into nothing. The conversion therefore belongs to the STORE, where the field's
+    // own signature says how the closure must be built - and it is permanent, which is what FClosures already is.
+    // ⛔ The signature is the FIELD's, not the procedure's: C calls through the declared type, which is the rule
+    // the argument path follows too (ForeignFieldClosureSig). A signature this call path cannot pass leaves the
+    // store exactly as it was - the bytes stay the entry PC, and the failure stays where it used to be.
+    ForC := (Sz = 8) and FieldWantsValueForC(UDTIdx, FieldIdx);
+    if ForC then ExprVal := EnsureIntRegister(FieldValueForC(UDTIdx, FieldIdx, ExprVal));
     case Sz of
       1: EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I8));
       2: EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I16));
       4: EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_I32));
     else
+      // ⭐ DIVERGENZE 561 · 576 - ...and a field ValueForC has converted is written BARE: RTC_NPTR takes C's mark off
+      // and writes the address as it is. RTC_I64, which a procedure field took before, wrote a C address WITH bit 61
+      // on it - the same shape as 376 - and RTC_PTR64 would send an already-bare address through PtrStoreValue,
+      // which in the fb mode reads one above 2^32 as a PACKED array name.
+      if ForC then
+        EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_NPTR))
       // ⭐ ...and a POINTER field says so on the way IN too, the twin of the load half: written into C's
       // memory a machine address must lose the VM's tag, or C dereferences bit 61 (DIVERGENZE 376).
-      if (F.PtrPointee <> '') and FRecNativeKnob and FNativeMemory and NativeRecordType(F.PtrPointee) then
+      else if (F.PtrPointee <> '') and FRecNativeKnob and FNativeMemory and NativeRecordType(F.PtrPointee) then
         EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_NPTR))   // phase 3.2
       else if (F.PtrPointee <> '') or (F.RawPtrPointee <> '') or (F.MultiPtrPointee <> '') then
         EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AddrVal, ExprVal, MakeSSAConstInt(RTC_PTR64))
@@ -40862,7 +40884,7 @@ begin
         srtString: EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), HandleVal,
                      EnsureStringRegister(DefVal), MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
       else         EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal,
-                     EnsureIntRegister(DefVal), MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
+                     EnsureIntRegister(FieldValueForC(UDTIdx, i, DefVal)), MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
       end;
     end;
   // ...and an ARRAY member's "= { ... }" (DIVERGENZE 541): its backing was allocated above, so the elements go in now.
@@ -41982,7 +42004,8 @@ begin
           if FixCap > 0 then StrVal := EmitFixedLenPad(StrVal, FixCap, FixWide);
           EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), HandleVal, StrVal, MakeSSAConstInt(Slot));
         end;
-    else         EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal, EnsureIntRegister(ArgVal), MakeSSAConstInt(Slot));
+    else         EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal,
+                   EnsureIntRegister(FieldValueForC(UDTIdx, FieldIdx, ArgVal)), MakeSSAConstInt(Slot));
     end;
     Inc(FieldIdx);
   end;
@@ -42172,7 +42195,8 @@ begin
               if FixCap > 0 then StrVal := EmitFixedLenPad(StrVal, FixCap, FixWide);
               EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), HandleVal, StrVal, MakeSSAConstInt(Slot));
             end;
-        else         EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal, EnsureIntRegister(ArgVals[i]), MakeSSAConstInt(Slot));
+        else         EmitInstruction(ssaRecordStoreInt, MakeSSAValue(svkNone), HandleVal,
+                       EnsureIntRegister(FieldValueForC(AggUDT, i, ArgVals[i])), MakeSSAConstInt(Slot));
         end;
       end;
     Exit;
@@ -55645,6 +55669,8 @@ begin
     EmitInstruction(ssaRecordLoadInt, BitUnit, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
     ExprVal := EmitBitFieldInsert(BitUnit, ExprVal, UDTIdx, BitIdx);
   end;
+  // ⭐ DIVERGENZE 561: a PROCEDURE field written through the managed road is the machine address too.
+  if Op = ssaRecordStoreInt then ExprVal := FieldValueForC(UDTIdx, BitIdx, ExprVal);
   EmitInstruction(Op, MakeSSAValue(svkNone), HandleVal, ExprVal, MakeSSAConstInt(Slot));
 end;
 
@@ -56736,6 +56762,16 @@ begin
     T := BasicProcCallbackSig(ArgListNode.GetChild(i));
     if T <> '' then
       // gia' pronta: la coda variadica puo' portare un callback quanto un parametro dichiarato
+    // ⭐ DIVERGENZE 591 - ...AND A NATIVE RECORD IS AN ADDRESS, IN THE TAIL AS ANYWHERE. The declared-parameter road
+    // asks ForeignNativeRecSpec FIRST for exactly this reason (phase 3.7) and the tail did not, so "@suites(0)" handed
+    // to a variadic entry was marked "REC:" - the MANAGED road, which expects a record HANDLE - and C was given a
+    // value it could not follow: "CU_register_nsuites(2, @more1(0), @more2(0))" died with an access violation while
+    // the same table through the non-variadic CU_register_suites worked. ONE rule, two roads, written on one of them.
+    else if (GetEnvironmentVariable('SB_VARARG_NREC') <> '0') and
+            ForeignNativeRecSpecOnce(ArgListNode.GetChild(i), T) then
+      // T is already the spec. ⭐ SB_VARARG_NREC=0 restores the road of before - the A/B on ONE binary, and what
+      // lets the guard be SABOTAGED: with it the same argument is marked "REC:" again and C is handed a value it
+      // cannot follow.
     else if ForeignRecordArg(ArgListNode.GetChild(i)) then
       T := 'REC:ANY PTR' + ForeignRecPtrOffsets(ArgListNode.GetChild(i))   // a record's address, in the tail as anywhere (245)
     // ⛔ ASKED BEFORE THE WIDTH, since DIVERGENZE 516: "@p" of a pointer scalar now has a width code
@@ -56983,6 +57019,70 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.FieldWantsValueForC(UDTIdx, FieldIdx: Integer): Boolean;
+// ⭐ DIVERGENZE 561 · 576 - does this field of a NATIVE record hold something C must be able to USE, rather than a
+// name of the VM? Two kinds do, and the store and the value converter ask THE SAME question here so they cannot
+// disagree about which fields are converted.
+//   · a PROCEDURE field, whose signature this call path can pass (561);
+//   · a POINTER field whose pointee is NOT a UDT (576) - a "ZString Ptr", an "Any Ptr", a scalar pointer.
+// ⛔⛔ THE SECOND CONDITION IS THE WHOLE SAFETY OF 576, and it is what DIVERGENZE 379 did not have. Bit 62 is
+// RAWPTR_TAG and SHARED_REC_FLAG at once, so at run time a raw-heap pointer cannot be told from a CAllocate'd block
+// of shared records; a record block only ever lives behind a UDT pointee, so excluding those decides it STATICALLY.
+begin
+  Result := False;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) or (FieldIdx < 0) or (FieldIdx > High(FUDTs[UDTIdx].Fields)) then Exit;
+  if not (FRecNativeKnob and FNativeMemory and NativeRecordType(FUDTs[UDTIdx].Name)) then Exit;
+  if FUDTs[UDTIdx].Fields[FieldIdx].IsArray then Exit;
+  if FUDTs[UDTIdx].Fields[FieldIdx].FuncPtrSig <> '' then
+    Exit(ForeignFieldClosureSig(FUDTs[UDTIdx].Fields[FieldIdx].FuncPtrSig) <> '');
+  // ⭐ SB_PTRFIELD_FORC=0 restores the road of before for the POINTER half: the A/B on ONE binary, and what lets
+  // the guards of 576 be sabotaged. The PROCEDURE half (561) is above and is not affected by it.
+  if GetEnvironmentVariable('SB_PTRFIELD_FORC') = '0' then Exit;
+  Result := (FUDTs[UDTIdx].Fields[FieldIdx].RawPtrPointee <> '') or
+            (FUDTs[UDTIdx].Fields[FieldIdx].PtrPointee <> '') or
+            (FUDTs[UDTIdx].Fields[FieldIdx].MultiPtrPointee <> '');
+end;
+
+function TSSAGenerator.FieldPointeeIsUDT(UDTIdx, FieldIdx: Integer): Boolean;
+// ⭐ DIVERGENZE 576 - and WHICH of the two pointer roads this field takes. A UDT pointee is where a CAllocate'd
+// block of shared RECORDS can live, and bit 62 is SHARED_REC_FLAG and RAWPTR_TAG at once: for those the value is
+// only UNMARKED (taking C's mark off is never ambiguous), never resolved as raw-heap memory. That is the line
+// DIVERGENZE 379 could not draw at run time and the declaration draws here.
+begin
+  Result := False;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) or (FieldIdx < 0) or (FieldIdx > High(FUDTs[UDTIdx].Fields)) then Exit;
+  Result := (FUDTs[UDTIdx].Fields[FieldIdx].PtrPointee <> '') or
+            (FUDTs[UDTIdx].Fields[FieldIdx].MultiPtrPointee <> '') or
+            (FindUDT(FUDTs[UDTIdx].Fields[FieldIdx].RawPtrPointee) >= 0);
+end;
+
+function TSSAGenerator.FieldValueForC(UDTIdx, FieldIdx: Integer; const V: TSSAValue): TSSAValue;
+// ⭐ DIVERGENZE 561 · 576 - the value a field of a NATIVE record is written with, wherever the write is emitted:
+// for a PROCEDURE field the machine address C can jump to, built here and permanent; for a POINTER field the
+// address C can dereference (bcValueForC). Every MANAGED store of a field - a record's defaults, an aggregate
+// initialiser, a constructor's field list, the member-store tail - comes through this one function, and so does
+// the raw store half.
+// ⛔ It is ONE function because the rule reaches six emission sites, and this file already records what two copies
+// of one rule cost (the "As String * n" padding, DIVERGENZE 288).
+var
+  Sig: string;
+begin
+  Result := V;
+  if not FieldWantsValueForC(UDTIdx, FieldIdx) then Exit;
+  Sig := '';
+  if FUDTs[UDTIdx].Fields[FieldIdx].FuncPtrSig <> '' then
+    Sig := ForeignFieldClosureSig(FUDTs[UDTIdx].Fields[FieldIdx].FuncPtrSig);
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  if Sig <> '' then
+    EmitInstruction(ssaValueForC, Result, EnsureIntRegister(V), MakeSSAConstString(Sig), MakeSSAValue(svkNone))
+  else if FieldPointeeIsUDT(UDTIdx, FieldIdx) then
+    // ⛔ Immediate = -2: a UDT pointee, so only C's mark comes off - see FieldPointeeIsUDT.
+    EmitInstruction(ssaValueForC, Result, EnsureIntRegister(V), MakeSSAValue(svkNone), MakeSSAConstInt(-2))
+  else
+    // ⛔ Immediate = -1 is the POINTER mode: no signature to name, and a negative can never be a pool index.
+    EmitInstruction(ssaValueForC, Result, EnsureIntRegister(V), MakeSSAValue(svkNone), MakeSSAConstInt(-1));
+end;
+
 function TSSAGenerator.ForeignFieldClosureSig(const FieldSig: string): string;
 // The closure signature of a PROCEDURE field (DIVERGENZE 423), from the field's "p1,p2|ret": each type spelled
 // as the marshaller names it, "~" between parameters (a comma separates the parameters of an entry). '' when a
@@ -57015,6 +57115,14 @@ begin
       end;
   end;
   Result := 'FNPTR:' + Ret + ':' + T;
+end;
+
+function TSSAGenerator.ForeignNativeRecSpecOnce(ArgNode: TASTNode; out Spec: string): Boolean;
+// ForeignNativeRecSpec asked ONCE: it walks the tree and reports under NREC_DIAG, so a test written as
+// "if F(x) <> '' then T := F(x)" would do the work - and print the line - twice.
+begin
+  Spec := ForeignNativeRecSpec(ArgNode);
+  Result := Spec <> '';
 end;
 
 function TSSAGenerator.ForeignNativeRecSpec(ArgNode: TASTNode): string;

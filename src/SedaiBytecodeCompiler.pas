@@ -333,6 +333,7 @@ begin
     ssaRecMarkPush: Result := bcRecMarkPush;   // M8: block-scoped reclamation
     ssaRecMarkPop: Result := bcRecMarkPop;
     ssaLoadProcAddr: Result := bcLoadProcAddr;  // M5.2: @sub → entry PC
+    ssaValueForC: Result := bcValueForC;    // DIVERGENZE 561: → the machine address C can jump to
     ssaThreadCreate: Result := bcThreadCreate;
     ssaThreadWait: Result := bcThreadWait;
     ssaThreadSelf: Result := bcThreadSelf;       // M5.5
@@ -2248,6 +2249,11 @@ begin
   // Src2 = the text register) keep decoding as the define form.
   if (Instr.OpCode = ssaKey) and (Instr.Src2.Kind <> svkRegister) then
     BCInstr.Immediate := -1;
+  // ⭐ DIVERGENZE 561: ssaValueForC carries the FNPTR signature of the field as a const STRING in Src2. It is
+  // interned into the pool and its INDEX rides the Immediate - the same channel a string literal uses through Src1,
+  // and the reason no new serialised table is needed for it.
+  if (Instr.OpCode = ssaValueForC) and (Instr.Src2.Kind = svkConstString) then
+    BCInstr.Immediate := FProgram.AddStringConstant(Instr.Src2.ConstString);
 
   {$IFDEF DEBUG_BYTECODE}
   if DebugBytecode and OpIn(Instr.OpCode, [ssaPrintInt, ssaLoadEL, ssaLoadER]) then

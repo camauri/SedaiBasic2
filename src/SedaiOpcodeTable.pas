@@ -42,7 +42,7 @@ uses
 const
   // Auto-generated from SedaiBytecodeTypes.pas const block (declaration order).
   // Values ARE the bcXxx constants -> cannot drift from their numeric definitions.
-  OPCODE_LIST_COUNT = 590 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcPtrFromInt (DIVERGENZE 528)  // +1 bcUtfConv (utf_conv.bi)  // +2 bcArrayLoadSingle/StoreSingle (phase 2.6)   // +2 bcArrayLoadNarrow/StoreNarrow (phase 2.5)   // +1 bcGfxScreenList; +1 bcCloseFunc; +1 bcGfxPaletteUsing; +1 bcStrAscW; +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt; +1 bcStrMidAssignArr; +1 bcGfxCircleExF; +1 bcRecordReallocBlock; +1 bcRecordBlockLen; +2 the wide "Any set" searches; +2 bcForeignCall/F; +2 bcArrayDescPtr/Ind; +1 bcArrayElemAddr
+  OPCODE_LIST_COUNT = 591 {$IFDEF WEB_MODE} + 12 {$ENDIF};   // +1 bcValueForC (DIVERGENZE 561)  // +1 bcPtrFromInt (DIVERGENZE 528)  // +1 bcUtfConv (utf_conv.bi)  // +2 bcArrayLoadSingle/StoreSingle (phase 2.6)   // +2 bcArrayLoadNarrow/StoreNarrow (phase 2.5)   // +1 bcGfxScreenList; +1 bcCloseFunc; +1 bcGfxPaletteUsing; +1 bcStrAscW; +1 bcGfxDrawString; +5 bit intrinsics; +5 CEIL..COPYSIGN; +2 the bit-casts; +1 bcCpuCount; +13 BigInt; +1 bcStrMidAssignArr; +1 bcGfxCircleExF; +1 bcRecordReallocBlock; +1 bcRecordBlockLen; +2 the wide "Any set" searches; +2 bcForeignCall/F; +2 bcArrayDescPtr/Ind; +1 bcArrayElemAddr
   OPCODES: array[0..OPCODE_LIST_COUNT - 1] of Word = (
     bcLoadConstInt, bcLoadConstFloat, bcLoadConstString, bcCopyInt, bcCopyFloat, bcCopyString,
     bcLoadVar, bcStoreVar, bcAddInt, bcSubInt, bcMulInt, bcDivInt,
@@ -56,7 +56,7 @@ const
     bcSlow, bcSleep, bcKey, bcNop, bcClear, bcTron,
     bcTroff, bcDataAdd, bcDataReadInt, bcDataReadFloat, bcDataReadString, bcDataRestore,
     bcGet, bcGetkey, bcPrintUsing, bcPrintUsingStage, bcPrintUsingRun, bcRecordNewArrayInd,
-    bcRecordNewBlock, bcRecordReallocBlock, bcRecordBlockLen, bcForeignCall, bcForeignCallF, bcPudef, bcChar, bcLoad, bcSave, bcVerify,
+    bcRecordNewBlock, bcRecordReallocBlock, bcRecordBlockLen, bcForeignCall, bcForeignCallF, bcValueForC, bcPudef, bcChar, bcLoad, bcSave, bcVerify,
     bcBload, bcBsave, bcBoot, bcRun, bcList, bcNew,
     bcDelete, bcRenumber, bcCatalog, bcCopyFile, bcScratch, bcRenameFile,
     bcConcat, bcMkdir, bcChdir, bcRmdir, bcRaiseError, bcMoveFile,
@@ -193,7 +193,7 @@ const
   // with slack fails `--verify-opcodes` immediately - and it prints the right numbers to use.
   // ⇒ Growing a group is now ONE edit: its size. The base ladder, DENSE_TOTAL and the dispatch
   //   ranges in RunTemplate.inc all follow from it.
-  DENSE_CORE_SIZE     = 173;  // group 0   (bcForeignCall/F = subs 171/172)
+  DENSE_CORE_SIZE     = 174;  // group 0   (bcForeignCall/F = subs 171/172, bcValueForC = sub 173)
   DENSE_STRING_SIZE   = 56;   // group 1   (bcUtfConv = sub 55; bcStrInstrRevAnyW = 54)
   DENSE_MATH_SIZE     = 43;   // group 2   (CEIL/ROUND/MIN/MAX/COPYSIGN + the two bit-casts)
   DENSE_ARRAY_SIZE    = 60;   // group 3   (bcPtrFromInt = 59, bcArrayDescPtr/Ind = subs 52/53, bcArrayElemAddr = 54, bcArrayLoad/StoreNarrow = 55/56, bcArrayLoad/StoreSingle = 57/58)

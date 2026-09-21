@@ -226,6 +226,10 @@ type
     // qui: una pagina eseguibile per confronto di `qsort` sarebbe una syscall per confronto.
     FClosures: TStringList;
     FGaveClosureToC: Boolean;   // una procedura BASIC e' stata consegnata a C (DIVERGENZE 517)
+    // ⭐ DIVERGENZE 561 - lo SPAN degli indirizzi di codice delle chiusure. PtrLoadHome lo chiede per OGNI puntatore
+    // letto dalla memoria di C, e finche' nessuna chiusura esiste FCloHi vale 0: due confronti e via. Senza, la
+    // ricerca lineare su FClosures starebbe su un percorso caldo (il ciclo C ridA' il PC a Pascal per ogni indirizzo).
+    FCloLo, FCloHi: PtrUInt;
     // ⭐ MEMORY A FOREIGN CALL HANDED BACK (DIVERGENZE 239): base and length (0 = not known), sorted by
     // base. A machine address is dereferenceable only inside one of these - bounds-checked when the
     // length is known - and a region leaves when C's own free releases it.
@@ -907,6 +911,9 @@ type
                               out AAvail: PtrUInt; out AElemW: Integer): Boolean;   // ...e com'e' fatta
     function ForeignMakeClosure(ACtx: TObject; AEntryPC: Int64;
                                 const ASig: string): Pointer;       // una procedura BASIC che C puo' chiamare
+    function ClosureEntryPC(A: PtrUInt): Int64;                     // ...e la strada inversa (DIVERGENZE 425 · 561)
+    function ValueForC(Ctx: TExecutionContext; V: Int64; SigIdx: Int64): Int64;   // bcValueForC (561 · 576)
+    function PtrValueForC(V: Int64; RawHeapToo: Boolean): Int64;    // ...its pointer half (576)
     function PtrFromIntValue(Ctx: TExecutionContext; V: Int64): Int64;   // bcPtrFromInt (DIVERGENZE 528)
     function VMPointerForMachineAddr(ACtx: TExecutionContext; A: PtrUInt): Int64;  // ...e la strada inversa
     function ArrayBufferAvail(A, NeedBytes: PtrUInt; out AAvail: PtrUInt): Boolean;  // phase 2.3, --bounds-check
@@ -7233,6 +7240,12 @@ var
 begin
   Result := V;
   if not ForeignIsMachineAddress(PtrUInt(V)) then Exit;
+  // ⭐ DIVERGENZE 561 - ...and a CLOSURE OF THIS PROGRAM IS HOME TOO. The eight bytes of a procedure field hold the
+  // machine address C jumps to; read back they must be the procedure again, because under fbc "t->pTestFunc = @t1"
+  // compares the same address twice. Asked before the array span: a closure page is not in it.
+  Result := ClosureEntryPC(PtrUInt(V));
+  if Result <> 0 then Exit;
+  Result := V;
   // The span and the candidate list are built here too, and read - under FArrDescLock with workers, as the C loop's entry
   // builds them: a worker may be rebuilding them. Outside every candidate buffer and the raw heap there is nothing to
   // come home to, and the walk over every array is skipped.
@@ -8499,14 +8512,86 @@ function TBytecodeVM.ForeignPtrHome(ACtx: TObject; A: PtrUInt): Int64;
 // ⭐ DIVERGENZE 425 - ...and the CLOSURE of a procedure of the program is home too: C hands back what it was given
 // ("xmlSchemaGetParserErrors" writes the handler set with "@onerr"), and it must read as "@onerr" again - under fbc
 // both are the same machine address, so "e = @onerr" is true there.
+begin
+  Result := ClosureEntryPC(A);
+  if Result <> 0 then Exit;
+  Result := VMPointerForMachineAddr(TExecutionContext(ACtx), A);
+end;
+
+function TBytecodeVM.ClosureEntryPC(A: PtrUInt): Int64;
+// ⭐ DIVERGENZE 425 · 561 - Which BASIC procedure is this machine address the closure of? 0 when it is none.
+// Asked on both roads home: by ForeignPtrHome for a pointer a call RETURNED, and by PtrLoadHome for one read out of
+// C's own memory - the eight bytes of a procedure field, which this program wrote there (561) or handed over earlier.
+// ⛔ The span test comes FIRST and is the whole reason this is cheap: a program that never gave a procedure to C
+// has FCloHi = 0 and pays two comparisons per pointer read, on a path the C hot loop already returns to Pascal for.
 var
   k: Integer;
 begin
-  if (A <> 0) and (FClosures <> nil) then
-    for k := 0 to FClosures.Count - 1 do
-      if PtrUInt(TAbiClosure(PSbClosureCtx(FClosures.Objects[k])^.Closure).Code) = A then
-        Exit(PSbClosureCtx(FClosures.Objects[k])^.EntryPC);
-  Result := VMPointerForMachineAddr(TExecutionContext(ACtx), A);
+  Result := 0;
+  if (A < FCloLo) or (A > FCloHi) or (FClosures = nil) then Exit;
+  for k := 0 to FClosures.Count - 1 do
+    if PtrUInt(TAbiClosure(PSbClosureCtx(FClosures.Objects[k])^.Closure).Code) = A then
+      Exit(PSbClosureCtx(FClosures.Objects[k])^.EntryPC);
+end;
+
+function TBytecodeVM.ValueForC(Ctx: TExecutionContext; V: Int64; SigIdx: Int64): Int64;
+// ⭐ DIVERGENZE 561 · 576 - bcValueForC: what a field of a NATIVE record must hold so that C, reading those eight
+// bytes LATER and from its own code, finds something it can use. Two kinds of field ask it, and SigIdx says which:
+//
+//   SigIdx >= 0   a PROCEDURE field. The index names the field's "FNPTR:<ret>:<a~b>" signature in the string pool,
+//                 and the value becomes the CLOSURE C can jump to. ⛔ ONLY A BASIC ENTRY PC IS CONVERTED: 0 stays 0
+//                 (a field being cleared), and an address C wrote - or one already made a closure - goes in as it is,
+//                 because building a closure "at" a machine address makes a page that jumps into the bytecode at
+//                 139678089441344.
+//   SigIdx = -1   a POINTER field whose pointee is NOT a UDT. The value becomes the machine address, which is what
+//                 PtrStoreValue already did for a C-marked one and for a packed array name - plus the road this
+//                 entry adds, the VM's own RAW BYTE HEAP.
+//   SigIdx = -2   a POINTER field whose pointee IS a UDT. The SAME, minus the raw-heap road: there a bit-62 value
+//                 may be a CAllocate'd block of shared RECORDS, which is the ambiguity DIVERGENZE 379 died on.
+begin
+  Result := V;
+  if V = 0 then Exit;
+  if (V shr 61) and 7 = 1 then Exit(V and not FGNPTR_TAG);          // C's mark: a bare address is what the bytes want
+  if SigIdx < 0 then Exit(PtrValueForC(V, SigIdx = -1));
+  if ForeignIsMachineAddress(PtrUInt(V)) then Exit;                 // already an address C can call
+  if (V < 0) or (FProgram = nil) or (V >= FProgram.GetInstructionCount) then Exit;
+  if (SigIdx < 0) or (SigIdx >= FProgram.StringConstants.Count) then Exit;
+  Result := Int64(PtrUInt(ForeignMakeClosure(Ctx, V, FProgram.StringConstants[SigIdx])));
+  if Result = 0 then Result := V;        // a signature this call path cannot pass: the bytes stay as they were
+end;
+
+function TBytecodeVM.PtrValueForC(V: Int64; RawHeapToo: Boolean): Int64;
+// ⭐⭐ DIVERGENZE 576 - A POINTER INTO THE VM'S OWN RAW BYTE HEAP, AS C MUST READ IT. "@"literal"" is a SADD copy
+// in that heap, so a field filled with one held 4000000000000010 - bit 62, a NAME of the VM - and the first C that
+// dereferenced it died (`CU_register_suites`, and the same shape in four other decks).
+//
+// ⛔⛔ WHY THIS IS SAFE HERE AND WAS NOT IN DIVERGENZE 379. That entry tried the same cure at the store and
+// RETRACTED it: SHARED_REC_FLAG and RAWPTR_TAG are THE SAME BIT (62), so at run time a raw-heap pointer and a
+// CAllocate'd block of shared RECORDS are indistinguishable, and resolving the second as raw memory died on the
+// first store. The discriminator that entry lacked is STATIC and the call site has it: only a field whose declared
+// pointee is NOT a UDT reaches here (FieldValueForC), and a record block can only live behind a UDT pointee.
+// ⚠️ The hole that leaves is declared: a record block CAST into an "Any Ptr" field. It cannot RAISE - the offset
+// is bounds-tested against the committed heap and anything outside it is written unchanged - but the address would
+// be wrong. It is wrong today too (C reads bit 62 and faults), so nothing that worked stops working.
+//
+// ⚠️ The raw heap is an address range RESERVED ONCE and grown by COMMITTING pages, never reallocated (see
+// RawAlloc): that is what makes an address handed to C stay valid after the heap grows.
+var
+  Ofs: PtrUInt;
+begin
+  Result := V;
+  if V <= 0 then Exit;
+  // A REGION pointer (framebuffer, image, array descriptor) is not a byte of the heap: its offset carries page and
+  // handle bits, and it is resolved at dereference time. Only the plain byte heap has an address to hand over.
+  if (V and RAWPTR_TAG) <> 0 then
+  begin
+    if not RawHeapToo then Exit;          // a UDT pointee: bit 62 may be a block of shared records (379)
+    if (V and RAWPTR_REGION_ANY) <> 0 then Exit;
+    Ofs := PtrUInt(V and RAWPTR_OFS_MASK);
+    if (FRawHeap = nil) or (Ofs = 0) or (Ofs >= PtrUInt(FRawHeapTop)) then Exit;
+    Exit(Int64(PtrUInt(@FRawHeap[Ofs])));
+  end;
+  Result := PtrStoreValue(V);        // a packed array name becomes its element's address; anything else stays
 end;
 
 procedure TBytecodeVM.RebuildHomeSpan;
@@ -8538,6 +8623,14 @@ begin
         Take(PtrUInt(@FArrays[i].FloatData[0]), PtrUInt(Length(FArrays[i].FloatData)) * SizeOf(Double));
     end;
   end;
+  // ⭐⭐ DIVERGENZE 561 - THE CLOSURE PAGES ARE HOME TOO, and this line is what makes the answer reach the two
+  // COMPILED readers. RTC_PTR64 has an INLINE fast path in the C hot loop and in the AOT: an address outside this
+  // span is marked as C's on the spot, without ever calling PtrLoadHome - so the procedure written into a field came
+  // back as a tagged address and "t->pTestFunc = @t1" was false, and calling the field from BASIC would have jumped
+  // to it. Inside the span both hand the PC back to Pascal, where ClosureEntryPC answers the procedure.
+  // ⚠️ It widens [FHomeLo, FHomeHi] only for a program that has actually given a procedure to C - FCloHi is 0
+  // until then - and the closure pages and FPC's heap both come from mmap, so the two ends are usually neighbours.
+  if FCloHi <> 0 then Take(FCloLo, FCloHi - FCloLo + 1);
   if FHomeLo > FHomeHi then begin FHomeLo := 1; FHomeHi := 0; end;   // nothing to bring home: every address is outside
   if FRawHeap <> nil then
   begin
@@ -8679,7 +8772,13 @@ var
   Key: string;
 begin
   Result := nil;
-  if AEntryPC <= 0 then Exit;
+  if AEntryPC = 0 then Exit;
+  // ⭐ DIVERGENZE 561 - A VALUE THAT IS ALREADY A MACHINE ADDRESS IS NOT AN ENTRY PC, and it reaches here through
+  // the ordinary argument road: a procedure-pointer VARIABLE holding what a procedure field gave back, or what
+  // memcpy copied out of one. Wrapping it would build a page that jumps into the bytecode at that number.
+  if (AEntryPC shr 61) and 7 = 1 then Exit(Pointer(PtrUInt(AEntryPC) and not PtrUInt(FGNPTR_TAG)));
+  if ForeignIsMachineAddress(PtrUInt(AEntryPC)) then Exit(Pointer(PtrUInt(AEntryPC)));
+  if AEntryPC < 0 then Exit;
   if not ForeignCallbackSig(ASig, RetK, ArgK, NA) then Exit;
   Key := IntToStr(AEntryPC) + '|' + UpperCase(ASig);
   if FClosures = nil then FClosures := TStringList.Create;
@@ -8718,6 +8817,10 @@ begin
   C^.Closure := Cl;
   FClosures.AddObject(Key, TObject(C));
   FGaveClosureToC := True;   // ⛔ da qui in poi C puo' richiamarci quando vuole, anche a programma finito (517)
+  // 561: lo span che rende gratuita la domanda inversa finche' nessuna chiusura esiste
+  if (FCloHi = 0) or (PtrUInt(Cl.Code) < FCloLo) then FCloLo := PtrUInt(Cl.Code);
+  if PtrUInt(Cl.Code) > FCloHi then FCloHi := PtrUInt(Cl.Code);
+  FHomeValid := 0;           // ...e lo span di RebuildHomeSpan ora lo comprende: va ricostruito
   Result := Cl.Code;
 end;
 
@@ -11813,6 +11916,10 @@ begin
           // A function pointer that was never assigned holds 0, and anything outside the program is not
           // an entry point either: jumping there ran whatever bytes followed and surfaced as an access
           // violation somewhere else entirely. Report it where it happens.
+          // ⭐ DIVERGENZE 561: a value that is one of OUR OWN CLOSURES is that procedure - see the twin arm in
+          // RunTemplate.inc. Asked only on the road to the error.
+          if (HandleNum64 <= 0) or (HandleNum64 >= FProgram.GetInstructionCount) then
+            HandleNum64 := ClosureEntryPC(PtrUInt(HandleNum64 and not FGNPTR_TAG));
           if (HandleNum64 <= 0) or (HandleNum64 >= FProgram.GetInstructionCount) then
             raise ERangeError.Create('Call through an unset or invalid procedure pointer');
           FramePush(Ctx, HandleNum64, Ctx.PC);   // indirect: the entry PC is the register value
@@ -11892,6 +11999,11 @@ begin
     // procedure in a C record or returns one did nothing or crashed.
     bcLoadProcAddr:
       Ctx.IntRegs[Instr.Dest] := Instr.Immediate;
+    // ⭐ DIVERGENZE 561 - the machine address C will jump to LATER. ⛔ It is in BOTH dispatchers on purpose: this
+    // one runs the body of a procedure C calls back, and a callback that installs another handler into a struct of
+    // C's (allegro's file interface, CUnit's registry) stores one from HERE. That is the lesson of the 560.
+    bcValueForC:
+      Ctx.IntRegs[Instr.Dest] := ValueForC(Ctx, Ctx.IntRegs[Instr.Src1], Instr.Immediate);
     // FFI: Immediate = index into the foreign declaration table, Src1 = staged argument count.
     bcForeignCall:
       begin

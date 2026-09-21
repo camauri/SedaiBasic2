@@ -171,6 +171,8 @@ begin
     bcThreadCreate, bcThreadWait, bcThreadDetach,
     // FreeBASIC function pointer call: Src1 = int register holding the target entry PC.
     bcCallSubIndirect,
+    // ⭐ DIVERGENZE 561 · 576: ValueForC reads the value in Src1 (int); what to make of it rides the Immediate.
+    bcValueForC,
     // Mutexes (M5.4): Lock/Unlock/Destroy Src1 = mutex handle reg.
     bcMutexLock, bcMutexUnlock, bcMutexDestroy,
     // Condition variables (M5.4): Wait/Signal/Broadcast/Destroy Src1 = cond handle reg.
@@ -563,6 +565,8 @@ begin
     // ⭐ FFI: the int-result form writes Dest. (The float-result form is bcForeignCallF, in
     // DestIsFloatReg - one opcode per result bank is what lets this classification be static.)
     bcForeignCall,
+    // ⭐ DIVERGENZE 561 · 576: ValueForC writes the value C must read in those bytes (int).
+    bcValueForC,
     // OOP (M4.3): RecordTypeId writes the runtime type-id (int).
     bcRecordTypeId,
     // OS threading (M5.2): LoadProcAddr writes an entry PC (int); ThreadCreate writes a thread handle (int).

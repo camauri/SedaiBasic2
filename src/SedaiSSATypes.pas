@@ -852,6 +852,17 @@ type
     ssaForeignCallF,        // Dest = float result
     // DIVERGENZE 528: "Cast(T Ptr, <integer>)" in the fb memory mode. Dest = Src1 with the machine-address tag
     // when the number is not a live packed VM name (the VM answers that: bcPtrFromInt).
+    // ⭐ DIVERGENZE 561 - a procedure value written into MEMORY that C reads later (a procedure field of a native
+    // record: chipmunk's cpCollisionHandler, CUnit's CU_TestInfo, allegro's ALLEGRO_FILE_INTERFACE). The eight bytes
+    // must BE a machine address C can jump to, so the value becomes the CLOSURE of that procedure right at the store,
+    // and stays one: the argument path (FNPTR:) only ever converted for the duration of ONE call.
+    // Dest = int reg (the machine address, or the value unchanged when it is not a BASIC entry PC);
+    // Src1 = int reg (the value); Src2 = svkConstString, the "FNPTR:<ret>:<a~b>" signature of the FIELD -> Immediate.
+    // ⛔⛔ AT THE END OF THE ENUM, AND NOT BESIDE ssaLoadProcAddr WHERE IT BELONGS BY MEANING. This unit is read
+    // with "Op in [...]" in a dozen places, and an FPC set constructor over an enum this long only holds the first
+    // 256 ORDINALS: adding a member in the middle pushed ssaArrayLBound past that edge and SedaiGVN stopped
+    // compiling ("range check error in set constructor"). A new SSA opcode goes here, at the bottom.
+    ssaValueForC,
     ssaPtrFromInt,
     ssaDummy            // Placeholder to avoid trailing comma issues
   );

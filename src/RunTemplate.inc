@@ -53,6 +53,11 @@ var
   // which is why this is a load and not a branch.
   ArrMapP: PInteger;
   NextPC: Integer;          // indirect call target, read before FramePush can slide the view
+  // ⛔ DIVERGENZE 561 - ...and the SAME value in sixty-four bits. A procedure pointer may hold a MACHINE address
+  // (one of our closures, read out of C's memory), and an Integer keeps its low half: the address came in halved and
+  // the guard below reported "an unset or invalid procedure pointer", which reads like a wrong VALUE and was a
+  // narrow VARIABLE. The test and the closure lookup run on this one; NextPC takes the answer, which is a real PC.
+  NextPC64: Int64;
   ArrayIdx, LinearIdx: Integer;   // used by the HOT typed accessors in ArrayHotOps.inc
   InputStr, PrintStr: string;
   InputVal: Double;
@@ -1271,11 +1276,18 @@ EventPollCounter := 0;
           else
           begin
             // Indirect call: the entry PC is in the register, not the Immediate.
-            NextPC := IntRegs[Instr^.Src1];            // read BEFORE the view can slide
+            NextPC64 := IntRegs[Instr^.Src1];          // read BEFORE the view can slide
             // ⛔ The same check the slow path makes: a pointer that is 0 (never set, or an address that did not
             // resolve) jumped to PC 0 and ran the program AGAIN from its first line, in silence (17 Sep 2026).
-            if (NextPC <= 0) or (NextPC >= FProgram.GetInstructionCount) then
+            // ⭐ DIVERGENZE 561 - ...and a value that is one of OUR OWN CLOSURES is that procedure. It reaches a
+            // register whenever the bytes travel as bytes - memcpy of a vtable a library keeps, a union read - where
+            // no typed field read was there to bring it home. Asked only on the road to the error, so nothing that
+            // already worked changes route.
+            if (NextPC64 <= 0) or (NextPC64 >= FProgram.GetInstructionCount) then
+              NextPC64 := ClosureEntryPC(PtrUInt(NextPC64 and not FGNPTR_TAG));
+            if (NextPC64 <= 0) or (NextPC64 >= FProgram.GetInstructionCount) then
               raise ERangeError.Create('Call through an unset or invalid procedure pointer');
+            NextPC := NextPC64;
             FramePush(Ctx, NextPC, CurPC);
             IntRegs := Ctx.IntRegs;
             GrowCallStackIfNeeded(Ctx);
@@ -1398,6 +1410,13 @@ EventPollCounter := 0;
         bcRecordBlockLen:  // Delete[] p: how many records the block holds (1 when it is a lone record)
           begin
             IntRegs[Instr^.Dest] := SharedRecordBlockLen(IntRegs[Instr^.Src1]);
+            Inc(CurPC);
+          end;
+        // ⭐ DIVERGENZE 561: the machine address C will jump to LATER, for a procedure written into a field of its
+        // memory. Immediate = the index in the string pool of the FNPTR signature the FIELD declares.
+        bcValueForC:
+          begin
+            IntRegs[Instr^.Dest] := ValueForC(Ctx, IntRegs[Instr^.Src1], Instr^.Immediate);
             Inc(CurPC);
           end;
         // ⭐ FFI: call a C function. Immediate = index into the foreign declaration table, Src1 = how

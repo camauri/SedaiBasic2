@@ -1408,6 +1408,9 @@ begin
     // sourced argument does not raise: the C function answers wrong numbers. The whole region stays
     // interpreted, which for a call out of the process costs nothing worth measuring. DIVERGENZE 183.
     bcForeignCall, bcForeignCallF,
+    // ⛔ DIVERGENZE 561: bcValueForC builds an EXECUTABLE PAGE (mprotect) and files it with the VM. Same reason
+    // as the two above, and it is rare by construction - one per (procedure, signature), cached.
+    bcValueForC,
     bcArrayIdxPush, bcArrayIdxResolve, bcArrayIdxResolveInd:
       Result := True;
   else

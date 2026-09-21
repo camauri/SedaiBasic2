@@ -213,6 +213,12 @@ const
   // its own - and the C hot loop's arms are a whitelist too. DIVERGENZE 183.
   bcForeignCall     = bcGroupCore + 171;   // Dest = int result (or unused, for a SUB)
   bcForeignCallF    = bcGroupCore + 172;   // Dest = float result (SINGLE / DOUBLE return)
+  // ⭐ DIVERGENZE 561 - a BASIC procedure written into memory C reads LATER: Dest(int) = the machine address C can
+  // jump to, Src1(int) = the value, Immediate = the index in the string pool of the FNPTR signature of the field.
+  // A value that is not a BASIC entry PC (0, an address C wrote, one already made a closure) comes out unchanged.
+  // ⛔ Not covered by the C hot loop, the AOT or the JIT: it builds an executable page. All three are whitelists,
+  // so leaving it out of them is the refusal - the same shape as bcForeignCall above.
+  bcValueForC     = bcGroupCore + 173;
   bcRecordBlockLen  = bcGroupCore + 170; // Dest = how many CONSECUTIVE records the block starting at IntRegs[Src1] holds
                                         //   (1 when the handle is a lone record). What "Delete[] p" needs to run one
                                         //   destructor per element: fbc keeps the same number in a UInteger in front
@@ -2170,6 +2176,7 @@ begin
         170: Result := 'RecordBlockLen';
         171: Result := 'ForeignCall';
         172: Result := 'ForeignCallF';
+        173: Result := 'ValueForC';        // DIVERGENZE 561
         111: Result := 'RecordTypeId';
         133: Result := 'RecordFree';
         112: Result := 'RecMarkPush';
