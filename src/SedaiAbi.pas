@@ -484,7 +484,12 @@ const
   CLO_SSE   = CLO_NGP * 8;                // CLO_NSSE words
   CLO_RAX   = CLO_SSE + CLO_NSSE * 8;
   CLO_XMM0  = CLO_RAX + 8;
-  CLO_BLOCK = CLO_XMM0 + 8;               // ...then padding, decided per ABI below
+  // ⭐ DIVERGENZE 565 - SysV: the SECOND eightbyte of a struct returned in registers, reloaded into RDX / XMM1 by the
+  // trampoline. Without them a 16-byte struct a callback answered reached C with its upper half zero (chipmunk's
+  // colorForShape: "0.25 0.5 0 0" for a colour of four Singles). Win64 returns no struct in two registers.
+  CLO_RDX   = CLO_XMM0 + 8;
+  CLO_XMM1  = CLO_RDX + 8;
+  CLO_BLOCK = CLO_XMM1 + 8;               // ...then padding, decided per ABI below
 
 type
   PClosureCtx = ^TClosureCtx;
@@ -551,6 +556,8 @@ asm
   call AbiClosureEntry
   mov  rax,  [rsp + 112]
   movq xmm0, [rsp + 120]
+  mov  rdx,  [rsp + 128]
+  movq xmm1, [rsp + 136]
   add  rsp, $B8
   ret
 end;
@@ -662,6 +669,10 @@ begin
   // from these two slots on its way out.
   PQWord(Saved + CLO_RAX)^ := 0;
   PQWord(Saved + CLO_XMM0)^ := 0;
+{$IFNDEF WINDOWS}
+  PQWord(Saved + CLO_RDX)^ := 0;
+  PQWord(Saved + CLO_XMM1)^ := 0;
+{$ENDIF}
   if RetInMem then
   begin
     PQWord(Saved + CLO_RAX)^ := PtrUInt(MemRet);   // the callee returns the hidden pointer in RAX
@@ -678,12 +689,14 @@ begin
     for k := 0 to RetN - 1 do
       if RetCl[k] = ecSSE then
       begin
-        if NSS = 0 then Move(RetBuf[k * 8], (Saved + CLO_XMM0)^, 8);
+        if NSS = 0 then Move(RetBuf[k * 8], (Saved + CLO_XMM0)^, 8)
+        else Move(RetBuf[k * 8], (Saved + CLO_XMM1)^, 8);
         Inc(NSS);
       end
       else
       begin
-        if NGP = 0 then Move(RetBuf[k * 8], (Saved + CLO_RAX)^, 8);
+        if NGP = 0 then Move(RetBuf[k * 8], (Saved + CLO_RAX)^, 8)
+        else Move(RetBuf[k * 8], (Saved + CLO_RDX)^, 8);
         Inc(NGP);
       end;
   end

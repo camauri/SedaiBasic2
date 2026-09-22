@@ -1252,6 +1252,9 @@ type
     procedure EmitSharedSyncIn;                          // M6: load shared-global slots -> their registers
     procedure EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);  // value-copy
     procedure EmitUserFunctionCall(Name: string; ArgsNode: TASTNode; out Result: TSSAValue);  // V3
+    function FuncPtrSigRetUDT(const Sig1, Sig2: string): string;                      // the record a procptr signature returns (592)
+    function FuncPtrRecordCallType(ObjNode: TASTNode): string;                         // the record "v(args)" / "o.f(args)" returns (592)
+    function IsFuncPtrRecordCall(ObjNode: TASTNode): Boolean;                          // "v(args)" through a record-returning procptr (592)
     function EmitFuncPtrCall(const FPName, Sig: string; ArgListNode: TASTNode): TSSAValue;  // FB function-pointer indirect call
     function DerefFuncPtrSig(Node: TASTNode): string;   // "*pf" of a "<funcptr type> Ptr" -> its signature
     function EmitIndirectCall(const PCValIn: TSSAValue; const Sig: string; ArgListNode: TASTNode): TSSAValue;  // indirect call through an already-loaded entry-PC value
@@ -3303,11 +3306,19 @@ begin
       end;
       if T = '#P' then T := 'ANY PTR';                  // a procedure-pointer parameter
       T := UpperFast(CanonicalType(UpperFast(T)));
+      // ⭐ DIVERGENZE 565 - a record is a struct by value here too, as on the "@proc" road below (563).
+      if (T <> '') and (ForeignKindOf(T) = fkUnknown) and (GetEnvironmentVariable('SB_FIELD_SVAL') <> '0') then
+        T := CallbackStructLeg(T);
       if (T = '') or (ForeignKindOf(T) = fkUnknown) then Exit;
       if FpP <> '' then FpP := FpP + '~';
       FpP := FpP + T;
     end;
     Ret := UpperFast(CanonicalType(UpperFast(Trim(Ret))));
+    if (Ret <> '') and (ForeignKindOf(Ret) = fkUnknown) and (GetEnvironmentVariable('SB_FIELD_SVAL') <> '0') then
+    begin
+      Ret := CallbackStructLeg(Ret);
+      if Ret = '' then Exit;
+    end;
     if (Ret <> '') and (ForeignKindOf(Ret) = fkUnknown) then Exit;
     Exit('FNPTR:' + Ret + ':' + FpP);
   end;
@@ -52464,6 +52475,13 @@ begin
   Result := FuncPtrTypeSig(FPointerVars.Values[PtrName]);
 end;
 
+function DynStructByValueOn: Boolean;
+// SB_DYN_SVAL=0 is the A/B knob on one binary for DIVERGENZE 565: a call through a C address whose signature has a
+// struct by value goes back to the BASIC indirect call ("unset or invalid procedure pointer").
+begin
+  Result := GetEnvironmentVariable('SB_DYN_SVAL') <> '0';
+end;
+
 function TSSAGenerator.ForeignDynEntry(const Sig: string): string;
 // ⭐ THE ENTRY THAT CALLS A C ADDRESS (strato 3 del rapporto `ffi`): a procedure pointer holding what
 // DyLibSymbol / GetProcAddress / dlsym handed back is a MACHINE address, and the indirect call jumped to it
@@ -52485,7 +52503,10 @@ begin
   if Ret <> '' then
   begin
     Ret := UpperFast(CanonicalType(Ret));
-    if ForeignKindOf(Ret) in [fkUnknown, fkLongDouble] then Exit;
+    // ⭐ DIVERGENZE 565 - ...a STRUCT returned by value is a record TryForeignCall already knows how to receive (329):
+    // "cd(cs, cpTransformIdentity)" through chipmunk's cpShapeClass.cacheData answers a cpBB.
+    if (ForeignKindOf(Ret) = fkLongDouble) or
+       ((ForeignKindOf(Ret) = fkUnknown) and ((FindUDT(Ret) < 0) or not DynStructByValueOn)) then Exit;
   end;
   Params := '';
   Rest := Copy(Sig, 1, Bar - 1) + ',';
@@ -52501,7 +52522,10 @@ begin
     // entry PC as a number. As a pointer, the call site makes the argument a callback (VariadicCallSiteDecl).
     else if FuncPtrTypeSig(T) <> '' then T := 'ANY PTR'
     else T := UpperFast(CanonicalType(T));
-    if ForeignKindOf(T) in [fkUnknown, fkLongDouble] then Exit;
+    // ...and so is a struct PASSED by value (382): the entry names the UDT, and the call spells its layout.
+    if (ForeignKindOf(T) = fkLongDouble) or
+       ((ForeignKindOf(T) = fkUnknown) and not ((FEnumNames <> nil) and (FEnumNames.IndexOf(T) >= 0)) and
+        ((FindUDT(T) < 0) or not DynStructByValueOn)) then Exit;
     if Params <> '' then Params := Params + ',';
     Params := Params + T;
   end;
@@ -52651,6 +52675,8 @@ var
   Defs, D, PT: string;
   DefList: TStringList;
   DefNode, PNode: TASTNode;
+  RetUDT: Integer;
+  RcHandle: TSSAValue;
 
   // A parameter node shaped as a declaration's ("As <type>"), for the conversions that ask one (535).
   function ParamOfType(const TypeName: string): TASTNode;
@@ -52783,8 +52809,31 @@ begin
   // The pointer value (entry PC) and the indirect call. FramePush/Pop preserve the caller's registers,
   // so the call stays inline (no block split): control resumes at the next instruction on return.
   PCVal := EnsureIntRegister(PCVal);
+  // ⭐ DIVERGENZE 592 - A UDT RETURNED BY VALUE takes the protocol a DIRECT call uses (EmitUserFunctionCall): the
+  // caller allocates the result record and hands its handle in XFER_RESULT_HANDLE_SLOT, after the arguments, and the
+  // callee copies its return value into it. Without it the callee copied into handle 0: "c = v(1)" through a
+  // "Function(...) As Col" variable answered "Null or invalid pointer dereference", and so did every procedure field
+  // of that shape - chipmunk's colorForShape, called from BASIC. SB_INDIRECT_SRET=0 is the A/B knob on one binary.
+  RetUDT := -1;
+  if (not RetIsByref) and (RetPart <> '') and (GetEnvironmentVariable('SB_INDIRECT_SRET') <> '0') then
+    RetUDT := FindUDT(CanonicalType(UpperFast(Trim(RetPart))));
+  if RetUDT >= 0 then
+  begin
+    RcHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRecordNew, RcHandle,
+                    MakeSSAConstInt(FUDTs[RetUDT].LiveBytes), MakeSSAConstInt(0),
+                    MakeSSAConstInt(FUDTs[RetUDT].NStr or (Int64(RetUDT) shl 32)));
+    EmitRecordInit(RcHandle, RetUDT);
+    EmitXferStore(srtInt, XFER_RESULT_HANDLE_SLOT, RcHandle);
+  end;
   if not FInDispatcher then EmitSharedSyncOut;
   EmitInstruction(ssaCallSubIndirect, MakeSSAValue(svkNone), PCVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  if RetUDT >= 0 then
+  begin
+    RegisterResultTemp(RcHandle, FUDTs[RetUDT].Name);
+    Result := RcHandle;
+    Exit;
+  end;
   // Read the result (FUNCTION); a SUB pointer used as a value yields int 0 harmlessly.
   RetRT := srtInt;
   // ⛔ A UDT RETURNED BY VALUE IS AN INT HANDLE, and TypeNameToBank answers the FLOAT default for a
@@ -53321,6 +53370,51 @@ begin
     Result := VarRecordTypeName(VarToStr(Node.Value));
 end;
 
+function TSSAGenerator.FuncPtrSigRetUDT(const Sig1, Sig2: string): string;
+// The record a procedure-pointer signature "params|ret" returns BY VALUE ('' for a scalar, a reference or none):
+// the first of the two signatures given that is not empty (a local one, then the module's).
+var
+  Sig, Ret: string;
+begin
+  Result := '';
+  Sig := Sig1;
+  if Sig = '' then Sig := Sig2;
+  if Pos('|', Sig) = 0 then Exit;
+  Ret := Copy(Sig, Pos('|', Sig) + 1, MaxInt);
+  if Pos('|', Ret) > 0 then Exit;                       // "|BYREF"
+  Ret := UpperFast(CanonicalType(UpperFast(Trim(Ret))));
+  if (Ret <> '') and (FindUDT(Ret) >= 0) then Result := Ret;
+end;
+
+function TSSAGenerator.FuncPtrRecordCallType(ObjNode: TASTNode): string;
+// ⭐ DIVERGENZE 592 - the record returned by value by "v(args)" (v a procedure-pointer VARIABLE, not an array) or by
+// "obj.f(args)" (f a procedure-pointer FIELD) - '' for anything else. The object of a member access that is such a
+// call is the record the call returns.
+var
+  Nm: string;
+  Slot: Integer;
+  C0: TASTNode;
+begin
+  Result := '';
+  while (ObjNode <> nil) and (ObjNode.NodeType = antParentheses) and (ObjNode.ChildCount >= 1) do
+    ObjNode := ObjNode.GetChild(0);
+  if (ObjNode = nil) or (ObjNode.NodeType <> antArrayAccess) or (ObjNode.ChildCount < 2) then Exit;
+  C0 := ObjNode.GetChild(0);
+  if C0.NodeType = antIdentifier then
+  begin
+    Nm := C0.ValueUpper;
+    if ArrayIndexOf(Nm) >= 0 then Exit;
+    Result := FuncPtrSigRetUDT(FFuncPtrSigs.Values[Nm], FModuleFuncPtrSigs.Values[Nm]);
+  end
+  else if (C0.NodeType = antMemberAccess) and (C0.ChildCount >= 1) then
+    Result := FuncPtrSigRetUDT(UDTFuncPtrFieldSig(FindUDT(ObjectTypeName(C0.GetChild(0))), VarToStr(C0.Value), Slot), '');
+end;
+
+function TSSAGenerator.IsFuncPtrRecordCall(ObjNode: TASTNode): Boolean;
+begin
+  Result := FuncPtrRecordCallType(ObjNode) <> '';
+end;
+
 function TSSAGenerator.ObjectTypeName(ObjNode: TASTNode): string;
 // The UDT type name of an object expression, without emitting any code. Empty if not a record.
 var
@@ -53500,7 +53594,14 @@ begin
       // the identical access through a variable was right.
       if (Result = '') and (ArrayIndexOf(ArrName) < 0) then
         Result := ForeignRetUDTName(ArrName);
+      // ⭐ DIVERGENZE 592 - ...and a PROCEDURE-POINTER variable whose type returns a record: "v(4).r" answered '' here,
+      // so the access never lowered the call and read the pointer's own value as a record.
+      if (Result = '') and (ArrayIndexOf(ArrName) < 0) then
+        Result := FuncPtrSigRetUDT(FFuncPtrSigs.Values[ArrName], FModuleFuncPtrSigs.Values[ArrName]);
     end
+    // ...and "obj.f(args)", f a procedure-pointer FIELD whose type returns a record (592).
+    else if FuncPtrRecordCallType(ObjNode) <> '' then
+      Result := FuncPtrRecordCallType(ObjNode)
     // "p[i][j].field": the cell p[i] holds a MANAGED block, so p[i][j] is a record of the cell's
     // pointee type. ⛔ ProcessMemberAccess asks this BEFORE it asks ResolveRecordObject and gives up
     // when the answer is '': the write half already worked through the resolver while the read half
@@ -54686,6 +54787,16 @@ begin
     ObjNode := ObjNode.GetChild(0);
   if ForeignDataArrayRecordType(ObjNode) <> '' then
     Exit(ForeignDataArrayElemAddr(ObjNode, HandleVal, TypeName, True));
+  // ⭐ DIVERGENZE 592 - "v(args).f", v a procedure-pointer VARIABLE whose type returns a record: the call yields the
+  // handle of the record it returned (EmitIndirectCallVM allocates it). Taken as an index into v, the call was never
+  // made and the field was read at the pointer's value.
+  if IsFuncPtrRecordCall(ObjNode) then
+  begin
+    ProcessExpression(ObjNode, HandleVal);
+    HandleVal := EnsureIntRegister(HandleVal);
+    TypeName := FuncPtrRecordCallType(ObjNode);
+    Exit(True);
+  end;
   // The call of an overloaded "Operator ->" (RewriteArrowOperators, 285): calling it yields the handle
   // of the record it returns, and that record is the object of the access.
   if ObjNode.Attributes.Values['ARROWOP'] <> '' then
@@ -55275,16 +55386,19 @@ begin
   // "h->field" where h holds a RAW ADDRESS: the field lives at a byte offset, not in a record slot.
   // ⛔ A "String * n" field read this way is its n bytes, and an ordinary read converts at the first NUL exactly as the
   // managed read at the end of this routine does (phase 3: "u = r.f" answered "ab" plus four NULs).
-  if TryEmitRawUDTField(Node.GetChild(0), VarToStr(Node.Value), Result) then
+  // ⛔ DIVERGENZE 592 - ...but never over a CALL through a procedure pointer that returns a record: "v(4).r" read as an
+  // index into v, the call was never made and the field was read at the pointer's value plus an offset.
+  if (not IsFuncPtrRecordCall(Node.GetChild(0))) and
+     TryEmitRawUDTField(Node.GetChild(0), VarToStr(Node.Value), Result) then
   begin
     if (Result.Kind = svkRegister) and (Result.RegType = srtString) and AnyFixedLen then
       Result := MaybeFixedLenRead(Node, Result);
     Exit;
   end;
   // ...and "a(i)->field" where the ELEMENT may hold a C address (DIVERGENZE 259): decided at run time.
-  if TryEmitForeignElemField(Node, Result) then Exit;
+  if (not IsFuncPtrRecordCall(Node.GetChild(0))) and TryEmitForeignElemField(Node, Result) then Exit;
   // ...and "b->g[i].f" where b is such a base, one indexed pointer field further down (DIVERGENZE 388).
-  if TryEmitForeignChainField(Node, Result) then Exit;
+  if (not IsFuncPtrRecordCall(Node.GetChild(0))) and TryEmitForeignChainField(Node, Result) then Exit;
   TypeName := RecordTypeOfAddrOfObject(Node.GetChild(0));   // "(@X)->f" is "X.f"
   if TypeName = '' then TypeName := ObjectTypeName(Node.GetChild(0));
   // ...and an ENUM member named through the TYPE ITSELF ("T.member"), not through an instance. The
@@ -57226,7 +57340,14 @@ begin
   if Bar = 0 then Exit;
   Ret := UpperFast(Trim(Copy(FieldSig, Bar + 1, MaxInt)));
   if Ret <> '' then Ret := UpperFast(CanonicalType(Ret));
-  if (Ret <> '') and (ForeignKindOf(Ret) = fkUnknown) then Exit;
+  // ⭐ DIVERGENZE 565 - ...a RECORD is a struct by value, spelled as the "@proc" road spells it (563): chipmunk's
+  // cpSpaceDebugDrawOptions holds six procedure fields that take or return a colour of four Singles, and C was handed
+  // the VM's entry PCs as they were. SB_FIELD_SVAL=0 is the A/B knob on one binary.
+  if (Ret <> '') and (ForeignKindOf(Ret) = fkUnknown) then
+  begin
+    if GetEnvironmentVariable('SB_FIELD_SVAL') <> '0' then Ret := CallbackStructLeg(Ret) else Ret := '';
+    if Ret = '' then Exit;
+  end;
   Params := Copy(FieldSig, 1, Bar - 1);
   T := '';
   if Trim(Params) <> '' then
@@ -57239,6 +57360,8 @@ begin
         Start := i + 1;
         if Piece = '#P' then Piece := 'ANY PTR'          // a procedure pointer is a pointer to C
         else if Piece <> '' then Piece := UpperFast(CanonicalType(Piece));
+        if (Piece <> '') and (ForeignKindOf(Piece) = fkUnknown) and (GetEnvironmentVariable('SB_FIELD_SVAL') <> '0') then
+          Piece := CallbackStructLeg(Piece);
         if (Piece = '') or (ForeignKindOf(Piece) = fkUnknown) then Exit;
         if T <> '' then T := T + '~';
         T := T + Piece;
