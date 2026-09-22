@@ -751,6 +751,7 @@ type
     function ProcReturnPtrUDT(const NameU: string): string;       // pointee UDT of a "FUNCTION f(...) AS T PTR", else ''
     function ManagedPtrArithUDT(Node: TASTNode): string;          // pointee UDT of "p", "(p)", "p±n", "n+p" for a managed UDT pointer
     function ProcHasParamCount(const NameU: string; N: Integer): Boolean;
+    function CallbackStructLeg(const TypeName: string): string;   // 563: a struct BY VALUE as one leg of that signature
     function BasicProcCallbackSig(Node: TASTNode): string;   // "@proc" -> FNPTR:<ret>:<args>
     function ForeignRecordArg(Node: TASTNode): Boolean;      // "@rec" / a UDT PTR -> a record handle (DIVERGENZE 245)
     function ForeignNarrowArg(Node: TASTNode; out TypeU: string): Integer;  // "@n" of a narrow value -> width code (DIVERGENZE 247)
@@ -1753,6 +1754,8 @@ type
     function ByrefRetCallName(Node: TASTNode): string;   // call to a BYREF-returning FUNCTION? -> its resolved label
     function EmitByrefRetAddress(Node: TASTNode): TSSAValue;   // ...lowered to the ADDRESS it returns
     function RawUDTPtrType(const Name: string): string;   // "T PTR" holding a RAW address -> T
+    function AppendStructLeaves(UDTIdx: Integer; Base: Int64; Depth: Integer;
+                                var FieldsS: string; var Al: Integer; out Why: string): Boolean;   // 564: the flattened leaves
     function ForeignStructRetSpec(UDTIdx: Integer; out Why: string): string;   // a struct returned BY VALUE (329)
     function ForeignRetUDTName(const NameU: string): string;   // ...and the UDT such a call answers (329)
     function ForeignRetPtrUDTName(const NameU: string): string;   // ...and the UDT a foreign call POINTS AT
@@ -3205,6 +3208,35 @@ begin
   else if TypeU = 'SINGLE' then Result := 7;
 end;
 
+function TSSAGenerator.CallbackStructLeg(const TypeName: string): string;
+// ⭐ DIVERGENZE 563 - a STRUCT BY VALUE as one leg of a callback's "FNPTR:" signature. The layout is the same one
+// ForeignStructRetSpec writes for a call, respelled with characters the signature can carry: ':' separates the
+// return from the arguments there and '~' separates the arguments, so a leg may use neither.
+//   STRUCT#<size>#<align>#<kind>.<offset>+<kind>.<offset>+...
+// ⛔ AND NOT A COMMA BETWEEN THE FIELDS: the comma already separates the PARAMETERS of an entry in the foreign
+//   table line, so a leg written with one is split in two and the runtime reads half a layout as a type of its
+//   own ("11.8 has no C type here"). It is the same trap the '~' note below records for the argument list.
+// ⛔ '' when the type has no C layout this classification can place - the caller then drops the whole signature
+// and the closure is never built, which is the loud failure, not a guess.
+var
+  Spec, Why, Fields: string;
+  p, q: Integer;
+begin
+  Result := '';
+  // ⭐ SB_CB_STRUCT=0 restores the road of before - the signature is dropped, the closure is never built and the
+  // call fails loudly. It is the A/B on ONE binary, and what lets the guard of 563 be sabotaged.
+  if GetEnvironmentVariable('SB_CB_STRUCT') = '0' then Exit;
+  if FindUDT(TypeName) < 0 then Exit;
+  Spec := ForeignStructRetSpec(FindUDT(TypeName), Why);
+  if Copy(Spec, 1, 5) <> 'SRET:' then Exit;
+  Delete(Spec, 1, 5);
+  p := Pos(':', Spec); if p <= 0 then Exit;
+  q := Pos(':', Copy(Spec, p + 1, MaxInt)); if q <= 0 then Exit;
+  Fields := Copy(Spec, p + q + 1, MaxInt);
+  Result := 'STRUCT#' + Copy(Spec, 1, p - 1) + '#' + Copy(Spec, p + 1, q - 1) + '#' +
+            StringReplace(StringReplace(Fields, '@', '.', [rfReplaceAll]), '/', '+', [rfReplaceAll]);
+end;
+
 function TSSAGenerator.BasicProcCallbackSig(Node: TASTNode): string;
 // "@<procedura BASIC>" passato a un parametro PUNTATORE di una funzione C: la firma di quella
 // procedura, scritta come "FNPTR:<ritorno>:<arg,arg,...>" (DIVERGENZE 218). '' per ogni altra cosa.
@@ -3296,7 +3328,15 @@ begin
     // An alias ("byval d as LPARAM") is named through the alias table first: ForeignKindOf knows only
     // canonical names, and an unknown one would drop the whole signature - the closure never built.
     if T <> '' then T := UpperFast(CanonicalType(T));
-    if (T = '') or (ForeignKindOf(T) = fkUnknown) then Exit;
+    if T = '' then Exit;
+    // ⭐ DIVERGENZE 563 - ...and a parameter declared as a RECORD is a struct BY VALUE, spelled out here because
+    // the runtime has no way back to the declaration. Asked before the refusal: ForeignKindOf sees only the NAME
+    // of a UDT and answers fkUnknown, which dropped the whole signature and left C jumping to a bytecode PC.
+    if ForeignKindOf(T) = fkUnknown then
+    begin
+      T := CallbackStructLeg(T);
+      if T = '' then Exit;
+    end;
     // ⛔⛔ IL SEPARATORE E' "~", NON LA VIRGOLA. La virgola separa gia' i PARAMETRI nella riga della
     // tabella esterna, quindi una firma scritta con le virgole veniva spezzata da ParseForeignDecl:
     // "FNPTR:LONG:ANY PTR,ANY PTR" diventava DUE parametri, il callback ne riceveva uno solo, e il
@@ -3312,7 +3352,13 @@ begin
      (NameNode.GetChild(0).NodeType = antIdentifier) then
     Ret := NameNode.GetChild(0).ValueUpper;
   if Ret <> '' then Ret := UpperFast(CanonicalType(Ret));
-  if (Ret <> '') and (ForeignKindOf(Ret) = fkUnknown) then Exit;
+  // ⭐ DIVERGENZE 563 - ...and a RECORD return is a struct by value too (chipmunk's spatial-index bounding-box
+  // function answers a cpBB, 32 bytes through memory).
+  if (Ret <> '') and (ForeignKindOf(Ret) = fkUnknown) then
+  begin
+    Ret := CallbackStructLeg(Ret);
+    if Ret = '' then Exit;
+  end;
   Result := 'FNPTR:' + Ret + ':' + Params;
 end;
 
@@ -27509,45 +27555,40 @@ begin
   Result := T;
 end;
 
-function TSSAGenerator.ForeignStructRetSpec(UDTIdx: Integer; out Why: string): string;
-// ⭐ THE C LAYOUT OF A STRUCT A C FUNCTION RETURNS BY VALUE (DIVERGENZE 329), spelled for the
-// marshaller: "SRET:<size>:<align>:<kind>@<offset>/...". The CALL SITE is the only place that knows
-// it - the runtime has no way back to a UDT declaration - which is why it travels in the declaration
-// line, exactly as "REC:" and "W<k>:" do for arguments.
+function TSSAGenerator.AppendStructLeaves(UDTIdx: Integer; Base: Int64; Depth: Integer;
+  var FieldsS: string; var Al: Integer; out Why: string): Boolean;
+// ⭐ DIVERGENZE 564 - THE PRIMITIVE LEAVES OF A STRUCT, FLATTENED, with each one's offset in the WHOLE image.
+// ForeignStructRetSpec used to walk one level and refuse a field that was itself a record or an array by name; the
+// spec it writes is a flat list of "<kind>@<offset>", which is exactly what a flattened aggregate produces, so the
+// refusal was a missing recursion and not a limit of the format. It blocked `cpContactPointSet` (a long, a cpVect
+// and an ARRAY OF RECORDS), `CXCursor` (an inline array of pointers), `CXType` and `CXString`.
 //
-// ⛔ PRIMITIVE FIELDS ONLY, and a refusal that NAMES what stopped it. The SysV eightbyte
-// classification needs to know, for every byte of the struct, whether it is INTEGER or SSE; a nested
-// aggregate, an array member, a string or a bit field would have to be flattened first, and guessing
-// there does not raise - it puts the value in the wrong register file and the caller reads a number
-// nobody returned. That is the one failure this whole path exists to avoid.
-// ⛔ DIVERGENZE 446 - THE FIELDS ACCUMULATE APART, and Result is written only at the end. They used to accumulate in
-// Result itself, so a refusal half-way ("field U is itself a record") left "6@0" behind: the call site saw a
-// non-empty layout, the compile-time refusal never fired, and C was handed an empty "SVAL:" that failed at run time
-// with no reason (fontconfig's FcValue, a tag and a UNION).
+// ⛔ The refusals that REMAIN are the ones where a leaf's eightbyte class is genuinely unknown here - a string, a
+// bit field, a CVA_LIST, a nested UNION block, a record member held as a HANDLE rather than in the bytes. Guessing
+// any of those does not raise: it puts the value in the wrong register file and the caller reads a number nobody
+// returned, which is the one failure this whole path exists to avoid.
 var
-  i, n, Al, Sz: Integer;
+  i, n, Sz, Nested, e, Cnt, d: Integer;
   Offsets: TInt64Array;
-  TotalSize: Int64;
+  Lbs, Ubs: TInt64Array;
+  TotalSize, ElemSz, Ofs: Int64;
   K: TForeignKind;
   F: ^TUDTField;
-  FieldsS: string;
+  ElemT: string;
 begin
-  Result := ''; Why := ''; FieldsS := '';
+  Result := False; Why := '';
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then begin Why := 'it is not a declared type'; Exit; end;
+  if Depth > 6 then begin Why := 'it nests deeper than this classification follows'; Exit; end;
   if FUDTs[UDTIdx].IsUnion then begin Why := 'it is a UNION'; Exit; end;
-  if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then
-  begin Why := 'it has no C byte layout'; Exit; end;
+  if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then begin Why := 'it has no C byte layout'; Exit; end;
   if TotalSize <= 0 then begin Why := 'it has no C byte layout'; Exit; end;
   n := Length(FUDTs[UDTIdx].Fields);
   if n = 0 then begin Why := 'it declares no field'; Exit; end;
-  Al := 1;
   for i := 0 to n - 1 do
   begin
     F := @FUDTs[UDTIdx].Fields[i];
-    if F^.IsArray or F^.InlineArray then
-      begin Why := 'field "' + F^.Name + '" is an array'; Exit; end;
-    if (F^.NestedType <> '') or F^.InlineNested then
-      begin Why := 'field "' + F^.Name + '" is itself a record'; Exit; end;
+    if i > High(Offsets) then begin Why := 'its layout has fewer fields than it declares'; Exit; end;
+    Ofs := Base + Offsets[i];
     if F^.BitWidth > 0 then
       begin Why := 'field "' + F^.Name + '" is a bit field'; Exit; end;
     if F^.IsCvaList then
@@ -27556,6 +27597,66 @@ begin
       begin Why := 'field "' + F^.Name + '" is inside a nested UNION or TYPE block'; Exit; end;
     if (F^.Bank = srtString) or F^.IsWString or F^.IsZString or (F^.StrCapacity > 0) then
       begin Why := 'field "' + F^.Name + '" is a string'; Exit; end;
+    // ⭐ A RECORD MEMBER THAT LIVES IN THE BYTES is its own leaves, at its own offset (226). One held as a
+    // HANDLE is not in this image at all, and stays refused.
+    if F^.InlineNested or (F^.NestedType <> '') then
+    begin
+      if not F^.InlineNested then
+        begin Why := 'field "' + F^.Name + '" is a record held as a handle, not in the bytes'; Exit; end;
+      Nested := FindUDT(F^.NestedType);
+      if Nested < 0 then begin Why := 'field "' + F^.Name + '" names a type this unit cannot find'; Exit; end;
+      if not AppendStructLeaves(Nested, Ofs, Depth + 1, FieldsS, Al, Why) then
+      begin Why := 'field "' + F^.Name + '": ' + Why; Exit; end;
+      System.Continue;
+    end;
+    // ⭐ ...and an ARRAY MEMBER in the bytes is its elements, one entry each. A DYNAMIC one (IsArray) holds an
+    // FArrays handle and has no bytes here.
+    if F^.IsArray or F^.InlineArray then
+    begin
+      if not F^.InlineArray then
+        begin Why := 'field "' + F^.Name + '" is a dynamic array, held as a handle'; Exit; end;
+      d := InlineArrayDims(UDTIdx, i, Lbs, Ubs);
+      if d <= 0 then begin Why := 'field "' + F^.Name + '" is an array whose bounds are not fixed'; Exit; end;
+      Cnt := 1;
+      for e := 0 to d - 1 do
+      begin
+        if Ubs[e] < Lbs[e] then begin Why := 'field "' + F^.Name + '" is an empty array'; Exit; end;
+        Cnt := Cnt * Integer(Ubs[e] - Lbs[e] + 1);
+      end;
+      if (Cnt <= 0) or (Cnt > 256) then
+        begin Why := 'field "' + F^.Name + '" is an array of ' + IntToStr(Cnt) + ' elements'; Exit; end;
+      // an array OF RECORDS: every element is its own set of leaves
+      if F^.ArrayElemType <> '' then
+      begin
+        Nested := FindUDT(F^.ArrayElemType);
+        if Nested < 0 then begin Why := 'field "' + F^.Name + '" names an element type this unit cannot find'; Exit; end;
+        ElemSz := NativeImageBytes(Nested);
+        if ElemSz <= 0 then begin Why := 'field "' + F^.Name + '" has elements with no C byte layout'; Exit; end;
+        for e := 0 to Cnt - 1 do
+          if not AppendStructLeaves(Nested, Ofs + Int64(e) * ElemSz, Depth + 1, FieldsS, Al, Why) then
+          begin Why := 'field "' + F^.Name + '": ' + Why; Exit; end;
+        System.Continue;
+      end;
+      ElemT := UpperFast(F^.ArrayElemScalarType);
+      if (ElemT = '') and (F^.ArrayElemPtrPointee <> '') then ElemT := 'ANY PTR';
+      if ElemT = '' then begin Why := 'field "' + F^.Name + '" is an array of an element type this unit cannot name'; Exit; end;
+      if F^.ArrayElemPtrPointee <> '' then K := fkPointer
+      else
+      begin
+        K := ForeignKindOf(UpperFast(CanonicalType(ElemT)));
+        if (K = fkUnknown) or (K = fkVoid) or (K = fkStruct) then
+          begin Why := 'field "' + F^.Name + '" is an array of "' + ElemT + '"'; Exit; end;
+      end;
+      ElemSz := ForeignKindSize(K);
+      if ElemSz <= 0 then begin Why := 'field "' + F^.Name + '" is an array of a zero-width element'; Exit; end;
+      if ElemSz > Al then Al := Integer(ElemSz);
+      for e := 0 to Cnt - 1 do
+      begin
+        if FieldsS <> '' then FieldsS := FieldsS + '/';
+        FieldsS := FieldsS + IntToStr(Ord(K)) + '@' + IntToStr(Ofs + Int64(e) * ElemSz);
+      end;
+      System.Continue;
+    end;
     // A POINTER field - declared "T Ptr", a raw scalar pointer, or a function pointer - is eight
     // INTEGER bytes, which is all the classification needs of it.
     if (F^.PtrPointee <> '') or (F^.RawPtrPointee <> '') or (F^.MultiPtrPointee <> '') or
@@ -27574,12 +27675,41 @@ begin
       else
         K := fkS64;    // every 64-bit name: for the ABI they are one INTEGER eightbyte
       end;
-    if i > High(Offsets) then begin Why := 'its layout has fewer fields than it declares'; Exit; end;
     Sz := ForeignKindSize(K);
     if Sz > Al then Al := Sz;
     if FieldsS <> '' then FieldsS := FieldsS + '/';
-    FieldsS := FieldsS + IntToStr(Ord(K)) + '@' + IntToStr(Offsets[i]);
+    FieldsS := FieldsS + IntToStr(Ord(K)) + '@' + IntToStr(Ofs);
   end;
+  Result := True;
+end;
+
+function TSSAGenerator.ForeignStructRetSpec(UDTIdx: Integer; out Why: string): string;
+// ⭐ THE C LAYOUT OF A STRUCT A C FUNCTION RETURNS OR TAKES BY VALUE (DIVERGENZE 329), spelled for the
+// marshaller: "SRET:<size>:<align>:<kind>@<offset>/...". The CALL SITE is the only place that knows it - the
+// runtime has no way back to a UDT declaration - which is why it travels in the declaration line, exactly as
+// "REC:" and "W<k>:" do for arguments.
+//
+// ⭐ DIVERGENZE 564 - THE LEAVES ARE FLATTENED, so a nested record and an array member are spelled out rather
+// than refused: AppendStructLeaves walks them and writes each primitive at its offset in the WHOLE image. What
+// still refuses, and BY NAME, is a leaf whose eightbyte class cannot be known here (a string, a bit field, a
+// union block, a record held as a handle) - the SysV classification needs to know for every byte whether it is
+// INTEGER or SSE, and guessing there does not raise: it puts the value in the wrong register file.
+// ⛔ DIVERGENZE 446 - THE FIELDS ACCUMULATE APART, and Result is written only at the end. They used to accumulate in
+// Result itself, so a refusal half-way ("field U is itself a record") left "6@0" behind: the call site saw a
+// non-empty layout, the compile-time refusal never fired, and C was handed an empty "SVAL:" that failed at run time
+// with no reason (fontconfig's FcValue, a tag and a UNION).
+var
+  Al: Integer;
+  Offsets: TInt64Array;
+  TotalSize: Int64;
+  FieldsS: string;
+begin
+  Result := ''; Why := ''; FieldsS := ''; Al := 1;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then begin Why := 'it is not a declared type'; Exit; end;
+  if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then begin Why := 'it has no C byte layout'; Exit; end;
+  if TotalSize <= 0 then begin Why := 'it has no C byte layout'; Exit; end;
+  if not AppendStructLeaves(UDTIdx, 0, 0, FieldsS, Al, Why) then Exit;
+  if FieldsS = '' then begin Why := 'it declares no field this classification can place'; Exit; end;
   if Al > 8 then Al := 8;
   Result := 'SRET:' + IntToStr(TotalSize) + ':' + IntToStr(Al) + ':' + FieldsS;
 end;

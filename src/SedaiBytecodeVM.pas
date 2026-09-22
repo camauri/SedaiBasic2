@@ -41,7 +41,7 @@ unit SedaiBytecodeVM;
 interface
 
 uses
-  Classes, SysUtils, Math, Variants, StrUtils, DateUtils, RegExpr, SedaiRegexEngine,
+  Classes, SysUtils, Types, Math, Variants, StrUtils, DateUtils, RegExpr, SedaiRegexEngine,
   SedaiBytecodeTypes, SedaiOutputInterface, SedaiSSATypes,
   SedaiConsoleBehavior, SedaiConsoleState, SedaiDebugger, SedaiExecutorErrors,
   SedaiMemoryMapper, SedaiSpriteTypes, SedaiExecutionContext, SedaiDrawQueue,
@@ -929,9 +929,9 @@ type
     function ForeignWideUnit(RawPtr: Int64; out PU: PWord; out AvailUnits: PtrUInt): Boolean;
     function ForeignRegionAddr(A, NeedBytes: PtrUInt; out AAvail: PtrUInt): Pointer;
     procedure RunClosureBody(ACtx: TExecutionContext; AEntryPC: Int64;
-                             ARet: Pointer; AArgs: PPointer;
-                             ARetKind: TForeignKind;
-                             const AArgKinds: array of TForeignKind; ANArgs: Integer);
+                             ARet: Pointer; AArgs: PPointer; ARetKind: TForeignKind;
+                             const AArgKinds: array of TForeignKind; ANArgs: Integer;
+                             ARetSize: Integer; const AArgSizes: array of Integer);
     function ReallocSharedRecordBlock(OldHandle: Int64; NewN, ByteSize, StrC, TypeId: Integer): Int64;  // N consecutive shared records (Callocate block)
     procedure FreeSharedRecord(Handle: Int64);   // DELETE: release a shared record, recycle its slot
     // Resolve a tagged raw pointer to a real address in its region (byte heap or framebuffer), checking
@@ -1216,6 +1216,11 @@ type
     ArgKinds: array[0..15] of TForeignKind;
     Closure: TObject;            // TAbiClosure, posseduta: vive quanto la VM
     Sig: string;
+    // ⭐ DIVERGENZE 563 - una STRUCT PER VALORE nel callback: il genere da solo non basta, servono i BYTE.
+    // RetSize e' quanti byte il risultato occupa (0 = non e' una struct); ArgSizes lo stesso per ogni argomento,
+    // e serve a dichiarare la regione che il corpo BASIC leggera'.
+    RetSize: Integer;
+    ArgSizes: array[0..15] of Integer;
   end;
    // QueryPerformanceCounter, same purpose
 
@@ -8122,12 +8127,13 @@ begin
   else if GetCurrentThreadId = VM.FMainThreadId then Ctx := TExecutionContext(C^.Ctx)
   else Ctx := VM.CallbackCtx(TExecutionContext(C^.Ctx));         // a thread C owns: one of its own
   VM.RunClosureBody(Ctx, C^.EntryPC, ARet, AArgs,
-                    C^.RetKind, C^.ArgKinds, C^.NArgs);
+                    C^.RetKind, C^.ArgKinds, C^.NArgs, C^.RetSize, C^.ArgSizes);
 end;
 
 procedure TBytecodeVM.RunClosureBody(ACtx: TExecutionContext; AEntryPC: Int64;
   ARet: Pointer; AArgs: PPointer; ARetKind: TForeignKind;
-  const AArgKinds: array of TForeignKind; ANArgs: Integer);
+  const AArgKinds: array of TForeignKind; ANArgs: Integer;
+  ARetSize: Integer; const AArgSizes: array of Integer);
 // Esegue la procedura BASIC a AEntryPC con gli argomenti che C ha appena messo nei registri, e scrive
 // il risultato dove C lo aspetta.
 //
@@ -8187,9 +8193,33 @@ begin
           end;
           Inc(SlotI);
         end;
+      // ⭐⭐ DIVERGENZE 563 - A STRUCT BY VALUE: the callee is handed its ADDRESS, which since phase 3.2 is what the
+      // VALUE of a native record IS. The ABI layer has already put the eightbytes back together contiguously
+      // (AbiClosureEntry), so AArgs[i] points at a complete image of the struct; a BYVAL record parameter copies
+      // from it on entry, which is exactly what "by value" means for the callee - C's copy is scratch.
+      // ⛔ The region is declared so the body may READ it: without that, bounds-checked memory refuses an address
+      // nobody handed over through a call.
+      fkStruct:
+        begin
+          ACtx.XferInt[SlotI] := Int64(PtrUInt(AArgs[i])) or FGNPTR_TAG;
+          if (i <= High(AArgSizes)) and (AArgSizes[i] > 0) then
+            ForeignNoteRegion(ACtx, PtrUInt(AArgs[i]), PtrUInt(AArgSizes[i]), True, False);
+          Inc(SlotI);
+        end;
     else
       begin ACtx.XferInt[SlotI] := PInt64(AArgs[i])^; Inc(SlotI); end;
     end;
+  end;
+
+  // ⭐⭐ DIVERGENZE 563 - A STRUCT RESULT IS A HIDDEN OUT-PARAMETER HERE, not a value in the result slot: a BASIC
+  // function that answers a record is handed the DESTINATION's address in XFER_RESULT_HANDLE_SLOT and builds its
+  // answer there. So the closure points that slot straight at the buffer the ABI says the caller will read - which
+  // is the caller's own memory for a struct returned through memory, and a 16-byte scratch when it comes back in
+  // registers - and there is nothing left to copy afterwards.
+  if (ARetKind = fkStruct) and (ARetSize > 0) and (ARet <> nil) then
+  begin
+    ForeignNoteRegion(ACtx, PtrUInt(ARet), PtrUInt(ARetSize), True, False);
+    ACtx.XferInt[XFER_RESULT_HANDLE_SLOT] := Int64(PtrUInt(ARet)) or FGNPTR_TAG;
   end;
 
   SavePC := ACtx.PC;
@@ -8228,6 +8258,11 @@ begin
   end;
 
   if ARet = nil then Exit;
+  // ⭐⭐ DIVERGENZE 563 - ...and a STRUCT BY VALUE going OUT: the body answers the address of its record, and the
+  // bytes are copied where the ABI says the caller will read them. ARet is the caller's own buffer when the struct
+  // goes through memory and a 16-byte scratch when it goes in registers, so copying exactly ARetSize is right in
+  // both: a struct that does not fit in two eightbytes is a MEMORY return by definition.
+  if ARetKind = fkStruct then Exit;    // built straight into ARet through the hidden out-parameter, above
   case ARetKind of
     fkVoid:   ;
     fkFloat:  PSingle(ARet)^ := ACtx.XferFloat[255];
@@ -8770,6 +8805,11 @@ var
   Args: array of TAbiType;
   Cl: TAbiClosure;
   Key: string;
+  RetRef: TAbiType;               // 563: built from the layout when the result is a struct by value
+  RetLeg: string;
+  ArgLegs: TStringDynArray;
+  SzT, AlT: Integer;
+  FlT: TForeignStructFields;
 begin
   Result := nil;
   if AEntryPC = 0 then Exit;
@@ -8797,18 +8837,43 @@ begin
   C^.NArgs := NA;
   C^.Sig := ASig;
   for i := 0 to NA - 1 do C^.ArgKinds[i] := ArgK[i];
+  // ⭐ DIVERGENZE 563 - a STRUCT BY VALUE, in or out. The ABI layer already knows how to take one apart for a
+  // closure (AbiClosureEntry classifies it and rebuilds it contiguously) and how to put one back; what was missing
+  // is the TYPE, which only the call site knows. The signature carries it as a "STRUCT#..." leg.
+  ForeignCallbackLegs(ASig, RetLeg, ArgLegs);
+  RetRef := nil;
+  if RetK = fkStruct then
+  begin
+    RetRef := StructRetRef(ForeignCbStructSpec(RetLeg));
+    ForeignStructSpec(ForeignCbStructSpec(RetLeg), SzT, AlT, FlT);
+    C^.RetSize := SzT;
+  end
+  else
+    RetRef := KindToRef(RetK);
+  if RetRef = nil then
+  begin
+    Dispose(C);
+    raise EForeignCallError.Create('callback: the result has a type this call path cannot pass');
+  end;
   SetLength(Args, NA);
   for i := 0 to NA - 1 do
   begin
-    Args[i] := KindToRef(ArgK[i]);
+    if (ArgK[i] = fkStruct) and (i <= High(ArgLegs)) then
+    begin
+      Args[i] := StructRetRef(ForeignCbStructSpec(ArgLegs[i]));
+      if ForeignStructSpec(ForeignCbStructSpec(ArgLegs[i]), SzT, AlT, FlT) then C^.ArgSizes[i] := SzT;
+    end
+    else
+      Args[i] := KindToRef(ArgK[i]);
     if Args[i] = nil then
     begin
+      RetRef.Free;
       Dispose(C);
       raise EForeignCallError.CreateFmt(
         'callback: parameter %d has a type this call path cannot pass', [i + 1]);
     end;
   end;
-  Cl := TAbiClosure.Create(KindToRef(RetK), Args, @SbClosureTrampoline, C);
+  Cl := TAbiClosure.Create(RetRef, Args, @SbClosureTrampoline, C);
   if not Cl.Ready then
   begin
     Cl.Free; Dispose(C);

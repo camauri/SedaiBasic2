@@ -23,7 +23,7 @@ unit SedaiForeignDecl;
 interface
 
 uses
-  SysUtils;
+  SysUtils, Types;   // Types: TStringDynArray, for the legs of a callback signature (563)
 
 type
   { What a declared BASIC type means to a C ABI. fkUnknown is NOT a fallback that gets guessed at: a
@@ -91,6 +91,16 @@ function ForeignNarrowBytes(ACode: Integer): Integer;
   here, so the SSA refuses the call BY NAME instead of guessing an eightbyte class. }
 function ForeignStructSpec(const ATypeName: string; out ASize, AAlign: Integer;
                            out AFields: TForeignStructFields): Boolean;
+
+{ ⭐ DIVERGENZE 563 - a callback signature's "STRUCT#<size>#<align>#<k>.<ofs>,..." leg, turned back into the
+  "SRET:<size>:<align>:<k>@<ofs>/..." spelling every other reader of a by-value layout already speaks. '' when the
+  leg is not one. }
+function ForeignCbStructSpec(const ALeg: string): string;
+
+{ ⭐ The legs of a callback signature "FNPTR:<ret>:<a~b>" as TEXT, which ForeignCallbackSig reduces to kinds:
+  a struct leg carries a layout that a kind alone cannot hold. False when the signature is not one. }
+function ForeignCallbackLegs(const ATypeName: string; out ARetLeg: string;
+                             out AArgLegs: TStringDynArray): Boolean;
 
 { How many bytes the kind occupies, for the buffer an argument is marshalled into. }
 function ForeignKindSize(AKind: TForeignKind): Integer;
@@ -259,6 +269,10 @@ begin
   if Copy(T, 1, 5) = 'SRET:' then Exit(fkStruct);
   // ...and a struct passed BY VALUE as an argument (DIVERGENZE 382): the same layout spelling, another name.
   if Copy(T, 1, 5) = 'SVAL:' then Exit(fkStruct);
+  // ⭐ DIVERGENZE 563 - ...and a struct BY VALUE inside a callback's "FNPTR:" signature, where ':' and '~' are
+  // already taken as separators: "STRUCT#<size>#<align>#<kind>.<offset>,..." says the same thing with characters
+  // the signature can carry. ForeignCbStructSpec turns it back into the "SRET:" spelling the ABI type is built from.
+  if Copy(T, 1, 7) = 'STRUCT#' then Exit(fkStruct);
   // ZSTRING / WSTRING with no PTR is a fixed buffer in a UDT, never a scalar parameter; a STRING
   // parameter of a foreign function is the address of its bytes.
   if (T = 'STRING') or (T = 'ZSTRING') or (T = 'WSTRING') then Exit(fkPointer);
@@ -298,6 +312,51 @@ begin
     Inc(n);
   end;
   Result := n > 0;
+end;
+
+function ForeignCbStructSpec(const ALeg: string): string;
+var
+  T: string;
+begin
+  Result := '';
+  T := UpperCase(Trim(ALeg));
+  if Copy(T, 1, 7) <> 'STRUCT#' then Exit;
+  Delete(T, 1, 7);
+  Result := 'SRET:' + StringReplace(StringReplace(StringReplace(T, '#', ':', [rfReplaceAll]),
+                                    '.', '@', [rfReplaceAll]), '+', '/', [rfReplaceAll]);
+end;
+
+function ForeignCallbackLegs(const ATypeName: string; out ARetLeg: string;
+                             out AArgLegs: TStringDynArray): Boolean;
+var
+  T, Rest: string;
+  p, i, Start, n: Integer;
+begin
+  Result := False; ARetLeg := ''; SetLength(AArgLegs, 0);
+  T := UpperCase(Trim(ATypeName));
+  if Copy(T, 1, 6) <> 'FNPTR:' then Exit;
+  Rest := Copy(T, 7, MaxInt);
+  p := Pos(':', Rest);
+  if p = 0 then Exit;
+  ARetLeg := Trim(Copy(Rest, 1, p - 1));
+  Rest := Copy(Rest, p + 1, MaxInt);
+  n := 0;
+  if Trim(Rest) <> '' then
+  begin
+    Start := 1;
+    for i := 1 to Length(Rest) + 1 do
+      if (i > Length(Rest)) or (Rest[i] = '~') then
+      begin
+        if Trim(Copy(Rest, Start, i - Start)) <> '' then
+        begin
+          SetLength(AArgLegs, n + 1);
+          AArgLegs[n] := Trim(Copy(Rest, Start, i - Start));
+          Inc(n);
+        end;
+        Start := i + 1;
+      end;
+  end;
+  Result := True;
 end;
 
 function ForeignKindSize(AKind: TForeignKind): Integer;

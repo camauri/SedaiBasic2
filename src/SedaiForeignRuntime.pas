@@ -188,6 +188,11 @@ type
   che possono divergere. Risponde nil per un tipo che questo percorso non sa passare. }
 function KindToRef(K: TForeignKind): TAbiType;
 
+{ ⭐ DIVERGENZE 329 · 563 - the ABI's own type for a STRUCT BY VALUE, built from the layout the call site
+  wrote ("SRET:"/"SVAL:"). Exported for the same reason KindToRef is: a CLOSURE needs the same type, and a
+  second copy of this construction would be a second opinion about the same bytes. nil when the spec is not one. }
+function StructRetRef(const ATypeName: string): TAbiType;
+
 { How many bytes are readable from machine address A to the end of the memory MAPPING that holds it; 0
   when A is not in readable memory. It is the extent a block of unknown size can be given (DIVERGENZE
   239): not the block's own size - C does not say it - but the line past which a read would fault. }
