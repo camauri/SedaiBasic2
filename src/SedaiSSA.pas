@@ -520,6 +520,7 @@ type
     FAddrSharedScalars: TStringList;
     FRawModuleScalars: TStringList;      // MODULE-level @-taken builtin scalars: name (UPPER) -> type. Raw byte slot whose address lives in a shared int array "<name>$RA" (cross-proc visible), so @/deref are bit-exact like the local case.
     FScalarPtrBanks: TStringList;        // name (UPPER) -> distinct bank chars of pointers taking its @ (I/F/$). A module scalar is raw-backed (RAWMODULE) ONLY if a DIFFERENT-bank pointer takes its @ (genuine type-punning); a same-bank-only scalar stays SHARED/managed so @/varptr/byref/pointer-param keep working across call boundaries.
+    FWZParams: TStringList;              // DIVERGENZE 569: unsized ByRef ZString/WString params with @ taken -> Z / W
     FAddrLocalVars: TStringList;         // @-taken LOCALS (in a SUB/FUNCTION): name (UPPER) -> type name. Backed by
                                          // a per-frame 1-field record (handle in hidden "<name>$REC"), so the address
                                          // is distinct per recursion level (a module-level @-taken var stays SHARED-backed).
@@ -1254,6 +1255,7 @@ type
     procedure EmitSharedSyncIn;                          // M6: load shared-global slots -> their registers
     procedure EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);  // value-copy
     procedure EmitUserFunctionCall(Name: string; ArgsNode: TASTNode; out Result: TSSAValue);  // V3
+    function ZStrFieldIndexNode(Node: TASTNode): TASTNode;                             // "x.dat[i]" on a ZString * n field (571)
     function StrLitMark(const V: TSSAValue): TSSAValue;                                  // a literal's text for ssaStrSAdd (593)
     function FuncPtrSigRetUDT(const Sig1, Sig2: string): string;                      // the record a procptr signature returns (592)
     function FuncPtrRecordCallType(ObjNode: TASTNode): string;                         // the record "v(args)" / "o.f(args)" returns (592)
@@ -2175,6 +2177,7 @@ begin
   FScalarPtrBanks := TIndexedStringList.Create;
   FScalarPtrBanks.CaseSensitive := False;
   FAddrLocalVars := TIndexedStringList.Create;
+  FWZParams := TIndexedStringList.Create;
   FRefVars := TIndexedStringList.Create;
   FRawFromAddrOf := TIndexedStringList.Create;
   FRawFromAddrOf.CaseSensitive := False;
@@ -2374,6 +2377,7 @@ begin
   FAddrSharedScalars.Free;
   FScalarPtrBanks.Free;
   FAddrLocalVars.Free;
+  FWZParams.Free;
   FRefVars.Free;
   FRawPtrVars.Free;
   FRawPtrScoped.Free;
@@ -4235,6 +4239,25 @@ begin
         // and that IS the pointer. Reading/writing through it uses raw load/store at the pointer's declared
         // pointee width, so a Single's bytes can be read as an Integer (type-punning).
         Result := EnsureIntRegister(AddrLocalHandle(VarToStr(Node.Value)))
+      // ⭐ DIVERGENZE 569 - "@w" of an unsized ByRef ZString / WString parameter is a pointer to CHARACTERS, as in fbc:
+      // "(*w)[i]" and a C routine read them. The record cell's field pointer has none behind it, so it is the text's
+      // bytes (ZString, as SADD) or its wide cells (WString). ⚠️ Declared: a write THROUGH it does not reach w.
+      else if (FWZParams.IndexOfName(Node.ValueUpper) >= 0) and IsAddrLocal(VarToStr(Node.Value)) then
+      begin
+        TempNode := TASTNode.CreateWithValue(antIdentifier, Node.ValueUpper, Node.Token);
+        try
+          ProcessStringExpression(TempNode, TempVal);
+        finally
+          TempNode.Free;
+        end;
+        if FWZParams.Values[Node.ValueUpper] = 'W' then
+          Result := EmitWStringTempAddr(TempVal)
+        else
+        begin
+          Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaStrSAdd, Result, EnsureStringRegister(TempVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        end;
+      end
       else if IsAddrLocal(VarToStr(Node.Value)) then
       begin
         // @local STRING: a record-field pointer into this frame's backing record (slot 0) — distinct per call.
@@ -8768,6 +8791,13 @@ begin
         Exit;
       end;
 
+      // ⭐ DIVERGENZE 571 - "x.dat[i]" on a "ZString * n" FIELD is that byte of the field (see ZStrFieldIndexNode).
+      StaticArrNode := ZStrFieldIndexNode(Node);
+      if StaticArrNode <> nil then
+      begin
+        try ProcessExpression(StaticArrNode, Result); finally StaticArrNode.Free; end;
+        Exit;
+      end;
       // ⭐ ...unless the "array" is a STATIC MEMBER: it is a global array under a dotted name, and every
       // path below works on it once the reference is rewritten. See RewriteStaticMemberArray.
       StaticArrNode := RewriteStaticMemberArray(Node);
@@ -11094,6 +11124,20 @@ begin
 
   VarNode := Node.GetChild(0);
   ExprNode := Node.GetChild(1);
+  // ⭐ DIVERGENZE 571 - "x.dat[i] = v" on a "ZString * n" FIELD writes that byte of the field (see ZStrFieldIndexNode).
+  CastNode := ZStrFieldIndexNode(VarNode);
+  if CastNode <> nil then
+  begin
+    UnwrapAssign := TASTNode.Create(antAssignment, Node.Token);
+    try
+      UnwrapAssign.AddChild(CastNode);
+      UnwrapAssign.AddChild(ExprNode.Clone);
+      ProcessAssignment(UnwrapAssign);
+    finally
+      UnwrapAssign.Free;
+    end;
+    Exit;
+  end;
   // ⭐ "Str(x) = expr" / "WStr(x) = expr". Str of something that is ALREADY a string is the identity,
   // and fbc accepts it where an lvalue is expected - its own suite writes "Swap Str(u1), Str(u2)" over
   // a UDT that converts to a zstring, and the whole statement fell out here as "Array not declared:
@@ -53472,6 +53516,38 @@ begin
     Result := MakeSSAValue(svkNone);
 end;
 
+function TSSAGenerator.ZStrFieldIndexNode(Node: TASTNode): TASTNode;
+// ⭐ DIVERGENZE 571 - "x.dat[i]" / "m->dat[i]" on a "ZString * n" FIELD of a NATIVE record is byte i of the field, as
+// in fbc; it read 0 and wrote nowhere, because the index shapes know a ZString * n VARIABLE and a pointer, and a field
+// is neither. The answer is the shape that already works, built here: "Cast(UByte Ptr, @x.dat)[i]" - the field's
+// bytes are its C image. A new node the caller frees, or nil. SB_ZFIELD_INDEX=0 is the A/B knob.
+var
+  M: TASTNode;
+  U, F: Integer;
+  CastN, AddrN: TASTNode;
+begin
+  Result := nil;
+  if (Node = nil) or (Node.NodeType <> antArrayAccess) or (Node.ChildCount < 2) then Exit;
+  if Node.Attributes.Values['BRACKET'] <> '1' then Exit;
+  if not (FRecNativeKnob and FNativeMemory) or (GetEnvironmentVariable('SB_ZFIELD_INDEX') = '0') then Exit;
+  M := Node.GetChild(0);
+  if (M = nil) or (M.NodeType <> antMemberAccess) or (M.ChildCount < 1) then Exit;
+  U := FindUDT(ObjectTypeName(M.GetChild(0)));
+  if (U < 0) or not NativeRecordType(FUDTs[U].Name) then Exit;
+  F := UDTFieldIndex(U, VarToStr(M.Value));
+  if F < 0 then Exit;
+  if not (FUDTs[U].Fields[F].IsZString and (not FUDTs[U].Fields[F].IsWString) and
+          (FUDTs[U].Fields[F].StrCapacity > 0) and (not FUDTs[U].Fields[F].IsArray)) then Exit;
+  AddrN := TASTNode.Create(antProcAddress, M.Token);
+  AddrN.AddChild(M.Clone);
+  CastN := TASTNode.CreateWithValue(antCast, 'UBYTE PTR', M.Token);
+  CastN.AddChild(AddrN);
+  Result := TASTNode.Create(antArrayAccess, Node.Token);
+  Result.Attributes.Values['BRACKET'] := '1';
+  Result.AddChild(CastN);
+  Result.AddChild(Node.GetChild(1).Clone);
+end;
+
 function TSSAGenerator.FuncPtrSigRetUDT(const Sig1, Sig2: string): string;
 // The record a procedure-pointer signature "params|ret" returns BY VALUE ('' for a scalar, a reference or none):
 // the first of the two signatures given that is not empty (a local one, then the module's).
@@ -57152,8 +57228,13 @@ begin
     // resolved it to a machine address and C dereferenced the VM's own tagged value. ⛔ It is the
     // question VarArgIsAddress is FOR ("pointer or number is the one thing the bank cannot answer"),
     // asked of the shape a C API is most often written in: build the value and pass it, in one line.
+    // ⭐ DIVERGENZE 579 - ...and so is a POINTER FIELD ("printf("%s", s.name)" with "name As ZString Ptr"): it went as an
+    // INTEGER, which hands C the value as it is - C's mark included, since a native record's pointer field is read
+    // marked - and printf followed a tagged address. As a pointer the marshaller takes the mark off.
     else if IsForeignPtrCall(ArgListNode.GetChild(i)) or
-            VarArgIsAddress(ArgListNode.GetChild(i)) then
+            VarArgIsAddress(ArgListNode.GetChild(i)) or
+            ((ArgListNode.GetChild(i).NodeType = antMemberAccess) and ExprIsPointerTyped(ArgListNode.GetChild(i)) and
+             (GetEnvironmentVariable('SB_VARARG_PTRFIELD') <> '0')) then
     begin
       T := 'ANY PTR';
       // ⭐ DIVERGENZE 443 - ...and the ADDRESS OF A POINTER VARIABLE is a cell C may fill with one of ITS pointers:
@@ -58155,6 +58236,19 @@ begin
     if Kind = fkVoid then
       raise Exception.CreateFmt('Foreign function %s: parameter %d has no type', [Decl.Name, i + 1]);
 
+    // ⭐ DIVERGENZE 578 - a "ZString * n" whose address the program takes lives in RAW BYTES, and handed to a pointer
+    // parameter it is THOSE bytes, as fbc passes the buffer itself: "strstr(own, "") = @own" is -1 there. It went as a
+    // SADD COPY, and a C that keeps the pointer (bfd_hash_lookup with copy = 0) kept the copy. SB_ZFIX_BYADDR=0 is the A/B.
+    if (Kind = fkPointer) and (Pos('WSTRING', UpperFast(Decl.ParamTypeNames[i])) = 0) and
+       (Pos(' PTR PTR', UpperFast(Decl.ParamTypeNames[i])) = 0) and
+       (GetEnvironmentVariable('SB_ZFIX_BYADDR') <> '0') and
+       RawZStringBufAddr(ArgListNode.GetChild(i), ArgVal) then
+    begin
+      StageRTs[i] := srtInt;
+      StageVals[i] := EnsureIntRegister(ArgVal);
+      StageSlots[i] := SlotI; Inc(SlotI);
+      System.Continue;
+    end;
     ProcessExpression(ArgListNode.GetChild(i), ArgVal);
     if ForeignKindIsFloat(Kind) then
     begin
@@ -59222,6 +59316,7 @@ begin
     FFuncPtrSigs.Assign(FModuleFuncPtrSigs);              // function-pointer params/locals of THIS proc, over the module's
     FFuncPtrDefs.Assign(FModuleFuncPtrDefs);              // ...and their types' defaults (534)
     FAddrLocalVars.Clear;                                 // @-taken locals of THIS proc (filled by ProcessDim)
+    FWZParams.Clear;
     CollectTopLevelLabels(Proc, 2);                       // GOTO-unwind: this proc's block-depth-0 labels (body starts at child 2)
     CollectLocalRecordVars(Proc);
     FCurrentProcDeclNames.Clear;
@@ -59275,8 +59370,22 @@ begin
         // (marked only for non-string scalars); it would keep a managed handle, not raw bytes.
         if ParamNodeJ.Attributes.Values['ADDRPARAM'] = '1' then
         begin
+          // ⭐ DIVERGENZE 569 - ...and an UNSIZED "ByRef w As ZString / WString" is a VARIABLE-LENGTH string like a
+          // String, not a character buffer (it has no n): filed as ZSTRING/WSTRING it took the RAW path with no bytes
+          // behind it, so "len(w)" read 0 in the whole procedure as soon as "@w" appeared anywhere in it. It takes the
+          // record cell a String parameter takes. SB_WZPARAM_ADDR=0 is the A/B knob.
           if FAddrLocalVars.IndexOfName(ParamNodeJ.ValueUpper) < 0 then
-            FAddrLocalVars.Add(ParamNodeJ.ValueUpper + '=' + ParamNodeJ.GetChild(0).ValueUpper);
+          begin
+            if ((ParamNodeJ.GetChild(0).ValueUpper = 'ZSTRING') or (ParamNodeJ.GetChild(0).ValueUpper = 'WSTRING')) and
+               (StrCapOf(FZStringVars, ParamNodeJ.ValueUpper, 0) <= 0) and
+               (GetEnvironmentVariable('SB_WZPARAM_ADDR') <> '0') then
+            begin
+              FAddrLocalVars.Add(ParamNodeJ.ValueUpper + '=STRING');
+              FWZParams.Values[ParamNodeJ.ValueUpper] := Copy(ParamNodeJ.GetChild(0).ValueUpper, 1, 1);
+            end
+            else
+              FAddrLocalVars.Add(ParamNodeJ.ValueUpper + '=' + ParamNodeJ.GetChild(0).ValueUpper);
+          end;
           // ⭐ A STRING PARAMETER IS BACKED BY A RECORD CELL, NOT BY RAW BYTES - the same split the
           // @-taken local DIM has made since it was written: a var-len string is a MANAGED handle, and a
           // raw slot holding it is read back as an address and dereferenced (EAccessViolation on the
@@ -60889,6 +60998,7 @@ begin
   FAddrTakenScalars.Clear;
   FRawModuleScalars.Clear;
   FAddrLocalVars.Clear;
+  FWZParams.Clear;
   FRawPtrVars.Clear;
   FForeignDataScalars.Clear;
   FForeignProcExterns.Clear;
