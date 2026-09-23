@@ -520,6 +520,7 @@ type
     FAddrSharedScalars: TStringList;
     FRawModuleScalars: TStringList;      // MODULE-level @-taken builtin scalars: name (UPPER) -> type. Raw byte slot whose address lives in a shared int array "<name>$RA" (cross-proc visible), so @/deref are bit-exact like the local case.
     FScalarPtrBanks: TStringList;        // name (UPPER) -> distinct bank chars of pointers taking its @ (I/F/$). A module scalar is raw-backed (RAWMODULE) ONLY if a DIFFERENT-bank pointer takes its @ (genuine type-punning); a same-bank-only scalar stays SHARED/managed so @/varptr/byref/pointer-param keep working across call boundaries.
+    FPlusToken: TLexerToken;             // DIVERGENZE 586: an operator token for a synthesised "pp + i"
     FWZParams: TStringList;              // DIVERGENZE 569: unsized ByRef ZString/WString params with @ taken -> Z / W
     FAddrLocalVars: TStringList;         // @-taken LOCALS (in a SUB/FUNCTION): name (UPPER) -> type name. Backed by
                                          // a per-frame 1-field record (handle in hidden "<name>$REC"), so the address
@@ -1255,6 +1256,7 @@ type
     procedure EmitSharedSyncIn;                          // M6: load shared-global slots -> their registers
     procedure EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);  // value-copy
     procedure EmitUserFunctionCall(Name: string; ArgsNode: TASTNode; out Result: TSSAValue);  // V3
+    function PtrPtrElemObj(ObjNode: TASTNode): TASTNode;                               // "pp[i]" of a native T Ptr Ptr as an object (586)
     function ZStrFieldIndexNode(Node: TASTNode): TASTNode;                             // "x.dat[i]" on a ZString * n field (571)
     function StrLitMark(const V: TSSAValue): TSSAValue;                                  // a literal's text for ssaStrSAdd (593)
     function FuncPtrSigRetUDT(const Sig1, Sig2: string): string;                      // the record a procptr signature returns (592)
@@ -2378,6 +2380,7 @@ begin
   FScalarPtrBanks.Free;
   FAddrLocalVars.Free;
   FWZParams.Free;
+  FPlusToken.Free;
   FRefVars.Free;
   FRawPtrVars.Free;
   FRawPtrScoped.Free;
@@ -11124,6 +11127,26 @@ begin
 
   VarNode := Node.GetChild(0);
   ExprNode := Node.GetChild(1);
+  // ⭐ DIVERGENZE 586 - "pp[i]->f = v", pp a native "T Ptr Ptr": the object is "(*(pp + i))" (see PtrPtrElemObj).
+  if (VarNode.NodeType = antMemberAccess) and (VarNode.ChildCount >= 1) then
+  begin
+    CastNode := PtrPtrElemObj(VarNode.GetChild(0));
+    if CastNode <> nil then
+    begin
+      UnwrapAssign := TASTNode.Create(antAssignment, Node.Token);
+      try
+        ThisFieldNode := TASTNode.CreateWithValue(antMemberAccess, VarNode.Value, VarNode.Token);
+        ThisFieldNode.Attributes.Values['ARROW'] := VarNode.Attributes.Values['ARROW'];
+        ThisFieldNode.AddChild(CastNode);
+        UnwrapAssign.AddChild(ThisFieldNode);
+        UnwrapAssign.AddChild(ExprNode.Clone);
+        ProcessAssignment(UnwrapAssign);
+      finally
+        UnwrapAssign.Free;
+      end;
+      Exit;
+    end;
+  end;
   // ⭐ DIVERGENZE 571 - "x.dat[i] = v" on a "ZString * n" FIELD writes that byte of the field (see ZStrFieldIndexNode).
   CastNode := ZStrFieldIndexNode(VarNode);
   if CastNode <> nil then
@@ -53516,6 +53539,43 @@ begin
     Result := MakeSSAValue(svkNone);
 end;
 
+function TSSAGenerator.PtrPtrElemObj(ObjNode: TASTNode): TASTNode;
+// ⭐ DIVERGENZE 586 - "pp[i]" where pp is a "T Ptr Ptr" over NATIVE memory (Callocate'd, or C's), as the OBJECT of a
+// member access: the element is what LIVES at pp + i. "(*(pp + i))->f" already read and wrote it; "pp[i]->f" did not -
+// an earlier road took the index for a managed record handle ("Invalid record handle 0"). The shape that works, built
+// here, as a new node the caller frees; nil otherwise. fb memory mode only (strict has its own answer). SB_PTRPTR_INDEX=0.
+var
+  Nm, Pointee: string;
+  Idx, Sum, Der: TASTNode;
+begin
+  Result := nil;
+  if (ObjNode = nil) or (ObjNode.NodeType <> antArrayAccess) or (ObjNode.ChildCount < 2) then Exit;
+  if (ObjNode.GetChild(0) = nil) or (ObjNode.GetChild(0).NodeType <> antIdentifier) then Exit;
+  if not FNativeMemory or (GetEnvironmentVariable('SB_PTRPTR_INDEX') = '0') then Exit;
+  Nm := ObjNode.GetChild(0).ValueUpper;
+  if ArrayIndexOf(Nm) >= 0 then Exit;
+  Pointee := UpperFast(ManagedPtrPointee(Nm));
+  if (Length(Pointee) <= 4) or (Copy(Pointee, Length(Pointee) - 3, 4) <> ' PTR') then Exit;
+  if FindUDT(Trim(Copy(Pointee, 1, Length(Pointee) - 4))) < 0 then Exit;
+  Idx := ObjNode.GetChild(1);
+  if (Idx <> nil) and (Idx.NodeType in [antArgumentList, antExpressionList]) then
+  begin
+    if Idx.ChildCount <> 1 then Exit;
+    Idx := Idx.GetChild(0);
+  end;
+  if Idx = nil then Exit;
+  // ⛔ The "+" carries an OPERATOR token: raw pointer arithmetic is recognised by the token (ttOpAdd), and with the
+  // identifier's token "pp + i" was an unscaled integer sum - one byte on, a garbage address.
+  if FPlusToken = nil then FPlusToken := TLexerToken.Create(ttOpAdd, '+', 0, 0, 0, 1);
+  Sum := TASTNode.CreateWithValue(antBinaryOp, '+', FPlusToken);
+  Sum.AddChild(ObjNode.GetChild(0).Clone);
+  Sum.AddChild(Idx.Clone);
+  Der := TASTNode.Create(antDeref, ObjNode.GetChild(0).Token);
+  Der.AddChild(Sum);
+  Result := TASTNode.Create(antParentheses, ObjNode.Token);
+  Result.AddChild(Der);
+end;
+
 function TSSAGenerator.ZStrFieldIndexNode(Node: TASTNode): TASTNode;
 // ⭐ DIVERGENZE 571 - "x.dat[i]" / "m->dat[i]" on a "ZString * n" FIELD of a NATIVE record is byte i of the field, as
 // in fbc; it read 0 and wrote nowhere, because the index shapes know a ZString * n VARIABLE and a pointer, and a field
@@ -55504,10 +55564,24 @@ var
   Bank: TSSARegisterType;
   HandleVal, DestVal, TempV: TSSAValue;
   Op: TSSAOpCode;
-  AccNode: TASTNode;
+  AccNode, ThisObj: TASTNode;
 begin
   Result := MakeSSAValue(svkNone);
   if Node.ChildCount < 1 then Exit;
+  // ⭐ DIVERGENZE 586 - "pp[i]->f", pp a native "T Ptr Ptr": read through "(*(pp + i))" (see PtrPtrElemObj).
+  AccNode := PtrPtrElemObj(Node.GetChild(0));
+  if AccNode <> nil then
+  begin
+    ThisObj := TASTNode.CreateWithValue(antMemberAccess, Node.Value, Node.Token);
+    ThisObj.Attributes.Values['ARROW'] := Node.Attributes.Values['ARROW'];
+    ThisObj.AddChild(AccNode);
+    try
+      ProcessMemberAccess(ThisObj, Result);
+    finally
+      ThisObj.Free;
+    end;
+    Exit;
+  end;
   // FreeBASIC allows an ENUM member to be named through its enum: "MyEnum.option1" is just "option1".
   // The members are module-wide constants under their bare names, so hand the bare name to the ordinary
   // identifier path. Without this the qualified form fell through to the UDT member machinery, which had
