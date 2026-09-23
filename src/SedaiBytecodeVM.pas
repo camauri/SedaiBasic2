@@ -1351,6 +1351,7 @@ var
   // off: the overlap costs a second compilation and buys nothing.
   GJitOverAot: Boolean = False;
   GRecImgHome: Boolean = True;   // DIVERGENZE 566: SB_RECIMG_HOME=0 is the A/B
+  GLongjmpGuard: Boolean = True; // DIVERGENZE 577: SB_LONGJMP_GUARD=0 is the A/B
   // AOT_ARRDESC=0 riporta EnsureArrDesc alla sezione critica INCONDIZIONATA (il comportamento del
   // 4a8b8ac). E' il riferimento dell'A/B su un binario solo: quel commit ha corretto tre difetti a
   // thread veri e ha messo un lock globale sul cammino di chiamata, che su binary-trees costava 5,6x.
@@ -1984,6 +1985,7 @@ begin
   end;
   GJitOverAot := SysUtils.GetEnvironmentVariable('JIT_OVERAOT') = '1';
   GRecImgHome := SysUtils.GetEnvironmentVariable('SB_RECIMG_HOME') <> '0';   // DIVERGENZE 566 A/B
+  GLongjmpGuard := SysUtils.GetEnvironmentVariable('SB_LONGJMP_GUARD') <> '0';   // DIVERGENZE 577 A/B
   GArrDescFast := SysUtils.GetEnvironmentVariable('AOT_ARRDESC') <> '0';
   GNoExcFrame := SysUtils.GetEnvironmentVariable('AOT_EXCFRAME') <> '1';
   InitCriticalSection(FSharedRecLock);
@@ -9291,13 +9293,59 @@ begin
   end;
 end;
 
+function FpcPushExceptAddr(Ft: Longint; ABuf, ANewAddr: Pointer): Pointer; external name 'FPC_PUSHEXCEPTADDR';
+procedure FpcPopAddrStack; external name 'FPC_POPADDRSTACK';
+
+function ExceptFrameHead: PExceptAddr;
+// The head of the RTL's per-thread list of exception frames (System's ExceptAddrStack, which no unit can name): a dummy
+// frame is pushed, its "next" is the head, and it is popped again. Nothing is raised and nothing is jumped to.
+var
+  A: TExceptAddr;
+  Dummy: Pointer;
+begin
+  Dummy := nil;
+  FpcPushExceptAddr(1, @Dummy, @A);
+  Result := A.next;
+  FpcPopAddrStack;
+end;
+
 procedure TBytecodeVM.ExecForeignCall(Ctx: TExecutionContext; TableIdx, NArgs: Integer;
   out ResInt: Int64; out ResFloat: Double);
+var
+  FrameHead, Stale: PExceptAddr;
+  CallDepth: Integer;
 begin
   // ⭐ DIVERGENZE 434: what PRINT left in C's stdout goes out BEFORE C runs, or a write of C to its unbuffered stderr
   // passes in front of it - fbc flushes after every print. One flag test per call; the flush only when PRINT wrote.
   CStdoutSync;
+  // ⭐ DIVERGENZE 577 - C MAY NEVER RETURN INTO THE FRAMES IT WAS CALLED FROM. A fatal CUnit assertion longjmps out of
+  // the test callback, past every Pascal frame between the closure and the routine that jumped: the VM's callback
+  // executor, its instructions, the inner foreign call. Their exception frames stay linked in the RTL's list - pointing
+  // at dead stack - and the VM's call stack stays as deep as the abandoned body left it; the program went on and died
+  // at the end (exit code 255 is the RTL's popaddrstack finding a list that no longer adds up). So what this call found
+  // is taken back when C returns: the exception list is cut back to its head (the orphan on top is pointed at the saved
+  // head and popped ONCE - a walk down the orphans would read dead stack), and the VM's frames are popped to the depth
+  // the call began at. SB_LONGJMP_GUARD=0 is the A/B knob.
+  if GLongjmpGuard then
+  begin
+    FrameHead := ExceptFrameHead;
+    CallDepth := Ctx.CallStackPtr;
+  end;
   TForeignTable(ForeignTable).Invoke(TableIdx, Ctx, Ctx.XferInt, Ctx.XferFloat, NArgs, ResInt, ResFloat);
+  if GLongjmpGuard then
+  begin
+    Stale := ExceptFrameHead;
+    if (Stale <> FrameHead) and (Stale <> nil) then
+    begin
+      Stale^.next := FrameHead;
+      FpcPopAddrStack;
+    end;
+    while Ctx.CallStackPtr > CallDepth do
+    begin
+      Dec(Ctx.CallStackPtr);
+      FramePop(Ctx);
+    end;
+  end;
 end;
 
 function TBytecodeVM.ArrGetInt(const A: TArrayStorage; Idx: Integer): Int64;
