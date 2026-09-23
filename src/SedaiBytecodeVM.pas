@@ -1189,6 +1189,13 @@ type
 procedure SetDateLocaleMode(Enabled: Boolean);
 function DateLocaleMode: Boolean;
 
+var
+  // ⭐ A FUSED run (DIVERGENZE 573, SedaiFused): the program IS the executable, so the lookup BESIDE THE
+  // PROGRAM of DIVERGENZE 188 - which exists only because under `sb prog.bas` the executable is the
+  // interpreter - has no reason left, and switching it off is what makes a fused program read a relative
+  // file exactly as an fbc executable does (from the current directory, and nowhere else).
+  GFusedRun: Boolean = False;
+
 implementation
 
 uses
@@ -11412,7 +11419,7 @@ function TBytecodeVM.ResolveReadPath(const APath: string): string;
 // ⚠️ An ABSOLUTE path is never redirected: the program was explicit, and being explicit must win.
 begin
   Result := APath;
-  if GNoProgDirFallback then Exit;   // the A/B knob - see its declaration
+  if GNoProgDirFallback or GFusedRun then Exit;   // the A/B knob - see its declaration; a fused run is fbc's
   if (APath = '') or (FProgramDir = '') then Exit;
   if FileExists(APath) or DirectoryExists(APath) then Exit;
   {$IFDEF UNIX}
@@ -23099,7 +23106,7 @@ begin
           // 📊 This is the line retrogra needs: %FBDATA% in fbsystem.bi does DIR("FreeBASIC.rsc", 255)
           // on the CURRENT directory, so from anywhere but its own folder the font never loaded,
           // rgcfont stayed 0 and the first glyph dereferenced address 0.
-          if (not FDirOpen) and (not GNoProgDirFallback) and
+          if (not FDirOpen) and (not GNoProgDirFallback) and (not GFusedRun) and
              (FProgramDir <> '') and (ExtractFilePath(DirSpec) = '') then
             FDirOpen := FindFirst(FProgramDir + DirectorySeparator + DirSpec, faAnyFile, FDirRec) = 0;
         end

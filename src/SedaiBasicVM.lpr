@@ -76,7 +76,9 @@ uses
   SedaiRunner, SedaiBytecodeSerializer, SedaiPreprocessor,
   // Installs GPPTypeSizeHook: "#assert sizeof( T )" on a USER TYPE is answered by the compiler's
   // own layout rule instead of being left unmade. Linked for its initialization, not called.
-  SedaiTypeSizeProbe;
+  SedaiTypeSizeProbe,
+  // A program that IS an executable: sb + .basc + trailer (DIVERGENZE 573, job/markdown/ESEGUIBILE-FUSO.md)
+  SedaiFused;
 
 // Include version information (must be after uses, contains const declarations)
 {$I Version.inc}
@@ -652,6 +654,10 @@ var
   GProgramArgs: array of string;   // COMMAND$: everything on the command line after the script file
   GExtraModules: TStringList = nil; // --module: the non-main modules of a multi-module program (162)
   GSkipNextArg: Boolean = False;    // ...the file name that follows --module is not a program argument
+  // ⭐ FUSED MODE (DIVERGENZE 573): this very executable carries a .basc in its tail. Then the whole command
+  // line belongs to the program, as it does for an fbc executable, and the program's home is this file's
+  // directory - which is what a C library asking the kernel for "the executable" now gets too.
+  GFusedPayload: TMemoryStream = nil;
 {$IFDEF WITH_WINDOW}
 var
   GPresenter: TWindowPresenter = nil;
@@ -2396,7 +2402,10 @@ begin
   try
     Timer := CreateHiResTimer;
     try
-      BytecodeProgram := Serializer.LoadFromFile(BytecodeFile);
+      if GFusedPayload <> nil then
+        BytecodeProgram := Serializer.LoadFromStream(GFusedPayload)   // the tail of this executable
+      else
+        BytecodeProgram := Serializer.LoadFromFile(BytecodeFile);
       // ⛔ A .basc was compiled for ONE memory mode and runs in it: a --memory asking for the other, or a
       // build locked to STRICT meeting an fb file, is refused here through the error path below.
       AdoptCompiledMemoryMode(BytecodeProgram.NativeMemory);
@@ -2650,6 +2659,7 @@ var
   Param: string;
   VerifyMsg: string;
   VerifyI: Integer;
+  FusedFlags: LongWord;
 
 begin
     // ⛔ EVERY unit declares {$codepage UTF8}, so a string LITERAL carries code page 65001 - while a
@@ -2693,6 +2703,29 @@ begin
 
     // Initialize random number generator
     Randomize;
+
+    // ⭐ A FUSED PROGRAM (DIVERGENZE 573): checked before ANYTHING reads the command line, because in a fused
+    // file the command line is the PROGRAM's - no sb flag is recognised (an fbc executable has none), not even
+    // the diagnostic ones below. What `sb` would take from a flag was decided at fusion time and sits in the
+    // trailer. ⛔ HERMETIC: no sedai.conf is read (an fbc executable reads no configuration file); what the
+    // run needs - the memory mode above all - travels in the .basc. Environment knobs (HOTC_DIAG, SB_*) stay:
+    // they are diagnostics, not configuration. SB_NO_FUSED=1 runs this file as the plain sb it contains.
+    if GetEnvironmentVariable('SB_NO_FUSED') <> '1' then
+    begin
+      TestFile := SelfExecutablePath;
+      if ReadFusedPayload(TestFile, GFusedPayload, FusedFlags) then
+      begin
+        SetLength(GProgramArgs, ParamCount);
+        for i := 1 to ParamCount do GProgramArgs[i - 1] := ParamStr(i);
+        OptJit := (FusedFlags and FUSED_FLAG_JIT) <> 0;
+        OptHome := (FusedFlags and FUSED_FLAG_HOME) <> 0;
+        GFusedRun := True;   // the lookup beside the program (188) is fbc's current directory again
+        RunFromBytecode(TestFile, False, False, False, False
+          {$IFDEF ENABLE_PROFILER}, False, '', ''{$ENDIF});
+        FreeAndNil(GFusedPayload);
+        Exit;
+      end;
+    end;
 
     // Initialize debug flags from command-line parameters
     InitDebugFlags;

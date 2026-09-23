@@ -51,6 +51,8 @@ uses
   SedaiPreprocessor,
   // Where headers and libraries live (sedai.conf / SEDAI_* / fbc on the PATH) - see LoadConfig below
   SedaiConfig, SedaiMemoryMode,
+  // --fuse: sb + .basc + trailer, a program that IS an executable (DIVERGENZE 573)
+  SedaiFused,
   // Installs GPPTypeSizeHook: see the note in SedaiTypeSizeProbe. Linked for its initialization.
   SedaiTypeSizeProbe,
   // Dialect auto-detection (line numbers => classic, otherwise Modern)
@@ -131,6 +133,15 @@ begin
   WriteLn('  --help, -h      Show this help message');
   WriteLn('  --verbose, -v   Show compilation progress');
   WriteLn('  --quiet, -q     Suppress all output except errors');
+  WriteLn('  --fuse          Build a stand-alone EXECUTABLE: the sb runtime with the');
+  WriteLn('                  program inside (default name: the source without extension).');
+  WriteLn('                  C libraries that look next to "the executable" find the');
+  WriteLn('                  program''s directory, as with an fbc executable. Also takes');
+  WriteLn('                  an existing .basc: sbc --fuse prog.basc');
+  WriteLn('  --runtime FILE  The sb to fuse with (default: the sb beside sbc). A Windows');
+  WriteLn('                  sb.exe makes a Windows executable.');
+  WriteLn('  --jit, --home   With --fuse: run with the loop JIT / in the program''s');
+  WriteLn('                  directory, as sb --jit / sb --home would');
   WriteLn;
   WriteLn('Examples:');
   WriteLn('  --target wasm   Emit a WebAssembly module (.wasm) instead of bytecode');
@@ -142,6 +153,7 @@ begin
   WriteLn('  sbc program.bas --target wasm   Compile to ./program.wasm');
   WriteLn('  sbc program.bas out.basc        Compile to out.basc');
   WriteLn('  sbc program.bas -v              Compile with verbose output');
+  WriteLn('  sbc --fuse program.bas          Build ./program, a stand-alone executable');
 end;
 
 { --target wasm: stop after register allocation and hand the SSA to the WASM
@@ -666,6 +678,12 @@ var
   OptVerbose, OptQuiet, OptHelp: Boolean;
   i: Integer;
   Param: string;
+  OptFuse: Boolean;
+  FuseFlags: LongWord;
+  FuseRuntime, FuseBasc, FuseTmp, Head: string;
+  FuseSkipNext: Boolean;
+  FuseSecond: string;
+  HeadStream: TFileStream;
 
 begin
     // ⛔ EVERY unit declares {$codepage UTF8}, so a string LITERAL carries code page 65001 - while a
@@ -690,11 +708,29 @@ begin
     OptVerbose := False;
     OptQuiet := False;
     OptHelp := False;
+    OptFuse := False;
+    FuseFlags := 0;
+    FuseRuntime := '';
+    FuseSkipNext := False;
+    FuseSecond := '';
 
     for i := 1 to ParamCount do
     begin
       Param := ParamStr(i);
-      if (Param = '--help') or (Param = '-h') or (Param = '-?') then
+      if FuseSkipNext then
+        FuseSkipNext := False
+      else if Param = '--fuse' then
+        OptFuse := True
+      else if (Param = '--runtime') and (i < ParamCount) then
+      begin
+        FuseRuntime := ParamStr(i + 1);
+        FuseSkipNext := True;
+      end
+      else if Param = '--jit' then
+        FuseFlags := FuseFlags or FUSED_FLAG_JIT
+      else if Param = '--home' then
+        FuseFlags := FuseFlags or FUSED_FLAG_HOME
+      else if (Param = '--help') or (Param = '-h') or (Param = '-?') then
         OptHelp := True
       else if (Param = '--verbose') or (Param = '-v') then
         OptVerbose := True
@@ -729,12 +765,29 @@ begin
           else ExtraModules.Add(Param);
         end
         else if OutputFile = '' then
-          OutputFile := Param;
+          OutputFile := Param
+        else if FuseSecond = '' then
+          FuseSecond := Param;   // "sbc --fuse prog.basc out": the first is the INPUT, this is the output
       end;
     end;
 
+    // ⭐ --fuse from an existing .basc: the positional that would be the output name is the INPUT.
+    FuseBasc := '';
+    if OptFuse and (SourceFile = '') and SameText(ExtractFileExt(OutputFile), '.basc') then
+    begin
+      FuseBasc := OutputFile;
+      OutputFile := FuseSecond;
+    end;
+
+    if (FuseSecond <> '') and (FuseBasc = '') then
+    begin
+      WriteLn(ErrOutput, 'ERROR: unexpected argument "', FuseSecond, '"');
+      ExitCode := 1;
+      Exit;
+    end;
+
     // Show help if requested or no file provided
-    if OptHelp or (SourceFile = '') then
+    if OptHelp or ((SourceFile = '') and (FuseBasc = '')) then
     begin
       PrintHelp;
       if SourceFile = '' then
@@ -759,6 +812,91 @@ begin
               '": a .bas file is SOURCE, and this would destroy it.');
       WriteLn(ErrOutput, '  If you meant an output file, give it a .basc extension.');
       ExitCode := 1;
+      Exit;
+    end;
+
+    // ⛔ --jit / --home / --runtime shape a FUSED executable only: accepted and ignored on a plain compile they
+    // would be the flag that did nothing and said nothing.
+    if not OptFuse and ((FuseFlags <> 0) or (FuseRuntime <> '')) then
+    begin
+      WriteLn(ErrOutput, 'ERROR: --jit, --home and --runtime apply to --fuse only (sb takes --jit/--home at run time)');
+      ExitCode := 1;
+      Exit;
+    end;
+
+    if OptFuse then
+    begin
+      // ⛔ Every refusal here is LOUD: a fused file that half-worked would be a program that runs somebody
+      // else's bytes, or none. What cannot be fused is named before anything is compiled.
+      if OptTargetWasm then
+      begin
+        WriteLn(ErrOutput, 'ERROR: --fuse makes a native executable; it cannot be combined with --target wasm');
+        ExitCode := 1;
+        Exit;
+      end;
+      if FuseRuntime = '' then
+      begin
+        FuseRuntime := ExtractFilePath(SelfExecutablePath) + 'sb';
+        {$IFDEF WINDOWS}FuseRuntime := FuseRuntime + '.exe';{$ENDIF}
+      end;
+      if not FileExists(FuseRuntime) then
+      begin
+        WriteLn(ErrOutput, 'ERROR: --fuse needs the sb runtime, and "', FuseRuntime, '" does not exist (give it with --runtime)');
+        ExitCode := 1;
+        Exit;
+      end;
+      // The runtime decides the target: a PE (MZ) makes a Windows executable, which is named .exe.
+      Head := '';
+      HeadStream := TFileStream.Create(FuseRuntime, fmOpenRead or fmShareDenyNone);
+      try
+        SetLength(Head, 4);
+        if HeadStream.Read(Head[1], 4) < 4 then Head := '';
+      finally
+        HeadStream.Free;
+      end;
+      if (Copy(Head, 1, 2) <> 'MZ') and (Head <> #$7F'ELF') then
+      begin
+        WriteLn(ErrOutput, 'ERROR: "', FuseRuntime, '" is neither an ELF nor a PE executable');
+        ExitCode := 1;
+        Exit;
+      end;
+      if OutputFile = '' then
+      begin
+        if SourceFile <> '' then OutputFile := ChangeFileExt(ExtractFileName(SourceFile), '')
+        else OutputFile := ChangeFileExt(ExtractFileName(FuseBasc), '');
+        if Copy(Head, 1, 2) = 'MZ' then OutputFile := OutputFile + '.exe';
+      end;
+      if SameText(ExtractFileExt(OutputFile), '.bas') or SameText(ExtractFileExt(OutputFile), '.basc') then
+      begin
+        WriteLn(ErrOutput, 'ERROR: refusing to write an executable over "', OutputFile, '"');
+        ExitCode := 1;
+        Exit;
+      end;
+      if not OptQuiet then
+        PrintVersion;
+      FuseTmp := '';
+      if FuseBasc = '' then
+      begin
+        FuseTmp := OutputFile + '.fuse-tmp.basc';
+        if not CompileFile(SourceFile, FuseTmp, OptVerbose, ExtraModules) then
+        begin
+          DeleteFile(FuseTmp);
+          ExitCode := 1;
+          Exit;
+        end;
+        FuseBasc := FuseTmp;
+      end;
+      try
+        WriteFusedExecutable(FuseRuntime, FuseBasc, OutputFile, FuseFlags);
+      finally
+        if FuseTmp <> '' then DeleteFile(FuseTmp);
+      end;
+      if not OptQuiet then
+        if SourceFile <> '' then
+          WriteLn('Fused: ', ExtractFileName(SourceFile), ' + ', FuseRuntime, ' -> ', OutputFile)
+        else
+          WriteLn('Fused: ', ExtractFileName(FuseBasc), ' + ', FuseRuntime, ' -> ', OutputFile);
+      ExitCode := 0;
       Exit;
     end;
 
