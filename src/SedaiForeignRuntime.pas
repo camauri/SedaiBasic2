@@ -886,6 +886,19 @@ begin
   B.Prepared := True;
 end;
 
+function CharOrNumPtrPtr(const TypeName: string): Boolean;
+// DIVERGENZE 587: a "T Ptr Ptr" whose T is characters or a numeric scalar - never a record, so a raw-heap name in its
+// cell is memory. "Any Ptr Ptr" is not one of them: its cell may hold a block of shared records (DIVERGENZE 379).
+var
+  U: string;
+begin
+  U := UpperCase(Trim(TypeName));
+  Result := (U = 'ZSTRING PTR PTR') or (U = 'WSTRING PTR PTR') or (U = 'UBYTE PTR PTR') or (U = 'BYTE PTR PTR') or
+            (U = 'SHORT PTR PTR') or (U = 'USHORT PTR PTR') or (U = 'LONG PTR PTR') or (U = 'ULONG PTR PTR') or
+            (U = 'INTEGER PTR PTR') or (U = 'LONGINT PTR PTR') or (U = 'ULONGINT PTR PTR') or (U = 'DOUBLE PTR PTR') or
+            (U = 'SINGLE PTR PTR');
+end;
+
 procedure TForeignTable.Invoke(Idx: Integer; ACtx: TObject; const XferInt: array of Int64;
   const XferFloat: array of Double; NArgs: Integer; out ResInt: Int64; out ResFloat: Double);
 // ⛔ ONE BUFFER PER ARGUMENT, AT ITS OWN WIDTH, and a pointer to each: that is the convention the whole
@@ -905,6 +918,7 @@ var
   RegLen: array[0..63] of PtrUInt;
   RegVM: array[0..63] of Int64;
   RegW: array[0..63] of Integer;
+  RawCellQ: Pointer;                   // DIVERGENZE 587: a raw-heap name in a PTR PTR cell, as C's address
   OutLoc: array[0..63] of Pointer;     // dove un parametro "T PTR PTR" tiene il suo puntatore
   OutOrig, OutSeen: array[0..63] of Int64;   // ...cio' che il programma ci teneva, e cio' che C ci ha trovato (450)
   NOut: Integer;
@@ -1450,7 +1464,17 @@ begin
               // address WITH the program's mark, and C dereferenced the mark (access violation). For the call the
               // cell holds the machine address; the loop below AbiCall brings it home or marks it again.
               if (PInt64(P)^ and FGNPTR_TAG) <> 0 then
-                PInt64(P)^ := PInt64(P)^ and not FGNPTR_TAG;
+                PInt64(P)^ := PInt64(P)^ and not FGNPTR_TAG
+              // ⭐ DIVERGENZE 587 - ...and a cell holding a name of the VM's RAW BYTE HEAP ("p = @buf" of a ZString * n)
+              // holds the machine address for the call: "strsep(@p, ",")" followed the name. Only where the declaration
+              // says the pointee is characters or numbers - a record block lives behind bit 62 too (DIVERGENZE 379).
+              // The loop below AbiCall brings back what C moved, or restores the name.
+              else if ((PInt64(P)^ and RAWPTR_TAG) <> 0) and (GetEnvironmentVariable('SB_PTRPTR_RAWCELL') <> '0') and
+                      CharOrNumPtrPtr(B^.Decl.ParamTypeNames[i]) then
+              begin
+                RawCellQ := FResolvePtr(ACtx, PInt64(P)^);
+                if RawCellQ <> nil then PInt64(P)^ := Int64(PtrUInt(RawCellQ));
+              end;
               OutSeen[NOut] := PInt64(P)^;
               Inc(NOut);
             end;
