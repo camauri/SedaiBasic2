@@ -542,7 +542,14 @@ build_target() {
 
     opts+=("-Fusrc" "-Fulib/$lib_sub_dir" "-FUlib/$lib_sub_dir" "-FEbin/$platform_dir")
 
+
     [[ -n "$extra_path" ]] && opts+=("-Fu$extra_path")
+    # `sb --window` (opt-in) presents through SDL2 and needs the binding. It used to find it only because the AUDIO block
+    # added deps/sdl2 - and sb has no audio since DIVERGENZE 585. ⚠️ Such an sb carries libSDL2 again: it is a developer
+    # build, and the 585 interposition applies to it; the plain sb, which the nets and the decks run, does not.
+    if [[ "$WINDOW" == "true" && "$output_name" == sb* ]]; then
+        opts+=("-Fu${SDL2_FOR_TARGETS:-./deps/sdl2}")
+    fi
 
     for define in "${DEBUG_DEFINES[@]}"; do
         opts+=("-d$define")
@@ -965,7 +972,12 @@ report_deps() {
 SDL2_FOR_TARGETS="$(config_value SDL2Path 2>/dev/null || true)"
 [[ -z "$SDL2_FOR_TARGETS" ]] && SDL2_FOR_TARGETS="./deps/sdl2"
 declare -A TARGETS=(
-    [sb]="SedaiBasicVM.lpr:sb::true:false"
+    # ⛔ sb carries NO audio (DIVERGENZE 585, 23 Sep 2026; owner, 9 Sep: "sb: SDL2 absent, SedaiSIDEvo absent"). The audio
+    # chain was the ONLY road by which the sdl2 binding reached sb's link (SedaiAudioBackend -> SedaiAudioSDL2Dyn -> sdl2,
+    # which drags xlib): libSDL2 and libX11 sat in sb's GLOBAL scope, and every SDL 1.2 library a program opened had its
+    # internal calls bound to SDL2's functions of the same name. --as-needed cannot drop them: the binding's inline
+    # helpers name SDL symbols in the objects, and ld decides before --gc-sections. `readelf -d sb | grep NEEDED`.
+    [sb]="SedaiBasicVM.lpr:sb::false:false"
     [sbc]="SedaiBasicCompiler.lpr:sbc::false:false"
     [sbd]="SedaiBasicDisassembler.lpr:sbd::false:false"
     [sbv]="SedaiVision.lpr:sbv:$SDL2_FOR_TARGETS:true:false"

@@ -1056,7 +1056,8 @@ if ($Clean) {
 # SDL2 path for sbv: use config if set, otherwise default
 $sdl2PathForTargets = if ($UserConfig.SDL2Path) { $UserConfig.SDL2Path } else { '.\deps\sdl2' }
 $targets = @{
-    'sb'  = @{ Lpr = 'SedaiBasicVM.lpr';           Output = 'sb';  ExtraPaths = @(); SupportsAudio = $true;  IsWeb = $false }
+    # sb carries NO audio (DIVERGENZE 585): the audio chain was the only road that brought SDL2 into sb - see build.sh
+    'sb'  = @{ Lpr = 'SedaiBasicVM.lpr';           Output = 'sb';  ExtraPaths = @(); SupportsAudio = $false; IsWeb = $false }
     'sbc' = @{ Lpr = 'SedaiBasicCompiler.lpr';     Output = 'sbc'; ExtraPaths = @(); SupportsAudio = $false; IsWeb = $false }
     'sbd' = @{ Lpr = 'SedaiBasicDisassembler.lpr'; Output = 'sbd'; ExtraPaths = @(); SupportsAudio = $false; IsWeb = $false }
     'sbv' = @{ Lpr = 'SedaiVision.lpr';            Output = 'sbv'; ExtraPaths = @($sdl2PathForTargets); SupportsAudio = $true; IsWeb = $false }

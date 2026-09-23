@@ -1396,6 +1396,9 @@ var
   // nothing start finding something, and the only honest way to attribute a moved counter is to run
   // the same binary both ways and diff the two lists of names.
   GNoProgDirFallback: Boolean = False;
+  // SB_USING_BINARY_ROUND=1 makes MODERN's PRINT USING round from the EXACT binary value again, as it did before
+  // DIVERGENZE 584 - the A/B knob of that entry, on ONE binary.
+  GUsingBinaryRound: Boolean = False;
   // SB_LEGACY_PATHS=1 makes EXEPATH and COMMAND$(0) answer what they answered before DIVERGENZE 188
   // - the INTERPRETER's path. The twin of the knob above, and for the same reason: when a suite
   // counter moves by one, the only honest way to attribute it is to run ONE binary both ways and
@@ -1976,6 +1979,7 @@ begin
   GPackedDiag := SysUtils.GetEnvironmentVariable('PACKED_DIAG') = '1';
   GSpinDiag := StrToIntDef(SysUtils.GetEnvironmentVariable('SPINDIAG'), 0);
   GNoProgDirFallback := SysUtils.GetEnvironmentVariable('SB_NO_PROGDIR_FALLBACK') = '1';
+  GUsingBinaryRound := SysUtils.GetEnvironmentVariable('SB_USING_BINARY_ROUND') = '1';
   GLegacyPaths := SysUtils.GetEnvironmentVariable('SB_LEGACY_PATHS') = '1';
   GRecDiag := SysUtils.GetEnvironmentVariable('RECDIAG') = '1';
   GHotCDiag := SysUtils.GetEnvironmentVariable('HOTC_DIAG') = '1';
@@ -2390,6 +2394,142 @@ begin
   SetLength(FArrays, 0);
 end;
 
+{ ---- the digits of a Double as libfb's PRINT USING sees them (DIVERGENZE 584) ----------------------------------
+  ⭐ fbc does NOT round from the binary value. hScaleDoubleToULL (rtlib/io_printusg.c, 1.10.1) first turns the Double
+  into a DECIMAL integer of at most 16 digits, ROUNDING, and hPrintNumber then rounds THOSE digits to the mask - a
+  double rounding. So 2.675, whose binary value is 2.67499999999999982236..., becomes 2675000000000000 and then 2.68,
+  where rounding the binary value gives 2.67. Ported line for line, including the divide-by-5 that keeps the
+  mantissa within 64 bits and the round-half-UP of hDivPow10_ULL. ⛔ MODERN only: CLASSIC keeps its own formatter. }
+
+function UsgPow10(n: Integer): QWord;
+begin
+  Result := 1;
+  while n > 0 do begin Result := Result * 10; Dec(n); end;
+end;
+
+function UsgDivPow10(a: QWord; n: Integer): QWord;   // hDivPow10_ULL: a / 10^n, half rounded UP
+var
+  b: QWord;
+begin
+  if n > 19 then Exit(0);
+  b := UsgPow10(n);
+  Result := a div b;
+  if (a mod b) >= (b + 1) div 2 then Inc(Result);
+end;
+
+function UsgNumDigits(a: QWord): Integer;
+begin
+  Result := 1;
+  while a >= 10 do begin a := a div 10; Inc(Result); end;
+end;
+
+function UsgScaleDouble(Value: Double; out Pow10: Integer): QWord;   // hScaleDoubleToULL; Value > 0 and finite
+var
+  v: QWord;
+  pow2, digs: Integer;
+begin
+  v := PQWord(@Value)^;
+  pow2 := Integer((v shr 52) and $7FF) - 1023;
+  v := v and ((QWord(1) shl 52) - 1);
+  if pow2 > -1023 then v := v or (QWord(1) shl 52)   // normalised
+  else Inc(pow2);                                    // denormal
+  Dec(pow2, 52);
+  Pow10 := 0;
+  while pow2 > 0 do
+    if v < (QWord(1) shl 63) then begin v := v * 2; Dec(pow2); end
+    else begin v := (v - 3) div 5 + 1; Inc(Pow10); Dec(pow2); end;   // /5, to nearest
+  while pow2 < 0 do
+    if v <= QWord($3333333333333333) then begin v := v * 5; Dec(Pow10); Inc(pow2); end
+    else begin v := v div 2 + (v and (v div 2) and 1); Inc(pow2); end; // /2, to even
+  digs := UsgNumDigits(v);
+  if digs > 16 then
+  begin
+    v := UsgDivPow10(v, digs - 16);
+    Inc(Pow10, digs - 16);
+  end;
+  Result := v;
+end;
+
+function UsgFixedDigits(AbsValue: Double; DecDigits: Integer): string;
+// "<int>.<DecDigits digits>" of AbsValue, rounded as fbc's fixed-point PRINT USING rounds it.
+var
+  v: QWord;
+  e: Integer;
+begin
+  if AbsValue = 0 then
+    v := 0
+  else
+    v := UsgScaleDouble(AbsValue, e);
+  if v = 0 then e := -DecDigits
+  else if e < -DecDigits then
+  begin
+    v := UsgDivPow10(v, -DecDigits - e);
+    e := -DecDigits;
+  end;
+  Result := UIntToStr(v) + StringOfChar('0', e + DecDigits);   // the value times 10^DecDigits
+  if DecDigits > 0 then
+  begin
+    if Length(Result) < DecDigits + 1 then
+      Result := StringOfChar('0', DecDigits + 1 - Length(Result)) + Result;
+    Insert('.', Result, Length(Result) - DecDigits + 1);
+  end;
+end;
+
+function UsgTooManyDigits(UV: QWord; UE, IntPos, DecDigits: Integer; HasDot, Neg, LeadSign, PlusSign,
+  TrailSign, FloatDollar: Boolean): string;
+{ libfb's hPrintNumber when a number has MORE THAN THREE integer digits beyond the field's positions: it gives up the
+  fixed point and prints the value in floating point behind a '%' (DIVERGENZE 584) - "#.####" on 983057.1 is
+  "%0.9831E+6". IntPos is the field's integer positions as libfb counts them ('#', ',' and the second '$' of "$$"),
+  already less the one an implicit minus takes. UV * 10^UE is the value's digits (UV > 0). Ported line for line:
+  the first digit is blanked for a positive number without a sign, the exponent has ONE digit (MIN_EXPDIGS 3), and a
+  larger one carries its own '%' after "E+". }
+var
+  Tot, DecN, D, Zd, IntK, i: Integer;
+  Dig, IntS, DecS, ExpS: string;
+begin
+  if HasDot then DecN := DecDigits else DecN := 0;
+  if (IntPos = -1) or ((IntPos = 0) and (DecN = 0)) then Inc(IntPos);
+  Tot := IntPos + DecN;
+  if (not Neg) and not (LeadSign or TrailSign) and (IntPos >= 1) and (Tot > 1) then Dec(Tot);
+  D := UsgNumDigits(UV);
+  Zd := 0;
+  if D < Tot then
+  begin
+    Zd := Tot - D;
+    Dec(UE, Zd);
+  end
+  else if D > Tot then
+  begin
+    UV := UsgDivPow10(UV, D - Tot);
+    Inc(UE, D - Tot);
+    if (Tot < 20) and (UV >= UsgPow10(Tot)) then begin UV := UV div 10; Inc(UE); end;
+  end;
+  if Tot > 0 then Dig := UIntToStr(UV) + StringOfChar('0', Zd) else Dig := '';
+  Inc(UE, DecN);                                     // the point moves to the end of the decimals
+  IntK := Length(Dig) - DecN;
+  if IntK < 0 then IntK := 0;
+  IntS := Copy(Dig, 1, IntK);
+  DecS := Copy(Dig, IntK + 1, MaxInt);
+  if (IntK = 0) and (IntPos > 0) then begin IntS := '0'; IntK := 1; end;
+  if UE < 0 then ExpS := 'E-' else ExpS := 'E+';
+  if Abs(UE) > 9 then ExpS := ExpS + '%';
+  ExpS := ExpS + IntToStr(Abs(UE));
+  Result := IntS;
+  if HasDot then Result := Result + '.' + DecS;
+  Result := Result + ExpS;
+  if FloatDollar then Result := '$' + Result;
+  if TrailSign then
+  begin
+    if Neg then Result := Result + '-' else if PlusSign then Result := Result + '+' else Result := Result + ' ';
+  end
+  else if LeadSign or Neg then
+  begin
+    if Neg then Result := '-' + Result else if PlusSign then Result := '+' + Result else Result := ' ' + Result;
+  end;
+  for i := IntK + 1 to IntPos do Result := ' ' + Result;
+  Result := '%' + Result;
+end;
+
 function TBytecodeVM.FormatUsing(const FormatStr: string; Value: Double;
   IsInt: Boolean; IntValue: Int64): string;
 { ⭐ ONE PLACE decides which dialect's PRINT USING rules apply, so the two
@@ -2434,6 +2574,9 @@ var
   AbsValue, Mant: Double;
   Body, Digits, IntPart, DecPart, Grouped, ExpStr: string;
   Ex, Width: Integer;
+  UV: QWord;
+  UE, UT, UD: Integer;
+  UDone: Boolean;
 begin
   IntDigits := 0; DecDigits := 0; Caret := 0; CommaCount := 0;
   LeadSign := False; TrailSign := False; TrailMinus := False;
@@ -2528,6 +2671,38 @@ begin
     if Sh < 0 then Sh := 0;
     Ex := 0;
     Mant := AbsValue;
+    { ⭐ fbc's digits (DIVERGENZE 584): the value's 16-digit decimal form, rounded to the T significant digits the
+      mask shows - the same hDivPow10_ULL that the fixed-point field uses. }
+    UT := Sh + DecDigits;
+    UDone := (AbsValue <> 0) and (UT >= 1) and (UT <= 18) and not GUsingBinaryRound
+             and not IsNan(AbsValue) and not IsInfinite(AbsValue);
+    if UDone then
+    begin
+      UV := UsgScaleDouble(AbsValue, UE);
+      UD := UsgNumDigits(UV);
+      if UD > UT then
+      begin
+        UV := UsgDivPow10(UV, UD - UT);
+        Inc(UE, UD - UT);
+        if UV >= UsgPow10(UT) then begin UV := UV div 10; Inc(UE); end;
+        Digits := UIntToStr(UV);
+      end
+      else
+      begin
+        Digits := UIntToStr(UV) + StringOfChar('0', UT - UD);
+        Dec(UE, UT - UD);
+      end;
+      Ex := UE + UT - Sh;
+      if Sh > 0 then
+      begin
+        Body := Copy(Digits, 1, Sh);
+        if DecDigits > 0 then Body := Body + '.' + Copy(Digits, Sh + 1, MaxInt);
+      end
+      else
+        Body := '0.' + Digits;
+    end
+    else
+    begin
     if Mant <> 0 then
     begin
       // bring the mantissa into [10^(Sh-1), 10^Sh) - or [0.1, 1) when Sh = 0
@@ -2545,6 +2720,7 @@ begin
       Mant := Mant / 10; Inc(Ex);
       Body := Format('%.*f', [DecDigits, Mant]);
     end;
+    end;   // the binary-rounding path (A/B knob, or a shape the port does not cover)
     // left-pad the mantissa so its integer digits fill the field's positions
     j := Pos('.', Body);
     if j = 0 then j := Length(Body) + 1;
@@ -2575,6 +2751,9 @@ begin
       if Neg then Body := '%-' + Body;
     end;
     if Ex < 0 then ExpStr := '-' else ExpStr := '+';
+    { ⚠️ An exponent WIDER than the carets allow is printed whole, with a '%' after the sign: "#.#^^^^" on 1e300 is
+      "0.1E+%301" (libfb's hPrintNumber, DIVERGENZE 584). }
+    if (Length(IntToStr(Abs(Ex))) > ExpDigits) and not GUsingBinaryRound then ExpStr := ExpStr + '%';
     ExpStr := 'E' + ExpStr + Format('%.*d', [ExpDigits, Abs(Ex)]);
     Result := Body + ExpStr;
     Exit;
@@ -2587,8 +2766,10 @@ begin
     if (Digits <> '') and (Digits[1] = '-') then Delete(Digits, 1, 1);
     if DecDigits > 0 then Digits := Digits + '.' + StringOfChar('0', DecDigits);
   end
+  else if GUsingBinaryRound or IsNan(AbsValue) or IsInfinite(AbsValue) then
+    Digits := Format('%.*f', [DecDigits, AbsValue])
   else
-    Digits := Format('%.*f', [DecDigits, AbsValue]);
+    Digits := UsgFixedDigits(AbsValue, DecDigits);   // fbc's double rounding (DIVERGENZE 584)
 
   j := Pos('.', Digits);
   if j > 0 then
@@ -2600,6 +2781,31 @@ begin
   begin
     IntPart := Digits;
     DecPart := '';
+  end;
+
+  { ⭐ TOO MANY INTEGER DIGITS: more than three beyond the field's positions and fbc stops printing a fixed point at
+    all (DIVERGENZE 584, libfb's hPrintNumber). The positions are counted as libfb counts them. }
+  if not GUsingBinaryRound and not IsNan(AbsValue) and not IsInfinite(AbsValue) then
+  begin
+    Sh := IntDigits + CommaCount;
+    if FloatDollar then Inc(Sh);
+    if Neg and not (LeadSign or TrailSign or TrailMinus) then Dec(Sh);
+    if IntPart = '0' then Ex := 0 else Ex := Length(IntPart);
+    if HasCommas and (Ex > 0) then Inc(Ex, (Ex - 1) div 3);
+    if Ex > Sh + 3 then
+    begin
+      if IsInt then
+      begin
+        UV := QWord(Abs(IntValue));
+        UE := 0;
+      end
+      else
+        UV := UsgScaleDouble(AbsValue, UE);
+      Result := UsgTooManyDigits(UV, UE, Sh, DecDigits, HasDot, Neg, LeadSign, LeadSign or TrailSign,
+        TrailSign or TrailMinus, FloatDollar);
+      if FixedDollar then Result := '$' + Result;
+      Exit;
+    end;
   end;
 
   { ⭐ THE FIELD'S CAPACITY in integer positions. Computed HERE, above the body,
