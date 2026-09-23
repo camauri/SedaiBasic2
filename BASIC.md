@@ -2312,7 +2312,7 @@ in a record, or in the numeric builtins. Keep one in a plain `Dim` until those c
 | Keyword | Status | Description |
 |---|---|---|
 | `+ (String concatenation)` | ✓ |  |
-| `& (String concatenation with conversion)` | ✓ | `&` concatenates, coercing numeric operands to string (FreeBASIC). |
+| `& (String concatenation with conversion)` | ✓ | `&` concatenates, coercing numeric operands to string (FreeBASIC). ⚠️ **The operands are evaluated left to right, whatever their type, and in fbc they are not**: fbc converts a NUMERIC right operand before it evaluates the operand on its left (with a `String` on the right it reads left to right), so `"s" & f(@b) & b`, where `f` writes `b`, prints the `b` of before the call under fbc. That is a defect of theirs, reported in `job/fbc-upstream/ISSUES.md` n. 7, and this product does not copy it (owner, 23 Sep 2026) — a declared divergence, DIVERGENZE 568. |
 | `STRPTR (String pointer)` | ✓ | Raw pointer to the string's data (read-only byte-heap snapshot, NUL-terminated); same model as `SADD`. A string LITERAL has ONE address for the whole run, as in fbc, which pools identical literals: `@"k" = @"k"` and `StrPtr("k") = @"k"` are -1, in any procedure and in any iteration of a loop (DIVERGENZE 593) |
 
 #### Relational Operators
