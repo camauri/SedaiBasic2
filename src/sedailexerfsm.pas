@@ -1763,7 +1763,11 @@ begin
           end;
           if not EmitByte(Val and $FF) then Exit;
         end;
-      'u', 'U':
+      // ⛔ ONLY the LOWER-CASE \u (DIVERGENZE 590). FreeBASIC documents "\unnnn" and nothing else; "\U" is an UNKNOWN
+      // escape, and fbc treats it as one when no digits follow ("\Ux" is "Ux"). Read as "\u" here, "\Ux" came out
+      // EMPTY - a code point 0, the terminator - and "\U0041x" as "Ax". With digits after it fbc itself loses
+      // characters ("\U0041x" is "U004"), a defect reported for its developers and not copied: here it is "U0041x".
+      'u':
         begin
           // unicode codepoint, up to 4 hex digits
           Inc(i);

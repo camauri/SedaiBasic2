@@ -216,9 +216,14 @@ function IncludeSearchPathCount: Integer;
 
 implementation
 
-uses
+uses SedaiFbReserved,
   SedaiLexerTypes,    // cVirtualEOL: the separator a multi-line #macro body is joined with
   SedaiConfig;        // where things are: sedai.conf, the environment, the command line
+
+function IsFbReservedMacroName(const UName: string): Boolean; inline;
+begin
+  Result := IsFbReservedName(UName);   // the measured table lives in SedaiFbReserved (DIVERGENZE 590)
+end;
 
 function IsEmulatedHeaderName(const FileName: string): Boolean;
 // Which headers RegisterEmulatedHeader answers for when the FreeBASIC tree is NOT there. The list is
@@ -5286,6 +5291,12 @@ var
             // ⚠️ SB_PP_LAX_DEFINE=1 puts the silence back, on one binary.
             if (MacroName <> '') and (GetEnvironmentVariable('SB_PP_LAX_DEFINE') <> '1') then
             begin
+              // ⛔ A KEYWORD IS A NAME THAT ALREADY EXISTS (DIVERGENZE 590): fbc answers "Duplicated definition" for
+              // "#define LEN(a) ..." or "#macro LINE(a, b)" exactly as for a program's own symbol, and a macro that
+              // took such a name here rewrote every later use of the keyword. The set is fbc's, measured.
+              if IsFbReservedMacroName(MacroName) then
+                raise EPreprocessorError.CreateFmt(
+                  'Duplicated definition, %s: it is a FreeBASIC keyword', [MacroName]);
               // ⛔ THE SYMBOL COLLISION IS ASKED FIRST, and the order is not cosmetic: the benign
               // exemption below is about a MACRO defined twice, and letting it answer first swallowed
               // the case it has nothing to do with - sqlite3ext.bi "#define"s over a name that
@@ -5305,6 +5316,9 @@ var
                  (Defs.Values[MacroName] =
                   Trim(StripDirectiveComment(Copy(DRest, p, MaxInt)))) then
                 // the same definition, written twice: nothing changes and fbc says nothing
+              // ⚠️ Measured (DIVERGENZE 590): fbc lets "#define __FB_ARGC__ ..." (and __FB_ARGV__, __FB_MAIN__) through
+              // ONLY while the program never uses the name - used afterwards, it is "error 4" on the #define line. A
+              // program redefines it to use it, so refusing always is the closer answer, and it stays.
               else if (Defs.IndexOfName(MacroName) >= 0) or (FnDefs.IndexOfName(MacroName) >= 0) then
                 raise EPreprocessorError.CreateFmt(
                   'Duplicated definition, %s: it is already a macro, and a "#define" over one needs ' +
@@ -5353,6 +5367,11 @@ var
             p := 1;
             while (p <= Length(DRest)) and IsIdentChar(DRest[p]) do Inc(p);
             MacroName := UpperFast(Copy(DRest, 1, p - 1));
+            // ⛔ The same rule as "#define" (DIVERGENZE 590): a keyword is not a free name for a macro.
+            if (MacroName <> '') and IsFbReservedMacroName(MacroName) and
+               (GetEnvironmentVariable('SB_PP_LAX_DEFINE') <> '1') then
+              raise EPreprocessorError.CreateFmt(
+                'Duplicated definition, %s: it is a FreeBASIC keyword', [MacroName]);
             // "#macro m ( arg1, arg2 )": FreeBASIC allows space before the parameter list, and the
             // manual writes it that way. Testing the very next character made such a macro OBJECT-like,
             // so an invocation expanded to the raw body and its arguments leaked out as code.

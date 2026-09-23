@@ -129,6 +129,7 @@ type
     // A DECLARE carrying an ALIAS is a FOREIGN procedure: NAME|SYMBOL|LIBRARY|RETURN|PARAMS, one per
     // line, handed to the SSA on the program node (DIVERGENZE 183).
     FForeignDecls: TStringList;
+    FConstRetProcs: TStringList;   // DIVERGENZE 590: FUNCTIONs / DECLAREs whose result is "As Const <type>"
     FForeignDefaults: TStringList;   // DIVERGENZE 557: NAME=encoded defaults of a foreign declaration's parameters
     FForeignRedecls: TStringList;   // DIVERGENZE 552: "<line>=<row>" of a foreign name declared again after #undef
     FForeignDataArrays: TStringList;   // DIVERGENZE 441: "NAME=symbol|T|lb:ub,..." - the data ARRAYS of C libraries
@@ -711,6 +712,7 @@ begin
   MemoizationThreshold := 3;  // Cache after 3 recursion levels
 
   FForeignDecls := TStringList.Create;
+  FConstRetProcs := TStringList.Create;
   FForeignDefaults := TStringList.Create;
   FForeignRedecls := TStringList.Create;
   FForeignDataArrays := TStringList.Create;
@@ -816,6 +818,7 @@ begin
     FExpressionParser.Free;
 
   FForeignDecls.Free;
+  FConstRetProcs.Free;
   FForeignDefaults.Free;
   FForeignRedecls.Free;
   FHeaderRoutines.Free;
@@ -1845,6 +1848,10 @@ begin
  // knows what a CALL is, and it needs the symbol, the library and the signature to build the call.
  if FForeignDecls.Count > 0 then
    Result.Attributes.Values['FOREIGNDECLS'] := StringReplace(FForeignDecls.Text, sLineBreak, ';', [rfReplaceAll]);
+ // ⭐ DIVERGENZE 590: the names whose RESULT was declared "As Const <type>" - a bodiless DECLARE emits no node, so
+ // this list is where the qualifier survives for the SSA, which refuses dropping it ("Dim As ZString Ptr p = f()").
+ if FConstRetProcs.Count > 0 then
+   Result.Attributes.Values['CONSTRETPROCS'] := ';' + StringReplace(FConstRetProcs.Text, sLineBreak, ';', [rfReplaceAll]);
  // DIVERGENZE 557: the defaults, one "NAME=d0#31d1..." per declaration, #30 between them (a string default may hold ';')
  if FForeignDefaults.Count > 0 then
    Result.Attributes.Values['FOREIGNDEFAULTS'] := StringReplace(FForeignDefaults.Text, sLineBreak, #30, [rfReplaceAll]);
@@ -2272,7 +2279,11 @@ begin
      // type name would classify the parameter as unknown and refuse the whole declaration. Every C
      // binding is full of them - zip.bi alone has dozens.
      else if FgnAfterAs and (FgnTok = 'CONST') then
+     begin
        // stay after-AS: the real type name is the next word
+       // ⭐ ...but at depth 0 it qualifies the RESULT, and the SSA refuses dropping it (DIVERGENZE 590).
+       if (FgnDepth = 0) and (FgnRet = '') and (FgnName <> '') then FConstRetProcs.Add(UpperFast(FgnName));
+     end
      // ⛔⛔ "As Sub Cdecl(...)" IS A PROCEDURE-POINTER TYPE, and the walk did not consume the SUB.
      // SUB and FUNCTION are their own token kind, so neither arm below matched them, the after-AS
      // flag stayed open, and the type recorded for the parameter was whatever word came next: the
@@ -5049,7 +5060,8 @@ begin
   if (Kind = kFUNCTION) and Context.Check(ttAsType) and Assigned(NameNode) then
   begin
     Context.Advance;                              // AS
-    SkipTypeQualifiers;                     // FB: "As Const <type>"
+    if SkipTypeQualifiersConst then         // FB: "As Const <type>" - kept for the SSA (DIVERGENZE 590)
+      FConstRetProcs.Add(UpperFast(NameNode.ValueUpper));
     // "Function f(...) As Sub()" / "As Function(...) As R": the return is a PROCEDURE POINTER, which is
     // not an identifier - so this reader passed it by and the SUB keyword was met where a name was
     // expected. A PARAMETER of that type has always been read (TryParseProcPtrType); the RETURN had not,

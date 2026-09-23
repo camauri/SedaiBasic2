@@ -37,6 +37,7 @@ uses
   SedaiSSATypes, SedaiBasicKeywords, SedaiNamespace, SedaiStaticLocals,
   SedaiFastLookup,        // TIndexedStringList: the name registries below answer IndexOf from a hash
   SedaiExecutorErrors,   // runtime error codes (ERR_NEXT_WITHOUT_FOR for the orphan-NEXT raise)
+  SedaiFbReserved,       // the names fbc keeps for itself, MEASURED (DIVERGENZE 590)
   SedaiPreprocessor,     // GPPUndefNames: the names "#undef" retired (DIVERGENZE 73)
   SedaiForeignDecl,      // the format of a foreign DECLARE, and nothing about libffi (DIVERGENZE 183)
   Contnrs;               // TFPStringHashTable: a map whose DELETE is constant time
@@ -556,6 +557,8 @@ type
     FModernMode: Boolean;                // FB scope: True = MODERN (lexical scope); False = CLASSIC (global-by-name)
     FNativeMemory: Boolean;              // memory mode fb (True) or strict (False) - SedaiMemoryMode; phase 0: carried, not yet read
     FRecNativeKnob: Boolean;             // phase 3.2: native records in the fb mode; SB_RECNATIVE=0 turns them off (A/B)
+    FPtrAliasWidthKnob: Boolean;   // DIVERGENZE 589: a pointee named by a TYPE ALIAS takes its builtin width; SB_PTR_ALIAS_WIDTH=0 is the A/B
+    FConstRetProcs: string;   // DIVERGENZE 590: ';NAME;NAME;' - results declared "As Const <type>" (the parser's CONSTRETPROCS)
     FRecNativeMethods: Boolean;          // phase 3.6: a type with METHODS can be native too; SB_RECNATIVE_METHODS=0 is the A/B
     FRecNativeCtors: Boolean;            // phase 3.6b: ...and one with a CONSTRUCTOR or DESTRUCTOR (SB_RECNATIVE_CTORS)
     FRecNativeHoist: Boolean;            // phase 3.7: a native local record's cell is allocated at the frame's entry
@@ -1095,6 +1098,9 @@ type
     procedure CollectAddressTakenVars(Node: TASTNode);
     procedure CollectDeclTypeOnce(Node: TASTNode);
     procedure CheckByrefArgType(const ProcName: string; ParamNode, ArgNode: TASTNode; Index: Integer);
+    procedure CheckPointerConstArg(const ProcName: string; ParamNode, ArgNode: TASTNode; Index: Integer);  // DIVERGENZE 590
+    procedure CheckPointerConstLet(const LName: string; RNode: TASTNode);                                 // DIVERGENZE 590
+    function CurrentProcParamIsConstP(const Name: string): Boolean;
     function ByrefArgRelation(const ProcName: string; ParamNode, ArgNode: TASTNode; out PT, AT: string): Integer;
     function ByrefArgIsTemporary(const ProcName: string; ParamNode, ArgNode: TASTNode): Boolean;
     // "Dim As V v": a variable named exactly like a type that owns member procedures — rejected, as fbc does.
@@ -1562,6 +1568,7 @@ type
     function PointeeTypeOf(const PtrName: string): string;   // pointee of a raw pointer, DIM *or* PARAMETER
     function PointeeOfDerefTarget(Node: TASTNode): string;   // ...of the EXPRESSION a "*" is applied to
     procedure RequireStringArg(const FuncName: string; ArgsNode: TASTNode);
+    procedure RequireNumericArg(const FuncName: string; ArgsNode: TASTNode);   // HEX/OCT/BIN (DIVERGENZE 590)
     function IsStringArgForBytePtrParam(ParamNode, ArgNode: TASTNode): Boolean;  // string arg -> byte-pointer param
     function TryEmitWStringPtrArg(ParamNode, ArgNode: TASTNode; out Val: TSSAValue): Boolean;  // WSTRING var -> WSTRING PTR param
     function EmitWStringTempAddr(const StrVal: TSSAValue): TSSAValue;           // any string value -> address of a wide-cell temporary
@@ -2014,6 +2021,7 @@ begin
   inherited Create;
   RecMarkCallsAllocate;             // force the gate read before the first EmitInstruction
   FRecNativeKnob := GetEnvironmentVariable('SB_RECNATIVE') <> '0';   // phase 3.2: on by default; =0 is the A/B
+  FPtrAliasWidthKnob := GetEnvironmentVariable('SB_PTR_ALIAS_WIDTH') <> '0';
   FRecNativeMethods := GetEnvironmentVariable('SB_RECNATIVE_METHODS') <> '0';   // phase 3.6: same, for types with methods
   FRecNativeCtors := GetEnvironmentVariable('SB_RECNATIVE_CTORS') <> '0';         // phase 3.6b: on by default; =0 is the A/B
   FRecNativeHoist := GetEnvironmentVariable('SB_RECNATIVE_HOIST') <> '0';         // phase 3.7: on by default; =0 is the A/B
@@ -3885,6 +3893,7 @@ end;
 // Main implementation with destination hint
 procedure TSSAGenerator.ProcessExpressionFull(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
 var
+  CastOperand: TASTNode;        // the operand a cast to a POINTER is given (DIVERGENZE 590)
   ThisPtrFld: TASTNode;         // "*z" on a pointer FIELD asked by its bare name (DIVERGENZE 524)
   ZCharAddr: TSSAValue;         // the address behind a ZSTRING/WSTRING character read (DIVERGENZE 25)
   ZCharWide: Integer;
@@ -4410,6 +4419,23 @@ begin
       // offset / managed handle is reinterpreted, not changed — the receiving variable's declared type
       // drives the deref). A scalar target type converts the value to that bank.
       ArrName2 := Node.ValueUpper;
+      // ⛔ A STRING OR A DECIMAL IS NOT AN ADDRESS (DIVERGENZE 590): "CPtr(Const ZString Ptr, ("abc"))", "Cast(ZString
+      // Ptr, "abc")" and "CPtr(ZString Ptr, 1.5)" are fbc's "error 28: Expected pointer" - and here the first one went
+      // on to run and died with an access violation inside strcmp. Only the provable operands: a string or decimal
+      // LITERAL, parenthesised or not (a string VARIABLE is left to the bank inference, which may guess).
+      if FModernMode and (Pos(' PTR', ArrName2) > 0) and (Node.ChildCount >= 1) and
+         (GetEnvironmentVariable('SB_LAX_CASTPTR') <> '1') then
+      begin
+        CastOperand := Node.GetChild(Node.ChildCount - 1);
+        while (CastOperand <> nil) and (CastOperand.NodeType = antParentheses) and (CastOperand.ChildCount >= 1) do
+          CastOperand := CastOperand.GetChild(0);
+        if (CastOperand <> nil) and (CastOperand.NodeType = antLiteral) and Assigned(CastOperand.Token) and
+           ((CastOperand.Token.TokenType = ttStringLiteral) or (CastOperand.Token.TokenType = ttFloat) or
+            ((CastOperand.Token.TokenType = ttNumber) and (VarType(CastOperand.Value) in [varDouble, varSingle, varCurrency]))) then
+          raise Exception.CreateFmt('Expected pointer: a cast to %s converts an ADDRESS, and it was given %s',
+            [ArrName2,
+             IfThen(CastOperand.Token.TokenType = ttStringLiteral, 'a string', 'a decimal number')]);
+      end;
       // ⭐ DIVERGENZE 395 - A TYPE ALIAS NAMES THE TYPE IT ALIASES. "Type cpFloat As Double : Cast(cpFloat,
       // 3.25)" compared the name as written against 'DOUBLE' and 'SINGLE', found neither, and took the
       // INTEGER conversion: 3. chipmunk's "Const CP_PI = Cast(cpFloat, 3.14159...)" was 3 in every
@@ -7120,6 +7146,7 @@ begin
         end
         else if (FuncName = 'HEX$') or (FuncName = 'HEX') or (FuncName = kWHEX) then
         begin
+          if FModernMode then RequireNumericArg('HEX', ArgListNode);
           // HEX$(n[, digits]) / WHEX - hex string (WHEX = wide; ASCII hex digits are identical UTF-8).
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
             ProcessExpression(ArgListNode.GetChild(0), ArgValue)
@@ -7140,6 +7167,7 @@ begin
         end
         else if (FuncName = 'OCT') or (FuncName = 'BIN') or (FuncName = kWOCT) or (FuncName = kWBIN) then
         begin
+          if FModernMode then RequireNumericArg(FuncName, ArgListNode);
           // OCT/BIN(n[, digits]) and the wide W* forms - octal/binary string of an integer. The W* forms
           // are wide; the digits are ASCII so the bytes are identical to the narrow form.
           if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) then
@@ -11128,6 +11156,9 @@ begin
 
   VarNode := Node.GetChild(0);
   ExprNode := Node.GetChild(1);
+  // DIVERGENZE 590: "b = a" may not drop a CONST that a's pointee carries, as the initialiser may not.
+  if FModernMode and (VarNode <> nil) and (VarNode.NodeType = antIdentifier) and (VarNode.ChildCount = 0) then
+    CheckPointerConstLet(VarNode.ValueUpper, ExprNode);
   // ⭐ DIVERGENZE 586 - "pp[i]->f = v", pp a native "T Ptr Ptr": the object is "(*(pp + i))" (see PtrPtrElemObj).
   if (VarNode.NodeType = antMemberAccess) and (VarNode.ChildCount >= 1) then
   begin
@@ -31338,6 +31369,23 @@ begin
   end;
 end;
 
+function TSSAGenerator.CurrentProcParamIsConstP(const Name: string): Boolean;
+// Was a PARAMETER of the procedure being lowered declared "As Const T Ptr" (the parser's CONSTP)? DIVERGENZE 590.
+var
+  Decl, ParamList, Pm: TASTNode;
+  i: Integer;
+begin
+  Result := False;
+  if FCurrentProcName = '' then Exit;
+  if not (FProcDecls.TryGetValue(FCurrentProcName, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2)) then Exit;
+  ParamList := Decl.GetChild(1);
+  for i := 0 to ParamList.ChildCount - 1 do
+  begin
+    Pm := ParamList.GetChild(i);
+    if Pm.ValueUpper = UpperFast(Name) then Exit(Pm.Attributes.Values['CONSTP'] = '1');
+  end;
+end;
+
 function TSSAGenerator.StringLiteralBytes(Node: TASTNode; out Bytes: Int64): Boolean;
 // A STRING LITERAL's size in bytes as fbc reports it: the characters plus the NUL terminator, because a
 // literal has type "ZString * (n+1)" there and not the STRING descriptor. Answers False for anything
@@ -46127,6 +46175,13 @@ begin
       // not a variable at all — it arrives as a member access, not a bare identifier.
       if NameNode.NodeType <> antIdentifier then Continue;
       NameU := NameNode.ValueUpper;
+      // ⛔ A NAME fbc KEEPS FOR ITSELF IS NOT A VARIABLE (DIVERGENZE 590): "Dim As Integer Cast", "Dim As UByte
+      // Virtual(3)", "Dim __FB_EVAL__ As Integer" - fbc refuses them; most keywords never reach here because the
+      // lexer does not make them identifiers, and these are the ones it lets through. The set is fbc's, measured.
+      // ⛔ ...unless the program RETIRED it: after "#undef TRUE" fbc takes "Const TRUE = -1" (its own boolean tests).
+      if IsFbReservedVarName(NameU) and ((GPPUndefNames = nil) or (GPPUndefNames.IndexOf(NameU) < 0)) and
+         (GetEnvironmentVariable('SB_PP_LAX_DEFINE') <> '1') then
+        raise Exception.CreateFmt('Duplicated definition: "%s" is a FreeBASIC keyword and cannot name a variable', [NameU]);
       if (FindUDT(NameU) >= 0) and TypeNameIsAScope(NameU) then
         raise Exception.CreateFmt('Duplicated definition: "%s" is already the name of a TYPE that has ' +
                                   'member procedures, and BASIC does not tell the two apart', [NameU]);
@@ -47338,7 +47393,13 @@ function TSSAGenerator.RawTypeCodeOfPointee(const PointeeType: string): Integer;
 var
   T: string;
 begin
-  T := UpperFast(PointeeType);
+  // ⭐ A POINTEE NAMED BY A TYPE ALIAS HAS THE ALIAS'S WIDTH (DIVERGENZE 589). This ladder compared the name as
+  // written, so "Type Uint16 As UShort" made "*cptr(Uint16 Ptr, p) = v" a store of EIGHT bytes: SDL_net's
+  // SDLNet_Write32 macro wrote two bytes past an eight-byte array into the next heap block, and the program died
+  // at exit in FreeMem - a crash that moved whenever a line was added or removed. NarrowRefArg resolved the alias
+  // and this function did not; both now do. Every one of the sixty-odd callers, pointer arithmetic included, sees
+  // the canonical name: for a name that is not an alias CanonicalType answers it unchanged.
+  if FPtrAliasWidthKnob then T := UpperFast(CanonicalType(PointeeType)) else T := UpperFast(PointeeType);
   // ⛔ SIGNEDNESS IS PART OF THE CODE, not a detail: the narrow views used to collapse onto the signed
   // one, so every unsigned pointee sign-extended on load (a UByte holding 200 read back as -56). The
   // 64-bit codes need no pair - the int bank IS 64 bits, so there is nothing to extend.
@@ -47408,6 +47469,51 @@ begin
     raise Exception.CreateFmt('%s takes a string: %s is a POINTER. Dereference it (*%s) if you mean ' +
       'the text it points at.',
       [FuncName, Arg.ValueUpper, Arg.ValueUpper]);
+end;
+
+procedure TSSAGenerator.RequireNumericArg(const FuncName: string; ArgsNode: TASTNode);
+// ⭐ HEX / OCT / BIN take a NUMBER (DIVERGENZE 590). fbc refuses a string: "error 99" for a literal, "error 58: Type
+// mismatch" for a CHARACTER read through a ZString/WString pointer - "*q" and "q[i]" are strings in fbc, one
+// character long, while "z[i]" on a fixed ZString is a byte and passes. We answered the text's value (0) or the
+// character's code. ⛔ The same design as RequireStringArg: ONLY WHAT IS PROVABLE - a string literal, and a "*" or a
+// "[ ]" applied to a name DECLARED as a ZString/WString pointer. A string VARIABLE is left alone: the declared-type
+// lookup keyed by bare name has been wrong across procedures before, and a refusal cannot stand on a guess.
+// SB_LAX_NUMARG=1 is the A/B knob.
+var
+  Arg: TASTNode;
+  Pte: string;
+
+  function CharPointee(const P: string): Boolean;
+  var U: string;
+  begin
+    U := UpperFast(Trim(P));
+    if Copy(U, 1, 6) = 'CONST ' then U := Trim(Copy(U, 7, MaxInt));
+    U := CanonicalType(U);
+    Result := (U = 'ZSTRING') or (U = 'WSTRING');
+  end;
+
+begin
+  if (ArgsNode = nil) or (GetEnvironmentVariable('SB_LAX_NUMARG') = '1') then Exit;
+  Arg := ArgsNode;
+  if Arg.NodeType in [antArgumentList, antExpressionList] then
+  begin
+    if Arg.ChildCount < 1 then Exit;
+    Arg := Arg.GetChild(0);
+  end;
+  if Arg = nil then Exit;
+  while (Arg.NodeType = antParentheses) and (Arg.ChildCount >= 1) do Arg := Arg.GetChild(0);
+  if (Arg.NodeType = antLiteral) and Assigned(Arg.Token) and (Arg.Token.TokenType = ttStringLiteral) then
+    raise Exception.CreateFmt('No matching overloaded function, %s(): it takes a number, and it was given a string',
+      [FuncName]);
+  Pte := '';
+  if (Arg.NodeType = antDeref) and (Arg.ChildCount >= 1) then
+    Pte := PointeeOfDerefTarget(Arg.GetChild(0))
+  else if (Arg.NodeType = antArrayAccess) and (Arg.ChildCount >= 1) and (Arg.Attributes.Values['BRACKET'] = '1') and
+          (Arg.GetChild(0).NodeType = antIdentifier) then
+    Pte := PointeeTypeOf(Arg.GetChild(0).ValueUpper);
+  if (Pte <> '') and CharPointee(Pte) then
+    raise Exception.CreateFmt('Type mismatch, at parameter 1 of %s(): a character read through a %s Ptr is a ' +
+      'string, not a number', [FuncName, UpperFast(Trim(Pte))]);
 end;
 
 function TSSAGenerator.PointeeOfDerefTarget(Node: TASTNode): string;
@@ -51210,6 +51316,34 @@ begin
       [ArgsNode.ChildCount, FUDTs[UDTIdx].Name, Slots]);
 end;
 
+function ChainLevelConst(const Chain: string; Level: Integer): Boolean;
+// Is the data Level dereferences down a PTRQUALS chain const? The same reading as CheckPointerConstAssign's
+// LevelConst: the chain is base-first in source order, level 1 is the outermost pointer's pointee.
+var
+  Depth: Integer;
+begin
+  Depth := Length(Chain) - 1;
+  if Level >= Depth then Exit(Chain[1] = '1');
+  Result := Chain[1 + Depth - Level] = '1';
+end;
+
+function QualsOfTypeText(const T: string): string;
+// The CONST chain (the parser's PTRQUALS format: character 1 the BASE, then one per PTR in source order) of a type
+// written as TEXT - a declared return type, "CONST ZSTRING PTR" -> "10". '' when the text names no pointer.
+var
+  W: TStringArray;
+  i: Integer;
+begin
+  Result := '';
+  W := UpperFast(Trim(T)).Split([' '], TStringSplitOptions.ExcludeEmpty);
+  if Length(W) = 0 then Exit;
+  if W[0] = 'CONST' then Result := '1' else Result := '0';
+  for i := 1 to High(W) do
+    if (W[i] = 'PTR') or (W[i] = 'POINTER') then
+      if W[i - 1] = 'CONST' then Result := Result + '1' else Result := Result + '0';
+  if Length(Result) < 2 then Result := '';
+end;
+
 procedure TSSAGenerator.CheckPointerConstAssign(Decl: TASTNode);
 // FreeBASIC's rule for initialising one pointer from another, and it is ONE rule: **a const may not be
 // dropped at any dereference level**. Not the base type - "Byte Ptr = UByte Ptr" is legal - and not the
@@ -51241,13 +51375,34 @@ var
 begin
   if (FVarPtrQuals = nil) or (Decl = nil) or (Decl.ChildCount < 3) then Exit;
   if Decl.GetChild(0).NodeType <> antIdentifier then Exit;
-  if Decl.GetChild(2).NodeType <> antIdentifier then Exit;     // only "= <another variable>" for now
   LName := Decl.GetChild(0).ValueUpper;
-  RName := Decl.GetChild(2).ValueUpper;
   // ⛔ The DESTINATION is the declaration being lowered right now, so its chain is on the NODE - it is
   // not in the registry yet, and must not be: registering it first would let a name shadow itself.
   LQ := Decl.Attributes.Values['PTRQUALS'];
-  RQ := FVarPtrQuals.Values[RName];
+  if Decl.GetChild(2).NodeType = antIdentifier then
+  begin
+    RName := Decl.GetChild(2).ValueUpper;
+    RQ := FVarPtrQuals.Values[RName];
+  end
+  // ⭐ ...and "= <a call>" (DIVERGENZE 590): the chain of the type the callee was DECLARED to return. getenv is
+  // "As Const ZString Ptr", and "Dim As ZString Ptr nm = getname( ... )" is fbc's error 181.
+  else if (Decl.GetChild(2).NodeType in [antFunctionCall, antArrayAccess]) and
+          (GetEnvironmentVariable('SB_LAX_CONSTPTR') <> '1') then
+  begin
+    // the callee's name: a call written like an index ("f()" in an initialiser) carries it in its first child
+    if Decl.GetChild(2).NodeType = antFunctionCall then RName := Decl.GetChild(2).ValueUpper
+    else if (Decl.GetChild(2).ChildCount >= 1) and (Decl.GetChild(2).GetChild(0).NodeType = antIdentifier) then
+      RName := Decl.GetChild(2).GetChild(0).ValueUpper
+    else Exit;
+    // ⛔ Only a name the parser saw declared "As Const <type>" - the type TEXT has lost the qualifier by here, and
+    // an array element or anything else with that name is not a call: both stay silent.
+    if Pos(';' + RName + ';', FConstRetProcs + ';') = 0 then Exit;
+    RQ := QualsOfTypeText(CalleeRetTypeName(Decl.GetChild(2)));
+    if RQ = '' then Exit;
+    RQ := '1' + Copy(RQ, 2, MaxInt);
+    RName := RName + '()';
+  end
+  else Exit;
   if (LQ = '') or (RQ = '') then Exit;                          // one side is not a declared pointer
   n := Length(LQ) - 1;                                          // the destination's pointer depth
   if Length(RQ) - 1 < n then n := Length(RQ) - 1;               // ...or the source's, whichever is less
@@ -51257,6 +51412,61 @@ begin
         'Invalid assignment/conversion: "%s" would drop the CONST that "%s" carries %d dereference(s) ' +
         'down. FreeBASIC lets a pointer assignment ADD a const at any level and never remove one.',
         [LName, RName, j]);
+end;
+
+procedure TSSAGenerator.CheckPointerConstLet(const LName: string; RNode: TASTNode);
+// ⭐ The same rule for an ASSIGNMENT, "b = a" (DIVERGENZE 590): fbc refuses dropping a CONST there exactly as in the
+// initialiser, and only the initialiser was checked. Both chains come from the declarations; nothing is guessed.
+var
+  LQ, RQ: string;
+  j, n: Integer;
+begin
+  if (FVarPtrQuals = nil) or (RNode = nil) or (GetEnvironmentVariable('SB_LAX_CONSTPTR') = '1') then Exit;
+  if (RNode.NodeType <> antIdentifier) or (RNode.ChildCount <> 0) then Exit;
+  LQ := FVarPtrQuals.Values[LName];
+  RQ := FVarPtrQuals.Values[RNode.ValueUpper];
+  if (LQ = '') or (RQ = '') then Exit;
+  n := Length(LQ) - 1;
+  if Length(RQ) - 1 < n then n := Length(RQ) - 1;
+  for j := 1 to n do
+    if ChainLevelConst(RQ, j) and not ChainLevelConst(LQ, j) then
+      raise Exception.CreateFmt(
+        'Invalid assignment/conversion: "%s" would drop the CONST that "%s" carries %d dereference(s) ' +
+        'down. FreeBASIC lets a pointer assignment ADD a const at any level and never remove one.',
+        [LName, RNode.ValueUpper, j]);
+end;
+
+procedure TSSAGenerator.CheckPointerConstArg(const ProcName: string; ParamNode, ArgNode: TASTNode; Index: Integer);
+// ⭐ ...and a BYVAL pointer PARAMETER is a destination too (DIVERGENZE 590): passing a "Const ZString Ptr" where the
+// parameter says "ZString Ptr" (or "Any Ptr") is fbc's error 181. A parameter keeps only its BASE qualifier (the
+// parser's CONSTP), so only that level is compared, and only at equal depth: a qualifier the declaration lost must
+// never turn into a refusal.
+var
+  PT, RQ, AName: string;
+  PDepth, RDepth: Integer;
+begin
+  if (FVarPtrQuals = nil) or (ParamNode = nil) or (ArgNode = nil) or (not FModernMode) or
+     (GetEnvironmentVariable('SB_LAX_CONSTPTR') = '1') then Exit;
+  if ParamNode.Attributes.Values['BYREF'] = '1' then Exit;
+  if ParamNode.Attributes.Values['CONSTP'] = '1' then Exit;               // the parameter keeps the const
+  PT := ParamDeclaredTypeName(ParamNode);
+  PDepth := Length(QualsOfTypeText(PT)) - 1;
+  if PDepth < 1 then Exit;                                                // not a pointer parameter
+  if (ArgNode.NodeType <> antIdentifier) or (ArgNode.ChildCount <> 0) then Exit;
+  AName := ArgNode.ValueUpper;
+  RQ := '';
+  if CurrentProcParamTypeName(AName) <> '' then
+  begin
+    if CurrentProcParamIsConstP(AName) then
+      RQ := '1' + StringOfChar('0', Length(QualsOfTypeText(CurrentProcParamTypeName(AName))) - 1);
+  end
+  else
+    RQ := FVarPtrQuals.Values[AName];
+  if RQ = '' then Exit;
+  RDepth := Length(RQ) - 1;
+  if (RDepth = PDepth) and (RQ[1] = '1') then
+    raise Exception.CreateFmt('Invalid assignment/conversion, at parameter %d of %s(): "%s" points at CONST data, ' +
+      'and the parameter would drop the CONST', [Index + 1, ProcName, AName]);
 end;
 
 function TSSAGenerator.TypeHasMemberProc(const TypeName: string): Boolean;
@@ -56855,6 +57065,9 @@ begin
   // DIVERGENZE 495: a variable of another size or class for a BYREF numeric parameter is refused, as fbc does.
   for i := 0 to NArgs - 1 do
     CheckByrefArgType(UpperFast(ParamOwnerName), ParamList.GetChild(i), ArgListNode.GetChild(i), i);
+  // DIVERGENZE 590: a CONST pointee may not be dropped by a BYVAL pointer parameter.
+  for i := 0 to NArgs - 1 do
+    CheckPointerConstArg(UpperFast(ParamOwnerName), ParamList.GetChild(i), ArgListNode.GetChild(i), i);
 
   // Phase 1: evaluate every explicit argument (in source order, preserving side-effect order) into a
   // bank register, recording its target transfer slot.
@@ -60867,6 +61080,7 @@ begin
   // these names must be recognised as a foreign call wherever it appears, including above the point the
   // DECLARE was written. The parser is the only pass that ever sees a bodiless DECLARE - it emits no
   // node - so this attribute is where that information exists. DIVERGENZE 183.
+  FConstRetProcs := AST.Attributes.Values['CONSTRETPROCS'];   // DIVERGENZE 590
   if AST.Attributes.Values['FOREIGNDECLS'] <> '' then
   begin
     // ⛔ Split BY HAND, not through DelimitedText: a parameter type carries a SPACE ("INTEGER PTR")

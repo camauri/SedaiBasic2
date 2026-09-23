@@ -2350,7 +2350,7 @@ in a record, or in the numeric builtins. Keep one in a plain `Dim` until those c
 |---|---|---|
 | `# (Argument stringize)` | ✓ | `#param` in a function-like macro body stringizes the argument into a string literal. |
 | `## (Argument concatenation)` | ✓ | `a ## b` in a macro body pastes the surrounding tokens together. |
-| `! (Escaped String Literal)` | ✓ | `!"\n\t\\\"..."` processes escape sequences (lexer): `\a \b \f \n \l \r \t \v \\ \" \'`, `\DDD` decimal, `\xNN` hex, `\&hNN`/`\&oNNN`/`\&bNNNN`, `\uNNNN`. Every numeric escape but `\u` names one **byte**; `\u` names a codepoint and is UTF-8 encoded. |
+| `! (Escaped String Literal)` | ✓ | `!"\n\t\\\"..."` processes escape sequences (lexer): `\a \b \f \n \l \r \t \v \\ \" \'`, `\DDD` decimal, `\xNN` hex, `\&hNN`/`\&oNNN`/`\&bNNNN`, `\uNNNN`. Every numeric escape but `\u` names one **byte**; `\u` names a codepoint and is UTF-8 encoded. ⚠️ **`\U` is an UNKNOWN escape** (only `\unnnn` is documented): the backslash goes and the letter stays, as fbc does for `\Ux` - so `!"\U0041x"` is `U0041x`. With digits after it fbc itself damages the literal (`U004` with its C backend, `U0041Ux` with `-gen gas64`), a defect reported in `job/fbc-upstream/ISSUES.md` n. 8 and not copied (DIVERGENZE 590, owner's rule of 17 Sep 2026). |
 | `$ (Non-Escaped String Literal)` | ✓ | `$"..."` takes the body verbatim (our default for `"..."`). |
 
 #### Pointer Operators
