@@ -1256,6 +1256,7 @@ type
     procedure EmitSharedSyncIn;                          // M6: load shared-global slots -> their registers
     procedure EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);  // value-copy
     procedure EmitUserFunctionCall(Name: string; ArgsNode: TASTNode; out Result: TSSAValue);  // V3
+    function PlusToken: TLexerToken;                                                   // an operator token for a synthesised "+" (586 · 595)
     function PtrPtrElemObj(ObjNode: TASTNode): TASTNode;                               // "pp[i]" of a native T Ptr Ptr as an object (586)
     function ZStrFieldIndexNode(Node: TASTNode): TASTNode;                             // "x.dat[i]" on a ZString * n field (571)
     function StrLitMark(const V: TSSAValue): TSSAValue;                                  // a literal's text for ssaStrSAdd (593)
@@ -53539,6 +53540,24 @@ begin
     Result := MakeSSAValue(svkNone);
 end;
 
+function TSSAGenerator.PlusToken: TLexerToken;
+// ⭐ DIVERGENZE 586 · 595 - the token of a SYNTHESISED "p + i". Raw pointer arithmetic (scaled by SizeOf the pointee)
+// is recognised by the TOKEN of the binary node (ttOpAdd), so a "+" built with an identifier's token was a plain
+// unscaled sum: right for a managed pointer (whose arithmetic counts elements anyway) and wrong over native memory -
+// "(*pp)[2].a" and "h.items[2].a" wrote and read the wrong record. With this token each base takes its own road.
+// One token, owned by the generator. SB_PLUS_TOKEN=0 hands out an IDENTIFIER token instead - the road of before, the
+// A/B on one binary.
+begin
+  if FPlusToken = nil then
+  begin
+    if GetEnvironmentVariable('SB_PLUS_TOKEN') = '0' then
+      FPlusToken := TLexerToken.Create(ttIdentifier, '+', 0, 0, 0, 1)
+    else
+      FPlusToken := TLexerToken.Create(ttOpAdd, '+', 0, 0, 0, 1);
+  end;
+  Result := FPlusToken;
+end;
+
 function TSSAGenerator.PtrPtrElemObj(ObjNode: TASTNode): TASTNode;
 // ⭐ DIVERGENZE 586 - "pp[i]" where pp is a "T Ptr Ptr" over NATIVE memory (Callocate'd, or C's), as the OBJECT of a
 // member access: the element is what LIVES at pp + i. "(*(pp + i))->f" already read and wrote it; "pp[i]->f" did not -
@@ -53566,8 +53585,7 @@ begin
   if Idx = nil then Exit;
   // ⛔ The "+" carries an OPERATOR token: raw pointer arithmetic is recognised by the token (ttOpAdd), and with the
   // identifier's token "pp + i" was an unscaled integer sum - one byte on, a garbage address.
-  if FPlusToken = nil then FPlusToken := TLexerToken.Create(ttOpAdd, '+', 0, 0, 0, 1);
-  Sum := TASTNode.CreateWithValue(antBinaryOp, '+', FPlusToken);
+  Sum := TASTNode.CreateWithValue(antBinaryOp, '+', PlusToken);
   Sum.AddChild(ObjNode.GetChild(0).Clone);
   Sum.AddChild(Idx.Clone);
   Der := TASTNode.Create(antDeref, ObjNode.GetChild(0).Token);
@@ -55363,7 +55381,7 @@ begin
       if ChainIdx <> nil then
       begin
         CancelObj := TASTNode.Create(antDeref, ObjNode.GetChild(0).Token);
-        SharedTmp := TASTNode.CreateWithValue(antBinaryOp, '+', ObjNode.GetChild(0).Token);
+        SharedTmp := TASTNode.CreateWithValue(antBinaryOp, '+', PlusToken);   // DIVERGENZE 595: an operator token (see PlusToken)
         SharedTmp.AddChild(ObjNode.GetChild(0).Clone);
         SharedTmp.AddChild(ChainIdx.Clone);
         CancelObj.AddChild(SharedTmp);
@@ -55476,7 +55494,7 @@ begin
         if ChainIdx <> nil then
         begin
           CancelObj := TASTNode.Create(antDeref, ObjNode.GetChild(0).Token);
-          SharedTmp := TASTNode.CreateWithValue(antBinaryOp, '+', ObjNode.GetChild(0).Token);
+          SharedTmp := TASTNode.CreateWithValue(antBinaryOp, '+', PlusToken);   // DIVERGENZE 595: an operator token (see PlusToken)
           SharedTmp.AddChild(ObjNode.GetChild(0).Clone);
           SharedTmp.AddChild(ChainIdx.Clone);
           CancelObj.AddChild(SharedTmp);
