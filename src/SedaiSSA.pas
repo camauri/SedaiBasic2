@@ -682,6 +682,7 @@ type
     FForeignProcExterns: TStringList;    // DIVERGENZE 422: ...whose type is a named PROCEDURE type (libxml's xmlFree)
     FForeignDataArrays: TStringList;     // DIVERGENZE 441: "NAME=symbol|T|lb:ub,..." - a C library's data ARRAY
     FFgnRedeclNames: TStringList;        // DIVERGENZE 552: foreign names declared again after a #undef
+    FFgnDefaults: TStringList;           // DIVERGENZE 557: NAME=encoded defaults of a foreign declaration's parameters
     FFgnRowLine: array of Integer;       // ...the source line each of their LATER rows was declared on (0 = none)
     FArrayScalarType: TStringList;
     FAddrNativeArrays: array of Boolean;  // phase 2.3: array id -> "@a(i)" is a machine address in the fb mode       // array name (UPPER) -> scalar element type name (for VAR inference before the array is declared in FProgram)
@@ -801,6 +802,7 @@ type
     function ForeignPtrCellArg(Node: TASTNode): Boolean;   // "@p" of a POINTER variable: a cell C may fill (443, 450)
     function VariadicCallSiteDecl(const Decl: TForeignDecl; ArgListNode: TASTNode;
                                   NArgs: Integer; const RetOverride: string = ''): Integer;   // la coda variadica di UN sito
+    function TryForeignDefaults(const NameU: string; const Decl: TForeignDecl; ArgListNode: TASTNode; NArgs: Integer; out ResultVal: TSSAValue): Boolean;  // 557
     function TryForeignCall(const NameU: string; ArgListNode: TASTNode;
                             out ResultVal: TSSAValue): Boolean;
     procedure CanonicaliseForeignDecls;   // resolve the declarations' types through the alias table
@@ -1252,6 +1254,7 @@ type
     procedure EmitSharedSyncIn;                          // M6: load shared-global slots -> their registers
     procedure EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; UDTIdx: Integer);  // value-copy
     procedure EmitUserFunctionCall(Name: string; ArgsNode: TASTNode; out Result: TSSAValue);  // V3
+    function StrLitMark(const V: TSSAValue): TSSAValue;                                  // a literal's text for ssaStrSAdd (593)
     function FuncPtrSigRetUDT(const Sig1, Sig2: string): string;                      // the record a procptr signature returns (592)
     function FuncPtrRecordCallType(ObjNode: TASTNode): string;                         // the record "v(args)" / "o.f(args)" returns (592)
     function IsFuncPtrRecordCall(ObjNode: TASTNode): Boolean;                          // "v(args)" through a record-returning procptr (592)
@@ -1404,6 +1407,7 @@ type
     function ArrayRank1Flag(ArrayIdx: Integer): TSSAValue;   // Src3 of ssaArrayUBound: array is 1-D
     function ApplyScalarNarrow(const VarName: string; Value: TSSAValue; SrcNode: TASTNode = nil): TSSAValue;  // narrow on scalar store
     function ApplyResultNarrow(const VarName: string; Value: TSSAValue): TSSAValue; // ...on a FUNCTION result
+    function ProcRetClosureSig(const ProcName: string): string;                        // a cdecl function's procptr result (583)
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
     // FB implicit THIS: a bare field name in a method body -> synthesized "this.<field>" access.
@@ -2351,6 +2355,7 @@ begin
   FTypeEnumMembers.Free;
   FTypeConstMembers.Free;
   FEnumNames.Free;
+  FreeAndNil(FFgnDefaults);
   FTypeDeclLine.Free;
   FEnumMemberType.Free;
   FEnumQualVals.Free;
@@ -3306,6 +3311,7 @@ begin
       end;
       if T = '#P' then T := 'ANY PTR';                  // a procedure-pointer parameter
       T := UpperFast(CanonicalType(UpperFast(T)));
+      if (T = 'CVA_LIST') and (GetEnvironmentVariable('SB_CB_VALIST') <> '0') then T := 'ANY PTR';   // 582
       // ⭐ DIVERGENZE 565 - a record is a struct by value here too, as on the "@proc" road below (563).
       if (T <> '') and (ForeignKindOf(T) = fkUnknown) and (GetEnvironmentVariable('SB_FIELD_SVAL') <> '0') then
         T := CallbackStructLeg(T);
@@ -3340,6 +3346,10 @@ begin
     // canonical names, and an unknown one would drop the whole signature - the closure never built.
     if T <> '' then T := UpperFast(CanonicalType(T));
     if T = '' then Exit;
+    // ⭐ DIVERGENZE 582 - a VA_LIST parameter ("byval ap As va_list", ODE's message handler) is what C passes for one:
+    // a POINTER (SysV hands the address of its __va_list_tag array, Win64 a char pointer). It had no C type, the whole
+    // signature was dropped, and C jumped into the bytecode. The handler hands it on to vsnprintf, which takes it back.
+    if (T = 'CVA_LIST') and (GetEnvironmentVariable('SB_CB_VALIST') <> '0') then T := 'ANY PTR';
     // ⭐ DIVERGENZE 563 - ...and a parameter declared as a RECORD is a struct BY VALUE, spelled out here because
     // the runtime has no way back to the declaration. Asked before the refusal: ForeignKindOf sees only the NAME
     // of a UDT and answers fkUnknown, which dropped the whole signature and left C jumping to a bytecode PC.
@@ -3485,8 +3495,13 @@ begin
   NameNode := Decl.GetChild(0);
   if (NameNode = nil) or (NameNode.ChildCount < 1) or (NameNode.GetChild(0).NodeType <> antIdentifier) then Exit;
   T := NameNode.GetChild(0).ValueUpper;
+  // ⭐ DIVERGENZE 575 - ...and a return type that is an ALIAS of one ("Type pT As T Ptr", CUnit's CU_pSuite): read
+  // through what it names, or "getit()->n" printed the pointer itself.
+  if ((Length(T) <= 4) or (Copy(T, Length(T) - 3, 4) <> ' PTR')) and (GetEnvironmentVariable('SB_RETALIAS_PTR') <> '0') then
+    T := UpperFast(CanonicalType(T));
   if (Length(T) <= 4) or (Copy(T, Length(T) - 3, 4) <> ' PTR') then Exit;
   T := Trim(Copy(T, 1, Length(T) - 4));
+  if FindUDT(T) < 0 then T := UpperFast(CanonicalType(T));
   if FindUDT(T) >= 0 then Result := T;
 end;
 
@@ -4252,7 +4267,7 @@ begin
         end;
         Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaStrSAdd, Result, EnsureStringRegister(TempVal),
-                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                        StrLitMark(TempVal), MakeSSAValue(svkNone));
       end
       // ⛔ ...AND THE FIELD OF THIS COMES FIRST HERE TOO. "@gi" inside a method of a type that has a
       // field "gi" answered the address of a module-shared "gi" of the same name - the third reader of
@@ -9727,7 +9742,7 @@ begin
           ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          EmitInstruction(ssaStrSAdd, Result, ArgReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          EmitInstruction(ssaStrSAdd, Result, ArgReg, StrLitMark(ArgValue), MakeSSAValue(svkNone));
           Exit;
         end;
 
@@ -31106,6 +31121,29 @@ begin
                       MakeSSAConstInt(BinaryElemBytesOfWidthCode(W) or (Bank shl 8)));
       Exit(True);
     end;
+    // ⭐ DIVERGENZE 559 - "Put #f, pos, a(i), n": n ELEMENTS from the one named, as fbc writes them (and GET reads them).
+    // The count was parsed and ignored, so one element went out - a 20-byte buffer made a 1-byte file. The block is the
+    // bytes from "@a(i)": a machine address in the fb memory model (phase 2.3), a name the transfer resolves in strict.
+    if (NIdx > 0) and (ArrIdx >= 0) and Assigned(CountNode) and
+       (FProgram.GetArray(ArrIdx).ElementType <> srtString) and
+       (ArrayRecordTypeOf(VarToStr(ValueNode.GetChild(0).Value)) = '') and
+       (GetEnvironmentVariable('SB_BIN_ELEMCOUNT') <> '0') then
+    begin
+      BaseNode := TASTNode.Create(antProcAddress, ValueNode.Token);
+      try
+        BaseNode.AddChild(ValueNode.Clone);
+        ProcessExpression(BaseNode, AddrVal);
+      finally
+        BaseNode.Free;
+      end;
+      ProcessExpression(CountNode, CntVal);
+      BytesReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaMulInt, BytesReg, EnsureIntRegister(CntVal),
+                      EnsureIntRegister(MakeSSAConstInt(BinaryElemBytesOfNode(ValueNode))), MakeSSAValue(svkNone));
+      if IsGet then Op := ssaGetBinMem else Op := ssaPutBinMem;
+      EmitInstruction(Op, MakeSSAValue(svkNone), HandleReg, EnsureIntRegister(AddrVal), BytesReg);
+      Exit(True);
+    end;
   end;
 
   // --- a whole UDT instance: "Put #f, , u" / "Get #f, , This" ---
@@ -32665,8 +32703,42 @@ function TSSAGenerator.ApplyResultNarrow(const VarName: string; Value: TSSAValue
 // ⛔ This deliberately does NOT reach the FOR counter, where the same narrowing would be faithful and
 // USELESS: "For i As UByte = 253 To 255" wraps the counter past 255 and never terminates - measured,
 // fbc spins there while we finish in three iterations. Reproducing an infinite loop is not fidelity.
+var
+  Sig: string;
 begin
   Result := ApplyScalarNarrow(VarName, Value);
+  // ⭐ DIVERGENZE 583 - a C-callable FUNCTION (cdecl / stdcall) whose result is a PROCEDURE-POINTER type hands C
+  // something C will CALL: ODE's user geom class asks the program's "collider" selector for a collision function and
+  // jumps to what it got. The entry PC of the VM is no address, so it becomes a closure, as a procedure field does
+  // (561); a BASIC caller takes it back to the procedure (EmitUserFunctionCall, ValueForC mode -3).
+  Sig := ProcRetClosureSig(VarName);
+  if Sig = '' then Exit;
+  Value := EnsureIntRegister(Result);
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaValueForC, Result, Value, MakeSSAConstString(Sig), MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.ProcRetClosureSig(const ProcName: string): string;
+// The closure signature of what a C-callable (cdecl / stdcall) FUNCTION returns when that is a PROCEDURE-POINTER type,
+// named ("As ColFn") or written in line ("As Function(...) As Long"); '' for anything else (583). SB_CB_PROCRET=0 is the
+// A/B knob on one binary.
+var
+  Decl, NameNode: TASTNode;
+  RetT, Sig: string;
+begin
+  Result := '';
+  if (ProcName = '') or (GetEnvironmentVariable('SB_CB_PROCRET') = '0') then Exit;
+  if not FProcDecls.TryGetValue(UpperFast(ProcName), Decl) or (Decl = nil) then Exit;
+  if Decl.Attributes.Values['CALLCONV'] = '' then Exit;
+  if Decl.ChildCount < 1 then Exit;
+  NameNode := Decl.GetChild(0);
+  if (NameNode = nil) or (NameNode.ChildCount < 1) or (NameNode.GetChild(0).NodeType <> antIdentifier) then Exit;
+  RetT := NameNode.GetChild(0).ValueUpper;
+  if FuncPtrTypeSig(RetT) <> '' then Sig := FuncPtrTypeSig(RetT)
+  else if (NameNode.Attributes.Values['FUNCPTR'] = '1') and (NameNode.Attributes.Values['FPRETBYREF'] = '') then
+    Sig := NameNode.Attributes.Values['FPPARAMS'] + '|' + NameNode.Attributes.Values['FPRET']
+  else Exit;
+  Result := ForeignFieldClosureSig(Sig);
 end;
 
 // Convert an INT value to float, remembering whether the source was UNSIGNED. The distinction is
@@ -33271,9 +33343,21 @@ begin
   // ⛔ ...AND A NAME IN A PROCEDURE TYPE'S DEFAULT IS A USE (DIVERGENZE 534). That default travels as TEXT on the node
   // (FPDEFAULTS, "I<name>"), not as a child, so the walk below never meets it: "Const K = 40" read by
   // "Function(ByVal As Long = K)" alone was counted once, never materialised, and the default answered 0.
-  if Node.Attributes.Values['FPDEFAULTS'] <> '' then
+  // ⭐ DIVERGENZE 557 - ...and so is one in the default of a FOREIGN parameter, which travels on the program node
+  // ("NAME=d0#31d1...", #30 between declarations): "byval b as long = BASE16" alone kept BASE16 from being born.
+  if (Node.Attributes.Values['FPDEFAULTS'] <> '') or (Node.Attributes.Values['FOREIGNDEFAULTS'] <> '') then
   begin
     Cur := Node.Attributes.Values['FPDEFAULTS'] + #31;
+    V := Node.Attributes.Values['FOREIGNDEFAULTS'];
+    if V <> '' then
+    begin
+      V := V + #30;
+      while Pos(#30, V) > 0 do
+      begin
+        Cur := Cur + Copy(Copy(V, 1, Pos(#30, V) - 1), Pos('=', Copy(V, 1, Pos(#30, V) - 1)) + 1, MaxInt) + #31;
+        Delete(V, 1, Pos(#30, V));
+      end;
+    end;
     V := '';
     for i := 1 to Length(Cur) do
       if Cur[i] = #31 then
@@ -42436,7 +42520,7 @@ begin
       begin
         DefVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaStrSAdd, DefVal, EnsureStringRegister(ArgVals[i]),
-                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                        StrLitMark(ArgVals[i]), MakeSSAValue(svkNone));
         ArgVals[i] := DefVal;
       end;
       EmitXferStore(RT, Slot, ArgVals[i]);          // coerced to the parameter's bank
@@ -50675,7 +50759,7 @@ begin
       begin
         Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaStrSAdd, Result, EnsureStringRegister(TempVal),
-                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                        StrLitMark(TempVal), MakeSSAValue(svkNone));
         Exit;
       end;
     end;
@@ -52740,7 +52824,7 @@ begin
             begin
               ProcessStringExpression(ArgListNode.GetChild(i), ArgVal);
               SAddr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-              EmitInstruction(ssaStrSAdd, SAddr, EnsureStringRegister(ArgVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+              EmitInstruction(ssaStrSAdd, SAddr, EnsureStringRegister(ArgVal), StrLitMark(ArgVal), MakeSSAValue(svkNone));
             end;
           finally
             PNode.Free;
@@ -52971,6 +53055,13 @@ begin
         FuncRetType := GetVariableType(Name);
       Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
       EmitXferLoad(FuncRetType, XFER_RESULT_SLOT, Result);
+      // ⭐ DIVERGENZE 583 - a C-callable function returning a procedure hands back a CLOSURE; the procedure is its PC.
+      if (FuncRetType = srtInt) and (ProcRetClosureSig(Name) <> '') then
+      begin
+        RcHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaValueForC, RcHandle, Result, MakeSSAValue(svkNone), MakeSSAConstInt(-3));
+        Result := RcHandle;
+      end;
     end
     else
     begin
@@ -53370,6 +53461,17 @@ begin
     Result := VarRecordTypeName(VarToStr(Node.Value));
 end;
 
+function TSSAGenerator.StrLitMark(const V: TSSAValue): TSSAValue;
+// ⭐ DIVERGENZE 593 - the second operand of an ssaStrSAdd: the LITERAL's text when the string is one, so the bytecode
+// carries its pool index and the VM hands every "@\"k\"" of the program ONE address, as fbc does (it pools identical
+// literals, with the gcc backend and with -gen gas64 alike). svkNone for any other string: that one is a COPY.
+begin
+  if (V.Kind = svkConstString) and (GetEnvironmentVariable('SB_LIT_POOL') <> '0') then
+    Result := MakeSSAConstString(V.ConstString)
+  else
+    Result := MakeSSAValue(svkNone);
+end;
+
 function TSSAGenerator.FuncPtrSigRetUDT(const Sig1, Sig2: string): string;
 // The record a procedure-pointer signature "params|ret" returns BY VALUE ('' for a scalar, a reference or none):
 // the first of the two signatures given that is not empty (a local one, then the module's).
@@ -53594,6 +53696,12 @@ begin
       // the identical access through a variable was right.
       if (Result = '') and (ArrayIndexOf(ArrName) < 0) then
         Result := ForeignRetUDTName(ArrName);
+      // ⭐ DIVERGENZE 594 - ...and one that returns a POINTER to a record, as "f(args)->field" of a BASIC function
+      // already answers through ProcReturnPtrUDT above: "*tcopy(...)->nm" (a ZString Ptr field of the record memcpy
+      // hands back) printed the address, because nobody knew what the object was.
+      if (Result = '') and (ArrayIndexOf(ArrName) < 0) and (FProcedureNames.IndexOf(ArrName) < 0) and
+         (GetEnvironmentVariable('SB_FGNPTR_OBJTYPE') <> '0') then
+        Result := ForeignRetPtrUDTName(ArrName);
       // ⭐ DIVERGENZE 592 - ...and a PROCEDURE-POINTER variable whose type returns a record: "v(4).r" answered '' here,
       // so the access never lowered the call and read the pointer's own value as a record.
       if (Result = '') and (ArrayIndexOf(ArrName) < 0) then
@@ -55318,7 +55426,7 @@ var
   TypeName, NestedT, MethodLbl, SMBack, QualKey, EnumQual: string;
   UDTIdx, Slot, QualIdx: Integer;
   Bank: TSSARegisterType;
-  HandleVal, DestVal: TSSAValue;
+  HandleVal, DestVal, TempV: TSSAValue;
   Op: TSSAOpCode;
   AccNode: TASTNode;
 begin
@@ -55478,6 +55586,18 @@ begin
     Op := ssaRecordLoadInt;
   end;
   EmitInstruction(Op, DestVal, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
+  // ⭐ DIVERGENZE 594 - ...and a POINTER field that holds what C reads (576) holds a MACHINE address: the typed raw read
+  // of a named object marks it (RTC_NPTR), and this managed road - "getit()->nm", an object that is a CALL - read it
+  // bare, so "*getit()->nm" dereferenced a machine address as a name of the VM. The same marking, by bcPtrFromInt.
+  if (Bank = srtInt) and (UDTFieldIndex(UDTIdx, VarToStr(Node.Value)) >= 0) and
+     FieldWantsValueForC(UDTIdx, UDTFieldIndex(UDTIdx, VarToStr(Node.Value))) and
+     (FUDTs[UDTIdx].Fields[UDTFieldIndex(UDTIdx, VarToStr(Node.Value))].FuncPtrSig = '') and
+     (GetEnvironmentVariable('SB_FIELDREAD_HOME') <> '0') then
+  begin
+    TempV := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaPtrFromInt, TempV, DestVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    DestVal := TempV;
+  end;
   // A BIT FIELD names part of the unit just loaded: shift it down and mask it.
   DestVal := EmitBitFieldExtract(DestVal, UDTIdx, UDTFieldIndex(UDTIdx, VarToStr(Node.Value)));
   // A fixed-length string FIELD ("As String * n") is stored NUL-padded to its capacity, like a
@@ -56535,7 +56655,7 @@ var
   ParamUdtU: string;
   CoercByval, HandledImplicit: Boolean;   // the coerced temporary IS the byval copy (m759)
   ParamUdtDef: Integer;                   // ...and a DEFAULT value is an argument too (m760)
-  ArgVal, TempVal2: TSSAValue;
+  ArgVal, TempVal2, LitMark: TSSAValue;
   StageSlots: array of Integer;
   StageRTs: array of TSSARegisterType;
   StageVals: array of TSSAValue;
@@ -56697,9 +56817,10 @@ begin
     else if (RT = srtInt) and IsStringArgForBytePtrParam(ParamList.GetChild(i), ArgExpr) then
     begin
       ProcessStringExpression(ArgExpr, ArgVal);
+      LitMark := StrLitMark(ArgVal);
       ArgVal := EnsureStringRegister(ArgVal);
       TempVal2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-      EmitInstruction(ssaStrSAdd, TempVal2, ArgVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      EmitInstruction(ssaStrSAdd, TempVal2, ArgVal, LitMark, MakeSSAValue(svkNone));
       ArgVal := TempVal2;
     end
     else if RT = srtString then
@@ -57360,6 +57481,7 @@ begin
         Start := i + 1;
         if Piece = '#P' then Piece := 'ANY PTR'          // a procedure pointer is a pointer to C
         else if Piece <> '' then Piece := UpperFast(CanonicalType(Piece));
+        if (Piece = 'CVA_LIST') and (GetEnvironmentVariable('SB_CB_VALIST') <> '0') then Piece := 'ANY PTR';   // 582
         if (Piece <> '') and (ForeignKindOf(Piece) = fkUnknown) and (GetEnvironmentVariable('SB_FIELD_SVAL') <> '0') then
           Piece := CallbackStructLeg(Piece);
         if (Piece = '') or (ForeignKindOf(Piece) = fkUnknown) then Exit;
@@ -57755,6 +57877,62 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.TryForeignDefaults(const NameU: string; const Decl: TForeignDecl; ArgListNode: TASTNode;
+  NArgs: Integer; out ResultVal: TSSAValue): Boolean;
+// DIVERGENZE 557: the call again, with the missing trailing arguments taken from the declaration's DEFAULTS. False (and
+// nothing emitted) when a missing parameter has no default this reader can build - the refusal then stands.
+var
+  Defs: TStringList;
+  Full: TASTNode;
+  Tok: TLexerToken;
+  i: Integer;
+  D: string;
+  N: TASTNode;
+begin
+  Result := False;
+  ResultVal := MakeSSAValue(svkNone);
+  if (FFgnDefaults = nil) or (GetEnvironmentVariable('SB_FGN_DEFAULTS') = '0') then Exit;
+  if FFgnDefaults.IndexOfName(NameU) < 0 then Exit;
+  Defs := TStringList.Create;
+  try
+    Defs.Delimiter := #31;
+    Defs.StrictDelimiter := True;
+    Defs.DelimitedText := FFgnDefaults.Values[NameU];
+    for i := NArgs to High(Decl.ParamTypeNames) do
+    begin
+      if i >= Defs.Count then Exit;
+      D := Defs[i];
+      if (D = '') or not (D[1] in ['N', 'S', 'I']) then Exit;
+    end;
+    Tok := nil;
+    if Assigned(ArgListNode) then Tok := ArgListNode.Token;
+    Full := TASTNode.Create(antArgumentList, Tok);
+    try
+      if Assigned(ArgListNode) and (ArgListNode.NodeType in [antArgumentList, antExpressionList]) then
+        for i := 0 to ArgListNode.ChildCount - 1 do Full.AddChild(ArgListNode.GetChild(i).Clone);
+      for i := NArgs to High(Decl.ParamTypeNames) do
+      begin
+        D := Defs[i];
+        case D[1] of
+          'S': N := TASTNode.CreateWithValue(antLiteral, Copy(D, 2, MaxInt), Tok);
+          'I': N := TASTNode.CreateWithValue(antIdentifier, UpperFast(Copy(D, 2, MaxInt)), Tok);
+        else
+          if (Pos('.', D) > 0) or (Pos('E', UpperFast(D)) > 0) then
+            N := TASTNode.CreateWithValue(antLiteral, StrToFloat(Copy(D, 2, MaxInt)), Tok)
+          else
+            N := TASTNode.CreateWithValue(antLiteral, StrToInt64(Copy(D, 2, MaxInt)), Tok);
+        end;
+        Full.AddChild(N);
+      end;
+      Result := TryForeignCall(NameU, Full, ResultVal);
+    finally
+      Full.Free;
+    end;
+  finally
+    Defs.Free;
+  end;
+end;
+
 function TSSAGenerator.TryForeignCall(const NameU: string; ArgListNode: TASTNode;
   out ResultVal: TSSAValue): Boolean;
 // Lower a call to a C function the program declared with "Declare ... Alias ... [Lib ...]".
@@ -57834,6 +58012,10 @@ begin
   NArgs := 0;
   if Assigned(ArgListNode) and (ArgListNode.NodeType in [antArgumentList, antExpressionList]) then
     NArgs := ArgListNode.ChildCount;
+  // ⭐ DIVERGENZE 557 - ...unless the declaration gives the missing ones a DEFAULT, which fbc applies:
+  // "FreeImage_Allocate(13, 7, 8)" of a routine declared with six parameters, three of them "= 0".
+  if (NArgs < Length(Decl.ParamTypeNames)) and TryForeignDefaults(NameU, Decl, ArgListNode, NArgs, ResultVal) then
+    Exit(True);
   // ⚠️ The declaration is the authority on how many values the callee reads. Passing FEWER than it
   // declares would leave the callee reading an unwritten transfer slot, so that is refused.
   if NArgs < Length(Decl.ParamTypeNames) then
@@ -58000,7 +58182,7 @@ begin
       begin
         PtrReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
         EmitInstruction(ssaStrSAdd, PtrReg, EnsureStringRegister(ArgVal),
-                        MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+                        StrLitMark(ArgVal), MakeSSAValue(svkNone));
         StageVals[i] := PtrReg;
       end
       else
@@ -60510,6 +60692,15 @@ begin
     if GetEnvironmentVariable('FGNDIAG') = '1' then
       for PsI := 0 to FProgram.ForeignDeclCount - 1 do
         WriteLn(ErrOutput, 'FGN[', PsI, '] ', FProgram.GetForeignDecl(PsI));
+  end;
+  // ⭐ DIVERGENZE 557 - the DEFAULTS of foreign parameters ("byval x as long = -5"), for a call that omits them.
+  FreeAndNil(FFgnDefaults);
+  if AST.Attributes.Values['FOREIGNDEFAULTS'] <> '' then
+  begin
+    FFgnDefaults := TIndexedStringList.Create;
+    FFgnDefaults.Delimiter := #30;
+    FFgnDefaults.StrictDelimiter := True;
+    FFgnDefaults.DelimitedText := AST.Attributes.Values['FOREIGNDEFAULTS'];
   end;
   // ⭐ DIVERGENZE 552 - the rows of a name declared AGAIN after a #undef, with the line each was declared on.
   FreeAndNil(FFgnRedeclNames);

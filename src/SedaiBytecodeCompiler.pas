@@ -2254,6 +2254,13 @@ begin
   // and the reason no new serialised table is needed for it.
   if (Instr.OpCode = ssaValueForC) and (Instr.Src2.Kind = svkConstString) then
     BCInstr.Immediate := FProgram.AddStringConstant(Instr.Src2.ConstString);
+  // ⭐ DIVERGENZE 593: an ssaStrSAdd of a string LITERAL carries its text in Src2; its pool index + 1 rides the
+  // Immediate, and the VM gives that constant one address for the whole run. 0 = a copy, as before (old .basc).
+  if (Instr.OpCode = ssaStrSAdd) and (Instr.Src2.Kind = svkConstString) then
+  begin
+    BCInstr.Immediate := FProgram.AddStringConstant(Instr.Src2.ConstString) + 1;
+    BCInstr.Src2 := 0;
+  end;
 
   {$IFDEF DEBUG_BYTECODE}
   if DebugBytecode and OpIn(Instr.OpCode, [ssaPrintInt, ssaLoadEL, ssaLoadER]) then

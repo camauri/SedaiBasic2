@@ -129,6 +129,7 @@ type
     // A DECLARE carrying an ALIAS is a FOREIGN procedure: NAME|SYMBOL|LIBRARY|RETURN|PARAMS, one per
     // line, handed to the SSA on the program node (DIVERGENZE 183).
     FForeignDecls: TStringList;
+    FForeignDefaults: TStringList;   // DIVERGENZE 557: NAME=encoded defaults of a foreign declaration's parameters
     FForeignRedecls: TStringList;   // DIVERGENZE 552: "<line>=<row>" of a foreign name declared again after #undef
     FForeignDataArrays: TStringList;   // DIVERGENZE 441: "NAME=symbol|T|lb:ub,..." - the data ARRAYS of C libraries
     // ⛔ EVERY TYPE NAME A "DECLARE" NAMES, with the line it stands on. fbc's single pass refuses a
@@ -444,6 +445,7 @@ type
     procedure ParseArrayInitBraceGroup(InitList: TASTNode; const DimSizes: array of Integer; Level: Integer);
     function ConstDimSizes(DimsNode: TASTNode): TDimSizeArray;
     // Optional "= { ... }" / "=> { ... }" array initializer on an already-built antArrayDecl.
+    function ResolvedTypeAlias(const S: string): string;   // an alias followed to what it names (567)
     function TryParseAggregateTuple(const DimTypeName: string; Nested: Boolean = False): TASTNode;
     procedure ParseOptionalArrayInit(Decl, Dimensions: TASTNode; const Tok: TLexerToken);
     function AtEndType: Boolean;
@@ -709,6 +711,7 @@ begin
   MemoizationThreshold := 3;  // Cache after 3 recursion levels
 
   FForeignDecls := TStringList.Create;
+  FForeignDefaults := TStringList.Create;
   FForeignRedecls := TStringList.Create;
   FForeignDataArrays := TStringList.Create;
   FDeclTypeUses := TStringList.Create;
@@ -813,6 +816,7 @@ begin
     FExpressionParser.Free;
 
   FForeignDecls.Free;
+  FForeignDefaults.Free;
   FForeignRedecls.Free;
   FHeaderRoutines.Free;
   FGatedDeclared.Free;
@@ -1841,6 +1845,9 @@ begin
  // knows what a CALL is, and it needs the symbol, the library and the signature to build the call.
  if FForeignDecls.Count > 0 then
    Result.Attributes.Values['FOREIGNDECLS'] := StringReplace(FForeignDecls.Text, sLineBreak, ';', [rfReplaceAll]);
+ // DIVERGENZE 557: the defaults, one "NAME=d0#31d1..." per declaration, #30 between them (a string default may hold ';')
+ if FForeignDefaults.Count > 0 then
+   Result.Attributes.Values['FOREIGNDEFAULTS'] := StringReplace(FForeignDefaults.Text, sLineBreak, #30, [rfReplaceAll]);
  // ...and where a name retired by #undef was declared AGAIN, so a call picks the declaration above it (552).
  if FForeignRedecls.Count > 0 then
    Result.Attributes.Values['FGNREDECL'] := StringReplace(FForeignRedecls.Text, sLineBreak, ';', [rfReplaceAll]);
@@ -1981,6 +1988,16 @@ var
   FgnVariadic: Boolean;     // "..." in the parameter list: the C tail (printf, sprintf, ...)
   FgnK: Integer;            // DIVERGENZE 552: the earlier rows of a name a #undef retired
   FgnFnPtrRet: Boolean;     // ...e il RITORNO di un parametro "as function(...) as T" e' suo, non nostro
+  // ⭐ DIVERGENZE 557 - the DEFAULT of a parameter ("byval x as long = -5"), captured as its tokens and encoded as the
+  // procedure-pointer defaults are (N<number> / S<string> / I<name>, X when it is none of them)
+  FgnDefOn: Boolean;        // inside "= ..." of a parameter
+  FgnDefIdx: Integer;       // ...of which parameter (0-based)
+  FgnDefParen: Integer;     // parentheses opened inside the default
+  FgnDefToks: TStringList;  // ...its tokens: kind letter + text
+  FgnDefs: TStringList;     // index -> encoded default
+  FgnDefAny: Boolean;
+  FgnDefK: Integer;
+  FgnDefEnc: string;
   FgnByVal: Boolean;        // the parameter's stated passing mode; unstated reads as BYREF
   FgnLastDecl: Integer;     // index in FDeclTypeUses of the type just recorded, so a PTR can mark it
   FgnNameRaw: string;
@@ -2138,6 +2155,9 @@ begin
    FgnName := ''; FgnAlias := ''; FgnLib := ''; FgnRet := ''; FgnParams := '';
    FgnDepth := 0; FgnAfterAs := False; FgnIsFunc := False; FgnTypeOpen := False;
    FgnVariadic := False; FgnFnPtrRet := False;
+   FgnDefOn := False; FgnDefIdx := -1; FgnDefParen := 0; FgnDefAny := False;
+   FgnDefToks := TStringList.Create; FgnDefs := TStringList.Create;
+   try
    // ⛔ THE PASSING MODE AND THE POINTER SUFFIX DECIDE WHETHER AN INCOMPLETE TYPE IS AN ERROR, so the
    // walk has to carry both. fbc refuses "byval as <incomplete>" (error 71) and takes the same type
    // "byref" or "ptr" without a word: win/sql.bi declares "byval BufferLength as SQLLEN" where SQLLEN
@@ -2156,6 +2176,50 @@ begin
    while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
    begin
      FgnTok := UpperFast(VarToStr(Context.CurrentToken.Value));
+     // ⭐ DIVERGENZE 557 - "= <default>" of a parameter: its tokens up to the "," or ")" that ends the parameter.
+     if FgnDefOn then
+     begin
+       if (FgnDefParen = 0) and Context.CheckAny([ttSeparParam, ttDelimParClose]) then
+       begin
+         FgnDefOn := False;
+         FgnDefEnc := 'X';
+         if (FgnDefToks.Count = 1) and (FgnDefToks[0][1] = 'S') then FgnDefEnc := FgnDefToks[0]
+         else if (FgnDefToks.Count = 1) and (FgnDefToks[0][1] in ['N', 'I']) then FgnDefEnc := FgnDefToks[0]
+         else if (FgnDefToks.Count = 2) and (FgnDefToks[0] = 'O-') and (FgnDefToks[1][1] = 'N') then
+           FgnDefEnc := 'N-' + Copy(FgnDefToks[1], 2, MaxInt)
+         // "= @"abc"" on a ZString Ptr parameter: the literal's address, which is what the literal itself becomes
+         // when it is handed to a pointer parameter (and the same one, DIVERGENZE 593).
+         else if (FgnDefToks.Count = 2) and (FgnDefToks[0] = 'O@') and (FgnDefToks[1][1] = 'S') then
+           FgnDefEnc := FgnDefToks[1];
+         while FgnDefs.Count <= FgnDefIdx do FgnDefs.Add('');
+         if FgnDefIdx >= 0 then FgnDefs[FgnDefIdx] := FgnDefEnc;
+         FgnDefAny := True;
+         // fall through: the "," or ")" is the scanner's own
+       end
+       else
+       begin
+         if Context.Check(ttDelimParOpen) then Inc(FgnDefParen)
+         else if Context.Check(ttDelimParClose) then Dec(FgnDefParen);
+         if Context.Check(ttStringLiteral) then FgnDefToks.Add('S' + VarToStr(Context.CurrentToken.Value))
+         else if Context.CheckAny([ttNumber, ttInteger, ttFloat]) then FgnDefToks.Add('N' + VarToStr(Context.CurrentToken.Value))
+         else if Context.Check(ttIdentifier) then FgnDefToks.Add('I' + VarToStr(Context.CurrentToken.Value))
+         else FgnDefToks.Add('O' + VarToStr(Context.CurrentToken.Value));
+         Context.Advance;
+         Continue;
+       end;
+     end
+     else if (FgnDepth = 1) and (not FgnFnPtrRet) and (FgnRet = '') and Context.Check(ttOpEq) then
+     begin
+       FgnDefOn := True; FgnDefParen := 0; FgnDefToks.Clear;
+       if FgnParams = '' then FgnDefIdx := -1
+       else
+       begin
+         FgnDefIdx := 0;
+         for FgnDefK := 1 to Length(FgnParams) do if FgnParams[FgnDefK] = ',' then Inc(FgnDefIdx);
+       end;
+       Context.Advance;
+       Continue;
+     end;
      if Context.Check(ttDelimParOpen) then
      begin Inc(FgnDepth); FgnAfterAs := False; FgnTypeOpen := False; end
      else if Context.Check(ttDelimParClose) then
@@ -2344,6 +2408,21 @@ begin
            Break;
          end;
      FForeignDecls.Add(FgnName + '|' + FgnAlias + '|' + FgnLib + '|' + FgnRet + '|' + FgnParams);
+     // ⭐ DIVERGENZE 557 - ...and the defaults of its parameters, beside the table (the table's format is read by the
+     // runtime and the .basc, and the defaults are for the SSA alone).
+     if FgnDefAny then
+     begin
+       FgnDefEnc := '';
+       for FgnDefK := 0 to FgnDefs.Count - 1 do
+       begin
+         if FgnDefK > 0 then FgnDefEnc := FgnDefEnc + #31;
+         FgnDefEnc := FgnDefEnc + FgnDefs[FgnDefK];
+       end;
+       FForeignDefaults.Values[FgnName] := FgnDefEnc;
+     end;
+   end;
+   finally
+     FgnDefToks.Free; FgnDefs.Free;
    end;
    Result := nil;
    Exit;
@@ -4838,7 +4917,10 @@ begin
     if (DecoU = 'CDECL') or (DecoU = 'STDCALL') or (DecoU = 'PASCAL') or
        (DecoU = 'FASTCALL') or (DecoU = 'THISCALL') or (DecoU = 'OVERLOAD') then
     begin
-      if DecoU = 'OVERLOAD' then SaidOverload := True;
+      if DecoU = 'OVERLOAD' then SaidOverload := True
+      // ⭐ DIVERGENZE 583 - ...and a C calling convention is KEPT: it is how a procedure says C may call it, and the
+      // SSA asks it before making a procedure-pointer RESULT something C can call.
+      else if (DecoU = 'CDECL') or (DecoU = 'STDCALL') then Result.Attributes.Values['CALLCONV'] := DecoU;
       Context.Advance;
     end
     else if (DecoU = kALIAS) or (DecoU = kLIB) then
@@ -11907,6 +11989,25 @@ begin
   DoNodeCreated(Result);
 end;
 
+function TPackratParser.ResolvedTypeAlias(const S: string): string;
+// "Type F As Double" -> DOUBLE: the chain of type aliases followed a few links, never in a circle (the same walk
+// the constant folder's ResolveAlias makes). S itself when it is not an alias.
+var
+  i, Guard: Integer;
+  T, Nx: string;
+begin
+  T := S;
+  for Guard := 1 to 8 do
+  begin
+    i := FTypeAliasOf.IndexOfName(T);
+    if i < 0 then Break;
+    Nx := UpperFast(Trim(FTypeAliasOf.ValueFromIndex[i]));
+    if (Nx = '') or (Nx = T) then Break;
+    T := Nx;
+  end;
+  Result := T;
+end;
+
 function TPackratParser.TryParseAggregateTuple(const DimTypeName: string; Nested: Boolean = False): TASTNode;
 // FreeBASIC aggregate init "= (a, b, c)": a parenthesised comma-tuple that sets a UDT's fields in
 // declaration order. Answers the antArgumentList (TUPLEINIT), or NIL with the stream left exactly where
@@ -11946,9 +12047,15 @@ begin
       // fields to fill. "Dim As colours c = (colours.green)" was read as a one-field tuple and the
       // variable got nothing - 0 where fbc answers the member, in silence - while the identical
       // initialiser without the parentheses was right.
+      // ⭐ DIVERGENZE 567 - ...and all three are asked of what an ALIAS names: "Type cpFloat As Double" then
+      // "Dim tmax As cpFloat = (1.0F/0.0F)" (the header's INFINITY) was a one-field tuple and stored 0.
       if (TupleDepth = 0) and (not Nested) and (not IsBuiltinTypeName(DimTypeName)) and
          (FEnumNamesSeen.IndexOf(UpperFast(DimTypeName)) < 0) and
-         (Pos(' PTR', UpperFast(DimTypeName)) = 0) then
+         (Pos(' PTR', UpperFast(DimTypeName)) = 0) and
+         ((GetEnvironmentVariable('SB_ALIAS_PAREN') = '0') or
+          ((not IsBuiltinTypeName(ResolvedTypeAlias(UpperFast(DimTypeName)))) and
+           (FEnumNamesSeen.IndexOf(ResolvedTypeAlias(UpperFast(DimTypeName))) < 0) and
+           (Pos(' PTR', ResolvedTypeAlias(UpperFast(DimTypeName))) = 0))) then
       begin
         Context.Advance;
         if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttSeparParam]) then IsTuple := True;

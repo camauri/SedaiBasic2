@@ -333,7 +333,10 @@ begin
     bcStrWStringN:
       Line := Format('%4d: %-20s R%d, R%d, R%d', [Index, 'StrWStringN', Instr.Dest, Instr.Src1, Instr.Src2]);
     bcStrSAdd:
-      Line := Format('%4d: %-20s R%d, R%d', [Index, 'StrSAdd', Instr.Dest, Instr.Src1]);
+      if Instr.Immediate > 0 then   // DIVERGENZE 593: a literal, one address for the run
+        Line := Format('%4d: %-20s R%d, R%d  literal [%d]', [Index, 'StrSAdd', Instr.Dest, Instr.Src1, Instr.Immediate - 1])
+      else
+        Line := Format('%4d: %-20s R%d, R%d', [Index, 'StrSAdd', Instr.Dest, Instr.Src1]);
     bcFileExists:
       Line := Format('%4d: %-20s R%d, R%d', [Index, 'FileExists', Instr.Dest, Instr.Src1]);
     bcCurDir:

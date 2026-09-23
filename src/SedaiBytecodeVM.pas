@@ -297,6 +297,12 @@ type
     FRawFreeSz: array of PtrUInt;               // matching block payload sizes
     FRawFreeCount: Integer;
     FRawHeapLock: TRTLCriticalSection;
+    FLitSAdd: array of Int64;              // DIVERGENZE 593: the address of each string LITERAL, by pool index (0 = none yet)
+    // DIVERGENZE 566: the C image of a MANAGED record handed to C ("REC:"), address -> record handle, so the address
+    // C hands back (a callback's user data, pthread_getspecific) is that record again. Open addressing, power-of-two.
+    FRecImgKey: array of PtrUInt;
+    FRecImgVal: array of Int64;
+    FRecImgCount: Integer;
     FProgram: TBytecodeProgram;
     // ⭐ The MEMORY MODE of the loaded program (SedaiMemoryMode): True = fb. Phase 1 of the pointer model: in fb
     // Allocate & co. answer LIBC blocks - the machine address with FGNPTR_TAG, the mark every C-address arm
@@ -957,7 +963,10 @@ type
     procedure ExecRecMarkPush(Ctx: TExecutionContext);                            // bcRecMarkPush, all engines
     procedure ExecRecMarkPop(Ctx: TExecutionContext);                             // bcRecMarkPop, all engines
     procedure FreeFrameCells(Ctx: TExecutionContext; Mark: Integer); // phase 2.1b: release the frame's cells down to Mark
-    function StrSAdd(const S: string): Int64;   // SADD(s) -> raw pointer to a NUL-terminated byte copy
+    function StrSAdd(const S: string): Int64;
+    function LiteralSAdd(ConstIdx: Integer; const S: string): Int64;
+    procedure RecImageNote(Addr: PtrUInt; Handle: Int64);
+    function RecImageHandle(ACtx: TExecutionContext; Addr: PtrUInt): Int64;   // SADD(s) -> raw pointer to a NUL-terminated byte copy
     function FormatNumber(Value: Double; const Mask: string): string;  // FORMAT(num, mask) -> formatted string (numeric masks)
     function FormatDateMask(Value: Double; const Mask: string): string;  // FORMAT(serial, mask) -> date/time formatted string
     procedure ImageConvertRowExec(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);  // IMAGECONVERTROW
@@ -1341,6 +1350,7 @@ var
   // JIT_OVERAOT=1 lets the loop JIT compile loops the AOT already owns (see BuildJitLoops). Default
   // off: the overlap costs a second compilation and buys nothing.
   GJitOverAot: Boolean = False;
+  GRecImgHome: Boolean = True;   // DIVERGENZE 566: SB_RECIMG_HOME=0 is the A/B
   // AOT_ARRDESC=0 riporta EnsureArrDesc alla sezione critica INCONDIZIONATA (il comportamento del
   // 4a8b8ac). E' il riferimento dell'A/B su un binario solo: quel commit ha corretto tre difetti a
   // thread veri e ha messo un lock globale sul cammino di chiamata, che su binary-trees costava 5,6x.
@@ -1973,6 +1983,7 @@ begin
     if GPairDiagTop < 0 then GPairDiagTop := 20;
   end;
   GJitOverAot := SysUtils.GetEnvironmentVariable('JIT_OVERAOT') = '1';
+  GRecImgHome := SysUtils.GetEnvironmentVariable('SB_RECIMG_HOME') <> '0';   // DIVERGENZE 566 A/B
   GArrDescFast := SysUtils.GetEnvironmentVariable('AOT_ARRDESC') <> '0';
   GNoExcFrame := SysUtils.GetEnvironmentVariable('AOT_EXCFRAME') <> '1';
   InitCriticalSection(FSharedRecLock);
@@ -5679,6 +5690,24 @@ begin
   Result := RAWPTR_TAG or Int64(dataOfs);
 end;
 
+function TBytecodeVM.LiteralSAdd(ConstIdx: Integer; const S: string): Int64;
+// The one address of string constant ConstIdx (DIVERGENZE 593). The table is guarded by the raw heap's lock: two
+// threads reaching the same literal first must not publish two blocks.
+begin
+  EnterCriticalSection(FRawHeapLock);
+  try
+    if ConstIdx >= Length(FLitSAdd) then SetLength(FLitSAdd, ConstIdx + 16);
+    Result := FLitSAdd[ConstIdx];
+    if Result = 0 then
+    begin
+      Result := StrSAdd(S);
+      FLitSAdd[ConstIdx] := Result;
+    end;
+  finally
+    LeaveCriticalSection(FRawHeapLock);
+  end;
+end;
+
 function TBytecodeVM.StrSAdd(const S: string): Int64;
 // FreeBASIC SADD: a raw byte-heap pointer to a NUL-terminated COPY of the string's bytes. A read-only
 // snapshot — writes through it do not propagate back to the managed string (the managed string model has
@@ -8586,6 +8615,14 @@ function TBytecodeVM.ValueForC(Ctx: TExecutionContext; V: Int64; SigIdx: Int64):
 begin
   Result := V;
   if V = 0 then Exit;
+  // ⭐ DIVERGENZE 583 - SigIdx = -3 is the road BACK: the result of a C-callable function that returns a procedure is a
+  // closure (so C can call it), and a BASIC caller wants the procedure - its entry PC - so that "sel(1) = @f" is true.
+  if SigIdx = -3 then
+  begin
+    if ForeignIsMachineAddress(PtrUInt(V and not FGNPTR_TAG)) and (ClosureEntryPC(PtrUInt(V and not FGNPTR_TAG)) > 0) then
+      Result := ClosureEntryPC(PtrUInt(V and not FGNPTR_TAG));
+    Exit;
+  end;
   if (V shr 61) and 7 = 1 then Exit(V and not FGNPTR_TAG);          // C's mark: a bare address is what the bytes want
   if SigIdx < 0 then Exit(PtrValueForC(V, SigIdx = -1));
   if ForeignIsMachineAddress(PtrUInt(V)) then Exit;                 // already an address C can call
@@ -8706,6 +8743,13 @@ begin
     Base := PtrUInt(@FRawHeap[0]);
     if (A >= Base) and (A - Base < PtrUInt(FRawHeapCap)) then
       Exit(Int64(A - Base) or RAWPTR_TAG);
+  end;
+  // ⭐ DIVERGENZE 566 - the C image of a MANAGED record we handed to C: that record's handle again, so "p->text" of the
+  // user data a callback receives, and "back = tg" of what pthread_getspecific returns, are the record.
+  if FRecImgCount > 0 then
+  begin
+    Result := RecImageHandle(ACtx, A);
+    if Result <> 0 then Exit;
   end;
   // ⭐ Phase 3.2: outside the span of every candidate buffer nothing below can answer. Single-threaded only: a worker
   // may reshape an array between the generation test and the walk.
@@ -9019,6 +9063,79 @@ begin
   if (R = nil) or (Ofs >= PtrUInt(Length(R^.Bytes))) then Exit;
   ALen := PtrUInt(Length(R^.Bytes)) - Ofs;
   Result := @R^.Bytes[Ofs];
+  // ⭐ DIVERGENZE 566 - the image of the WHOLE record is what C keeps as user data: remembered, so it comes home.
+  if (Ofs = 0) and (Value >= 0) and GRecImgHome then RecImageNote(PtrUInt(Result), Handle);
+end;
+
+procedure TBytecodeVM.RecImageNote(Addr: PtrUInt; Handle: Int64);
+var
+  OldK: array of PtrUInt;
+  OldV: array of Int64;
+  Cap, i, h: Integer;
+begin
+  EnterCriticalSection(FFgnLock);
+  try
+    Cap := Length(FRecImgKey);
+    if (FRecImgCount + 1) * 2 > Cap then
+    begin
+      OldK := FRecImgKey; OldV := FRecImgVal;
+      if Cap = 0 then Cap := 64 else Cap := Cap * 2;
+      SetLength(FRecImgKey, 0); SetLength(FRecImgVal, 0);
+      SetLength(FRecImgKey, Cap); SetLength(FRecImgVal, Cap);
+      FRecImgCount := 0;
+      for i := 0 to High(OldK) do
+        if OldK[i] <> 0 then
+        begin
+          h := Integer((OldK[i] shr 4) and PtrUInt(Cap - 1));
+          while FRecImgKey[h] <> 0 do h := (h + 1) and (Cap - 1);
+          FRecImgKey[h] := OldK[i]; FRecImgVal[h] := OldV[i]; Inc(FRecImgCount);
+        end;
+    end;
+    h := Integer((Addr shr 4) and PtrUInt(Cap - 1));
+    while (FRecImgKey[h] <> 0) and (FRecImgKey[h] <> Addr) do h := (h + 1) and (Cap - 1);
+    if FRecImgKey[h] = 0 then Inc(FRecImgCount);
+    FRecImgKey[h] := Addr; FRecImgVal[h] := Handle;
+  finally
+    LeaveCriticalSection(FFgnLock);
+  end;
+end;
+
+function TBytecodeVM.RecImageHandle(ACtx: TExecutionContext; Addr: PtrUInt): Int64;
+// The record whose C image starts at Addr, or 0. ⛔ Asked of the record too: a handle freed and reused, or a record
+// whose image moved, no longer starts there, and a stale entry must not name it.
+var
+  Cap, h: Integer;
+  Handle: Int64;
+  R: PRecordStorage;
+begin
+  Result := 0;
+  if FRecImgCount = 0 then Exit;
+  Handle := 0;
+  EnterCriticalSection(FFgnLock);
+  try
+    Cap := Length(FRecImgKey);
+    h := Integer((Addr shr 4) and PtrUInt(Cap - 1));
+    while FRecImgKey[h] <> 0 do
+    begin
+      if FRecImgKey[h] = Addr then begin Handle := FRecImgVal[h]; Break; end;
+      h := (h + 1) and (Cap - 1);
+    end;
+  finally
+    LeaveCriticalSection(FFgnLock);
+  end;
+  if Handle = 0 then Exit;
+  if ACtx = nil then ACtx := FCtx;
+  if (Handle and SHARED_REC_FLAG) <> 0 then
+  begin
+    if (Handle and SHARED_REC_MASK) > High(FSharedRecords) then Exit;
+  end
+  else if (ACtx = nil) or (Handle > High(ACtx.Records)) then Exit;
+  try
+    R := ResolveRec(ACtx, Handle);
+  except
+    Exit;
+  end;
+  if (R <> nil) and (Length(R^.Bytes) > 0) and (PtrUInt(@R^.Bytes[0]) = Addr) then Result := Handle;
 end;
 
 function TBytecodeVM.ForeignRecRun(ACtx: TObject; Value: Int64; out ACount: Integer;
@@ -10049,6 +10166,7 @@ var
 
 begin
   FProgram := Program_;
+  SetLength(FLitSAdd, 0);   // DIVERGENZE 593: literal addresses are by POOL INDEX, and a new program has a new pool
   FNativeMemory := Assigned(Program_) and Program_.NativeMemory;   // decided when it was compiled
   RewritePackedArrayOps;   // phase 2.5: before EnsureDenseOps builds the per-PC index and the JIT reads the bytecode
 
@@ -16920,7 +17038,14 @@ begin
         Ctx.StringRegs[Instr.Dest] := S;
       end;
     33: // bcStrSAdd - SADD(s): raw byte-heap pointer to a NUL-terminated copy of the string
-      Ctx.IntRegs[Instr.Dest] := StrSAdd(Ctx.StringRegs[Instr.Src1]);
+      // ⭐ DIVERGENZE 593 - ...and of a string LITERAL (Immediate = pool index + 1), ONE address for the run: fbc pools
+      // identical literals, so "@\"k\" = @\"k\"" is -1 there, and a C library keyed on the address (chipmunk's
+      // post-step callbacks) saw two keys. Allocated the first time and kept: a literal in a loop no longer allocates a
+      // block per iteration either.
+      if Instr.Immediate > 0 then
+        Ctx.IntRegs[Instr.Dest] := LiteralSAdd(Instr.Immediate - 1, Ctx.StringRegs[Instr.Src1])
+      else
+        Ctx.IntRegs[Instr.Dest] := StrSAdd(Ctx.StringRegs[Instr.Src1]);
     40: // bcFileExists - FILEEXISTS(path): -1 if the file exists, else 0 (cross-platform).
         // A relative path that is not in the current directory is looked for BESIDE THE PROGRAM -
         // read-only, so it can only turn a False into a True. See ResolveReadPath.

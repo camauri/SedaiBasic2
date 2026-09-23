@@ -1054,6 +1054,14 @@ begin
     if (B^.ArgKinds[i] = fkPointer) and (i <= High(B^.Decl.ParamTypeNames)) and
        (UpperCase(Copy(B^.Decl.ParamTypeNames[i], 1, 7)) = 'VALIST:') then
     begin
+      // ⭐ DIVERGENZE 582 - ...unless it is C's OWN va_list, which a callback received ("sub on_message(..., byval ap As
+      // va_list)" handed to vsnprintf): a machine address, C's mark on it, and C gets it back as it was.
+      if (XferInt[SlotI] and FGNPTR_TAG) <> 0 then
+      begin
+        PPointer(Vals[i])^ := Pointer(PtrUInt(XferInt[SlotI] and not FGNPTR_TAG));
+        Inc(SlotI);
+        Continue;
+      end;
       if not Assigned(FVaList) then
         raise EForeignCallError.CreateFmt('%s: argument %d is a va_list and this build cannot build one',
                                           [B^.Decl.Name, i + 1]);
