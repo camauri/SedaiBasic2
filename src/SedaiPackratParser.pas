@@ -15215,7 +15215,15 @@ begin
   // ...and with an ALIAS outside such a block too (DIVERGENZE 433, the rule a bodiless Declare already follows).
   else if (not HasParens) and (TypeName <> '') and ((FExternCDepth > 0) or (AliasSym <> '')) and (Flags = '') and
           not ModuleDeclaresNameElsewhere(Nm, True) then
-    AddCLibraryData(TypeName);
+    AddCLibraryData(TypeName)
+  // ⭐ DIVERGENZE 609 - ...and a FIXED character buffer of C ("extern allegro_error as zstring * 256"): the capacity
+  // flag kept it out of the line above, the name became a zero NUMBER of the program, and "Len(allegro_error)" answered
+  // 1 where fbc reads the text C wrote there. It is C's variable like any other, typed "ZSTRING * n".
+  // SB_EXTERN_FIXZSTR=0 is the A/B knob.
+  else if (not HasParens) and ((UpperFast(TypeName) = 'ZSTRING') or (UpperFast(TypeName) = 'WSTRING')) and
+          (Length(Flags) > 1) and (Flags[1] = '*') and ((FExternCDepth > 0) or (AliasSym <> '')) and
+          (GetEnvironmentVariable('SB_EXTERN_FIXZSTR') <> '0') and not ModuleDeclaresNameElsewhere(Nm, True) then
+    AddCLibraryData(UpperFast(TypeName) + ' * ' + Copy(Flags, 2, MaxInt));
 end;
 
 procedure TPackratParser.ScanDeclNames(Precise: Boolean; Into: TStringList; const Nm: string; out Found: Boolean);

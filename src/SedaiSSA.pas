@@ -685,6 +685,8 @@ type
     FArrayRecordType: TStringList;       // array name (UPPER) -> element UDT type name (UPPER)
     FForeignDataScalars: TStringList;    // DIVERGENZE 405: an Extern of a C library whose type is a SCALAR (its address is C's)
     FForeignProcExterns: TStringList;    // DIVERGENZE 422: ...whose type is a named PROCEDURE type (libxml's xmlFree)
+    FStoreExprNode: TASTNode;            // DIVERGENZE 612: the expression a field store is writing, for FieldValueForC
+    FForeignProcExternSigs: TStringList; // DIVERGENZE 607: ...and its signature, "NAME=p1,p2|ret" (the field format)
     FForeignDataArrays: TStringList;     // DIVERGENZE 441: "NAME=symbol|T|lb:ub,..." - a C library's data ARRAY
     FFgnRedeclNames: TStringList;        // DIVERGENZE 552: foreign names declared again after a #undef
     FFgnDefaults: TStringList;           // DIVERGENZE 557: NAME=encoded defaults of a foreign declaration's parameters
@@ -1079,6 +1081,8 @@ type
     function PtrPointeeOf(Node: TASTNode): string;
     function AddrOfScalarPointee(Target: TASTNode): string;                    // DIVERGENZE 405: "@x" / "@a(i)" on a numeric scalar
     function IsForeignDataScalar(const NameU: string): Boolean;                // ...an Extern scalar of C, visible here
+    function RefVarFixStrCap(const Name: string; out Wide: Boolean): Integer;    // 609: an Extern ZSTRING * n, its n
+    function ExternStoreForC(const NameU: string; var V: TSSAValue; ExprNode: TASTNode): Boolean;       // 607 · 610: the value C can use
     function ForeignExternIsPointer(const NameU: string): Boolean;             // ...whose declared type is a pointer (412 · 413)
     function EmitCastToScalarPtr(Operand: TASTNode; const V: TSSAValue; const Pointee: string): TSSAValue;
     function TryEmitManagedPtrArith(Node: TASTNode; out Res: TSSAValue): Boolean;
@@ -1427,6 +1431,7 @@ type
     function ProcRetClosureSig(const ProcName: string): string;                        // a cdecl function's procptr result (583)
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
     procedure ProcessMemberStore(MemberNode, ExprNode: TASTNode);          // rec.field = expr
+    procedure ProcessMemberStoreBody(MemberNode, ExprNode: TASTNode);
     // FB implicit THIS: a bare field name in a method body -> synthesized "this.<field>" access.
     function NameBoundInThisProc(const NameU: string): Boolean;     // bound HERE, not in another proc (523)
     function ImplicitThisFieldIsPointer(Node: TASTNode): Boolean;   // ...and was it a POINTER field? (522)
@@ -1811,6 +1816,7 @@ type
     function TryRawUDTFieldAddress(MemberNode: TASTNode; out Value: TSSAValue): Boolean;  // @h->field over a RAW address
     function TryEmitRawUDTField(ObjNode: TASTNode; const FieldName: string; out Value: TSSAValue): Boolean;
     function TryEmitRawUDTFieldStore(ObjNode: TASTNode; const FieldName: string; ExprNode: TASTNode): Boolean;
+    function TryEmitRawUDTFieldStoreBody(ObjNode: TASTNode; const FieldName: string; ExprNode: TASTNode): Boolean;
     function EmitDir(Node: TASTNode): TSSAValue;   // FreeBASIC DIR: start/continue a directory walk
     function TryEmitCvaMacro(const NameU: string; ArgsNode: TASTNode;
                              Tok: TLexerToken; out Value: TSSAValue): Boolean;  // CVA_START/ARG/COPY/END
@@ -2083,6 +2089,7 @@ begin
   FArrayRecordType := TIndexedStringList.Create;
   FForeignDataScalars := TIndexedStringList.Create;
   FForeignProcExterns := TIndexedStringList.Create;
+  FForeignProcExternSigs := TStringList.Create;
   FForeignDataArrays := TStringList.Create;
   FForeignDataScalars.CaseSensitive := False;
   FArrayScalarType := TIndexedStringList.Create;
@@ -2314,6 +2321,7 @@ begin
   FArrayRecordType.Free;
   FForeignDataScalars.Free;
   FForeignProcExterns.Free;
+  FForeignProcExternSigs.Free;
   FForeignDataArrays.Free;
   FFgnRedeclNames.Free;
   FArrayScalarType.Free;
@@ -3917,6 +3925,7 @@ var
   CastLeft, CastRight: Boolean;   // apply "Operator T.Cast() As String" to this binary operand?
   CatRaw, CatWide, CatNul, CmpCut: Boolean;  // this binary node is a CONSTANT concatenation carrying a NUL
   CatLen: Integer;                  // (DIVERGENZE 154): its operands are read RAW
+  FixWide: Boolean;               // DIVERGENZE 609: an Extern WSTRING * n (else ZSTRING * n)
   NumCast: Boolean;               // arithmetic op: apply a numeric Cast operator to a UDT operand
   RecUDTIdx, RecSlotK, RecFieldIdx: Integer;   // OFFSETOF: UDT index + field scan
   RecFieldNode, RecIdxNode: TASTNode;          // OFFSETOF: the field, and "m(i)"'s index list
@@ -5170,6 +5179,10 @@ begin
         // left every READ through the pointer refused by the region check. The mark is not the whole fact.
         else if (FuncRetType = srtInt) and ForeignExternIsPointer(UpperFast(VarName)) then
           EmitInstruction(ssaRawLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAConstInt(RTC_PTR64))
+        // ⭐ DIVERGENZE 609 - a C library's FIXED character buffer is the text at its address, to the terminator.
+        else if (FuncRetType = srtString) and (RefVarFixStrCap(VarName, FixWide) > 0) then
+          EmitInstruction(ssaRawLoadZStr, Result, EnsureIntRegister(Left), MakeSSAValue(svkNone),
+                          MakeSSAConstInt(Ord(FixWide)))
         else
         case FuncRetType of
           srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -11167,6 +11180,7 @@ var
   CopyOp: TSSAOpCode;  NulCap, ConstNulCap: Integer;
   NulWide, ConstNulWide: Boolean;
   NulVal: TSSAValue;
+  FixCap: Integer; FixW: Boolean; FixCut: TSSAValue;   // DIVERGENZE 609: an Extern ZSTRING * n
 begin
   // SSAPROF: entry stamp for the lvalue-probe head bucket. Captured HERE, not at the antAssignment
   // call site: antConst / DIM initializers also route through this procedure, and a stale call-site
@@ -11517,6 +11531,31 @@ begin
       ExprValue := EnsureIntRegister(ExprValue);
       EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue,
                       MakeSSAConstInt(RefVarNarrowCode(VarName)));
+      Exit;
+    end;
+    // ⭐ DIVERGENZE 609 - ...and a C library's FIXED character buffer is written as its bytes, cut to n - 1 characters and
+    // terminated, as fbc writes a "ZString * n": never past the buffer C owns.
+    FixCap := RefVarFixStrCap(VarName, FixW);
+    if FixCap > 0 then
+    begin
+      FixCut := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      if FixW then
+        EmitInstruction(ssaStrLeftW, FixCut, EnsureStringRegister(ExprValue), EnsureIntRegister(MakeSSAConstInt(FixCap - 1)),
+                        MakeSSAValue(svkNone))
+      else
+        EmitInstruction(ssaStrLeft, FixCut, EnsureStringRegister(ExprValue), EnsureIntRegister(MakeSSAConstInt(FixCap - 1)),
+                        MakeSSAValue(svkNone));
+      EmitInstruction(ssaRawStoreZStr, MakeSSAValue(svkNone), EnsureIntRegister(VarReg), FixCut, MakeSSAConstInt(Ord(FixW)));
+      Exit;
+    end;
+    // ⭐ DIVERGENZE 607 · 610 - AN EXTERN OF C WHOSE TYPE IS A POINTER IS WRITTEN WITH WHAT C CAN USE, the twin of the
+    // RTC_PTR64 load above and the same funnel a pointer or procedure FIELD of a native record takes (561 · 576). A
+    // plain ssaRefStoreInt wrote the VM's value: a BASIC procedure's entry PC into "error_print_progname" (C jumped into
+    // nothing), a tagged pointer into "rgb_map" / "environ" (C dereferenced bit 61). SB_EXTERN_FORC=0 is the A/B knob.
+    if (RefVarBank(VarName) = srtInt) and FNativeMemory and ForeignExternIsPointer(UpperFast(VarName)) and
+       (GetEnvironmentVariable('SB_EXTERN_FORC') <> '0') and ExternStoreForC(UpperFast(VarName), ExprValue, ExprNode) then
+    begin
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAConstInt(RTC_NPTR));
       Exit;
     end;
     case RefVarBank(VarName) of
@@ -12013,7 +12052,20 @@ var
   VarReg, ExprValue: TSSAValue;
   DerefBank: TSSARegisterType;
   DerefTgt, CancelTgt: TASTNode;
+  SrcRec, DstRec: TSSAValue;
+  SrcType, DstType: string;
 begin
+  // ⭐ DIVERGENZE 614 - "*p = r" WITH A RECORD POINTEE COPIES THE RECORD, as "a = b" does (TryRecordCopyAssign). There
+  // was no rung for it: the store fell to the scalar one and wrote r's HANDLE / ADDRESS into the first field of *p
+  // ("*p = r" then "p->a" printed 444975576), native or not. Found closing 611 (a record with a 2-D field copied into
+  // a Callocate'd block). SB_DEREF_RECCOPY=0 is the A/B knob.
+  if (FindUDT(UpperFast(DerefedType(VarNode.GetChild(0)))) >= 0) and
+     (GetEnvironmentVariable('SB_DEREF_RECCOPY') <> '0') and
+     ResolveRecordObject(ExprNode, SrcRec, SrcType) and ResolveRecordObject(VarNode, DstRec, DstType) then
+  begin
+    EmitRecordCopy(DstRec, EnsureIntRegister(SrcRec), FindUDT(UpperFast(DerefedType(VarNode.GetChild(0)))));
+    Exit;
+  end;
   // "*@x = expr" is "x = expr" - see the note in the antDeref arm of ProcessExpression. Both halves
   // need it, or the read of a place works and the write to the same place does not.
   CancelTgt := DerefOfAddrOfTarget(VarNode);
@@ -27959,11 +28011,42 @@ var
   F: TUDTField;
   Lb, Ub, NSz, NAl: Int64;
   D: TASTNode;
+  di: Integer;
 begin
   Result := False; Count := 0; ElemBytes := 0;
   F := FUDTs[UDTIdx].Fields[FieldIdx];
   if not F.IsArray then Exit;
-  if (F.ArrayBounds = nil) or (F.ArrayBounds.ChildCount <> 1) then Exit;
+  if F.ArrayBounds = nil then Exit;
+  // ⭐ DIVERGENZE 610 · 611 - ...and MORE THAN ONE DIMENSION for the raw layout: C lays "v(0 To 2, 0 To 2)" as nine
+  // elements in a row, the last index the fastest (fbc's order too), so its image is the product of the extents.
+  // Refused, it made the whole TYPE non-native - Allegro's RGB_MAP ("data(0 To 31, 0 To 31, 0 To 31) As UByte") was a
+  // VM record block C could not read - and left an Extern of C with such a field unreadable (identity_matrix). Only
+  // the raw layout asks (AllowRecordElems): the other caller copies into a one-dimensional hidden array.
+  // SB_MULTIDIM_FIELD=0 is the A/B knob.
+  if (F.ArrayBounds.ChildCount > 1) and AllowRecordElems and (GetEnvironmentVariable('SB_MULTIDIM_FIELD') <> '0') then
+  begin
+    if (F.ArrayElemType <> '') or (F.ArrayElemPtrPointee <> '') or (F.ArrayElemBank = srtString) then Exit;
+    Count := 1;
+    for di := 0 to F.ArrayBounds.ChildCount - 1 do
+    begin
+      D := F.ArrayBounds.GetChild(di);
+      Lb := 0;
+      if D.NodeType = antDimRange then
+      begin
+        if D.ChildCount < 2 then Exit;
+        if not FoldLayoutBound(D.GetChild(0), Lb) then Exit;
+        if not FoldLayoutBound(D.GetChild(1), Ub) then Exit;
+      end
+      else if not FoldLayoutBound(D, Ub) then Exit;
+      if Ub < Lb then Exit;
+      Count := Count * (Ub - Lb + 1);
+    end;
+    ElemBytes := BinaryElemBytesOfWidthCode(TypeNameWidthCode(F.ArrayElemScalarType));
+    if F.ArrayElemBank = srtFloat then
+      if TypeNameWidthCode(F.ArrayElemScalarType) <> 7 then ElemBytes := 8;
+    Exit((Count > 0) and (ElemBytes > 0));
+  end;
+  if F.ArrayBounds.ChildCount <> 1 then Exit;
   if F.ArrayElemBank = srtString then Exit;
   // ⛔ An array of "<UDT> Ptr" is eight bytes an element in C, and the RAW layout must say so. Refusing it
   // here refused the WHOLE type: libjpeg's jpeg_compress_struct carries "quant_tbl_ptrs(0 To 3) As
@@ -29457,6 +29540,21 @@ begin
 end;
 
 function TSSAGenerator.TryEmitRawUDTFieldStore(ObjNode: TASTNode; const FieldName: string;
+  ExprNode: TASTNode): Boolean;
+// DIVERGENZE 612: the expression is kept where FieldValueForC can ask what it IS ("@proc" into an Any Ptr field).
+var
+  Saved: TASTNode;
+begin
+  Saved := FStoreExprNode;
+  FStoreExprNode := ExprNode;
+  try
+    Result := TryEmitRawUDTFieldStoreBody(ObjNode, FieldName, ExprNode);
+  finally
+    FStoreExprNode := Saved;
+  end;
+end;
+
+function TSSAGenerator.TryEmitRawUDTFieldStoreBody(ObjNode: TASTNode; const FieldName: string;
   ExprNode: TASTNode): Boolean;
 // "h->field = expr" where h holds a RAW ADDRESS: the WRITE half of TryEmitRawUDTField, and it did not
 // exist. Reading a field of a UDT laid over raw memory went to its byte offset; writing one still took
@@ -35664,7 +35762,7 @@ begin
   MemberNode := ArrAccessNode.GetChild(0);
   if (MemberNode = nil) or (MemberNode.NodeType <> antMemberAccess) or (MemberNode.ChildCount < 1) then Exit;
   IdxN := ArrAccessNode.GetChild(1);
-  if (IdxN = nil) or (IdxN.ChildCount <> 1) then Exit;
+  if (IdxN = nil) or (IdxN.ChildCount < 1) then Exit;
   if not ResolveRawUDTBase(MemberNode.GetChild(0), TypeName, U, Offsets, TotalSize,
                            BaseNode, IdxNode, ChainNode) then Exit;
   FI := -1;
@@ -35675,7 +35773,7 @@ begin
     if (not IsArray) or (ArrayElemType <> '') or (ArrayElemBank = srtString) then Exit;
   if not UDTFieldArrayShape(U, FI, Cnt, EB, True) then Exit;
   n := InlineArrayDims(U, FI, Lbs, Ubs);
-  if n <> 1 then Exit;
+  if n <> IdxN.ChildCount then Exit;    // several dimensions: one index each (610 · 611)
   if (FUDTs[U].Fields[FI].ArrayElemPtrPointee <> '') and NativeRecordType(FUDTs[U].Fields[FI].ArrayElemPtrPointee) then
     Code := RTC_NPTR
   else if FUDTs[U].Fields[FI].ArrayElemPtrPointee <> '' then Code := RTC_PTR64
@@ -35683,14 +35781,27 @@ begin
   Bank := FUDTs[U].Fields[FI].ArrayElemBank;
   if (Bank = srtFloat) and (Code <> RTC_SINGLE) then Code := RTC_DOUBLE;
   FieldAddr := EmitRawUDTFieldAddr(BaseNode, IdxNode, ChainNode, TotalSize, Offsets[FI]);
-  ProcessExpression(IdxN.GetChild(0), IV);
-  if IV.Kind = svkConstFloat then IV := MakeSSAConstInt(Trunc(IV.ConstFloat));
-  IV := EnsureIntRegister(IV);
-  Lin := IV;
-  if Lbs[0] <> 0 then
+  // The linear index, row-major as C and fbc lay it: lin = (..((i0 - l0) * e1 + (i1 - l1)) * e2 ..) + (in - ln).
+  Lin := MakeSSAValue(svkNone);
+  for k := 0 to n - 1 do
   begin
-    Lin := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-    EmitInstruction(ssaSubInt, Lin, IV, EnsureIntRegister(MakeSSAConstInt(Lbs[0])), MakeSSAValue(svkNone));
+    ProcessExpression(IdxN.GetChild(k), IV);
+    if IV.Kind = svkConstFloat then IV := MakeSSAConstInt(Trunc(IV.ConstFloat));
+    IV := EnsureIntRegister(IV);
+    if Lbs[k] <> 0 then
+    begin
+      Prod := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaSubInt, Prod, IV, EnsureIntRegister(MakeSSAConstInt(Lbs[k])), MakeSSAValue(svkNone));
+      IV := Prod;
+    end;
+    if k = 0 then Lin := IV
+    else
+    begin
+      Prod := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaMulInt, Prod, Lin, EnsureIntRegister(MakeSSAConstInt(Ubs[k] - Lbs[k] + 1)), MakeSSAValue(svkNone));
+      Lin := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaAddInt, Lin, Prod, IV, MakeSSAValue(svkNone));
+    end;
   end;
   Prod := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaMulInt, Prod, Lin, EnsureIntRegister(MakeSSAConstInt(EB)), MakeSSAValue(svkNone));
@@ -36322,6 +36433,41 @@ begin
   Result := False;
   if (NameU = '') or (FForeignDataScalars.IndexOfName(NameU) < 0) then Exit;
   if FInProcedure and (FCurrentProcDeclNames <> nil) and (FCurrentProcDeclNames.IndexOf(NameU) >= 0) then Exit;
+  Result := True;
+end;
+
+function TSSAGenerator.ExternStoreForC(const NameU: string; var V: TSSAValue; ExprNode: TASTNode): Boolean;
+// DIVERGENZE 607 · 610 - V converted to what C can use once written into the pointer Extern NameU: a closure with the
+// Extern's own signature for a PROCEDURE type, C's mark taken off for a pointer to a RECORD (FieldValueForC's -2, the
+// line 576 draws), the address C can dereference for any other pointer (-1). False - store as before - for a
+// procedure type whose signature no closure can pass.
+var
+  Sig, T: string;
+  R: TSSAValue;
+begin
+  Result := False;
+  R := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  if FForeignProcExterns.IndexOf(NameU) >= 0 then
+  begin
+    Sig := ForeignFieldClosureSig(FForeignProcExternSigs.Values[NameU]);
+    if Sig = '' then Exit;
+    EmitInstruction(ssaValueForC, R, EnsureIntRegister(V), MakeSSAConstString(Sig), MakeSSAValue(svkNone));
+  end
+  else
+  begin
+    T := FForeignDataScalars.Values[NameU];
+    T := Trim(Copy(T, 1, Length(T) - 4));
+    // ...and "@proc" into a plain pointer Extern is a closure with the PROCEDURE's signature (612, as for a field)
+    Sig := '';
+    if (ExprNode <> nil) and (GetEnvironmentVariable('SB_ANYPTR_PROC') <> '0') then Sig := BasicProcCallbackSig(ExprNode);
+    if Sig <> '' then
+      EmitInstruction(ssaValueForC, R, EnsureIntRegister(V), MakeSSAConstString(Sig), MakeSSAValue(svkNone))
+    else if FindUDT(UpperFast(CanonicalType(T))) >= 0 then
+      EmitInstruction(ssaValueForC, R, EnsureIntRegister(V), MakeSSAValue(svkNone), MakeSSAConstInt(-2))
+    else
+      EmitInstruction(ssaValueForC, R, EnsureIntRegister(V), MakeSSAValue(svkNone), MakeSSAConstInt(-1));
+  end;
+  V := R;
   Result := True;
 end;
 
@@ -46955,12 +47101,32 @@ begin
   Result := UpperFast(CanonicalType(UpperFast(FRefVars.ValueFromIndex[idx]))) = 'WSTRING';
 end;
 
+function TSSAGenerator.RefVarFixStrCap(const Name: string; out Wide: Boolean): Integer;
+// DIVERGENZE 609 - the capacity n of a reference to a C library's FIXED character buffer, "ZSTRING * n" / "WSTRING * n"
+// (the parser types an "extern allegro_error as zstring * 256" so); 0 for anything else.
+var
+  idx, p: Integer;
+  T: string;
+begin
+  Result := 0; Wide := False;
+  idx := FRefVars.IndexOfName(UpperFast(Name));
+  if idx < 0 then Exit;
+  T := UpperFast(FRefVars.ValueFromIndex[idx]);
+  p := Pos(' * ', T);
+  if p = 0 then Exit;
+  if Trim(Copy(T, 1, p - 1)) = 'WSTRING' then Wide := True
+  else if Trim(Copy(T, 1, p - 1)) <> 'ZSTRING' then Exit;
+  Result := StrToIntDef(Trim(Copy(T, p + 3, MaxInt)), 0);
+end;
+
 function TSSAGenerator.RefVarBank(const Name: string): TSSARegisterType;
 // The pointee bank of a reference variable (from its declared scalar type).
 var
   idx: Integer;
+  W: Boolean;
 begin
   Result := srtInt;
+  if RefVarFixStrCap(Name, W) > 0 then Exit(srtString);   // 609: C's character buffer is TEXT
   idx := FRefVars.IndexOfName(UpperFast(Name));
   if idx >= 0 then Result := TypeNameToBank(FRefVars.ValueFromIndex[idx], Name);
 end;
@@ -49487,7 +49653,14 @@ begin
       // name is asked HERE, where the declared spelling still exists: ForeignExternIsPointer then loads it with C's
       // mark, and a call through it takes the C branch of the indirect call instead of jumping to a BASIC PC.
       if (FuncPtrTypeSig(Node.GetChild(1).ValueUpper) <> '') or (Node.Attributes.Values['FUNCPTR'] = '1') then
+      begin
         FForeignProcExterns.Add(LhsU);   // ...or a procedure type written in place (DIVERGENZE 605)
+        // ...and the signature C calls it with, for a STORE into it (DIVERGENZE 607)
+        if Node.Attributes.Values['FUNCPTR'] = '1' then
+          FForeignProcExternSigs.Values[LhsU] := Node.Attributes.Values['FPPARAMS'] + '|' + Node.Attributes.Values['FPRET']
+        else
+          FForeignProcExternSigs.Values[LhsU] := FuncPtrTypeSig(Node.GetChild(1).ValueUpper);
+      end;
       // ⭐ DIVERGENZE 412 - ...and one whose type is a POINTER TO A SCALAR ("environ As ZString Ptr Ptr") is a
       // raw pointer: what it holds is C's memory, so "environ[0]" steps SizeOf bytes and loads raw. A pointer to
       // a RECORD (WINDOW_ Ptr, FILE Ptr) keeps its own road, the record-pointer one (DIVERGENZE 413).
@@ -56383,6 +56556,20 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessMemberStore(MemberNode, ExprNode: TASTNode);
+// DIVERGENZE 612: the expression is kept where FieldValueForC can ask what it IS ("@proc" into an Any Ptr field).
+var
+  Saved: TASTNode;
+begin
+  Saved := FStoreExprNode;
+  FStoreExprNode := ExprNode;
+  try
+    ProcessMemberStoreBody(MemberNode, ExprNode);
+  finally
+    FStoreExprNode := Saved;
+  end;
+end;
+
+procedure TSSAGenerator.ProcessMemberStoreBody(MemberNode, ExprNode: TASTNode);
 // Lower "obj.field = expr" to ssaRecordStore<bank>(handle, value, slot). If the member is not a field
 // but a PROPERTY setter (FreeBASIC), lower a method call obj.<prop>.SET(expr) instead.
 var
@@ -57985,7 +58172,13 @@ begin
   if not FieldWantsValueForC(UDTIdx, FieldIdx) then Exit;
   Sig := '';
   if FUDTs[UDTIdx].Fields[FieldIdx].FuncPtrSig <> '' then
-    Sig := ForeignFieldClosureSig(FUDTs[UDTIdx].Fields[FieldIdx].FuncPtrSig);
+    Sig := ForeignFieldClosureSig(FUDTs[UDTIdx].Fields[FieldIdx].FuncPtrSig)
+  // ⭐ DIVERGENZE 612 - "@proc" (through casts) written into a POINTER field: C will CALL what it finds there
+  // (Allegro's DIALOG.dp holding d_list_proc's getter, a sigaction handler declared Any Ptr). The field names no
+  // signature, but the procedure has one - the same one the argument path takes for "@proc" to an Any Ptr parameter
+  // (BasicProcCallbackSig, 218). Without it the entry PC went through the pointer road and C jumped into nothing.
+  else if (FStoreExprNode <> nil) and (GetEnvironmentVariable('SB_ANYPTR_PROC') <> '0') then
+    Sig := BasicProcCallbackSig(FStoreExprNode);
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   if Sig <> '' then
     EmitInstruction(ssaValueForC, Result, EnsureIntRegister(V), MakeSSAConstString(Sig), MakeSSAValue(svkNone))
@@ -61530,6 +61723,7 @@ begin
   FRawPtrVars.Clear;
   FForeignDataScalars.Clear;
   FForeignProcExterns.Clear;
+  FForeignProcExternSigs.Clear;
   FRawPtrScoped.Clear;    // beside FRawPtrVars: the same fact with the SCOPE it was learnt in
   FRawFromAddrOf.Clear;   // beside FRawPtrVars: it records WHY one of them is raw
   FWStringVars.Clear;

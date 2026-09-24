@@ -3133,6 +3133,11 @@ var
           // defined(NAME) or defined NAME -> 1/0
           while (p <= Length(S)) and (S[p] in [' ', #9]) do Inc(p);
           DefParen := (p <= Length(S)) and (S[p] = '(');
+          // ⛔ DIVERGENZE 608 - fbc wants the parenthesis: "#if defined X" is "error 6: Expected '(', found 'X'". Accepted
+          // here, a program fbc refuses compiled. SB_DEFINED_NOPAREN=1 is the A/B knob.
+          if (not DefParen) and (GetEnvironmentVariable('SB_DEFINED_NOPAREN') <> '1') then
+            raise EPreprocessorError.CreateFmt('Expected "(" after defined, found "%s"',
+                                               [Trim(Copy(S, p, 32))]);
           if DefParen then Inc(p);
           while (p <= Length(S)) and (S[p] in [' ', #9]) do Inc(p);
           // ⭐ A LEADING '.' (or '..') asks for the GLOBAL scope, and for defined() it names the same

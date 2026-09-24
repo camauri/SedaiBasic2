@@ -4177,7 +4177,7 @@ var
     // ...and RawStoreInt's: a C-marked value loses the mark, a packed VM name (>= 2^32, top bits clear) goes through
     // AotPtrStore, everything else is written as it is. rax = the address, rcx = the value.
     procedure EmitPtrStore;
-    var pNotTag, pTop, pLow, pWrite: Integer;
+    var pNotTag, pTop, pLow, pWrite, pRaw: Integer;
     begin
       E.EmitBytes([$48, $89, $CA]);                        // mov rdx, rcx
       E.EmitBytes([$48, $C1, $EA, 61]);                    // shr rdx, 61
@@ -4186,12 +4186,16 @@ var
       E.EmitBytes([$48, $0F, $BA, $F1, 61]);               // btr rcx, 61          (a C-marked value: bare)
       E.EmitBytes([$E9]); pWrite := E.Len; E.Emit32(0);    // jmp write
       E.Patch32(pNotTag, LongWord(E.Len - (pNotTag + 4))); // @nottag
+      // DIVERGENZE 613: a VM raw offset (RAWPTR_TAG, top bits 010) is the VM's to translate too
+      E.EmitBytes([$83, $FA, $02]);                        // cmp edx, 2
+      E.EmitBytes([$0F, $84]); pRaw := E.Len; E.Emit32(0); // je call
       E.EmitBytes([$85, $D2]);                             // test edx, edx
       E.EmitBytes([$0F, $85]); pTop := E.Len; E.Emit32(0); // jnz write            (top bits set: as it is)
       E.EmitBytes([$48, $89, $CA]);                        // mov rdx, rcx
       E.EmitBytes([$48, $C1, $EA, 32]);                    // shr rdx, 32
       E.EmitBytes([$0F, $84]); pLow := E.Len; E.Emit32(0); // jz write             (below 2^32: as it is)
-      SpillVolatiles;                                      // a packed VM name: the VM decides
+      E.Patch32(pRaw, LongWord(E.Len - (pRaw + 4)));       // @call
+      SpillVolatiles;                                      // a packed VM name or a raw offset: the VM decides
       E.MemOp([$4D, $8B], R11, R8, AOTCTX_PTRSTORE);       // r11 = primitive
       E.MemOp([$49, $8B], ABI_ARG0, R8, AOTCTX_VMSELF);    // arg0 = VMSelf
       MovRR(ABI_ARG1, RCX);                                // arg1 = the value

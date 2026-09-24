@@ -7519,6 +7519,9 @@ begin
   Result := V or FGNPTR_TAG;
 end;
 
+var
+  GRawPtrStoreOn: Boolean = True;   // DIVERGENZE 613: SB_RAWPTR_STORE=0 turns the RAWPTR_TAG half of PtrStoreValue off
+
 function TBytecodeVM.PtrStoreValue(V: Int64): Int64;
 // ...and its write twin: what a pointer becomes in C's (or native) memory. A C-marked address loses the mark; in the fb mode a
 // PACKED array pointer becomes the address of its element (phase 1, guard m799); anything else is written as it is.
@@ -7526,6 +7529,19 @@ function TBytecodeVM.PtrStoreValue(V: Int64): Int64;
 begin
   Result := V;
   if (V shr 61) and 7 = 1 then Exit(V and not FGNPTR_TAG);
+  // ⭐ DIVERGENZE 613 - ...and a RAW offset of the VM's heap (RAWPTR_TAG) is the machine address of those bytes too. A
+  // pointer C wrote into its memory and the program read back comes HOME (RTC_PTR64 turns an address inside the VM's
+  // heap into its offset); "*s += 1" then wrote the offset - 4000000000000011 - where C expects an address, and C faulted
+  // (Allegro's ugetx cursor walked by the program's own getx). Only in the fb mode; an offset that resolves to nothing
+  // (bit 62 is SHARED_REC_FLAG too) stays as it was. SB_RAWPTR_STORE=0 is the A/B knob.
+  if FNativeMemory and ((V shr 61) and 7 = 2) and GRawPtrStoreOn then
+  begin
+    try
+      Exit(Int64(PtrUInt(BlockAddr(nil, V, 1))));
+    except
+      on ERangeError do Exit(V);
+    end;
+  end;
   if FNativeMemory and (V >= (Int64(1) shl POINTER_ARRAY_SHIFT)) and ((V and (RAWPTR_TAG or FGNPTR_TAG)) = 0) and
      (FPrivArrCount = 0) then
   try
@@ -8503,6 +8519,10 @@ begin
       FramePop(ACtx);
     end;
   end;
+  // ⭐ DIVERGENZE 607 - ...and what the body PRINTed goes out before C goes on, the twin of the sync before a foreign
+  // call (434): glibc's error() calls the program's error_print_progname and THEN writes to its unbuffered stderr, and
+  // the callback's line came out after the message where fbc prints it before.
+  CStdoutSync;
 
   if ARet = nil then Exit;
   // ⭐⭐ DIVERGENZE 563 - ...and a STRUCT BY VALUE going OUT: the body answers the address of its record, and the
@@ -24358,6 +24378,7 @@ end;
 
 
 initialization
+  if SysUtils.GetEnvironmentVariable('SB_RAWPTR_STORE') = '0' then GRawPtrStoreOn := False;   // DIVERGENZE 613
   if SysUtils.GetEnvironmentVariable('FRAMESAVE_NOSTR') = '1' then GFrameSaveNoStr := 1;
   if SysUtils.GetEnvironmentVariable('FRAMEBANK') = '0' then GFrameBankNarrow := 0;
   if SysUtils.GetEnvironmentVariable('FRAMERANGE') = '0' then GFrameRangeNarrow := 0;

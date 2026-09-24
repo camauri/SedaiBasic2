@@ -451,6 +451,7 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
       case 10:                                           /* RTC_PTR64 (phase 3.2): RawStoreInt's rule */
         if (((uint64_t)v_ >> 61) == 1) *(int64_t *)p_ = (int64_t)((uint64_t)v_ & ~(1ULL << 61));
         else if ((uint64_t)v_ >= (1ULL << 32) && ((uint64_t)v_ >> 61) == 0) return pc;   /* a packed name: Pascal's */
+        else if (((uint64_t)v_ >> 61) == 2) return pc;   /* a VM raw offset (RAWPTR_TAG): Pascal's (DIVERGENZE 613) */
         else *(int64_t *)p_ = v_;
         break;
       case 11:                                           /* RTC_NPTR (phase 3.2): the mark comes off */
