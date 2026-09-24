@@ -57,7 +57,7 @@
         LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then
         begin
-          Ctx.StringRegs[InstrHot^.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
+          Ctx.StringRegs[InstrHot^.Dest] := ArrStrGet(FArrays[ArrayIdx], LinearIdx);
           {$IFDEF ENABLE_PROFILER}
           if Assigned(FProfiler) and FProfiler.Enabled then
             FProfiler.OnArrayAccess(ArrayIdx, False, LinearIdx);
@@ -130,7 +130,7 @@
         LinearIdx := Ctx.IntRegs[InstrHot^.Src2];
         if ArrayBoundsOK(ArrayIdx, LinearIdx) then
         begin
-          FArrays[ArrayIdx].StringData[LinearIdx] := Ctx.StringRegs[InstrHot^.Dest];
+          ArrStrPut(FArrays[ArrayIdx], LinearIdx, Ctx.StringRegs[InstrHot^.Dest]);
           {$IFDEF ENABLE_PROFILER}
           if Assigned(FProfiler) and FProfiler.Enabled then
             FProfiler.OnArrayAccess(ArrayIdx, True, LinearIdx);

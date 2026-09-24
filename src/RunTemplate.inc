@@ -679,7 +679,7 @@ EventPollCounter := 0;
         // Fused array-store-constant - sub-opcodes 80-82. Bounds-guarded: OOB store dropped (MODERN), CLASSIC raises.
         30: begin ArrIdxW := ArrMapP[Instr^.Src1]; if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then ArrSetIntAt(ArrIdxW, IntRegs[Instr^.Src2], Instr^.Immediate); Inc(CurPC); end; // bcArrayStoreIntConst
         31: begin ArrIdxW := ArrMapP[Instr^.Src1]; if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then FArrays[ArrIdxW].FloatData[IntRegs[Instr^.Src2]] := Double(Pointer(@Instr^.Immediate)^); Inc(CurPC); end; // bcArrayStoreFloatConst
-        32: begin ArrIdxW := ArrMapP[Instr^.Src1]; if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then FArrays[ArrIdxW].StringData[IntRegs[Instr^.Src2]] := FProgram.StringConstants[Instr^.Immediate]; Inc(CurPC); end; // bcArrayStoreStringConst
+        32: begin ArrIdxW := ArrMapP[Instr^.Src1]; if ArrayBoundsOK(ArrIdxW, IntRegs[Instr^.Src2]) then ArrStrPut(FArrays[ArrIdxW], IntRegs[Instr^.Src2], FProgram.StringConstants[Instr^.Immediate]); Inc(CurPC); end; // bcArrayStoreStringConst
 
         // Fused loop increment-and-branch (most common in hot loops) - sub-opcodes 90-93
         33: // bcAddIntToBranchLe

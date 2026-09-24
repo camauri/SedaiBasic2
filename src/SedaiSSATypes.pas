@@ -980,6 +980,10 @@ type
       strips FGNPTR_TAG on the store) - read through a packed "@a(i)" the VM brings the mark back. Not ElemIsPtr, which a
       pointer scalar's one-element backing also carries and whose cell keeps the mark. .basc v7, second facts byte bit 1. }
     BarePtr: Boolean;
+    { DIVERGENZE 615: an array of "ZString * n" in the fb memory mode is a BLOCK of n bytes per element, as fbc lays it -
+      "@a(i)" is a machine address, "*zp", "zp[16]" and C read the bytes. 0 for every other array. .basc v9, second facts
+      byte bit 2, then the Integer. }
+    FixStrBytes: Integer;
   end;
 
   TSSAProgram = class
@@ -1053,6 +1057,7 @@ type
     procedure SetArrayElemWidth(ArrayIdx, Width: Integer; Signed: Boolean);  // packed storage for a narrow type
     procedure SetArrayElemIsPtr(ArrayIdx: Integer);                          // its elements are pointers (257 B)
     procedure SetArrayAddrNative(ArrayIdx: Integer);                         // "@a(i)" is a machine address in fb (phase 2.3)
+    procedure SetArrayFixStrBytes(ArrayIdx, N: Integer);                     // a "ZString * n" array is n-byte cells (615)
     procedure SetArrayBarePtr(ArrayIdx: Integer);                            // its elements are bare machine addresses (545)
     procedure SetArrayPrivate(ArrayIdx: Integer);    // mark: proc-local, needs one storage PER THREAD
     procedure SetArrayDynamicShape(ArrayIdx: Integer; Dynamic: Boolean);  // mark: DYNAMIC slot (ERASE frees it)
@@ -2102,6 +2107,13 @@ procedure TSSAProgram.SetArrayAddrNative(ArrayIdx: Integer);
 begin
   if (ArrayIdx < 0) or (ArrayIdx >= FNextArrayIndex) then Exit;
   FArrays[ArrayIdx].AddrNative := True;
+end;
+
+procedure TSSAProgram.SetArrayFixStrBytes(ArrayIdx, N: Integer);
+// DIVERGENZE 615 - see TSSAArrayInfo.FixStrBytes.
+begin
+  if (ArrayIdx < 0) or (ArrayIdx >= FNextArrayIndex) then Exit;
+  FArrays[ArrayIdx].FixStrBytes := N;
 end;
 
 procedure TSSAProgram.SetArrayMultiDim(ArrayIdx: Integer);

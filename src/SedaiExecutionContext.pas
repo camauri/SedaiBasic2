@@ -157,6 +157,11 @@ type
     { DIVERGENZE 545: the elements are BARE machine addresses (TSSAArrayInfo.BarePtr) - a read through a packed
       "@a(i)" brings the mark back, a write through one takes it off. Fits the padding, like AddrPublished. }
     BarePtr: Boolean;
+    { DIVERGENZE 615: an array of "ZString * n" in the fb mode - n bytes per element in ByteData, the text NUL-terminated
+      inside its cell (fbc's layout), StringData empty. 0 for every other array. It fits the padding after the four
+      flags above, so ARRAY_STORAGE_FIELD_BYTES did not move: the routines that spell the fields out were visited by
+      hand (Alias, Release, Clear, Erase, Redim, RedimN, the Dim). Read and written ONLY through FixStrGet / FixStrSet. }
+    FixStrBytes: LongWord;
   end;
 
 
@@ -544,8 +549,58 @@ const
   ARRAY_STORAGE_FIELD_BYTES = 80;
 
 procedure CheckArrayStorageLayout;
+function FixStrGet(const A: TArrayStorage; Idx: Integer): string;
+procedure FixStrSet(var A: TArrayStorage; Idx: Integer; const S: string);
+// DIVERGENZE 615: EVERY element access of a string-banked array goes through these three, so a "ZString * n" array
+// (ByteData cells) and a managed one (StringData) answer through one door.
+function ArrStrGet(const A: TArrayStorage; Idx: Integer): string; inline;
+procedure ArrStrPut(var A: TArrayStorage; Idx: Integer; const S: string); inline;
+function ArrStrCount(const A: TArrayStorage): Integer; inline;
 
 implementation
+
+function ArrStrGet(const A: TArrayStorage; Idx: Integer): string;
+begin
+  if A.FixStrBytes > 0 then Result := FixStrGet(A, Idx) else Result := A.StringData[Idx];
+end;
+
+procedure ArrStrPut(var A: TArrayStorage; Idx: Integer; const S: string);
+begin
+  if A.FixStrBytes > 0 then FixStrSet(A, Idx, S) else A.StringData[Idx] := S;
+end;
+
+function ArrStrCount(const A: TArrayStorage): Integer;
+begin
+  if A.FixStrBytes > 0 then Result := Length(A.ByteData) div Integer(A.FixStrBytes) else Result := Length(A.StringData);
+end;
+
+function FixStrGet(const A: TArrayStorage; Idx: Integer): string;
+// DIVERGENZE 615 - element Idx of a "ZString * n" array: its bytes up to the terminator, never past its own cell.
+var
+  P: PAnsiChar;
+  L, N: Integer;
+begin
+  N := Integer(A.FixStrBytes);
+  P := PAnsiChar(@A.ByteData[Idx * N]);
+  L := 0;
+  while (L < N) and (P[L] <> #0) do Inc(L);
+  SetString(Result, P, L);
+end;
+
+procedure FixStrSet(var A: TArrayStorage; Idx: Integer; const S: string);
+// ...and the write, as fbc writes a "ZString * n": at most n - 1 characters, cut at an embedded NUL, then the
+// terminator. The bytes after the terminator keep what they had, as they do under fbc (a byte view sees them).
+var
+  L, N, k: Integer;
+begin
+  N := Integer(A.FixStrBytes);
+  L := Length(S);
+  for k := 1 to L do
+    if S[k] = #0 then begin L := k - 1; Break; end;
+  if L > N - 1 then L := N - 1;
+  if L > 0 then Move(S[1], A.ByteData[Idx * N], L);
+  A.ByteData[Idx * N + L] := 0;
+end;
 
 procedure CheckArrayStorageLayout;
 // The tripwire described at ARRAY_STORAGE_FIELD_BYTES. Cheap enough to run unconditionally at start-up:

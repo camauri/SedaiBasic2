@@ -101,7 +101,9 @@ const
   // type in their Immediate (RECNEW_NATIVE, RECBLOCK_NATIVE, RECARR_NATIVE) and reads their fields as raw memory, and a VM
   // that does not know the bits would allocate handles and then read them as addresses. The version bump is what makes an
   // older VM refuse such a file by name instead. A v7 file is read unchanged: nothing in it carries the bits.
-  BASC_VERSION = 8;
+  // v9 (24 Sep 2026): an array of "ZString * n" in the fb mode is n-byte cells (DIVERGENZE 615): the second facts byte's
+  // bit 2 says so, and the Integer n follows. A v8 file has no such array and is read unchanged.
+  BASC_VERSION = 9;
 
   // Flags
   BASC_FLAG_DEBUG_INFO = $0001;  // Contains source line mapping (always included)
@@ -358,7 +360,9 @@ begin
       RegType := 0;
       if ArrInfo.AddrNative then RegType := RegType or 1;
       if ArrInfo.BarePtr then RegType := RegType or 2;      // bit 1: bare pointers (DIVERGENZE 545)
+      if ArrInfo.FixStrBytes > 0 then RegType := RegType or 4;   // bit 2: "ZString * n" cells, n follows (v9, 615)
       Stream.WriteBuffer(RegType, SizeOf(RegType));
+      if ArrInfo.FixStrBytes > 0 then Stream.WriteBuffer(ArrInfo.FixStrBytes, SizeOf(ArrInfo.FixStrBytes));
     except
       on E: Exception do
         raise EBytecodeSerializerError.CreateFmt('Error writing array %d: %s', [i, E.Message]);
@@ -553,11 +557,14 @@ begin
       // loop, and a True left from the previous array would be read as this one's.
       ArrInfo.AddrNative := False;
       ArrInfo.BarePtr := False;
+      ArrInfo.FixStrBytes := 0;
       if Header.Version >= 7 then
       begin
         Stream.ReadBuffer(RegType, SizeOf(RegType));
         ArrInfo.AddrNative := (RegType and 1) <> 0;
         ArrInfo.BarePtr := (RegType and 2) <> 0;
+        if (Header.Version >= 9) and ((RegType and 4) <> 0) then
+          Stream.ReadBuffer(ArrInfo.FixStrBytes, SizeOf(ArrInfo.FixStrBytes));   // written above, in the same change
       end;
       Result.AddArrayInfo(ArrInfo);
     end;

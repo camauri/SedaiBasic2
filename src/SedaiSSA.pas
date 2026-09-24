@@ -1331,6 +1331,7 @@ type
     function NarrowConstInt(Value: Int64; WidthCode: Integer): Int64;  // B1.5 compile-time fold
     function TypeNameWidthCode(const TypeName: string): Integer;
     procedure NoteArrayAddrNative(ArrayIdx: Integer; ET: TSSARegisterType; const ElemTypeName: string);
+    procedure NoteArrayFixStr(ArrayIdx: Integer; const ElemTypeName: string; FixLen: Integer);   // 615: "ZString * n" cells
     function ArrayAddrIsNative(ArrayIdx: Integer): Boolean;
     function NarrowRefArg(const Pointee: string): TSSAValue;
     function FloatRefArg(const Pointee: string): TSSAValue;   // phase 2.6: a Single pointee's width
@@ -9582,6 +9583,20 @@ begin
             Result := MakeSSAConstInt(1);
             Exit;
           end;
+          // ⭐ DIVERGENZE 616 - ...and an element of a FIXED-LENGTH string array ("ZString * 8", "String * 5") is its declared
+          // size, 8 and 6 as fbc answers - not the 24 of a String descriptor. SB_SIZEOF_FIXSTR_ELEM=0 is the A/B knob.
+          if (Node.GetChild(1).GetChild(0).NodeType = antArrayAccess) and
+             (Node.GetChild(1).GetChild(0).ChildCount >= 1) and
+             (Node.GetChild(1).GetChild(0).GetChild(0).NodeType = antIdentifier) and
+             (FArrayFixedStr.Values[ArrayFactKey(Node.GetChild(1).GetChild(0).GetChild(0).ValueUpper)] <> '') and
+             (GetEnvironmentVariable('SB_SIZEOF_FIXSTR_ELEM') <> '0') then
+          begin
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, Result,
+                            MakeSSAConstInt(ArrayElemSizeBytes(Node.GetChild(1).GetChild(0).GetChild(0).ValueUpper)),
+                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            Exit;
+          end;
           FieldSzConst := BinaryElemBytesOfWidthCode(OperandWidthCode(Node.GetChild(1).GetChild(0)));
           if OperandWidthCode(Node.GetChild(1).GetChild(0)) = 0 then
           case InferExprBank(Node.GetChild(1).GetChild(0)) of
@@ -15597,6 +15612,7 @@ begin
       // unsigned 64-bit one (code 8) is already eight bytes wide.
       NoteArrayElemStorage(ArrayIdx, ElementType, ArrElemTypeName);
     NoteArrayAddrNative(ArrayIdx, ElementType, ArrElemTypeName);   // phase 2.3
+    NoteArrayFixStr(ArrayIdx, ArrElemTypeName, StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0));   // 615
       NoteArrayShape(DeclArrName, True);                 // "Dim x()" / "Dim x(Any)": dynamic, by shape
       // ⭐ ...and here the two spellings PART. Both register one runtime-sized dimension, but
       // "Dim a(Any)" STATED that there is one of them and the bare "Dim a()" did not - which is what
@@ -15811,6 +15827,7 @@ begin
     // it asked was never marked. Two call sites, one funnel - see NoteArrayElemStorage.
     NoteArrayElemStorage(ArrayIdx, ElementType, ArrElemTypeName);
     NoteArrayAddrNative(ArrayIdx, ElementType, ArrElemTypeName);   // phase 2.3
+    NoteArrayFixStr(ArrayIdx, ArrElemTypeName, StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0));   // 615
     // Subscripts make it FIXED - unless this DIM is the one ProcessRedim synthesizes for a "ReDim" of a
     // name never declared, which is a dynamic array however it is written.
     // ⛔ ...OR ONE OF THE SUBSCRIPTS IS "Any", WHICH *IS* THE WORD FOR DYNAMIC. "Dim b(Any, Any)" reaches
@@ -59139,6 +59156,30 @@ begin
   end;
   FAddrNativeArrays[ArrayIdx] := True;
   FProgram.SetArrayAddrNative(ArrayIdx);   // ...and for the VM: FBC.ArrayDescriptorPtr's base_ptr (and the .basc)
+end;
+
+procedure TSSAGenerator.NoteArrayFixStr(ArrayIdx: Integer; const ElemTypeName: string; FixLen: Integer);
+// ⭐ DIVERGENZE 615 - IN THE fb MEMORY MODE AN ARRAY OF "ZString * n" IS A BLOCK OF n-BYTE CELLS, as fbc lays it: the
+// element's text sits NUL-terminated in its own n bytes, "@a(i)" is the machine address of cell i (bcArrayElemAddr), and
+// "*zp", "zp[16]" (the next cell), a byte view and C all read the same bytes. Before, the elements were managed strings
+// and "@a(i)" a packed VM name that no reader took as text: Access violation, in BASIC as through C (Allegro's list getter
+// returning "@items(index)"). Only ZString: "String * n" pads with blanks and "WString * n" has wide cells, two other
+// layouts. strict keeps the managed array. SB_ZSTR_ARRAY_NATIVE=0 is the A/B knob.
+var
+  k, Old: Integer;
+begin
+  if not FNativeMemory or (ArrayIdx < 0) or (FixLen <= 0) then Exit;
+  if UpperFast(Trim(ElemTypeName)) <> 'ZSTRING' then Exit;
+  if GetEnvironmentVariable('SB_ZSTR_ARRAY_NATIVE') = '0' then Exit;
+  FProgram.SetArrayFixStrBytes(ArrayIdx, FixLen);
+  if ArrayIdx >= Length(FAddrNativeArrays) then
+  begin
+    Old := Length(FAddrNativeArrays);
+    SetLength(FAddrNativeArrays, ArrayIdx + 64);
+    for k := Old to High(FAddrNativeArrays) do FAddrNativeArrays[k] := False;
+  end;
+  FAddrNativeArrays[ArrayIdx] := True;
+  FProgram.SetArrayAddrNative(ArrayIdx);
 end;
 
 function TSSAGenerator.ArrayAddrIsNative(ArrayIdx: Integer): Boolean;

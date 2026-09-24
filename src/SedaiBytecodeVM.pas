@@ -6666,6 +6666,15 @@ begin
   PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+  // DIVERGENZE 615: a packed name into a STRING array names an ELEMENT - its text, whether the array is "ZString * n"
+  // cells (fb) or managed strings (strict, and every other string array): "*zp" of "@a(i)" read IntData, which a string
+  // array does not have, and died with an access violation.
+  if FArrays[ArrayIdx].ElementType = 2 then
+  begin
+    if PtrOffset >= ArrStrCount(FArrays[ArrayIdx]) then
+      raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+    Exit(ArrStrGet(FArrays[ArrayIdx], PtrOffset));
+  end;
   // ⛔ THE ELEMENT COUNT, NOT High(IntData). A packed array keeps IntData empty on purpose, so this
   // read -1 and the loop never ran: "*Cast(ZString Ptr, @foo(0))" over a UByte buffer - the very shape
   // this function was written for - answered the empty string, in silence. Guard m788.
@@ -6711,6 +6720,14 @@ begin
             ' highArr=', High(FArrays), ' n=', FArrays[ArrayIdx].TotalSize);
   if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) then
     raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+  // DIVERGENZE 615: ...and the write into a string element.
+  if FArrays[ArrayIdx].ElementType = 2 then
+  begin
+    if PtrOffset >= ArrStrCount(FArrays[ArrayIdx]) then
+      raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
+    ArrStrPut(FArrays[ArrayIdx], PtrOffset, Value);
+    Exit;
+  end;
   Lim := FArrays[ArrayIdx].TotalSize - 1;   // the element count - see PtrDomainLoadZStr
   if Wide then
   begin
@@ -7574,7 +7591,7 @@ begin
   E := V and POINTER_OFFSET_MASK;
   if (A >= 0) and (A <= High(FArrays)) and
      ((E < FArrays[A].TotalSize) or (E < Length(FArrays[A].IntData)) or (E < Length(FArrays[A].FloatData)) or
-      (E < Length(FArrays[A].StringData))) then Exit;
+      (E < ArrStrCount(FArrays[A]))) then Exit;
   Result := V or FGNPTR_TAG;
 end;
 
@@ -13525,7 +13542,7 @@ begin
         FArrays[Ctx.ArrMap[Instr.Src1]].FloatData[Ctx.IntRegs[Instr.Src2]] := Double(Pointer(@Instr.Immediate)^);
     32: // bcArrayStoreStringConst
       if ArrayBoundsOK(Ctx.ArrMap[Instr.Src1], Ctx.IntRegs[Instr.Src2]) then
-        FArrays[Ctx.ArrMap[Instr.Src1]].StringData[Ctx.IntRegs[Instr.Src2]] := FProgram.StringConstants[Instr.Immediate];
+        ArrStrPut(FArrays[Ctx.ArrMap[Instr.Src1]], Ctx.IntRegs[Instr.Src2], FProgram.StringConstants[Instr.Immediate]);
 
     // Fused loop increment-and-branch (Int) - sub-opcodes 90-93
     33: // bcAddIntToBranchLe: r[dest] += r[src1]; if (r[dest] <= r[src2]) goto target
@@ -13797,7 +13814,7 @@ begin
         begin
           MidRepl := Ctx.StringRegs[Instr.Dest];
           CharPos := Ctx.IntRegs[Instr.Immediate and $FFFF];
-          SrcLen := Length(FArrays[ArrayIdx].StringData[LinearIdx]);
+          SrcLen := Length(ArrStrGet(FArrays[ArrayIdx], LinearIdx));
           // Same clamping as sub-opcode 54, in the same order: a start past the end writes nothing,
           // and the replacement is already capped to len by the ssaStrLeft the lowering emits.
           if (CharPos >= 1) and (CharPos <= SrcLen) then
@@ -13806,8 +13823,15 @@ begin
             if CharVal2 > SrcLen - CharPos + 1 then CharVal2 := SrcLen - CharPos + 1;
             if CharVal2 > 0 then
             begin
-              UniqueString(FArrays[ArrayIdx].StringData[LinearIdx]);
-              Move(MidRepl[1], FArrays[ArrayIdx].StringData[LinearIdx][CharPos], CharVal2);
+              // DIVERGENZE 615: a "ZString * n" cell is its bytes - the characters are written in place there.
+              if FArrays[ArrayIdx].FixStrBytes > 0 then
+                Move(MidRepl[1], FArrays[ArrayIdx].ByteData[LinearIdx * Integer(FArrays[ArrayIdx].FixStrBytes) + CharPos - 1],
+                     CharVal2)
+              else
+              begin
+                UniqueString(FArrays[ArrayIdx].StringData[LinearIdx]);
+                Move(MidRepl[1], FArrays[ArrayIdx].StringData[LinearIdx][CharPos], CharVal2);
+              end;
             end;
           end;
         end;
@@ -14841,7 +14865,7 @@ begin
 end;
 
 procedure AotArrLoadStr(dstSlot, VMSelf: Pointer; ArrIdx, Idx: PtrInt); cdecl;
-// StringRegs[dest] := FArrays[ArrIdx].StringData[Idx], the EXACT expression of the interpreter's
+// StringRegs[dest] := ArrStrGet(FArrays[ArrIdx], Idx), the EXACT expression of the interpreter's
 // inline bcArrayLoadString arm - out of range yields '', as it does there. The two must agree; the
 // differential interp-vs-aot net (aot_validate) is what guards the pair.
 //
@@ -14857,13 +14881,13 @@ begin
   // table would have done for them has to happen here.
   ArrIdx := VM.MapArrDyn(VM.ActiveCtx, ArrIdx);
   if (Idx >= 0) and (Idx < VM.FArrays[ArrIdx].TotalSize) then
-    PAnsiString(dstSlot)^ := VM.FArrays[ArrIdx].StringData[Idx]
+    PAnsiString(dstSlot)^ := ArrStrGet(VM.FArrays[ArrIdx], Idx)
   else
     PAnsiString(dstSlot)^ := '';
 end;
 
 procedure AotArrStoreStr(VMSelf: Pointer; ArrIdx: PtrInt; srcVal: Pointer; Idx: PtrInt); cdecl;
-// FArrays[ArrIdx].StringData[Idx] := StringRegs[src], mirroring the interpreter's inline
+// FArrays[ArrIdx].StringData[Idx] := StringRegs[src] (through ArrStrPut, DIVERGENZE 615), mirroring the interpreter's inline
 // bcArrayStoreString arm: an out-of-range store is DROPPED there, so it is dropped here.
 //
 // The INDEX is the last parameter on purpose: it lets the emitter load it into the last ABI
@@ -14878,7 +14902,7 @@ begin
   // table would have done for them has to happen here.
   ArrIdx := VM.MapArrDyn(VM.ActiveCtx, ArrIdx);
   if (Idx >= 0) and (Idx < VM.FArrays[ArrIdx].TotalSize) then
-    VM.FArrays[ArrIdx].StringData[Idx] := AnsiString(srcVal);
+    ArrStrPut(VM.FArrays[ArrIdx], Idx, AnsiString(srcVal));
 end;
 
 procedure AotStrLoadConst(dstSlot, VMSelf: Pointer; imm: PtrInt); cdecl;
@@ -18350,7 +18374,13 @@ begin
        end
        else
          for k := 0 to High(FArrays[ArrayIdx].FloatData) do FArrays[ArrayIdx].FloatData[k] := 0.0;
-    2: for k := 0 to High(FArrays[ArrayIdx].StringData) do FArrays[ArrayIdx].StringData[k] := '';
+    2: if FArrays[ArrayIdx].FixStrBytes > 0 then   // DIVERGENZE 615: "ZString * n" cells, zeroed as fbc zeroes them
+       begin
+         if Length(FArrays[ArrayIdx].ByteData) > 0 then
+           FillChar(FArrays[ArrayIdx].ByteData[0], Length(FArrays[ArrayIdx].ByteData), 0);
+       end
+       else
+         for k := 0 to High(FArrays[ArrayIdx].StringData) do FArrays[ArrayIdx].StringData[k] := '';
   end;
 end;
 
@@ -18415,7 +18445,20 @@ begin
          if not Preserve then
            for k := 0 to NewSize - 1 do FArrays[ArrayIdx].FloatData[k] := 0.0;
        end;
-    2: begin
+    2: if FArrays[ArrayIdx].FixStrBytes > 0 then   // DIVERGENZE 615: the cells resize as bytes
+       begin
+         k := Length(FArrays[ArrayIdx].ByteData);
+         SetLength(FArrays[ArrayIdx].ByteData, NewSize * Integer(FArrays[ArrayIdx].FixStrBytes));
+         if Preserve then
+         begin
+           if Length(FArrays[ArrayIdx].ByteData) > k then
+             FillChar(FArrays[ArrayIdx].ByteData[k], Length(FArrays[ArrayIdx].ByteData) - k, 0);
+         end
+         else if Length(FArrays[ArrayIdx].ByteData) > 0 then
+           FillChar(FArrays[ArrayIdx].ByteData[0], Length(FArrays[ArrayIdx].ByteData), 0);
+       end
+       else
+       begin
          SetLength(FArrays[ArrayIdx].StringData, NewSize);
          if not Preserve then
            for k := 0 to NewSize - 1 do FArrays[ArrayIdx].StringData[k] := '';
@@ -18499,7 +18542,20 @@ begin
          SetLength(FArrays[ArrayIdx].FloatData, NewSize);
          if not Preserve then for k := 0 to NewSize - 1 do FArrays[ArrayIdx].FloatData[k] := 0.0;
        end;
-    2: begin
+    2: if FArrays[ArrayIdx].FixStrBytes > 0 then   // DIVERGENZE 615: the cells resize as bytes
+       begin
+         k := Length(FArrays[ArrayIdx].ByteData);
+         SetLength(FArrays[ArrayIdx].ByteData, NewSize * Integer(FArrays[ArrayIdx].FixStrBytes));
+         if Preserve then
+         begin
+           if Length(FArrays[ArrayIdx].ByteData) > k then
+             FillChar(FArrays[ArrayIdx].ByteData[k], Length(FArrays[ArrayIdx].ByteData) - k, 0);
+         end
+         else if Length(FArrays[ArrayIdx].ByteData) > 0 then
+           FillChar(FArrays[ArrayIdx].ByteData[0], Length(FArrays[ArrayIdx].ByteData), 0);
+       end
+       else
+       begin
          SetLength(FArrays[ArrayIdx].StringData, NewSize);
          if not Preserve then for k := 0 to NewSize - 1 do FArrays[ArrayIdx].StringData[k] := '';
        end;
@@ -18554,6 +18610,7 @@ begin
   Dst.DescDims    := Src.DescDims;
   Dst.AddrPublished := Src.AddrPublished;   // phase 2.3: see TArrayStorage.AddrPublished
   Dst.BarePtr := Src.BarePtr;               // DIVERGENZE 545: see TArrayStorage.BarePtr
+  Dst.FixStrBytes := Src.FixStrBytes;       // DIVERGENZE 615: see TArrayStorage.FixStrBytes
 end;
 
 procedure ReleaseArrayStorage(var A: TArrayStorage);
@@ -18648,6 +18705,7 @@ begin
   A.DescDims := 0;
   A.AddrPublished := False;
   A.BarePtr := False;
+  A.FixStrBytes := 0;   // DIVERGENZE 615
 end;
 
 procedure TBytecodeVM.ExecuteArrayDim(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -18775,6 +18833,7 @@ begin
         // takes the compiled engines out on their own (they deopt when the bounds test fails).
         FArrays[ArrayIdx].ElemWidth := ArrInfo.ElemWidth;
         FArrays[ArrayIdx].ElemSigned := ArrInfo.ElemSigned;
+        FArrays[ArrayIdx].FixStrBytes := 0;   // DIVERGENZE 615: set below, for a "ZString * n" array only
         SetLength(FArrays[ArrayIdx].ByteData, 0);
         case ArrInfo.ElementType of
           srtInt:
@@ -18802,6 +18861,16 @@ begin
               for i := 0 to ProdDims - 1 do FArrays[ArrayIdx].FloatData[i] := 0.0;
             end;
           srtString:
+            // ⭐ DIVERGENZE 615: an array of "ZString * n" in the fb mode is n-byte cells, zeroed (fbc's layout).
+            if FNativeMemory and (ArrInfo.FixStrBytes > 0) then
+            begin
+              FArrays[ArrayIdx].FixStrBytes := LongWord(ArrInfo.FixStrBytes);
+              SetLength(FArrays[ArrayIdx].StringData, 0);
+              SetLength(FArrays[ArrayIdx].ByteData, ProdDims * ArrInfo.FixStrBytes);
+              if Length(FArrays[ArrayIdx].ByteData) > 0 then
+                FillChar(FArrays[ArrayIdx].ByteData[0], Length(FArrays[ArrayIdx].ByteData), 0);
+            end
+            else
             begin
               SetLength(FArrays[ArrayIdx].StringData, ProdDims);
               for i := 0 to ProdDims - 1 do FArrays[ArrayIdx].StringData[i] := '';
@@ -18934,7 +19003,7 @@ begin
             case FArrays[ArrayIdx].ElementType of
               0: Ctx.IntRegs[Instr.Dest] := ArrGetInt(FArrays[ArrayIdx], LinearIdx);
               1: Ctx.FloatRegs[Instr.Dest] := ArrGetFloat(FArrays[ArrayIdx], LinearIdx);
-              2: Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[LinearIdx];
+              2: Ctx.StringRegs[Instr.Dest] := ArrStrGet(FArrays[ArrayIdx], LinearIdx);
             end
           else                                  // MODERN out-of-bounds read -> default (FreeBASIC)
             case FArrays[ArrayIdx].ElementType of
@@ -18953,7 +19022,7 @@ begin
             case FArrays[ArrayIdx].ElementType of
               0: ArrSetIntAt(ArrayIdx, LinearIdx, Ctx.IntRegs[Instr.Dest]);
               1: ArrSetFloatAt(ArrayIdx, LinearIdx, Ctx.FloatRegs[Instr.Dest]);
-              2: FArrays[ArrayIdx].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
+              2: ArrStrPut(FArrays[ArrayIdx], LinearIdx, Ctx.StringRegs[Instr.Dest]);
             end;
         end;
       2: // bcArrayDim
@@ -19125,9 +19194,9 @@ begin
           begin
             ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
             PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-            if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].StringData)) then
+            if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > (ArrStrCount(FArrays[ArrayIdx]) - 1)) then
               raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-            Ctx.StringRegs[Instr.Dest] := FArrays[ArrayIdx].StringData[PtrOffset];
+            Ctx.StringRegs[Instr.Dest] := ArrStrGet(FArrays[ArrayIdx], PtrOffset);
           end;
         end;
       16: // bcRefStoreInt
@@ -19222,9 +19291,9 @@ begin
           begin
             ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
             PtrOffset := PtrAddr and POINTER_OFFSET_MASK;
-            if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > High(FArrays[ArrayIdx].StringData)) then
+            if (ArrayIdx < 0) or (ArrayIdx > High(FArrays)) or (PtrOffset < 0) or (PtrOffset > (ArrStrCount(FArrays[ArrayIdx]) - 1)) then
               raise ERangeError.CreateFmt('Null or invalid pointer dereference (address %d)', [PtrAddr]);
-            FArrays[ArrayIdx].StringData[PtrOffset] := Ctx.StringRegs[Instr.Src2];
+            ArrStrPut(FArrays[ArrayIdx], PtrOffset, Ctx.StringRegs[Instr.Src2]);
           end;
         end;
       19: // bcRefAddrField — pack a record-field pointer from a handle (Src1) and slot (Immediate)
@@ -19433,7 +19502,14 @@ begin
           Ctx.IntRegs[Instr.Dest] := 0;
           if (ArrayIdx >= 0) and (ArrayIdx <= High(FArrays)) then
           begin
-            if FArrays[ArrayIdx].ElemWidth > 0 then
+            // DIVERGENZE 615: a "ZString * n" array - cell i starts n * i bytes in
+            if FArrays[ArrayIdx].FixStrBytes > 0 then
+            begin
+              if Length(FArrays[ArrayIdx].ByteData) > 0 then
+                Ctx.IntRegs[Instr.Dest] := Int64(PtrUInt(@FArrays[ArrayIdx].ByteData[0]) +
+                                             PtrUInt(PtrAddr * Integer(FArrays[ArrayIdx].FixStrBytes))) or FGNPTR_TAG;
+            end
+            else if FArrays[ArrayIdx].ElemWidth > 0 then
             begin
               if Length(FArrays[ArrayIdx].ByteData) > 0 then
                 Ctx.IntRegs[Instr.Dest] := Int64(PtrUInt(@FArrays[ArrayIdx].ByteData[0]) +
@@ -19640,7 +19716,7 @@ begin
           if MemberElemNeedsLbSub(PtrAddr) then
             LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
           if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
-            Ctx.StringRegs[Instr.Dest] := FArrays[PtrAddr].StringData[LinearIdx]
+            Ctx.StringRegs[Instr.Dest] := ArrStrGet(FArrays[PtrAddr], LinearIdx)
           else
             Ctx.StringRegs[Instr.Dest] := '';
         end;
@@ -19666,7 +19742,7 @@ begin
           if MemberElemNeedsLbSub(PtrAddr) then
             LinearIdx := LinearIdx - FArrays[PtrAddr].LowerBounds[0];
           if (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) and ArrayBoundsOK(PtrAddr, LinearIdx) then
-            FArrays[PtrAddr].StringData[LinearIdx] := Ctx.StringRegs[Instr.Dest];
+            ArrStrPut(FArrays[PtrAddr], LinearIdx, Ctx.StringRegs[Instr.Dest]);
         end;
       43: // bcArrayIdxResolveInd - member multi-dim linear index from the handle array's CURRENT dimensions
         begin
@@ -19782,6 +19858,7 @@ begin
             FArrays[DestArr].ElemWidth   := FArrays[PtrAddr].ElemWidth;    // a packed array copies its bytes
             FArrays[DestArr].ElemSigned  := FArrays[PtrAddr].ElemSigned;
             FArrays[DestArr].ByteData    := Copy(FArrays[PtrAddr].ByteData);
+            FArrays[DestArr].FixStrBytes := FArrays[PtrAddr].FixStrBytes;   // DIVERGENZE 615
           end;
         end;
       48: // bcArrayCopyRecords - value-copy an array-of-UDT member element-wise (independent element records)
