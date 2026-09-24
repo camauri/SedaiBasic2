@@ -2261,6 +2261,12 @@ begin
     BCInstr.Immediate := FProgram.AddStringConstant(Instr.Src2.ConstString) + 1;
     BCInstr.Src2 := 0;
   end;
+  // ⭐ DIVERGENZE 597: -1 = a fixed-length ZString, which has a buffer of its own and is never NULL, even empty.
+  if (Instr.OpCode = ssaStrSAdd) and (Instr.Src2.Kind = svkConstInt) and (Instr.Src2.ConstInt = -1) then
+  begin
+    BCInstr.Immediate := -1;
+    BCInstr.Src2 := 0;
+  end;
 
   {$IFDEF DEBUG_BYTECODE}
   if DebugBytecode and OpIn(Instr.OpCode, [ssaPrintInt, ssaLoadEL, ssaLoadER]) then

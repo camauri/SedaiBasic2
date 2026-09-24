@@ -266,6 +266,7 @@ type
     procedure ScanDeclNames(Precise: Boolean; Into: TStringList; const Nm: string; out Found: Boolean);
     procedure RejectEmptyAliasNames;
     function SkipAliasClause: Boolean;   // consume a linkage 'ALIAS "name"' where one is allowed
+    function WordUndefined(const U: string): Boolean;   // the program #undef'd this word (DIVERGENZE 606)
     procedure RejectStaticVarLenStringInit(Node: TASTNode; InNamespace: Boolean);
     procedure CollectModuleLocalNames(Node: TASTNode; InNamespace: Boolean);
     procedure NoteTypeCtorDtor(Node: TASTNode);
@@ -2834,7 +2835,9 @@ begin
         // FreeBASIC "LINE INPUT #n, var": LINE is not a registered keyword here (it is a bare
         // identifier), so detect the two-word form. Unambiguous — no statement has `line input`
         // meaning anything else.
-        else if (UpperFast(Token.Value) = kLINE) and Assigned(Context.PeekNext) and
+        // ⭐ DIVERGENZE 606: ...unless the program retired the word with "#undef line" (allegro.bi), after which fbc
+        // has neither statement and "line(b, 0, 0, 9, 9, c)" is a call of the program's own routine.
+        else if (UpperFast(Token.Value) = kLINE) and not WordUndefined(kLINE) and Assigned(Context.PeekNext) and
                 ((UpperFast(Context.PeekNext.Value) = kINPUT) or
                  (UpperFast(Context.PeekNext.Value) = kINPUTN)) then   // 'INPUT' or combined 'INPUT#'
           Result := ParseLineInputStatement
@@ -2842,7 +2845,7 @@ begin
         // parenthesis after it selects the graphics statement (vs LINE INPUT, vs an assignment to `line`).
         // A leading '-' also selects it ("LINE -(x2,y2)" omits the start), as does a leading STEP
         // ("LINE STEP(x1,y1)-...") or the image-target form ("LINE img,(x1,y1)-(x2,y2)").
-        else if (UpperFast(Token.Value) = kLINE) and Assigned(Context.PeekNext) and
+        else if (UpperFast(Token.Value) = kLINE) and not WordUndefined(kLINE) and Assigned(Context.PeekNext) and
                 ((Context.PeekNext.TokenType in [ttDelimParOpen, ttOpSub]) or
                  (UpperFast(Context.PeekNext.Value) = kSTEP) or LooksLikeImageTarget) then
           Result := ParseGfxLineStatement
@@ -13080,6 +13083,8 @@ const
 
   procedure Refuse(const W, What: string; T: TLexerToken);
   begin
+    // A word the program #undef'd is no longer reserved (DIVERGENZE 606): "#undef line" then "Sub line(...)" compiles in fbc.
+    if WordUndefined(UpperFast(W)) then Exit;
     HandleError(Format('"%s" is a reserved word and cannot name %s', [W, What]), T);
   end;
 
@@ -14827,6 +14832,12 @@ begin
   end;
 end;
 
+function TPackratParser.WordUndefined(const U: string): Boolean;
+begin
+  Result := (GPPUndefNames <> nil) and (GPPUndefNames.IndexOf(U) >= 0) and
+            (GetEnvironmentVariable('SB_UNDEF_KEYWORD') <> '0');
+end;
+
 function TPackratParser.SkipAliasClause: Boolean;
 // ⭐ ALIAS "name" IS ACCEPTED IN FIVE STATEMENTS, and it was skipped in three. A linkage alias is a
 // name for the LINKER, which a bytecode VM has none of, so every one of the five is entitled to
@@ -14892,6 +14903,7 @@ var
   DArrOK: Boolean;
   DaLb, DaUb: Int64;
   DimC: TASTNode;
+  FpNode: TASTNode;           // DIVERGENZE 605: "extern v As Sub(...)" / "As Function(...) As T"
 
   procedure AddCLibraryData(const DataType: string);
   // The Extern names a C library's VARIABLE (DIVERGENZE 253): "Dim Shared ByRef v As T", FGNDATA naming
@@ -14998,6 +15010,33 @@ begin
       begin
         HadConstQual := True;
         Context.Advance;
+      end;
+      // ⭐ DIVERGENZE 605 - ...a PROCEDURE type written in place: "extern ugetc as function(byval s as const zstring
+      // ptr) as long" (allegro.bi), "extern error_print_progname as sub()" (libc). This line used to leave here, so
+      // the Extern built no node at all and a call through it answered "Array not declared". Read with the reader a
+      // Dim of the same type uses, and turned into the same C-library variable (AddCLibraryData below) carrying the
+      // FUNCPTR attributes a Dim carries - the SSA files the signature from those.
+      if Context.Check(ttProcedureStart) and (Dims = nil) and ((FExternCDepth > 0) or (AliasSym <> '')) and
+         (GetEnvironmentVariable('SB_EXTERN_PROCTYPE') <> '0') then
+      begin
+        FpNode := TASTNode.Create(antArrayDecl, BlameTok);
+        try
+          if TryParseProcPtrType(FpNode) and
+             ((Context.CurrentToken = nil) or Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile])) and
+             not ModuleDeclaresNameElsewhere(Nm, True) then
+          begin
+            // registered HERE: an Exit inside this try leaves the whole routine after the finally rewinds
+            AddCLibraryData('INTEGER');                 // what a procedure pointer is stored as, as for a Dim
+            Decl.Attributes.Values['FUNCPTR'] := '1';
+            Decl.Attributes.Values['FPPARAMS'] := FpNode.Attributes.Values['FPPARAMS'];
+            Decl.Attributes.Values['FPRET'] := FpNode.Attributes.Values['FPRET'];
+            Decl.Attributes.Values['FPRETBYREF'] := FpNode.Attributes.Values['FPRETBYREF'];
+            Decl.Attributes.Values['FPDEFAULTS'] := FpNode.Attributes.Values['FPDEFAULTS'];
+          end;
+        finally
+          FpNode.Free;
+        end;
+        Exit;
       end;
       if not Context.Check(ttIdentifier) then Exit;        // a procedure type: not ours
       TypeName := UpperFast(VarToStr(Context.CurrentToken.Value));

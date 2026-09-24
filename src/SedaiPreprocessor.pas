@@ -3042,6 +3042,7 @@ var
   // "&HFF", or "1 + 2" parse correctly and nested macros expand.
   procedure Tokenize(const S: string; Depth: Integer);
   var p, q, IdStart, DotEnd: Integer; id, two: string; nm: string; ConstV, SzVal: Int64; ConstS: string;
+      DefParen: Boolean;   // "defined(" opened a parenthesis (DIVERGENZE 601)
   begin
     p := 1;
     while p <= Length(S) do
@@ -3131,7 +3132,8 @@ var
         begin
           // defined(NAME) or defined NAME -> 1/0
           while (p <= Length(S)) and (S[p] in [' ', #9]) do Inc(p);
-          if (p <= Length(S)) and (S[p] = '(') then Inc(p);
+          DefParen := (p <= Length(S)) and (S[p] = '(');
+          if DefParen then Inc(p);
           while (p <= Length(S)) and (S[p] in [' ', #9]) do Inc(p);
           // ⭐ A LEADING '.' (or '..') asks for the GLOBAL scope, and for defined() it names the same
           // symbol: "defined( ..symbol )" is fbc's own spelling in pp/pragma-reserve-4. The dots are
@@ -3155,7 +3157,12 @@ var
             nm := nm + '.' + UpperFast(Trim(Copy(S, p, q - p)));
             p := q;
           end;
-          while (p <= Length(S)) and (S[p] in [' ', #9, ')']) do Inc(p);
+          // ⛔ ONE ')' - the one "defined(" opened - and none if it opened none (DIVERGENZE 601). This loop skipped EVERY
+          // ')' after the name, so "(0 and (defined(X))) or 1" lost the two parentheses of the enclosing groups and was
+          // parsed as "0 and ... or 1" regrouped wrongly: false where fbc says true. allegro.bi guards its
+          // #inclib "alleg" with exactly that shape, and the whole Allegro 4 deck never loaded the library.
+          while (p <= Length(S)) and (S[p] in [' ', #9]) do Inc(p);
+          if DefParen and (p <= Length(S)) and (S[p] = ')') then Inc(p);
           // ⛔ A FUNCTION-LIKE MACRO IS DEFINED TOO. "#macro m(a)" and "#define f(a) ..." live in
           // FnDefs, not Defs, and only Defs was consulted - so "defined(m)" answered 0 for a macro
           // that had just been written three lines above. The two tables are one QUESTION with two

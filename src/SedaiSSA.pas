@@ -861,7 +861,9 @@ type
     function ProcedureLabelName(const Name: string): string;
     function OverloadNameForArity(const Name: string; Arity: Integer; const FPParams: string = '';
       Sep: Char = '~'): string;  // @name of an OVERLOAD set
-    function CondAsIntTruth(const V: TSSAValue): TSSAValue;   // a branchable 0/nonzero INT for any condition
+    function CondAsIntTruth(const V: TSSAValue; CondNode: TASTNode = nil): TSSAValue;   // a branchable 0/nonzero INT for any condition
+    function CharThroughPtr(Node: TASTNode; out Wide: Boolean): Boolean;   // "p[i]" / "*p" on a ZString/WString Ptr (DIVERGENZE 599)
+    function CharCodeOf(const V: TSSAValue; Wide: Boolean): TSSAValue;
     procedure StampFuncPtrTarget(InitNode: TASTNode; const Sig: string);   // tell "@f" what signature its destination wants
     // UDT/record support (M3)
     procedure RegisterUDTs(Node: TASTNode);        // pre-scan TYPE declarations (2 passes)
@@ -1068,7 +1070,9 @@ type
     procedure EmitRecBytesClear(const Rec: TSSAValue; ByteOfs, Bytes: Int64);
     procedure CollectWholeArrayFields(N: TASTNode; SkipDepth: Integer);
     function ManagedStepBytes(const Pointee: string): Int64;                    // DIVERGENZE 226: bytes one element of a pointee spans
-    function EmitManagedPtrStep(const PtrVal, Count: TSSAValue; Esz: Int64): TSSAValue;  // ...n elements, in the pointer's own unit
+    function EmitManagedPtrStep(const PtrVal, Count: TSSAValue; Esz: Int64;
+                                AnyTagIsBytes: Boolean = False): TSSAValue;  // ...n elements, in the pointer's own unit
+    function RawStepDualDomain(const PtrName: string): Boolean;   // a T Ptr Ptr PARAMETER steps by its value's domain (DIVERGENZE 596)
     function EmitIsRecPtr(const P: TSSAValue): TSSAValue;                      // ...1 when P is a record-field pointer, else 0
     function EmitRecPtrRestamp(const V: TSSAValue; W: Integer): TSSAValue;     // ...a field pointer re-read at another width
     function IsRecordHandleExpr(Node: TASTNode): Boolean;                      // ...a value that is a record handle or VIEW
@@ -1100,6 +1104,7 @@ type
     procedure CheckByrefArgType(const ProcName: string; ParamNode, ArgNode: TASTNode; Index: Integer);
     procedure CheckPointerConstArg(const ProcName: string; ParamNode, ArgNode: TASTNode; Index: Integer);  // DIVERGENZE 590
     procedure CheckPointerConstLet(const LName: string; RNode: TASTNode);                                 // DIVERGENZE 590
+    function TryLowerParenArgCall(Node: TASTNode): Boolean;                                              // DIVERGENZE 600
     function CurrentProcParamIsConstP(const Name: string): Boolean;
     function ByrefArgRelation(const ProcName: string; ParamNode, ArgNode: TASTNode; out PT, AT: string): Integer;
     function ByrefArgIsTemporary(const ProcName: string; ParamNode, ArgNode: TASTNode): Boolean;
@@ -1266,6 +1271,7 @@ type
     function PtrPtrElemObj(ObjNode: TASTNode): TASTNode;                               // "pp[i]" of a native T Ptr Ptr as an object (586)
     function ZStrFieldIndexNode(Node: TASTNode): TASTNode;                             // "x.dat[i]" on a ZString * n field (571)
     function StrLitMark(const V: TSSAValue): TSSAValue;                                  // a literal's text for ssaStrSAdd (593)
+    function StrSAddMark(ArgNode: TASTNode; const V: TSSAValue): TSSAValue;   // literal / fixed-length / var-len (DIVERGENZE 597)
     function FuncPtrSigRetUDT(const Sig1, Sig2: string): string;                      // the record a procptr signature returns (592)
     function FuncPtrRecordCallType(ObjNode: TASTNode): string;                         // the record "v(args)" / "o.f(args)" returns (592)
     function IsFuncPtrRecordCall(ObjNode: TASTNode): Boolean;                          // "v(args)" through a record-returning procptr (592)
@@ -5759,6 +5765,22 @@ begin
         if (FixedLenCapOfNode(Node.GetChild(1), CatWide) > 0) and CatWide then
           Right := EmitFixedLenToVarLen(EnsureStringRegister(Right), True);
       end;
+      // ⭐ DIVERGENZE 599 - A CHARACTER READ THROUGH A ZSTRING/WSTRING POINTER, MET BY A NUMBER, IS ITS CODE: fbc reads
+      // "p[i] <> 0" and "p[i] And i < 8" on the character's code. Here the one-character string was compared with a
+      // string register of the same NUMBER as the constant - "CmpString R14, R2, R2", itself - and the loop never ran.
+      // Only when the OTHER side is not a string: "p[i] = "a"" stays a string comparison, as in fbc.
+      if (Node.Token.TokenType in [ttOpEq, ttOpNeq, ttOpLt, ttOpGt, ttOpLe, ttOpGe, ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR]) and
+         (GetEnvironmentVariable('SB_CHAR_COND') <> '0') then
+      begin
+        if (Left.Kind = svkRegister) and (Left.RegType = srtString) and
+           not ((Right.Kind = svkConstString) or ((Right.Kind = svkRegister) and (Right.RegType = srtString))) and
+           CharThroughPtr(Node.GetChild(0), CatWide) then
+          Left := CharCodeOf(Left, CatWide);
+        if (Right.Kind = svkRegister) and (Right.RegType = srtString) and
+           not ((Left.Kind = svkConstString) or ((Left.Kind = svkRegister) and (Left.RegType = srtString))) and
+           CharThroughPtr(Node.GetChild(1), CatWide) then
+          Right := CharCodeOf(Right, CatWide);
+      end;
 
       // PHASE 3 TIER 3: Unwrap register-held constants for constant folding
       // If Left is a register holding a constant, treat it as a constant
@@ -9804,7 +9826,7 @@ begin
           ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-          EmitInstruction(ssaStrSAdd, Result, ArgReg, StrLitMark(ArgValue), MakeSSAValue(svkNone));
+          EmitInstruction(ssaStrSAdd, Result, ArgReg, StrSAddMark(Node.GetChild(1).GetChild(0), ArgValue), MakeSSAValue(svkNone));
           Exit;
         end;
 
@@ -20183,7 +20205,7 @@ begin
         CondValue := MakeSSARegister(srtInt, CmpReg);
       end;
 
-      CondValue := CondAsIntTruth(CondValue);   // a FLOAT condition is "<> 0.0"; see the note there
+      CondValue := CondAsIntTruth(CondValue, ConditionNode);   // a FLOAT condition is "<> 0.0"; see the note there
       if FResultTemps.Count > CondTempDepth then FlushResultTemps(CondTempDepth);
       // WHILE: continue if condition TRUE, exit if FALSE
       // UNTIL: continue if condition FALSE, exit if TRUE
@@ -20294,7 +20316,7 @@ begin
         CondValue := MakeSSARegister(srtInt, CmpReg);
       end;
 
-      CondValue := CondAsIntTruth(CondValue);   // a FLOAT condition is "<> 0.0"; see the note there
+      CondValue := CondAsIntTruth(CondValue, ConditionNode);   // a FLOAT condition is "<> 0.0"; see the note there
       if FResultTemps.Count > CondTempDepth then FlushResultTemps(CondTempDepth);
       // WHILE: loop back if condition TRUE, exit if FALSE
       // UNTIL: loop back if condition FALSE, exit if TRUE
@@ -20613,7 +20635,7 @@ begin
   end;
 end;
 
-function TSSAGenerator.CondAsIntTruth(const V: TSSAValue): TSSAValue;
+function TSSAGenerator.CondAsIntTruth(const V: TSSAValue; CondNode: TASTNode): TSSAValue;
 // A condition the branch opcodes can read. ssaJumpIfZero/ssaJumpIfNotZero take an INT register and read
 // their operand's INDEX in the int bank - so handing them a FLOAT register makes them test whatever
 // integer register happens to carry that number.
@@ -20627,15 +20649,53 @@ function TSSAGenerator.CondAsIntTruth(const V: TSSAValue): TSSAValue;
 // would be answering a question nobody asked.
 var
   Zero: TSSAValue;
+  W599: Boolean;
 begin
   Result := V;
   if V.Kind <> svkRegister then Exit;
+  // ⭐ DIVERGENZE 599 - ...BUT A CHARACTER READ THROUGH A ZSTRING/WSTRING POINTER IS NOT A STRING CONDITION. fbc takes
+  // "While p[i]" and "If *p Then" and tests the CHARACTER'S CODE; here the one-character string went to a STRING
+  // register and JumpIfZero read the int register of the same number, which nobody wrote - so the loop never ended
+  // and read past the terminator into an access violation (MediaInfo's deck, a strlen written by hand over getenv).
+  // Only that provable shape; any other string condition stays as it was.
+  if (V.RegType = srtString) and (CondNode <> nil) and (GetEnvironmentVariable('SB_CHAR_COND') <> '0') and
+     CharThroughPtr(CondNode, W599) then
+    Exit(CharCodeOf(V, W599));
   if V.RegType <> srtFloat then Exit;
   Zero := MakeSSARegister(srtFloat, FProgram.AllocRegister(srtFloat));
   EmitInstruction(ssaLoadConstFloat, Zero, MakeSSAConstFloat(0.0),
                   MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaCmpNeFloat, Result, V, Zero, MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.CharThroughPtr(Node: TASTNode; out Wide: Boolean): Boolean;
+// "p[i]" or "*p" where p is DECLARED a ZString / WString pointer: ONE character, which fbc reads as its CODE wherever a
+// number is wanted - a bare condition, a comparison with a number, And/Or. Provable shapes only (DIVERGENZE 599).
+var
+  Pte: string;
+begin
+  Result := False; Wide := False;
+  if Node = nil then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  Pte := '';
+  if (Node.NodeType = antDeref) and (Node.ChildCount >= 1) then
+    Pte := PointeeOfDerefTarget(Node.GetChild(0))
+  else if (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 1) and (Node.Attributes.Values['BRACKET'] = '1') and
+          (Node.GetChild(0).NodeType = antIdentifier) then
+    Pte := PointeeTypeOf(Node.GetChild(0).ValueUpper);
+  Pte := UpperFast(Trim(Pte));
+  if Copy(Pte, 1, 6) = 'CONST ' then Pte := Trim(Copy(Pte, 7, MaxInt));
+  Pte := CanonicalType(Pte);
+  Wide := Pte = 'WSTRING';
+  Result := Wide or (Pte = 'ZSTRING');
+end;
+
+function TSSAGenerator.CharCodeOf(const V: TSSAValue; Wide: Boolean): TSSAValue;
+begin
+  Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  if Wide then EmitInstruction(ssaStrAscW, Result, EnsureStringRegister(V), MakeSSAValue(svkNone), MakeSSAValue(svkNone))
+  else EmitInstruction(ssaStrAsc, Result, EnsureStringRegister(V), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
 end;
 
 procedure TSSAGenerator.ProcessIfStatement(Node: TASTNode);
@@ -20666,7 +20726,7 @@ begin
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone));
     CondValue := CondRegVal;
   end;
-  CondValue := CondAsIntTruth(CondValue);   // a FLOAT condition is "<> 0.0", not an int register index
+  CondValue := CondAsIntTruth(CondValue, Node.GetChild(0));   // a FLOAT condition is "<> 0.0", not an int register index
 
   // Generate unique labels
   ThenLabel := GenerateUniqueLabel('then');
@@ -30972,7 +31032,14 @@ begin
   if Node = nil then Exit;
   case Node.NodeType of
     antIdentifier:
-      Result := BinaryElemWidthCode(VarToStr(Node.Value));
+      // ⭐ DIVERGENZE 598: a PARAMETER of the procedure being lowered answers with ITS declared type. The width map is
+      // keyed by name and never held parameters, so "Sub put32(ByVal v As ULong) : Put #f, , v" wrote EIGHT bytes
+      // (MediaInfo's deck built a WAV header that way: 6488 bytes instead of 1644, and no audio stream was found).
+      // The parameter wins over a module variable of the same name, as it does everywhere else.
+      if (CurrentProcParamTypeName(VarToStr(Node.Value)) <> '') and (GetEnvironmentVariable('SB_PUT_PARAM_WIDTH') <> '0') then
+        Result := TypeNameWidthCode(CurrentProcParamTypeName(VarToStr(Node.Value)))
+      else
+        Result := BinaryElemWidthCode(VarToStr(Node.Value));
     antArrayAccess:
       if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
       begin
@@ -32217,6 +32284,30 @@ var
 begin
   Result := 0;
   if Node = nil then Exit;
+  // ⭐ DIVERGENZE 603: "IIf(c, a, b)" prints as the type its branches share - and a numeric LITERAL branch takes the
+  // other's. "Print IIf(p, p->len_, 0)" over a ULongInt field printed " 64" with a sign column where fbc prints "64"
+  // (Allegro's datafile sizes): the node was a call named IIF, and no rule asked its branches.
+  if FModernMode and (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antIdentifier) and (Node.GetChild(0).ValueUpper = 'IIF') and
+     (ArrayIndexOf('IIF') < 0) and (Node.GetChild(1).ChildCount = 3) and
+     (GetEnvironmentVariable('SB_IIF_PRINTKIND') <> '0') then
+  begin
+    // Measured against fbc, one rule per line: a CONSTANT condition folds the IIf to the chosen branch, which prints as
+    // itself ("IIf(0, u64, 5)" is " 5"); an unsigned 64-bit branch wins ("IIf(p, u64, n)" is "64"); two branches of one
+    // kind keep it (Boolean literals included: "true"); anything else - a narrow unsigned against a literal among them
+    // ("IIf(p, ub, 0)" is " 7") - prints signed.
+    MNode := Node.GetChild(1).GetChild(0);
+    if (MNode.NodeType = antLiteral) and not VarIsStr(MNode.Value) then
+    begin
+      if VarToStr(MNode.Value) <> '0' then Exit(PrintKindOfExpr(Node.GetChild(1).GetChild(1)))
+      else Exit(PrintKindOfExpr(Node.GetChild(1).GetChild(2)));
+    end;
+    AwIdx := PrintKindOfExpr(Node.GetChild(1).GetChild(1));
+    AwCode := PrintKindOfExpr(Node.GetChild(1).GetChild(2));
+    if (AwIdx = 2) or (AwCode = 2) then Exit(2);
+    if AwIdx = AwCode then Exit(AwIdx);
+    Exit(0);
+  end;
   // ⛔ A CALL THROUGH A PROCEDURE POINTER prints as what the procedure RETURNS, not as the pointer (DIVERGENZE
   // 417). "Sub s5(ByVal f As FN_) : Print f(21)" with "Type FN_ As Function(ByVal As Long) As Long" is a Long, and
   // fbc prints " 42" - the name f is a pointer (kind 3) since 417, and m907o caught its call taking that too.
@@ -35938,6 +36029,11 @@ begin
   while (Length(P) >= 6) and (Copy(P, 1, 6) = 'CONST ') do P := Trim(Copy(P, 7, MaxInt));
   while (Length(P) >= 6) and (Copy(P, Length(P) - 5, 6) = ' CONST') do P := Trim(Copy(P, 1, Length(P) - 6));
   if P = '' then Exit;
+  // ⭐ DIVERGENZE 599 - A WSTRING POINTER IN THE fb MODE may hold a MACHINE address (what C returns: MediaInfo_Get,
+  // wcsdup), and there one character is WIDE_CELL_BYTES bytes: "p[i]" stepped ONE byte per index and read
+  // "77 0 0 0 61 ..." where fbc reads "77 61 ...". A VM name still counts characters - EmitManagedPtrStep tells the two
+  // apart at run time. Only in fb: strict keeps the plain step it had. SB_WPTR_STEP=0 is the A/B knob.
+  if (P = 'WSTRING') and FNativeMemory and (GetEnvironmentVariable('SB_WPTR_STEP') <> '0') then Exit(WIDE_CELL_BYTES);
   if (P = 'STRING') or (P = 'ZSTRING') or (P = 'WSTRING') then Exit;
   if P = 'ANY' then Exit(1);
   if (Length(P) > 4) and (Copy(P, Length(P) - 3, 4) = ' PTR') then Exit(8);
@@ -35946,7 +36042,8 @@ begin
   if TypeSizeBytes(P) > 0 then Result := TypeSizeBytes(P);
 end;
 
-function TSSAGenerator.EmitManagedPtrStep(const PtrVal, Count: TSSAValue; Esz: Int64): TSSAValue;
+function TSSAGenerator.EmitManagedPtrStep(const PtrVal, Count: TSSAValue; Esz: Int64;
+                                          AnyTagIsBytes: Boolean): TSSAValue;
 // ⭐⭐ "p + n" on a pointer that is not raw, in the unit the POINTER counts in - and there are two, told
 // apart by the sign, which is what makes this a run-time question no declaration can answer:
 //   - a packed array pointer (positive) counts ELEMENTS: n;
@@ -35969,7 +36066,17 @@ begin
   P := EnsureIntRegister(PtrVal);
   F := EmitIsRecPtr(P);
   UseG := FNativeMemory and (Esz > 1);
-  if UseG then G := EmitIsNativeAddr(P);
+  if UseG and AnyTagIsBytes then
+  begin
+    // ⛔ DIVERGENZE 596, the raw-pointer road: a value that is not a VM name counts BYTES whatever its tag - a machine
+    // address (FGNPTR_TAG) AND a VM raw offset (RAWPTR_TAG, ScreenPtr / Allocate in the VM heap). Asking only for the
+    // first made "p[i]" of a ScreenPtr passed as a ULong Ptr parameter step one byte per element (bug_rawptr_param).
+    S := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaCmpGeInt, S, P, EnsureIntRegister(MakeSSAConstInt(Int64(1) shl 61)), MakeSSAValue(svkNone));
+    G := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaBitwiseAnd, G, S, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+  end
+  else if UseG then G := EmitIsNativeAddr(P);
   if Count.Kind = svkConstInt then
   begin
     S := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -36002,6 +36109,23 @@ begin
   end;
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaMulInt, Result, EnsureIntRegister(Count), S1, MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.RawStepDualDomain(const PtrName: string): Boolean;
+// ⭐ DIVERGENZE 596: a "T Ptr Ptr" PARAMETER is raw by rule (IsRawPtr), so "pp[i]" and "pp + i" stepped i * 8 BYTES -
+// right for C's char**, wrong for "@arr(0)" of an array of POINTERS, which stays a packed VM name in the fb mode (its
+// elements are the program's own pointers) and counts ELEMENTS: "pp[1]" read element 8 and died ("Null or invalid pointer
+// dereference", GLFW's drop callback shape). The value alone says which it is - a tagged machine address or a packed
+// name, and a pointer C hands to a callback arrives as one of the two (RunClosureBody) - so the step is decided at run
+// time, as EmitManagedPtrStep does for every pointer that is not raw. ONLY for a name raw by that rule, never for one
+// the provenance marked (an Allocate'd or C block), and only in fb. SB_PTRPP_DUALSTEP=0 is the A/B knob.
+begin
+  // ...and a PARAMETER marked raw by provenance too: a callback's "paths As Const ZString Ptr Ptr" is marked "C fills
+  // this one", and the same procedure is also called by the program with "@arr(0)" (GLFW's drop shape, called through
+  // the pointer glfwSetDropCallback hands back). For a parameter the VALUE always says which domain it is in.
+  Result := FNativeMemory and (PtrName <> '') and IsRawPtr(PtrName) and
+            ((not RawPtrMarkedHere(UpperFast(PtrName))) or (CurrentProcParamTypeName(PtrName) <> '')) and
+            (GetEnvironmentVariable('SB_PTRPP_DUALSTEP') <> '0');
 end;
 
 function TSSAGenerator.EmitIsRecPtr(const P: TSSAValue): TSSAValue;
@@ -47132,7 +47256,9 @@ begin
     end;
     Exit;
   end;
-  if sz > 1 then
+  if (sz > 1) and RawStepDualDomain(PtrName) then
+    IntVal := EmitManagedPtrStep(PtrVal, IntVal, sz, True)    // DIVERGENZE 596: the value's own unit
+  else if sz > 1 then
   begin
     SzVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaLoadConstInt, SzVal, MakeSSAConstInt(sz), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -49360,8 +49486,8 @@ begin
       // address of a C FUNCTION. CanonicalType answers INTEGER for it (a procedure type's storage alias), so the
       // name is asked HERE, where the declared spelling still exists: ForeignExternIsPointer then loads it with C's
       // mark, and a call through it takes the C branch of the indirect call instead of jumping to a BASIC PC.
-      if FuncPtrTypeSig(Node.GetChild(1).ValueUpper) <> '' then
-        FForeignProcExterns.Add(LhsU);
+      if (FuncPtrTypeSig(Node.GetChild(1).ValueUpper) <> '') or (Node.Attributes.Values['FUNCPTR'] = '1') then
+        FForeignProcExterns.Add(LhsU);   // ...or a procedure type written in place (DIVERGENZE 605)
       // ⭐ DIVERGENZE 412 - ...and one whose type is a POINTER TO A SCALAR ("environ As ZString Ptr Ptr") is a
       // raw pointer: what it holds is C's memory, so "environ[0]" steps SizeOf bytes and loads raw. A pointer to
       // a RECORD (WINDOW_ Ptr, FILE Ptr) keeps its own road, the record-pointer one (DIVERGENZE 413).
@@ -52060,7 +52186,9 @@ begin
   ProcessExpression(IndicesNode.GetChild(0), IdxVal);
   IdxK := IdxVal;                      // a constant index, kept for the managed step (DIVERGENZE 226)
   IdxVal := EnsureIntRegister(IdxVal);
-  if IsRawPtr(PtrName) and (RawElemSizeOf(PtrName) > 1) then
+  if RawStepDualDomain(PtrName) and (RawElemSizeOf(PtrName) > 1) then
+    IdxVal := EmitManagedPtrStep(PtrReg, IdxVal, RawElemSizeOf(PtrName), True)   // DIVERGENZE 596
+  else if IsRawPtr(PtrName) and (RawElemSizeOf(PtrName) > 1) then
   begin
     SzVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaLoadConstInt, SzVal, MakeSSAConstInt(RawElemSizeOf(PtrName)), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
@@ -52212,6 +52340,19 @@ begin
   if FindUDT(Pointee) >= 0 then
   begin
     Result := AddrVal;
+    Exit;
+  end;
+  // ⭐ DIVERGENZE 604 - "f(...)[i]" ON A ZSTRING / WSTRING POINTER: the byte (or wchar) is read into an INT register and
+  // NOTED, exactly as "t.p[i]" and "p[i]" are - a string context (PRINT, "&", a String) then takes the TEXT from that
+  // address, a numeric one the code. Here the register came from the pointee's STRING bank and an ssaRawLoadInt wrote
+  // into it, so "Print strchr(s, c)[0]" printed an empty line where fbc prints the rest of the string (Allegro,
+  // "get_filename(@buf)[0]").
+  if IsRaw and ((UpperFast(Pointee) = 'ZSTRING') or (UpperFast(Pointee) = 'WSTRING')) and
+     (GetEnvironmentVariable('SB_CALLIDX_ZSTR') <> '0') then
+  begin
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaRawLoadInt, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(Pointee)));
+    NoteZStrCharRead(Result, AddrVal, Ord(UpperFast(Pointee) = 'WSTRING'));
     Exit;
   end;
   Bank := TypeNameToBank(Pointee, '''');
@@ -53102,7 +53243,7 @@ begin
             begin
               ProcessStringExpression(ArgListNode.GetChild(i), ArgVal);
               SAddr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-              EmitInstruction(ssaStrSAdd, SAddr, EnsureStringRegister(ArgVal), StrLitMark(ArgVal), MakeSSAValue(svkNone));
+              EmitInstruction(ssaStrSAdd, SAddr, EnsureStringRegister(ArgVal), StrSAddMark(ArgListNode.GetChild(i), ArgVal), MakeSSAValue(svkNone));
             end;
           finally
             PNode.Free;
@@ -53737,6 +53878,28 @@ begin
     Result := ObjectTypeName(Node.GetChild(0))
   else
     Result := VarRecordTypeName(VarToStr(Node.Value));
+end;
+
+function TSSAGenerator.StrSAddMark(ArgNode: TASTNode; const V: TSSAValue): TSSAValue;
+// The second operand of an ssaStrSAdd, whatever the string: its LITERAL text (DIVERGENZE 593), or -1 when the argument is
+// a fixed-length ZString (DIVERGENZE 597: it has a buffer of its own, so even empty it is never NULL), or nothing - a
+// var-len String, which the VM answers 0 for when it is empty, as fbc's descriptor has no buffer then.
+var
+  W: Boolean;
+begin
+  Result := StrLitMark(V);
+  if Result.Kind <> svkNone then Exit;
+  if (ArgNode <> nil) and (FixedLenCapOfNode(ArgNode, W) > 0) and not W then Exit(MakeSSAConstInt(-1));
+  // ...and a "ZString * n" (FZStringVars, which FixedLenCapOfNode does not hold: it behaves as a var-len string
+  // everywhere but here). Scoped: a procedure's own declaration of the name decides, never the module's entry.
+  if (ArgNode <> nil) and (ArgNode.NodeType = antIdentifier) and (ArgNode.ChildCount = 0) then
+  begin
+    if (FCurrentProcName <> '') and (FZStringVars.IndexOfName(FCurrentProcName + '|' + ArgNode.ValueUpper) >= 0) then
+      Exit(MakeSSAConstInt(-1));
+    if (FCurrentProcName <> '') and (FCurrentProcDeclNames <> nil) and
+       (FCurrentProcDeclNames.IndexOf(ArgNode.ValueUpper) >= 0) then Exit;
+    if FZStringVars.IndexOfName(ArgNode.ValueUpper) >= 0 then Result := MakeSSAConstInt(-1);
+  end;
 end;
 
 function TSSAGenerator.StrLitMark(const V: TSSAValue): TSSAValue;
@@ -57198,7 +57361,7 @@ begin
     else if (RT = srtInt) and IsStringArgForBytePtrParam(ParamList.GetChild(i), ArgExpr) then
     begin
       ProcessStringExpression(ArgExpr, ArgVal);
-      LitMark := StrLitMark(ArgVal);
+      LitMark := StrSAddMark(ArgExpr, ArgVal);
       ArgVal := EnsureStringRegister(ArgVal);
       TempVal2 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaStrSAdd, TempVal2, ArgVal, LitMark, MakeSSAValue(svkNone));
@@ -60012,6 +60175,55 @@ begin
   end;
 end;
 
+function TSSAGenerator.TryLowerParenArgCall(Node: TASTNode): Boolean;
+// A binary operation used as a STATEMENT is the parser's reading of "proc (a) op b": the leftmost operand is the call
+// "proc(a)" and the rest is applied to its result - which fbc does not do. fbc reads a procedure name at the start of
+// a statement, without parentheses, as taking EVERYTHING after it as its argument, so "w (i + 1) * 2" passes 12 and
+// here it passed 6, with "Unhandled node type" warnings (MediaInfo's deck). The call is rebuilt as "proc((a) op b)".
+// Only a MODERN program, only a leftmost call of a known PROCEDURE with one argument, and never an array element.
+// SB_PAREN_ARG_CALL=0 is the A/B knob.
+var
+  L, Top, Arg, Holder, NewCall, Args, Par: TASTNode;
+  Name: string;
+begin
+  Result := False;
+  if (not FModernMode) or (GetEnvironmentVariable('SB_PAREN_ARG_CALL') = '0') then Exit;
+  L := Node;
+  while (L.NodeType = antBinaryOp) and (L.ChildCount >= 2) do L := L.GetChild(0);
+  if (L = Node) or (L.NodeType <> antArrayAccess) or (L.ChildCount < 2) then Exit;
+  if L.GetChild(0).NodeType <> antIdentifier then Exit;
+  if L.Attributes.Values['BRACKET'] = '1' then Exit;
+  Name := L.GetChild(0).ValueUpper;
+  if (FProcedureNames.IndexOf(Name) < 0) or (ArrayIndexOf(Name) >= 0) then Exit;
+  Args := L.GetChild(1);
+  if (Args.NodeType <> antExpressionList) or (Args.ChildCount <> 1) then Exit;
+  // the argument: the whole statement, with the leftmost call replaced by its own parenthesised argument
+  Top := Node.Clone;
+  try
+    Holder := Top;
+    while (Holder.GetChild(0).NodeType = antBinaryOp) and (Holder.GetChild(0).ChildCount >= 2) do
+      Holder := Holder.GetChild(0);
+    Par := TASTNode.Create(antParentheses, L.Token);
+    Par.AddChild(Args.GetChild(0).Clone);
+    Holder.RemoveChildAt(0);   // the cloned leftmost call (the tree owns its children)
+    Holder.InsertChild(0, Par);
+    NewCall := TASTNode.Create(antArrayAccess, L.Token);
+    NewCall.AddChild(L.GetChild(0).Clone);
+    Arg := TASTNode.Create(antExpressionList, Args.Token);
+    Arg.AddChild(Top);
+    Top := nil;
+    NewCall.AddChild(Arg);
+    try
+      ProcessStatement(NewCall);
+    finally
+      NewCall.Free;
+    end;
+    Result := True;
+  finally
+    Top.Free;
+  end;
+end;
+
 procedure TSSAGenerator.ProcessStatement(Node: TASTNode);
 // Thin dispatcher in front of the full statement lowering — same disease and cure as the
 // ProcessExpression pair above: the full body declares a dozen managed locals (TSSAValue
@@ -61023,6 +61235,16 @@ begin
       ProcessWebCommand(Node);
     end;
     {$ENDIF}
+    // ⭐ DIVERGENZE 600: "w (i + 1) * 2" - a procedure called WITHOUT parentheses whose argument BEGINS with one. The
+    // parser reads "w(i + 1)" as the call and the rest as an operation on its result; fbc takes the whole rest of the
+    // statement as the argument. See TryLowerParenArgCall.
+    antBinaryOp:
+      if not TryLowerParenArgCall(Node) then
+      begin
+        WriteLn(StdErr, '[SSA] WARNING: Unhandled node type ', Ord(Node.NodeType), ' - processing children');
+        for i := 0 to Node.ChildCount - 1 do
+          ProcessStatement(Node.GetChild(i));
+      end;
   else
     // Unhandled node type - still process children in case they contain statements
     // This ensures that nested statements are not silently dropped

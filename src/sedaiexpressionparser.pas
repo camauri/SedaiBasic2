@@ -3285,6 +3285,7 @@ function TExpressionParser.ParseCast(Token: TLexerToken): TASTNode;
 // value expression. Lowers to antCast(value = upper-case type string, child0 = value expr).
 var
   TypeStr: string;
+  CastHadConst: Boolean;   // the cast's type named CONST (DIVERGENZE 602)
   Depth: Integer;
   ValExpr, TypeOfExpr: TASTNode;
 begin
@@ -3408,7 +3409,22 @@ begin
     HandleError('Expected ")" to close CAST/CPTR', Context.CurrentToken);
     ValExpr.Free; Exit(nil);
   end;
+  // ⭐ DIVERGENZE 602: "CPtr(Const UByte Ptr, p)[i]" - the qualifier stayed in the type text, the pointee read "CONST
+  // UBYTE", which no width or bank rule knows, and the element came out as a DOUBLE (1.4e-312 where fbc prints 65).
+  // A const in a cast says what may be WRITTEN through the result, never how it is read: it is kept as CASTCONST and
+  // taken out of the name every reader parses. SB_CAST_KEEP_CONST=1 is the A/B knob.
+  CastHadConst := False;
+  if GetEnvironmentVariable('SB_CAST_KEEP_CONST') <> '1' then
+  begin
+    TypeStr := ' ' + Trim(TypeStr) + ' ';
+    while Pos(' CONST ', TypeStr) > 0 do
+    begin
+      CastHadConst := True;
+      Delete(TypeStr, Pos(' CONST ', TypeStr), 6);
+    end;
+  end;
   Result := TASTNode.CreateWithValue(antCast, Trim(TypeStr), Token);
+  if CastHadConst then Result.Attributes.Values['CASTCONST'] := '1';
   Result.AddChild(ValExpr);
   if Assigned(TypeOfExpr) then
   begin

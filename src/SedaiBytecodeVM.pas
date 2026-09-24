@@ -1399,6 +1399,8 @@ var
   // SB_USING_BINARY_ROUND=1 makes MODERN's PRINT USING round from the EXACT binary value again, as it did before
   // DIVERGENZE 584 - the A/B knob of that entry, on ONE binary.
   GUsingBinaryRound: Boolean = False;
+  // SB_EMPTY_STR_PTR=1: an empty String gets a buffer again, as before DIVERGENZE 597 (the A/B knob).
+  GEmptyStrPtr: Boolean = False;
   // SB_LEGACY_PATHS=1 makes EXEPATH and COMMAND$(0) answer what they answered before DIVERGENZE 188
   // - the INTERPRETER's path. The twin of the knob above, and for the same reason: when a suite
   // counter moves by one, the only honest way to attribute it is to run ONE binary both ways and
@@ -1980,6 +1982,7 @@ begin
   GSpinDiag := StrToIntDef(SysUtils.GetEnvironmentVariable('SPINDIAG'), 0);
   GNoProgDirFallback := SysUtils.GetEnvironmentVariable('SB_NO_PROGDIR_FALLBACK') = '1';
   GUsingBinaryRound := SysUtils.GetEnvironmentVariable('SB_USING_BINARY_ROUND') = '1';
+  GEmptyStrPtr := SysUtils.GetEnvironmentVariable('SB_EMPTY_STR_PTR') = '1';
   GLegacyPaths := SysUtils.GetEnvironmentVariable('SB_LEGACY_PATHS') = '1';
   GRecDiag := SysUtils.GetEnvironmentVariable('RECDIAG') = '1';
   GHotCDiag := SysUtils.GetEnvironmentVariable('HOTC_DIAG') = '1';
@@ -17305,6 +17308,13 @@ begin
       // block per iteration either.
       if Instr.Immediate > 0 then
         Ctx.IntRegs[Instr.Dest] := LiteralSAdd(Instr.Immediate - 1, Ctx.StringRegs[Instr.Src1])
+      // ⭐ DIVERGENZE 597 (owner, 24 Sep 2026: copy fbc) - AN EMPTY STRING HAS NO BUFFER. fbc's descriptor of an empty
+      // String holds a NULL data pointer, so "StrPtr(s)" is 0 and the string reaches a "ZString Ptr" parameter as NULL -
+      // a variable, an array element, a function result, an empty concatenation alike. A LITERAL "" is not one of them
+      // (the branch above: it has storage), nor is a fixed-length ZString (its own buffer, resolved in the SSA).
+      // SB_EMPTY_STR_PTR=1 gives the empty string a buffer again (the A/B knob).
+      else if (Ctx.StringRegs[Instr.Src1] = '') and (Instr.Immediate = 0) and not GEmptyStrPtr then   // -1: a fixed ZString
+        Ctx.IntRegs[Instr.Dest] := 0
       else
         Ctx.IntRegs[Instr.Dest] := StrSAdd(Ctx.StringRegs[Instr.Src1]);
     40: // bcFileExists - FILEEXISTS(path): -1 if the file exists, else 0 (cross-platform).

@@ -296,7 +296,8 @@ type
 implementation
 
 uses
-  DateUtils, StrUtils;
+  DateUtils, StrUtils,
+  SedaiPreprocessor;   // GPPUndefNames: a keyword the program #undef'd is a name again (DIVERGENZE 606)
 
 // Forward declaration for lazy extraction callback
 function StaticExtractTokenValue(Context: Pointer; RecIndex: Integer): string; forward;
@@ -1388,6 +1389,19 @@ begin
 
   // Full keyword lookup
   Match := ResolveKeyword(TokenText);
+  // ⭐ DIVERGENZE 606 - A KEYWORD THE PROGRAM #UNDEF'D IS A NAME. fbc's "#undef line" removes the keyword (LINE INPUT
+  // goes with it), and allegro.bi does exactly that for line, circle, screen, palette and rgb so that its own routines,
+  // variables and types can take those names: "Declare Sub line(...)" then "line(b, 0, 0, 9, 9, c)", "Extern screen As
+  // BITMAP Ptr", "Type RGB". Here the word stayed a keyword and the header's names could not be used ("Unexpected
+  // token", "Cannot take address of element of undeclared array"). ⚠️ The list covers the whole compilation, where
+  // fbc retires the word from the #undef ON: a program that used the keyword ABOVE its own #undef reads differently.
+  // SB_UNDEF_KEYWORD=0 is the A/B knob.
+  if Match.Found and (GPPUndefNames <> nil) and (GPPUndefNames.Count > 0) and
+     (GPPUndefNames.IndexOf(UpperCase(TokenText)) >= 0) and (GetEnvironmentVariable('SB_UNDEF_KEYWORD') <> '0') then
+  begin
+    Result := CreateToken(ttIdentifier);
+    Exit;
+  end;
 
   // ⭐ A TYPE SUFFIX ON A KEYWORD IS IGNORED, and the keyword stands. FreeBASIC says so in its own
   // words - "warning 44: Suffix ignored in 'if$'" - and compiles "if$ 1 then ... end if" as an
