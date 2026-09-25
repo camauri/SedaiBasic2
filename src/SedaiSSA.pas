@@ -5475,6 +5475,11 @@ begin
       // Handle unary operators (negation and NOT)
       if Node.ChildCount > 0 then
       begin
+        // ⛔ DIVERGENZE 624 - ...and "-p" / "Not p" on a pointer, refused by fbc as well.
+        if FModernMode and ((Node.Token.TokenType = ttOpSub) or (Node.Token.TokenType = ttBitwiseNOT)) and
+           PointerArgCertain(Node.GetChild(0)) and (GetEnvironmentVariable('SB_PTR_ARITH_REFUSE') <> '0') then
+          raise Exception.Create('Type mismatch: this operator does not take a pointer operand; convert it with ' +
+                                 'Cast(Integer, p) first');
         // Operator overloading: unary "-x" / "+x" / "Not x" on a UDT with a matching one-parameter
         // "Operator -(a AS T)" / "Operator Not(a AS T)". Resolved by the operand's static type; the
         // arity-suffixed label ("@1") keeps it distinct from the binary operator of the same symbol.
@@ -5777,6 +5782,18 @@ begin
       // declares no comparison operator at all, only "Operator Cast() As Double" - so the loop never
       // ended. A type with no numeric Cast is unaffected: TryEmitUDTCastToNumber declines and the
       // handle comparison (identity) stays, which is all we ever had for those.
+      // ⛔ DIVERGENZE 624 - ON A POINTER fbc TAKES ONLY "+" / "-" AND THE COMPARISONS: "p shr 48", "p * 2", "p And 1",
+      // "p Mod 2", "p Xor q"... are "error 20: Type mismatch" there (measured, both sides of the operator). They were
+      // accepted here and computed on the VM's value - tag bits included. SB_PTR_ARITH_REFUSE=0 is the A/B knob.
+      if FModernMode and (Node.ChildCount >= 2) and
+         (Node.Token.TokenType in [ttOpMul, ttOpDiv, ttOpIntDiv, ttOpMod, ttOpShl, ttOpShr,
+                                   ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR, ttOpEqv, ttOpImp]) and
+         // ⛔ PointerArgCertain, NOT ExprIsPointerTyped: the pointer maps are FLAT per name, and chipmunk.bi's
+         // "axis.x * B" - B a local cpFloat - was refused because another procedure has a pointer called b.
+         (PointerArgCertain(Node.GetChild(0)) or PointerArgCertain(Node.GetChild(1))) and
+         (GetEnvironmentVariable('SB_PTR_ARITH_REFUSE') <> '0') then
+        raise Exception.CreateFmt('Type mismatch: this operator does not take a pointer operand (only + and - and the ' +
+                                  'comparisons do); convert it with Cast(Integer, p) first (line %d)', [Node.SourceLine]);
       NumCast := Node.Token.TokenType in [ttOpAdd, ttOpSub, ttOpMul, ttOpDiv, ttOpIntDiv,
                                           ttOpMod, ttOpPow, ttOpShl, ttOpShr,
                                           ttBitwiseAND, ttBitwiseOR, ttBitwiseXOR,
