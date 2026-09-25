@@ -13594,7 +13594,12 @@ begin
         H := Up(k);
         if InType then
         begin
-          if ((H = 'TYPE') or (H = 'UNION')) and (Up(k + 2) <> 'AS') then
+          // ⛔ DIVERGENZE 618 - ...but a FIELD may be named TYPE or UNION: "type as long" (crt/math.bi's _exception on
+          // Windows) is a field, not a block. Counted as a block that never closes, it left the rest of the FILE
+          // "inside the type", every later declaration went uncollected, and "byval min as single" (raymath.bi) was
+          // refused as a reserved word. SB_SHADOW_TYPEFIELD=0 is the A/B knob.
+          if ((H = 'TYPE') or (H = 'UNION')) and (Up(k + 2) <> 'AS') and
+             ((Up(k + 1) <> 'AS') or (GetEnvironmentVariable('SB_SHADOW_TYPEFIELD') = '0')) then
             Inc(TypeDepth)                               // a nested anonymous block: its fields are ours
           else if (H = 'END') and ((Up(k + 1) = 'TYPE') or (Up(k + 1) = 'UNION') or (Up(k + 1) = 'ENUM')) then
           begin
