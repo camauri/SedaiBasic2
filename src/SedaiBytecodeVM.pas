@@ -8539,7 +8539,10 @@ begin
   // ⭐ DIVERGENZE 607 - ...and what the body PRINTed goes out before C goes on, the twin of the sync before a foreign
   // call (434): glibc's error() calls the program's error_print_progname and THEN writes to its unbuffered stderr, and
   // the callback's line came out after the message where fbc prints it before.
-  CStdoutSync;
+  // ⛔ ONLY ON THE MAIN THREAD. PRINT writes C's stdout with fwrite_UNLOCKED, so a flush from a thread of C (Allegro's
+  // timer, calling the program's procedure every tick) raced the main thread's own writes into the same buffer and bytes
+  // were LOST - half a PRINT line of allegro's l12, under load only. The case this exists for runs on the caller's thread.
+  if GetCurrentThreadId = MainThreadID then CStdoutSync;
 
   if ARet = nil then Exit;
   // ⭐⭐ DIVERGENZE 563 - ...and a STRUCT BY VALUE going OUT: the body answers the address of its record, and the

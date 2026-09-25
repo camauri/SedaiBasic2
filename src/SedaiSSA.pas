@@ -810,6 +810,7 @@ type
     function VariadicCallSiteDecl(const Decl: TForeignDecl; ArgListNode: TASTNode;
                                   NArgs: Integer; const RetOverride: string = ''): Integer;   // la coda variadica di UN sito
     function TryForeignDefaults(const NameU: string; const Decl: TForeignDecl; ArgListNode: TASTNode; NArgs: Integer; out ResultVal: TSSAValue): Boolean;  // 557
+    function ForeignBareCallable(const NameU: string): Boolean;   // 622: a no-parameter C function, called bare
     function TryForeignCall(const NameU: string; ArgListNode: TASTNode;
                             out ResultVal: TSSAValue): Boolean;
     procedure CanonicaliseForeignDecls;   // resolve the declarations' types through the alias table
@@ -3536,6 +3537,20 @@ begin
   if FindUDT(T) >= 0 then Result := T;
 end;
 
+function TSSAGenerator.ForeignBareCallable(const NameU: string): Boolean;
+// DIVERGENZE 622: a C FUNCTION (not a Sub) declared with no parameters, which a bare name calls.
+var
+  Idx: Integer;
+  D: TForeignDecl;
+begin
+  Result := False;
+  if GetEnvironmentVariable('SB_FOREIGN_BARECALL') = '0' then Exit;
+  Idx := ForeignDeclIndexAt(NameU);
+  if Idx < 0 then Exit;
+  if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), D) then Exit;
+  Result := (D.RetTypeName <> '') and (Length(D.ParamTypeNames) = 0) and not D.Variadic;
+end;
+
 function TSSAGenerator.BareCallableFunction(const NameU: string): Boolean;
 // FreeBASIC lets a FUNCTION be called with no parentheses when it needs no arguments: "x = Foo"
 // invokes Foo(). True only for a declared FUNCTION (a SUB yields no value) whose every parameter is
@@ -5282,6 +5297,20 @@ begin
         ArgListNode := TASTNode.Create(antArgumentList, Node.Token);
         EmitUserFunctionCall(UpperFast(VarName), ArgListNode, Result);
         ArgListNode.Free;
+      end
+      // ⭐ DIVERGENZE 622 - ...and a C FUNCTION of no parameters named without parentheses is a call too: Windows'
+      // crt/win32/stdlib.bi writes "#define _doserrno (*__doserrno)", and "*uloc" / "p = uloc" read an unbound variable -
+      // 0, then "Null or invalid pointer dereference" - where fbc calls the function. SB_FOREIGN_BARECALL=0 is the A/B.
+      else if (UpperFast(VarName) <> FCurrentProcName) and (not IsDeclaredName(VarName)) and
+              ForeignBareCallable(UpperFast(VarName)) then
+      begin
+        ArgListNode := TASTNode.Create(antArgumentList, Node.Token);
+        try
+          if not TryForeignCall(UpperFast(VarName), ArgListNode, Result) then
+            Result := GetOrAllocateVariable(VarName, Node.Attributes.Values['GLOBALSCOPE'] = '1');
+        finally
+          ArgListNode.Free;
+        end;
       end
       else
       begin
@@ -7850,6 +7879,12 @@ begin
               ProcessExpression(ArgListNode, ArgValue)
             else begin Result := MakeSSAValue(svkNone); Exit; end;
           end;
+          // ⭐ DIVERGENZE 621 - a POINTER converted by CInt / CUInt / CLngInt / CULngInt / CLng ... is its ADDRESS, the rule
+          // "Cast(Integer, p)" already follows (DIVERGENZE 235 · 565): C's mark came along, "CULngInt(p)" of a pointer C
+          // returned answered 2^61 + the address. SB_CONV_PTR_STRIP=0 is the A/B knob.
+          if (ArgListNode <> nil) and (ArgListNode.NodeType = antArgumentList) and (ArgListNode.ChildCount >= 1) and
+             ExprIsPointerTyped(ArgListNode.GetChild(0)) and (GetEnvironmentVariable('SB_CONV_PTR_STRIP') <> '0') then
+            ArgValue := EmitStripForeignTag(EnsureIntRegister(ArgValue));
 
           // Width code for the narrowing: signed/unsigned 8/16/32-bit; 0 = full 64-bit (CINT/CUINT/CLNGINT).
           if FuncName = 'CBYTE' then ConvW := 1
@@ -50765,7 +50800,16 @@ begin
   while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do
     Node := Node.GetChild(0);
   if Node.NodeType = antIdentifier then
-    Result := UpperFast(ManagedPtrPointee(VarToStr(Node.Value)))   // per-proc ptr param or DIM'd pointer
+  begin
+    Result := UpperFast(ManagedPtrPointee(VarToStr(Node.Value)));   // per-proc ptr param or DIM'd pointer
+    // DIVERGENZE 622: ...or a C function of no parameters called BARE - its declared return type names the pointee
+    if (Result = '') and (not IsDeclaredName(VarToStr(Node.Value))) and ForeignBareCallable(Node.ValueUpper) then
+    begin
+      T := UpperFast(Trim(ForeignRetTypeName(Node.ValueUpper)));
+      if (Length(T) > 4) and (Copy(T, Length(T) - 3, 4) = ' PTR') then
+        Result := Trim(Copy(T, 1, Length(T) - 4));
+    end;
+  end
   else if Node.NodeType = antDeref then
   begin
     // *(*inner): the type of *inner must itself be a pointer; deref it one more level.
@@ -54909,6 +54953,10 @@ begin
   if Node = nil then Exit;
   while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
   if ExprIsPointerValue(Node) then Exit(True);
+  // ⭐ DIVERGENZE 623 - ...and "@x" is a pointer too. Every caller wrote "ExprIsPointerTyped(x) or (x is antProcAddress)",
+  // testing the node BEFORE the parentheses came off: "Str((@q[0]))" - the shape of Windows' "#define stdin
+  // (@(__iob_func())[0])" - printed 2^61 + the address. Answered here, after the unwrap. SB_PAREN_ADDR_PTR=0 is the A/B.
+  if (Node.NodeType = antProcAddress) and (GetEnvironmentVariable('SB_PAREN_ADDR_PTR') <> '0') then Exit(True);
   if (Node.NodeType = antCast) and EndsPtr(VarToStr(Node.Value)) then Exit(True);
   // ⭐ ...and a STEP of a pointer, "p + n" / "n + p" / "p - n": still a pointer, still tagged. "Cast(Integer, pa + 3)"
   // with pa = @la(0) kept FGNPTR_TAG in the fb mode once @a(i) became a machine address (phase 2.3): 2^61 + 12 where
