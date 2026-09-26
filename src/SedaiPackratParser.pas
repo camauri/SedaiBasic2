@@ -12191,9 +12191,14 @@ function TPackratParser.ConstDimSizes(DimsNode: TASTNode): TDimSizeArray;
 var
   i, lb, ub: Integer;
   Dim: TASTNode;
+  // ⛔ A bound is any CONSTANT integer expression - "-1", "L", "N - 1" - not only a bare literal: with
+  // a literal-only test "Dim a(1 To 2, -1 To 1) = {{1}, {4, 7}}" lost its row padding and the second
+  // row slid into the first (DIVERGENZE 627). TryConstIntExpr is the parser's one folder for that.
   function LitInt(N: TASTNode; out V: Integer): Boolean;
+  var V64: Int64;
   begin
-    Result := (N <> nil) and (N.NodeType = antLiteral) and TryStrToInt(Trim(VarToStr(N.Value)), V);
+    Result := (N <> nil) and TryConstIntExpr(N, V64) and (V64 >= Low(Integer)) and (V64 <= High(Integer));
+    if Result then V := Integer(V64) else V := 0;
   end;
 begin
   SetLength(Result, 0);

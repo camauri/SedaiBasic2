@@ -1429,6 +1429,7 @@ type
     procedure ScanMultiDimArrays(Node: TASTNode);            // names ever given >1 dimension
     function ArrayRank1Flag(ArrayIdx: Integer): TSSAValue;   // Src3 of ssaArrayUBound: array is 1-D
     function ApplyScalarNarrow(const VarName: string; Value: TSSAValue; SrcNode: TASTNode = nil): TSSAValue;  // narrow on scalar store
+    function PtrStoreIntoIntVar(const VarName: string; SrcNode: TASTNode): Boolean;  // DIVERGENZE 630: store the bare address
     function ApplyResultNarrow(const VarName: string; Value: TSSAValue): TSSAValue; // ...on a FUNCTION result
     function ProcRetClosureSig(const ProcName: string): string;                        // a cdecl function's procptr result (583)
     procedure ProcessMemberAccess(Node: TASTNode; out Result: TSSAValue);  // read rec.field
@@ -11678,6 +11679,14 @@ begin
   // Refinement #2: a builtin SHARED scalar is backed by a 1-element global array — store to element 0 (a
   // live cross-thread write), reusing the array-store lowering. A SHARED UDT scalar is excluded here: its
   // handle never changes (value semantics), so "p = q" falls through to the memberwise record copy below.
+  // DIVERGENZE 630 - a pointer into a SHARED integer: the bare address, then the cell's own width.
+  if IsSharedScalar(VarName) and (VarRecordTypeName(VarName) = '') and PtrStoreIntoIntVar(VarName, ExprNode) then
+  begin
+    ProcessExpression(ExprNode, ExprValue);
+    EmitSharedScalarStoreVal(VarName,
+      ApplyScalarNarrow(VarName, EmitStripForeignTag(EnsureIntRegister(ExprValue)), nil));
+    Exit;
+  end;
   if IsSharedScalar(VarName) and (VarRecordTypeName(VarName) = '') then
   begin
     SharedAssign := TASTNode.Create(antAssignment, VarNode.Token);
@@ -11708,6 +11717,7 @@ begin
       else
       begin
         ExprValue := EnsureIntRegister(ExprValue);
+        if PtrStoreIntoIntVar(VarName, ExprNode) then ExprValue := EmitStripForeignTag(ExprValue);   // 630
         EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(VarName)), ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(VarName))));
       end;
     end
@@ -11740,6 +11750,7 @@ begin
     else
     begin
       ExprValue := EnsureIntRegister(ExprValue);
+      if PtrStoreIntoIntVar(VarName, ExprNode) then ExprValue := EmitStripForeignTag(ExprValue);   // 630
       EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), RawModuleAddrReg(VarName), ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(RawModuleScalarType(VarName))));
     end;
     Exit;
@@ -14558,6 +14569,8 @@ var
   UdtInitArrAccess, UdtInitIdxList: TASTNode;   // synthesized "arr(k) = elem" for an array-of-UDT init
   InitElemNode, TupleCtor, TupleArgs: TASTNode; // an array-of-UDT init element (a T(..) temporary or a bare tuple)
   m: Integer;
+  RecInitAllConst: Boolean; // DIVERGENZE 626: every dimension of an array-of-UDT has a constant size
+  RecInitStride, RecInitRest: Integer;
   BlkIdx: Integer;         // M8/FB: innermost open block scope (-1 if none) for block-scoped UDT dtors
   MDtorSlotIdx: Integer;   // V5e: index into FModuleDtorSlots for a module global's handle slot (-1 if none)
   EllipCount: Integer;     // FB ellipsis "lb TO ...": element count taken from the initializer list
@@ -15197,7 +15210,15 @@ begin
           // LOCAL Dim, or with the assignment on the next line, was right, which is the same tell that
           // named DIVERGENZE 80. ⇒ Every conversion the assignment path performs has to be offered
           // here; there are now two, and the next one added there belongs here as well.
-          if (not TryAllocAssign(UpperFast(ArrName), ArrayDeclNode.GetChild(2))) and
+          // ...and the THIRD (DIVERGENZE 630): a POINTER into an integer cell is the bare address, as on the
+          // assignment path - "Dim Shared b As LongInt = @a" kept C's mark where "b = @a" on the next line did not.
+          if PtrStoreIntoIntVar(UpperFast(ArrName), ArrayDeclNode.GetChild(2)) then
+          begin
+            ProcessExpression(ArrayDeclNode.GetChild(2), InitElemVal);
+            EmitSharedScalarStoreVal(UpperFast(ArrName), ApplyScalarNarrow(UpperFast(ArrName),
+              EmitStripForeignTag(EnsureIntRegister(InitElemVal)), nil));
+          end
+          else if (not TryAllocAssign(UpperFast(ArrName), ArrayDeclNode.GetChild(2))) and
              (not TryFixedLenStore(UpperFast(ArrName), ArrayDeclNode.GetChild(2))) then
           begin
             InitAssign := TASTNode.Create(antAssignment, ArrayDeclNode.GetChild(0).Token);
@@ -16063,8 +16084,16 @@ begin
 
     // FreeBASIC array-of-UDT initializer "= { T(a,b), T(c,d), ... }": every pre-allocated element record
     // (bcRecordNewArray, above) is value-copied from its (usually a temporary-construction) initializer via
-    // the normal array-store path, which does the UDT record copy. 1-D only (v1); index = lb + k.
-    if (RecArrUDTIdx >= 0) and (ArrayDeclNode.Attributes.Values['ARRAYINIT'] = '1') and (DimCount = 1) then
+    // the normal array-store path, which does the UDT record copy. Index = lb + k in 1-D.
+    // ⛔ ...and in N-D, when every dimension has a constant size: the parser flattened the nested braces
+    // ROW-MAJOR, so flat position k is the index tuple of that order. Until DIVERGENZE 626 this branch was
+    // 1-D only and a 2-D list of records was DROPPED IN SILENCE - every element read zero.
+    RecInitAllConst := (DimCount >= 1) and (Length(Dimensions) >= DimCount);
+    if RecInitAllConst then
+      for m := 0 to DimCount - 1 do
+        if Dimensions[m] <= 0 then RecInitAllConst := False;
+    if (RecArrUDTIdx >= 0) and (ArrayDeclNode.Attributes.Values['ARRAYINIT'] = '1') and
+       ((DimCount = 1) or RecInitAllConst) then
     begin
       InitVals := nil;
       for k := 0 to ArrayDeclNode.ChildCount - 1 do
@@ -16077,13 +16106,55 @@ begin
           UdtInitArrAccess := TASTNode.Create(antArrayAccess, Node.Token);
           UdtInitArrAccess.AddChild(TASTNode.CreateWithValue(antIdentifier, ArrName, Node.Token));
           UdtInitIdxList := TASTNode.Create(antExpressionList, Node.Token);
-          UdtInitIdxList.AddChild(TASTNode.CreateWithValue(antLiteral, LowerBounds[0] + k, Node.Token));
+          if DimCount = 1 then
+            UdtInitIdxList.AddChild(TASTNode.CreateWithValue(antLiteral, LowerBounds[0] + k, Node.Token))
+          else
+          begin
+            // row-major: the LAST index varies fastest (626)
+            RecInitRest := k;
+            RecInitStride := 1;
+            for m := 1 to DimCount - 1 do RecInitStride := RecInitStride * Dimensions[m];
+            for m := 0 to DimCount - 1 do
+            begin
+              UdtInitIdxList.AddChild(TASTNode.CreateWithValue(antLiteral,
+                LowerBounds[m] + RecInitRest div RecInitStride, Node.Token));
+              RecInitRest := RecInitRest mod RecInitStride;
+              if m + 1 < DimCount then RecInitStride := RecInitStride div Dimensions[m + 1];
+            end;
+          end;
           UdtInitArrAccess.AddChild(UdtInitIdxList);
           InitAssign.AddChild(UdtInitArrAccess);
           // A bare tuple element "(a, b, c)" (antArgumentList, TUPLEINIT) is a UDT aggregate: wrap it as a
           // "T(a, b, c)" temporary of the array's element type so the element-store path constructs and
           // copies it. A "T(...)" temporary element is already an expression — used as-is.
           InitElemNode := InitVals.GetChild(k);
+          // A PADDING slot of a short row (N-D, 626) is not a value: the element keeps what an element the
+          // list does not reach gets - the default constructor, or nothing.
+          if InitElemNode.Attributes.Values['ARRPAD'] = '1' then
+          begin
+            if FindCtorWithDefaults(ArrElemTypeName, 0) <> '' then
+            begin
+              TupleCtor := TASTNode.Create(antArrayAccess, Node.Token);
+              TupleCtor.Attributes.Values['SYNTHCTOR'] := '1';
+              TupleCtor.AddChild(TASTNode.CreateWithValue(antIdentifier, ArrElemTypeName, Node.Token));
+              TupleCtor.AddChild(TASTNode.Create(antExpressionList, Node.Token));
+              InitAssign.AddChild(TupleCtor);
+              try ProcessArrayStore(InitAssign); finally InitAssign.Free; end;
+            end
+            else
+              InitAssign.Free;
+            Continue;
+          end;
+          // ⭐ "{ Type(1, 0, 0), ... }": the bare Type() carries no <T>, and its type is the ELEMENT's -
+          // the fifth spelling of the rule that DIM, "Function =", RETURN and a parameter default already
+          // follow. Without it the node reached the SSA with an EMPTY name and died as "Array not
+          // declared: " (DIVERGENZE 625, found by raymath m04).
+          if (InitElemNode.NodeType = antArrayAccess) and (InitElemNode.Attributes.Values['INFERTYPE'] = '1') and
+             (InitElemNode.ChildCount >= 1) then
+          begin
+            InitElemNode.GetChild(0).Value := ArrElemTypeName;
+            InitElemNode.Attributes.Values['INFERTYPE'] := '';
+          end;
           // ⛔ ...and a ONE-VALUE group "(v)" is that same aggregate. The parser decides "tuple" by
           // looking for a top-level COMMA, so "{ (a, b) }" was tagged TUPLEINIT and "{ (-1) }" came
           // through as ordinary PARENTHESES - which this branch then missed, and the element store
@@ -26073,6 +26144,11 @@ begin
       // A BOOLEAN or an unsigned value is written in ITS OWN form ("true", no sign space), not through
       // the signed IntToString: fbc's WRITE# spells them the same way its PRINT does.
       Kind := FilePrintKind(Child, ExprVal);
+      // ...a POINTER as its address, without the foreign tag, as PRINT# writes it (DIVERGENZE 628)
+      if (Kind <> 0) and (ExprVal.Kind = svkRegister) and
+         (ExprIsPointerTyped(Child) or (Child.NodeType = antProcAddress)) and
+         (GetEnvironmentVariable('SB_PRINT_PTRKIND') <> '0') then
+        ExprVal := EmitStripForeignTag(ExprVal);
       if Kind = 0 then
       begin
         StrReg := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
@@ -26316,6 +26392,12 @@ begin
       // a BOOLEAN and no sign space for an unsigned there exactly as it does on screen. The console
       // arm above has decided this since B1.5 and PRINT#/WRITE# had their own lowering that never
       // asked - so "Print #f, b" wrote -1 while "Print b" wrote true, in the same program.
+      // ⛔ ...and a POINTER goes out as its address, without the foreign tag, as the console arm writes it
+      // (DIVERGENZE 628): "Print #f, p" of C memory wrote 2^61 + the address.
+      if (ExprVal.Kind = svkRegister) and (ExprVal.RegType = srtInt) and
+         (ExprIsPointerTyped(Child) or (Child.NodeType = antProcAddress)) and
+         (GetEnvironmentVariable('SB_PRINT_PTRKIND') <> '0') then
+        ExprVal := EmitStripForeignTag(ExprVal);
       EmitInstruction(ssaPrintFile, ExprVal, HandleReg,
                      MakeSSAConstInt(FilePrintKind(Child, ExprVal)), MakeSSAValue(svkNone));
     end;
@@ -32841,6 +32923,17 @@ begin
           Result := 3;
       end;
   end;
+  // ⭐ DIVERGENZE 628 - ...and any expression whose TYPE is a pointer prints as one: unsigned, no sign column, and
+  // (at the print arm) without the foreign tag. Only a variable, a field and "q[0]" had an arm, so "Print @r[0]",
+  // "Print @r->f" and "Print p + 1" wrote " 2^61 + the address" - Windows' "#define stdin (@(__iob_func())[0])",
+  // found by bi_layout_win64. ExprIsPointerTyped knows "@x", a Cast to a pointer, a pointer step and a call returning
+  // one. SB_PRINT_PTRKIND=0 is the A/B.
+  // ⛔ NEVER for a bare VARIABLE: a variable has its own, SCOPED, print kind above, and ExprIsPointerTyped reads the
+  // pointer maps, which are FLAT per name - a "Dim ByRef x" in a sibling Scope made "Print x" of an Integer lose its
+  // sign column (m779 caught it).
+  if (Result = 0) and (Node.NodeType <> antIdentifier) and ExprIsPointerTyped(Node) and
+     (GetEnvironmentVariable('SB_PRINT_PTRKIND') <> '0') then
+    Result := 3;
 end;
 
 function TSSAGenerator.PrintKindOf(const VarName: string): Integer;
@@ -33055,12 +33148,43 @@ function TSSAGenerator.ApplyScalarNarrow(const VarName: string; Value: TSSAValue
 var
   Idx: Integer;
 begin
+  // ⭐ DIVERGENZE 630 - a POINTER stored into an INTEGER variable is its ADDRESS, the rule CInt (621) and Cast (235)
+  // follow: "Dim b As LongInt = @i" kept C's mark (2^61) while "CInt(@i)" dropped it, so fbc's dim/global-init asked
+  // "b = CInt(@i)" and got false - 621 fixed one side and exposed the other. Only a source that is a pointer beyond
+  // doubt (PointerArgCertain: the flat pointer maps do not decide) and a target that is NOT a pointer here.
+  if (Value.Kind = svkRegister) and (Value.RegType = srtInt) and PtrStoreIntoIntVar(VarName, SrcNode) then
+    Value := EmitStripForeignTag(Value);
   Idx := -1;
   if FInProcedure and (FCurrentProcName <> '') then
     Idx := FVarWidthCode.IndexOf(FCurrentProcName + '|' + UpperFast(VarName));
   if Idx < 0 then Idx := FVarWidthCode.IndexOf(UpperFast(VarName));
   if Idx < 0 then Exit(Value);
   Result := ApplyNarrowCode(PtrInt(FVarWidthCode.Objects[Idx]), Value, SrcNode);
+end;
+
+function TSSAGenerator.PtrStoreIntoIntVar(const VarName: string; SrcNode: TASTNode): Boolean;
+// DIVERGENZE 630: is this store a POINTER going into an INTEGER variable, which keeps the bare address? One question
+// for every home a scalar can have (register, SHARED cell, raw slot of an @-taken one). SB_PTR_TO_INT_STRIP=0 is the A/B.
+// ⛔ The target must be DECLARED an integer. The first draft asked "is it NOT known as a pointer here?", and the pointer
+// maps do not know every pointer: "Dim baz As TypeOf(foo) Ptr = @bar" (fbc's dim/typeof) and a PROCEDURE pointer
+// (m1083, m939) lost their mark and died on the dereference / the call. In doubt the store stays as it was.
+var
+  T: string;
+begin
+  Result := False;
+  if (SrcNode = nil) or (GetEnvironmentVariable('SB_PTR_TO_INT_STRIP') = '0') then Exit;
+  if (GetVariableType(VarName) <> srtInt) or NameIsPointerHere(VarName) then Exit;
+  // ...never a PROCEDURE pointer, whose declared type may read as an integer in the pre-scan ("Dim As Function Cdecl
+  // (...) As ZString Ptr f = sym", m939).
+  if FFuncPtrSigs.IndexOfName(UpperFast(VarName)) >= 0 then Exit;
+  // FPreVarDeclType, not FVarDeclTypeName: the second is CLEARED before the generation runs (it answered '' for all).
+  // ⛔ ...and the name as WRITTEN, not canonicalised: CanonicalType resolves a PROCEDURE-type alias ("Type LPSTRLEN As
+  // Function(...) As ULong") to an integer, and "Dim As LPSTRLEN f = Cast(LPSTRLEN, a)" lost its mark (m1083). An alias
+  // of a plain integer ("DWORD") keeps the old store - the safe side.
+  T := UpperFast(Trim(FPreVarDeclType.Values[UpperFast(VarName)]));
+  if not ((T = 'INTEGER') or (T = 'UINTEGER') or (T = 'LONGINT') or (T = 'ULONGINT') or (T = 'LONG') or
+          (T = 'ULONG') or (T = 'SHORT') or (T = 'USHORT') or (T = 'BYTE') or (T = 'UBYTE')) then Exit;
+  Result := PointerArgCertain(SrcNode);
 end;
 
 function TSSAGenerator.ApplyResultNarrow(const VarName: string; Value: TSSAValue): TSSAValue;
