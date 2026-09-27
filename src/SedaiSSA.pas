@@ -1074,11 +1074,15 @@ type
     procedure CollectWholeArrayFields(N: TASTNode; SkipDepth: Integer);
     function ManagedStepBytes(const Pointee: string): Int64;                    // DIVERGENZE 226: bytes one element of a pointee spans
     function EmitManagedPtrStep(const PtrVal, Count: TSSAValue; Esz: Int64;
-                                AnyTagIsBytes: Boolean = False): TSSAValue;  // ...n elements, in the pointer's own unit
+                                AnyTagIsBytes: Boolean = False; SmallIsAddr: Boolean = False): TSSAValue;  // ...n elements, in the pointer's own unit
+    function SmallAddrSteps(const Pointee: string): Boolean;   // DIVERGENZE 629: an untagged value below 2^32 is an address
     function RawStepDualDomain(const PtrName: string): Boolean;   // a T Ptr Ptr PARAMETER steps by its value's domain (DIVERGENZE 596)
     function EmitIsRecPtr(const P: TSSAValue): TSSAValue;                      // ...1 when P is a record-field pointer, else 0
     function EmitRecPtrRestamp(const V: TSSAValue; W: Integer): TSSAValue;     // ...a field pointer re-read at another width
     function IsRecordHandleExpr(Node: TASTNode): Boolean;                      // ...a value that is a record handle or VIEW
+    function BareVarNotPtrHere(Node: TASTNode): Boolean;   // DIVERGENZE 631
+    function AmbiguousPtrName(Node: TASTNode): Boolean;    // DIVERGENZE 629
+    function AmbiguousPtrNameS(const Name: string): Boolean;
     function PtrPointeeOf(Node: TASTNode): string;
     function AddrOfScalarPointee(Target: TASTNode): string;                    // DIVERGENZE 405: "@x" / "@a(i)" on a numeric scalar
     function IsForeignDataScalar(const NameU: string): Boolean;                // ...an Extern scalar of C, visible here
@@ -1336,7 +1340,7 @@ type
     function ArrayAddrIsNative(ArrayIdx: Integer): Boolean;
     function NarrowRefArg(const Pointee: string): TSSAValue;
     function FloatRefArg(const Pointee: string): TSSAValue;   // phase 2.6: a Single pointee's width
-    function EmitIsNativeAddr(const P: TSSAValue): TSSAValue;
+    function EmitIsNativeAddr(const P: TSSAValue; SmallIsAddr: Boolean = False): TSSAValue;
     function IsBoolArrayName(const ArrName: string): Boolean;
     function BoolToCByte(const V: TSSAValue): TSSAValue;
     procedure NoteArrayElemStorage(ArrayIdx: Integer; ET: TSSARegisterType;
@@ -32931,7 +32935,10 @@ begin
   // ⛔ NEVER for a bare VARIABLE: a variable has its own, SCOPED, print kind above, and ExprIsPointerTyped reads the
   // pointer maps, which are FLAT per name - a "Dim ByRef x" in a sibling Scope made "Print x" of an Integer lose its
   // sign column (m779 caught it).
-  if (Result = 0) and (Node.NodeType <> antIdentifier) and ExprIsPointerTyped(Node) and
+  // ⛔⛔ ...and asked through PointerArgCertain, not ExprIsPointerTyped: "Print n - 3" of an Integer n printed without its
+  // sign column because ANOTHER procedure has a "Double Ptr n" and ExprIsPointerTyped read the flat map for the operand.
+  // PointerArgCertain refuses a name some declaration gives a non-pointer type (FNonPtrNames, DIVERGENZE 483).
+  if (Result = 0) and (Node.NodeType <> antIdentifier) and PointerArgCertain(Node) and
      (GetEnvironmentVariable('SB_PRINT_PTRKIND') <> '0') then
     Result := 3;
 end;
@@ -36347,7 +36354,7 @@ begin
 end;
 
 function TSSAGenerator.EmitManagedPtrStep(const PtrVal, Count: TSSAValue; Esz: Int64;
-                                          AnyTagIsBytes: Boolean): TSSAValue;
+                                          AnyTagIsBytes: Boolean; SmallIsAddr: Boolean): TSSAValue;
 // ⭐⭐ "p + n" on a pointer that is not raw, in the unit the POINTER counts in - and there are two, told
 // apart by the sign, which is what makes this a run-time question no declaration can answer:
 //   - a packed array pointer (positive) counts ELEMENTS: n;
@@ -36379,8 +36386,16 @@ begin
     EmitInstruction(ssaCmpGeInt, S, P, EnsureIntRegister(MakeSSAConstInt(Int64(1) shl 61)), MakeSSAValue(svkNone));
     G := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaBitwiseAnd, G, S, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+    if SmallIsAddr then
+    begin
+      // ...and an untagged value below 2^32 (DIVERGENZE 629): EmitIsNativeAddr's second half, OR-ed in
+      S := EmitIsNativeAddr(P, True);
+      S1 := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaBitwiseOr, S1, G, S, MakeSSAValue(svkNone));
+      G := S1;
+    end;
   end
-  else if UseG then G := EmitIsNativeAddr(P);
+  else if UseG then G := EmitIsNativeAddr(P, SmallIsAddr);
   if Count.Kind = svkConstInt then
   begin
     S := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -36731,6 +36746,52 @@ begin
     Result := EmitRecPtrRestamp(V, W);
 end;
 
+function TSSAGenerator.AmbiguousPtrNameS(const Name: string): Boolean;
+// DIVERGENZE 629: is this NAME a pointer only by the FLAT maps' word? Some declaration gives it a non-pointer type
+// (FNonPtrNames, DIVERGENZE 483) and THIS procedure does not declare it a pointer (local or parameter). Then the small-address
+// step is not taken: "n - 3" of an Integer beside a "Double Ptr n" in another procedure answered 76. The step it had
+// before is kept - a name that is really a pointer and ambiguous loses only what 629 adds.
+var
+  U: string;
+begin
+  U := UpperFast(Name);
+  Result := (U <> '') and (FNonPtrNames.IndexOf(U) >= 0);
+  if Result and FInProcedure and
+     ((FCurrentProcPtrLocals.IndexOfName(U) >= 0) or (FCurrentProcPtrParams.IndexOfName(U) >= 0)) then Result := False;
+end;
+
+function TSSAGenerator.AmbiguousPtrName(Node: TASTNode): Boolean;
+var
+  N: TASTNode;
+begin
+  Result := False;
+  if Node = nil then Exit;
+  N := Node;
+  while (N.NodeType = antParentheses) and (N.ChildCount >= 1) do N := N.GetChild(0);
+  if (N.NodeType = antIdentifier) and (N.ChildCount = 0) then Result := AmbiguousPtrNameS(N.ValueUpper);
+end;
+
+function TSSAGenerator.BareVarNotPtrHere(Node: TASTNode): Boolean;
+// DIVERGENZE 631: is this operand a bare variable that, in the scope open now, is NOT a pointer (a float, or a name
+// no declaration here makes a pointer)? Only then the flat pointer maps' answer is overruled.
+// ⛔ Only a NON-INTEGER variable is overruled - a Double is never a pointer. "Not a pointer HERE" alone would also catch the
+// pointers the maps do not know (TypeOf(x) Ptr, a Var), the trap 630 paid for. The bank is asked of the LIVE scope
+// (ResolveExisting, as NameIsStringHere), not of the flat per-name verdict.
+var
+  N: TASTNode;
+  R: TSSAValue;
+begin
+  Result := False;
+  if (Node = nil) or (GetEnvironmentVariable('SB_PTRARITH_SCOPED') = '0') then Exit;
+  N := Node;
+  while (N.NodeType = antParentheses) and (N.ChildCount >= 1) do N := N.GetChild(0);
+  if (N.NodeType <> antIdentifier) or (N.ChildCount <> 0) then Exit;
+  if ResolveExisting(N.ValueUpper, R) then
+    Result := R.RegType in [srtFloat, srtString]
+  else if IsRawModuleScalar(N.ValueUpper) then
+    Result := TypeNameToBank(RawModuleScalarType(N.ValueUpper), N.ValueUpper) in [srtFloat, srtString];
+end;
+
 function TSSAGenerator.TryEmitManagedPtrArith(Node: TASTNode; out Res: TSSAValue): Boolean;
 // "p ± n", "n + p" and "p - q" on pointers that are not raw (DIVERGENZE 226): the step in the pointer's own
 // unit (EmitManagedPtrStep), and the difference of two record-field pointers in ELEMENTS - their byte
@@ -36742,14 +36803,22 @@ var
   IsSub, LIsPtr: Boolean;
   Esz: Int64;
   LV, RV, PV, IV, Step, M, A, B, E, D, X, T, G, GS, GD: TSSAValue;
+  PV_Node: TASTNode;
 begin
   Result := False;
   Res := MakeSSAValue(svkNone);
+  PV_Node := nil;
   if (Node = nil) or (Node.ChildCount < 2) or not Assigned(Node.Token) then Exit;
   IsSub := Node.Token.TokenType = ttOpSub;
   if not (IsSub or (Node.Token.TokenType = ttOpAdd)) then Exit;
   L := Node.GetChild(0); R := Node.GetChild(1);
   PL := PtrPointeeOf(L); PR := PtrPointeeOf(R);
+  // ⭐ DIVERGENZE 631 - a bare VARIABLE is a pointer only if it is one IN THIS SCOPE: PtrPointeeOf answers a name
+  // from the FLAT pointer maps, so a module "Dim As Double x" beside a "Dim As Double Ptr x" in a callback made
+  // "x - 3.0" pointer arithmetic - truncated to an integer (1 for 1.25), and a wrong number once the step learnt
+  // small addresses (629; gsl deck s08). SB_PTRARITH_SCOPED=0 is the A/B.
+  if (PL <> '') and BareVarNotPtrHere(L) then PL := '';
+  if (PR <> '') and BareVarNotPtrHere(R) then PR := '';
   if (PL <> '') and (PR <> '') then
   begin
     if not IsSub then Exit;                      // p + q is not arithmetic
@@ -36793,7 +36862,7 @@ begin
     // ⭐ PHASE 2.3 (fb): two tagged machine addresses subtract in BYTES - divided by SizeOf, elements again.
     if FNativeMemory and (Esz > 1) then
     begin
-      G := EmitIsNativeAddr(LV);
+      G := EmitIsNativeAddr(LV, SmallAddrSteps(Pt) and not AmbiguousPtrName(L) and not AmbiguousPtrName(R));
       GS := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
       EmitInstruction(ssaMulInt, GS, G, EnsureIntRegister(MakeSSAConstInt(Esz - 1)), MakeSSAValue(svkNone));
       GD := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -36804,8 +36873,8 @@ begin
     end;
     Exit(True);
   end;
-  if LIsPtr then begin PV := LV; IV := RV; end else begin PV := RV; IV := LV; end;
-  Step := EmitManagedPtrStep(PV, IV, Esz);
+  if LIsPtr then begin PV := LV; IV := RV; PV_Node := L; end else begin PV := RV; IV := LV; PV_Node := R; end;
+  Step := EmitManagedPtrStep(PV, IV, Esz, False, SmallAddrSteps(Pt) and not AmbiguousPtrName(PV_Node));
   Res := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   if IsSub then EmitInstruction(ssaSubInt, Res, PV, Step, MakeSSAValue(svkNone))
   else EmitInstruction(ssaAddInt, Res, PV, Step, MakeSSAValue(svkNone));
@@ -52575,7 +52644,8 @@ begin
   if (not IsRawPtr(PtrName)) and (ManagedStepBytes(ManagedPtrPointee(PtrName)) > 0) then
   begin
     if IdxK.Kind <> svkConstInt then IdxK := IdxVal;
-    IdxVal := EmitManagedPtrStep(PtrReg, IdxK, ManagedStepBytes(ManagedPtrPointee(PtrName)));
+    IdxVal := EmitManagedPtrStep(PtrReg, IdxK, ManagedStepBytes(ManagedPtrPointee(PtrName)), False,
+                                 SmallAddrSteps(ManagedPtrPointee(PtrName)) and not AmbiguousPtrNameS(PtrName));
   end;
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaAddInt, Result, PtrReg, IdxVal, MakeSSAValue(svkNone));
@@ -52689,7 +52759,7 @@ begin
       // ...a pointer that is not raw steps in its own unit, decided at run time (DIVERGENZE 226).
       Sz := ManagedStepBytes(Pointee);
       if IdxK.Kind <> svkConstInt then IdxK := IdxVal;
-      if Sz > 0 then IdxVal := EmitManagedPtrStep(BaseVal, IdxK, Sz);
+      if Sz > 0 then IdxVal := EmitManagedPtrStep(BaseVal, IdxK, Sz, False, SmallAddrSteps(Pointee));
     end;
   end;
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -59417,12 +59487,36 @@ begin
   if UpperFast(CanonicalType(Trim(Pointee))) = 'SINGLE' then Result := MakeSSAConstInt(RTC_SINGLE);
 end;
 
-function TSSAGenerator.EmitIsNativeAddr(const P: TSSAValue): TSSAValue;
+function TSSAGenerator.EmitIsNativeAddr(const P: TSSAValue; SmallIsAddr: Boolean): TSSAValue;
 // 1 when P is a tagged machine address (2^61 <= P < 2^62: FGNPTR_TAG set, RAWPTR_TAG clear), else 0.
 // Two compares and two ANDs - no SHR, for the reason EmitManagedPtrStep gives.
+// ⭐ DIVERGENZE 629 - ...and, with SmallIsAddr, an UNTAGGED value in [1, 2^32) as well: a number below 64 KiB made a
+// pointer ("Cast(Integer Ptr, 16)") takes no tag (the rule of 528: it could be a small record HANDLE), and "p + 1" then
+// stepped ONE where fbc steps SizeOf. Only for a pointer to a SCALAR (SmallAddrSteps), where no VM name falls there - a
+// packed name is "(array + 1) shl 32 or element", at least 2^32. Signed compares only: they are in the C hot loop.
 var
-  A, B, T: TSSAValue;
+  A, B, T, C: TSSAValue;
 begin
+  // ⭐ ONE range, not two: Q = P xor 2^61 maps a tagged address [2^61, 2^62) to [0, 2^61) and an untagged small value
+  // [0, 2^32) to [2^61, 2^61 + 2^32) - contiguous. A packed name [2^32, 2^61) lands above, a raw VM offset (bit 62) stays
+  // above, a record pointer (bit 63) is above as UNSIGNED. So "counts in bytes" is Q <u 2^61 + 2^32 - and an unsigned
+  // compare is a SIGNED one with bit 63 flipped on both sides (bcCmpLtUInt is not in the C hot loop nor in the AOT). The two
+  // XORs fold into one constant: P xor (2^61 or 2^63) <s (2^61 + 2^32) xor 2^63. Three operations, one FEWER than the
+  // tagged-only test below. ⛔ The first draft OR-ed a second range test in and cost +16-20% on a pointer walk in the three
+  // engines; one range with two signed compares still cost the JIT +20%. (0 falls inside: a step on a null pointer is in
+  // bytes in fbc too.)
+  if SmallIsAddr and FNativeMemory then
+  begin
+    C := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaBitwiseXor, C, EnsureIntRegister(P),
+                    EnsureIntRegister(MakeSSAConstInt(Int64(QWord($A000000000000000)))), MakeSSAValue(svkNone));
+    T := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaCmpLtInt, T, C, EnsureIntRegister(MakeSSAConstInt(Int64(QWord($A000000100000000)))),
+                    MakeSSAValue(svkNone));
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaBitwiseAnd, Result, T, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+    Exit;
+  end;
   A := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaCmpGeInt, A, EnsureIntRegister(P), EnsureIntRegister(MakeSSAConstInt(Int64(1) shl 61)),
                   MakeSSAValue(svkNone));
@@ -59433,6 +59527,26 @@ begin
   EmitInstruction(ssaBitwiseAnd, T, A, B, MakeSSAValue(svkNone));
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
   EmitInstruction(ssaBitwiseAnd, Result, T, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.SmallAddrSteps(const Pointee: string): Boolean;
+// DIVERGENZE 629: may an untagged value in [1, 2^32) of a pointer to this type be read as a MACHINE address when it
+// steps? Only in fb, and only for a SCALAR pointee (a number or a pointer): a record pointer may be a small HANDLE, and a
+// string pointer counts characters. SB_SMALL_ADDR_STEP=0 is the A/B.
+var
+  P: string;
+begin
+  Result := False;
+  if not FNativeMemory then Exit;
+  if GetEnvironmentVariable('SB_SMALL_ADDR_STEP') = '0' then Exit;
+  P := UpperFast(Trim(Pointee));
+  while (Length(P) >= 6) and (Copy(P, 1, 6) = 'CONST ') do P := Trim(Copy(P, 7, MaxInt));
+  while (Length(P) >= 6) and (Copy(P, Length(P) - 5, 6) = ' CONST') do P := Trim(Copy(P, 1, Length(P) - 6));
+  if (P = '') or (P = 'STRING') or (P = 'ZSTRING') or (P = 'WSTRING') or (P = 'ANY') then Exit;
+  if (Length(P) > 4) and (Copy(P, Length(P) - 3, 4) = ' PTR') then Exit(True);
+  P := UpperFast(CanonicalType(P));
+  if FindUDT(P) >= 0 then Exit;
+  Result := TypeSizeBytes(P) > 0;
 end;
 
 procedure TSSAGenerator.NoteArrayElemStorage(ArrayIdx: Integer; ET: TSSARegisterType;
