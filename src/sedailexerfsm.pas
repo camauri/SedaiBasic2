@@ -1322,6 +1322,7 @@ begin
   Result.WideLiteral := False;    // ...and for the wide-literal mark (the escaped-string scanner sets it)
   Result.UnsignedSuffixed := False;  // ...and for the "12u" mark
   Result.Unsigned64Suffixed := False;  // ...and for its WIDTH ("12u"/"12ull" vs "5ul")
+  Result.Long32Suffixed := False;  // ...and for the 32-bit Long/ULong mark (DIVERGENZE 410)
 
   Result.Line := ATokenLine;
   Result.Column := FTokenStartColumn;
@@ -1549,6 +1550,7 @@ begin
        else
          Result.SetExtractedValue(IntToStr(Int64(LongInt(LongVal and $FFFFFFFF))));
      end;
+     if IsIntText then Result.Long32Suffixed := True;   // DIVERGENZE 410: the TYPE is a 32-bit Long/ULong
    end;
  end;
  // Always cleared, on BOTH branches and whichever call site got here: ProcessNumber is reached from FSM
@@ -1567,6 +1569,7 @@ function TLexerFSM.LexAmpBaseLiteral: TLexerToken;
 // folded into an Int64 and the token's value is set to the decimal string, so the parser handles it as
 // an ordinary integer (values beyond Int64 wrap — an accepted v1 limit, like other big literals).
 var
+  BaseLong32: Boolean;   // DIVERGENZE 410
   Base, DigVal: Integer;
   Ch: Char;
   Val: Int64;
@@ -1629,6 +1632,7 @@ begin
   ConsumeIntLiteralSuffix;   // FreeBASIC typed integer literal: &hFFul, &b1010ULL, ... (dropped)
   // A trailing '&' Long suffix on a base literal (&HFFFFFFFF&) wraps to signed 32 bits, like the decimal
   // path in ProcessNumber. ProcessNumber never runs for a base literal, so apply and clear the flag here.
+  BaseLong32 := FPendingLongSuffix;   // DIVERGENZE 410: remembered for the token, the flag is cleared below
   if FPendingLongSuffix then
   begin
     if FPendingLong32Unsigned then Val := Int64(Val and $FFFFFFFF)
@@ -1637,6 +1641,7 @@ begin
     FPendingLong32Unsigned := False;
   end;
   Result := CreateToken(ttNumber);
+  Result.Long32Suffixed := BaseLong32;
   Result.SetExtractedValue(IntToStr(Val));   // logical value is decimal, not the "&H.." source text
   // The 'U' of the suffix, carried and cleared HERE for the same reason the '&' Long suffix is:
   // ProcessNumber never runs for a base literal, so a flag left standing would both miss THIS literal

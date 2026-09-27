@@ -633,6 +633,7 @@ type
     FNativeCacheReady: Boolean;
     FConstDeclSeen: TStringList;         // CONST names already seen: a name declared TWICE must not fold
     FConstStrBytes: TStringList;         // STRING consts: name (UPPER) -> byte size fbc reports (length + 1)
+    FConstTypeBytes: TStringList;        // DIVERGENZE 202 / 410: a TYPED numeric const (UPPER) -> SizeOf of its declared type
     FTypeAliases: TStringList;           // FB "TYPE alias AS underlying": alias (UPPER) -> underlying (UPPER)
     FTypeAliasRedecl: TStringList;       // an alias REDECLARED after #undef: key -> "line:target;..." (DIVERGENZE 418)
     // ⭐ TWO MEMBERS OF ONE TYPE THAT CARRY THE SAME "ALIAS" STRING ARE ONE PROCEDURE. Maps the label
@@ -1085,6 +1086,7 @@ type
     function IsRecordHandleExpr(Node: TASTNode): Boolean;                      // ...a value that is a record handle or VIEW
     function BareVarNotPtrHere(Node: TASTNode): Boolean;   // DIVERGENZE 631
     procedure RetireUndefConsts(AST: TASTNode);            // DIVERGENZE 633
+    procedure CheckConstRedeclared(AST: TASTNode);         // DIVERGENZE 640
     function AmbiguousPtrName(Node: TASTNode): Boolean;    // DIVERGENZE 629
     function AmbiguousPtrNameS(const Name: string): Boolean;
     function PtrPointeeOf(Node: TASTNode): string;
@@ -2238,6 +2240,8 @@ begin
   FMemberOwnerTypes.Duplicates := dupIgnore;
   FConstStrBytes := TIndexedStringList.Create;
   FConstStrBytes.CaseSensitive := False;
+  FConstTypeBytes := TIndexedStringList.Create;
+  FConstTypeBytes.CaseSensitive := False;
   FConstDeclSeen := TIndexedStringList.Create;
   FConstDeclSeen.Sorted := True;
   FConstDeclSeen.Duplicates := dupIgnore;
@@ -2428,6 +2432,7 @@ begin
   FWideNulConsts.Free;
   FNulConstScoped.Free;
   FConstStrBytes.Free;
+  FConstTypeBytes.Free;
   FRawFromAddrOf.Free;
   FRawUDTPtrs.Free;
   FRawUDTScoped.Free;
@@ -3932,6 +3937,8 @@ end;
 // Main implementation with destination hint
 procedure TSSAGenerator.ProcessExpressionFull(Node: TASTNode; out Result: TSSAValue; const DestHint: TSSAValue);
 var
+  TypeOfWrap, TypeOfInner: TASTNode;   // DIVERGENZE 408: SizeOf(TypeOf(e)) peeled to SizeOf(e)
+  Tmp202: TSSAValue;                    // DIVERGENZE 202: does the name resolve to a live variable here?
   CastOperand: TASTNode;        // the operand a cast to a POINTER is given (DIVERGENZE 590)
   ThisPtrFld: TASTNode;         // "*z" on a pointer FIELD asked by its bare name (DIVERGENZE 524)
   ZCharAddr: TSSAValue;         // the address behind a ZSTRING/WSTRING character read (DIVERGENZE 25)
@@ -9570,6 +9577,28 @@ begin
         // (identifier); a pointer variable argument resolves to pointer size (8). Used for "Allocate(n *
         // SizeOf(Integer))". A POINTER TYPE argument arrives as the single identifier "T PTR" (the parser
         // folds the juxtaposition, as it does for a DIM) and is likewise 8 bytes.
+        // ⭐ DIVERGENZE 408 - "SizeOf(TypeOf(e))" IS "SizeOf(e)": the size of e's TYPE, which is what SizeOf of an
+        // expression already answers. The wrapper reached no branch below and answered the default 8 for every
+        // operand ("SizeOf(TypeOf(ss))" of a Short: 8, fbc 2), while "SizeOf(ss)" and "Dim As TypeOf(ss) z" were
+        // right. The wrapper is peeled here, once, and the branches that follow decide. SB_SIZEOF_TYPEOF=0 is the A/B.
+        if (SameText(ArrName, 'SIZEOF')) and (ArrayIndexOf(ArrName) < 0) and
+           (Node.GetChild(1).NodeType in [antArgumentList, antExpressionList]) and
+           (Node.GetChild(1).ChildCount = 1) and
+           (Node.GetChild(1).GetChild(0).NodeType = antArrayAccess) and
+           (Node.GetChild(1).GetChild(0).ChildCount >= 2) and
+           (Node.GetChild(1).GetChild(0).GetChild(0).NodeType = antIdentifier) and
+           (Node.GetChild(1).GetChild(0).GetChild(0).ValueUpper = 'TYPEOF') and
+           (ArrayIndexOf('TYPEOF') < 0) and
+           (Node.GetChild(1).GetChild(0).GetChild(1).ChildCount = 1) and
+           (GetEnvironmentVariable('SB_SIZEOF_TYPEOF') <> '0') then
+        begin
+          TypeOfWrap := Node.GetChild(1).GetChild(0);
+          TypeOfInner := TypeOfWrap.GetChild(1).GetChild(0);
+          TypeOfWrap.GetChild(1).Children.Extract(TypeOfInner);   // detach WITHOUT freeing
+          Node.GetChild(1).Children.Extract(TypeOfWrap);
+          TypeOfWrap.Free;
+          Node.GetChild(1).AddChild(TypeOfInner);
+        end;
         // "SizeOf(*Cast(T Ptr, 0))" - FreeBASIC's idiom for "the size of the POINTEE type", and the
         // whole point of casting a null pointer: nothing is dereferenced, the expression exists only to
         // name a type. It is what the manual's own sizeofDerefPtr() macro is built on. The intercept
@@ -9708,6 +9737,11 @@ begin
           else if FConstStrBytes.IndexOfName(ArrName2) >= 0 then
             // A STRING CONST is a ZSTRING of its length + 1, not a string descriptor (FConstStrBytes).
             Result := MakeSSAConstInt(StrToInt64Def(FConstStrBytes.Values[ArrName2], 8))
+          else if (FConstTypeBytes.IndexOfName(ArrName2) >= 0) and (FindUDT(ArrName2) < 0) and
+                  not (FInProcedure and ResolveExisting(ArrName2, Tmp202) and (FSharedVars.IndexOf(ArrName2) < 0)) then
+            // ...and a TYPED numeric const, its declared type (DIVERGENZE 202 / 410). Not when the name resolves to a
+            // live variable HERE - a local of the same name wins, as it does for every other read.
+            Result := MakeSSAConstInt(StrToInt64Def(FConstTypeBytes.Values[ArrName2], 8))
           // ⛔ SIZEOF OF AN ARRAY IS THE SIZE OF ONE ELEMENT, which is FreeBASIC's rule and not C's:
           // "Dim As UByte a(0 To 15) : Print SizeOf(a)" answers 1 there, and ARRAYSIZE(a) is the whole
           // block. This ladder had no rung for an array name at all, so it fell to the last line, where
@@ -30668,6 +30702,13 @@ begin
   Result := 0;
   if Node = nil then Exit;
   while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  // ⭐ DIVERGENZE 410 - a literal with a 32-bit size suffix is a LONG ("5L", "5&") or a ULONG ("5UL"): width codes 5 / 6,
+  // the ones CLng / CULng narrow to. SB_LONG_SUFFIX_WIDTH=0 is the A/B.
+  if (Node.NodeType = antLiteral) and Assigned(Node.Token) and Node.Token.Long32Suffixed and
+     (GetEnvironmentVariable('SB_LONG_SUFFIX_WIDTH') <> '0') then
+  begin
+    if Node.Token.UnsignedSuffixed then Exit(6) else Exit(5);
+  end;
   case Node.NodeType of
     antIdentifier:
     begin
@@ -36750,6 +36791,77 @@ begin
     Result := EmitRecPtrRestamp(V, W);
 end;
 
+procedure TSSAGenerator.CheckConstRedeclared(AST: TASTNode);
+// ⭐ DIVERGENZE 640 - THE NAME OF A MODULE CONST CANNOT BE DECLARED AGAIN, ANYWHERE AFTER IT. MEASURED on fbc 1.10.1, all
+// "error 4: Duplicated definition": a local Dim, a local Const, a PARAMETER, a Dim inside a Scope (in a Sub or at module
+// level), whatever the case of the letters. And measured where it does NOT apply: a Sub written BEFORE the Const, a name
+// #undef'd in between (633), a Const inside a Namespace or local to another Sub, a module "Dim Shared" (a variable may be
+// shadowed). We accepted every form, and SizeOf of the local answered the CONST's type. In source order, module level;
+// a name ever #undef'd is never refused here (the position of the #undef is not known). SB_CONST_REDECL_REFUSE=0 is the A/B.
+var
+  Live: TStringList;
+  i, k: Integer;
+  Ch, D: TASTNode;
+
+  procedure Refuse(const Nm: string);
+  begin
+    raise Exception.CreateFmt('Duplicated definition: "%s" is a CONST of the module and cannot be declared again ' +
+                              '(fbc: error 4)', [Nm]);
+  end;
+
+  procedure CheckIn(N: TASTNode);
+  var c, d: Integer;
+    X: TASTNode;
+  begin
+    if N = nil then Exit;
+    if N.NodeType = antNamespace then Exit;
+    if N.NodeType = antParameterList then
+      for c := 0 to N.ChildCount - 1 do
+      begin
+        X := N.GetChild(c);
+        if (X.NodeType = antIdentifier) and (X.ValueUpper <> 'THIS') and (Live.IndexOf(X.ValueUpper) >= 0) then
+          Refuse(X.ValueUpper);
+      end;
+    if N.NodeType = antDim then
+      for d := 0 to N.ChildCount - 1 do
+      begin
+        X := N.GetChild(d);
+        if (X.NodeType = antArrayDecl) and (X.ChildCount >= 1) and (X.GetChild(0).NodeType = antIdentifier) and
+           (Live.IndexOf(X.GetChild(0).ValueUpper) >= 0) then
+          Refuse(X.GetChild(0).ValueUpper);
+      end;
+    for c := 0 to N.ChildCount - 1 do CheckIn(N.GetChild(c));
+  end;
+
+begin
+  if AST = nil then Exit;
+  if GetEnvironmentVariable('SB_CONST_REDECL_REFUSE') = '0' then Exit;
+  Live := TStringList.Create;
+  Live.Sorted := True;
+  Live.Duplicates := dupIgnore;
+  try
+    for i := 0 to AST.ChildCount - 1 do
+    begin
+      Ch := AST.GetChild(i);
+      if Ch.NodeType = antDim then
+      begin
+        for k := 0 to Ch.ChildCount - 1 do
+        begin
+          D := Ch.GetChild(k);
+          if (D.NodeType = antArrayDecl) and (D.Attributes.Values['CONSTDECL'] = '1') and (D.ChildCount >= 1) and
+             (D.GetChild(0).NodeType = antIdentifier) and (Pos('.', D.GetChild(0).ValueUpper) = 0) and
+             ((GPPUndefNames = nil) or (GPPUndefNames.IndexOf(D.GetChild(0).ValueUpper) < 0)) then
+            Live.Add(D.GetChild(0).ValueUpper);
+        end;
+      end
+      else if (Live.Count > 0) and (Ch.NodeType in [antProcedureDecl, antBlock]) then
+        CheckIn(Ch);
+    end;
+  finally
+    Live.Free;
+  end;
+end;
+
 procedure TSSAGenerator.RetireUndefConsts(AST: TASTNode);
 // ⭐ DIVERGENZE 633 - "#undef" RETIRES A CONST, AND THE NAME IS FREE AGAIN. fbc's #undef removes any symbol, not only a
 // macro: "Const FOO = ""foo"" : #undef FOO : Type FOO ... : Dim As FOO FOO = (1, 2, 3)" is a valid program (fbc's
@@ -40311,7 +40423,13 @@ begin
       if (PL <> nil) and (PL.NodeType = antArrayDecl) and (PL.ChildCount >= 2) and
          (PL.GetChild(0).NodeType = antIdentifier) and (PL.GetChild(1).NodeType = antIdentifier) then
         FPreVarDeclType.Values[PL.GetChild(0).ValueUpper] :=
-          PL.GetChild(1).ValueUpper;
+          PL.GetChild(1).ValueUpper
+      // ⭐ DIVERGENZE 408 - ...and an ARRAY's element type, which sits third ("name, dimensions, type"), under
+      // "NAME()" so a scalar of the same name keeps its own entry: "Dim As TypeOf(la(0)) z" asks it.
+      else if (PL <> nil) and (PL.NodeType = antArrayDecl) and (PL.ChildCount >= 3) and
+              (PL.GetChild(0).NodeType = antIdentifier) and (PL.GetChild(1).NodeType = antDimensions) and
+              (PL.GetChild(2).NodeType = antIdentifier) then
+        FPreVarDeclType.Values[PL.GetChild(0).ValueUpper + '()'] := PL.GetChild(2).ValueUpper;
     end;
   SavedTypePath := PushTypeScope(Node);   // DIVERGENZE 95: the children's lexical type scope
   for i := 0 to Node.ChildCount - 1 do PreCollectFuncRetTypes(Node.GetChild(i));
@@ -40855,6 +40973,11 @@ begin
           // ⭐ And then the DECLARED TYPE, with the bank only as the fallback: asking the bank alone is
           // three answers for ten types.
           TypeName := DeclaredTypeNameOf(TypeOfOperand);
+          // ⭐ DIVERGENZE 408 - ...and an ELEMENT of an array: "Dim As TypeOf(la(0)) z" with la a Long array fell to the
+          // bank fallback (INTEGER, 8 bytes; fbc 4). The element type the pre-scan filed under "NAME()".
+          if (TypeName = '') and (TypeOfOperand.NodeType = antArrayAccess) and (TypeOfOperand.ChildCount >= 1) and
+             (TypeOfOperand.GetChild(0).NodeType = antIdentifier) and (GetEnvironmentVariable('SB_SIZEOF_TYPEOF') <> '0') then
+            TypeName := FPreVarDeclType.Values[TypeOfOperand.GetChild(0).ValueUpper + '()'];
           // ⭐ ...and then the UDT the expression NAMES, which DeclaredTypeNameOf cannot answer for an
           // anonymous "T( )" temporary or an IIF over two of them. Without it the bank fallback below
           // said INTEGER and "Dim x As TypeOf( C( ) )" declared x an INTEGER: its constructor never
@@ -44671,6 +44794,20 @@ begin
         // parallel float/int array + M6 slot) that would make @/deref resolve against different storage.
         if Decl.Attributes.Values['RAWMODULE'] = '1' then Continue;
         VNameU := Decl.GetChild(0).ValueUpper;
+        // ⭐ DIVERGENZE 202 / 410 - a TYPED numeric CONST ("Const b As Byte = 200", or the type a size suffix gave it,
+        // "Const K = 4294967296UL") answers SizeOf of that type: the folded constant leaves no typed variable behind
+        // to ask, and SizeOf answered the 8-byte default. Declared twice, it keeps no entry (the fold's rule below).
+        if (Decl.Attributes.Values['CONSTDECL'] = '1') and (GetEnvironmentVariable('SB_CONST_TYPE_SIZE') <> '0') then
+        begin
+          if FConstDeclSeen.IndexOf(VNameU) >= 0 then
+          begin
+            if FConstTypeBytes.IndexOfName(VNameU) >= 0 then FConstTypeBytes.Delete(FConstTypeBytes.IndexOfName(VNameU));
+          end
+          else if IsBuiltinScalarTypeName(Decl.GetChild(1).ValueUpper) and
+                  not IsBuiltinStringTypeName(Decl.GetChild(1).ValueUpper) and
+                  (TypeSizeBytes(Decl.GetChild(1).ValueUpper) > 0) then
+            FConstTypeBytes.Values[VNameU] := IntToStr(TypeSizeBytes(Decl.GetChild(1).ValueUpper));
+        end;
         AddSharedVarSlot(VNameU);                       // keep the "is shared" marker (scope resolution)
         // CONST with an integer literal: remember the value so every READ folds to an immediate.
         // The backing array below is still declared and initialised - anything that resolves through
@@ -62148,6 +62285,7 @@ begin
   // pre-scan walks the AST. No-op when the program has no NAMESPACE (keyword is MODERN-only anyway).
   PreMarkStart; FlattenNamespaces(AST); PreMarkEnd('FlattenNamespaces');
   PreMarkStart; RetireUndefConsts(AST); PreMarkEnd('RetireUndefConsts');   // DIVERGENZE 633
+  PreMarkStart; CheckConstRedeclared(AST); PreMarkEnd('CheckConstRedeclared');   // DIVERGENZE 640
 
   // Which arrays are multi-dimensional, ANYWHERE in the program. Must precede lowering: the rank
   // decides whether a compiled backend may compute UBound natively, and it is asked at the first
@@ -62308,6 +62446,7 @@ begin
   FNativeNo.Clear; FNativeYes.Clear; FNativeProvisional.Clear; FNativeCacheReady := False;
   FConstDeclSeen.Clear;
   FConstStrBytes.Clear;
+  FConstTypeBytes.Clear;
   FArrayElemWidth.Clear;
   FUnsigned64Arrays.Clear;
   // FreeBASIC pointers: mark each address-taken (@x) declared scalar SHARED so the next pass backs it

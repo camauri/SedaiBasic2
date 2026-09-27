@@ -58,6 +58,7 @@ type
                                 // WIDE -- which is what makes Left/Mid/Len count codepoints over it.
     FUnsignedSuffixed: Boolean; // "12u" / "5ul" literal: UNSIGNED (the suffix is dropped -- see the property)
     FUnsigned64Suffixed: Boolean; // ...and the suffix was a 64-BIT one ("12u" / "12ull"), not "5ul"
+    FLong32Suffixed: Boolean;   // DIVERGENZE 410: "5L" / "5UL" / "5&" - a 32-bit Long/ULong literal
 
     // Lazy evaluation flags for performance
     FDisplayStringCached: string;
@@ -174,6 +175,9 @@ type
     // suffixed literal as unsigned-64 dropped the sign column from "5UL * 3L"; taking none of them as
     // unsigned-64 made "1ull Shl 63" negative. Both are wrong, and only the width tells them apart.
     property Unsigned64Suffixed: Boolean read FUnsigned64Suffixed write FUnsigned64Suffixed;
+    // DIVERGENZE 410 - the literal carried a 32-bit size suffix ("L", "UL", "&"). The lexer narrows the VALUE to 32 bits,
+    // and without this mark nothing said the TYPE was a Long: "SizeOf(1L)" answered 8 where fbc answers 4.
+    property Long32Suffixed: Boolean read FLong32Suffixed write FLong32Suffixed;
 
     // INTERNAL: Lazy extraction setup (used by lexer)
     procedure SetupLazyExtraction(ExtractorCtx: Pointer; ExtractorFn: TTokenValueExtractor; RecIdx: Integer);

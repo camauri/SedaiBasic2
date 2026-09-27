@@ -4169,12 +4169,24 @@ function PPResolveTypeName(const Operand: string): string;
 //                       never becomes some OTHER type. fbc's own pp/if relies on an undeclared
 //                       identifier being accepted here rather than refused.
 var
-  U: string;
+  U, Base: string;
+  PBr: Integer;
 begin
   U := UpperFast(Trim(Operand));
   if U = '' then Exit('');
   if (GPPVarTypes <> nil) and (GPPVarTypes.IndexOfName(U) >= 0) then
     Exit(UpperFast(GPPVarTypes.Values[U]));
+  // ⭐ DIVERGENZE 639 - ...and an ELEMENT of a declared array, "TypeOf(la(0))": the element's type is the array's.
+  // Only for a NAME this table holds as a VARIABLE, so a function call "f(1)" keeps its verbatim echo. A trailing
+  // member access or anything after the parentheses is left alone. SB_PP_TYPEOF_ELEM=0 is the A/B.
+  PBr := Pos('(', U);
+  if (PBr > 1) and (U[Length(U)] = ')') and (GPPVarTypes <> nil) and
+     (GetEnvironmentVariable('SB_PP_TYPEOF_ELEM') <> '0') then
+  begin
+    Base := Trim(Copy(U, 1, PBr - 1));
+    if (GPPVarTypes.IndexOfName(Base) >= 0) and (Pos(')', Copy(U, PBr, Length(U) - PBr)) = 0) then
+      Exit(UpperFast(GPPVarTypes.Values[Base]));
+  end;
   if PPIsBuiltinTypeWord(U) or
      ((GPPTypeNames <> nil) and (GPPTypeNames.IndexOf(U) >= 0)) then
     Exit(U);                              // a TYPE names itself: "TypeOf(Integer)" is Integer
@@ -4474,7 +4486,7 @@ procedure PPNoteDeclarations(const Line: string);
 // ⚠️ Everything is folded to UPPER: "As Byte", "as byte" and "AS BYTE" are one type.
 var
   L, W, TypeName, Nm: string;
-  i, j, k: Integer;
+  i, j, k, Depth: Integer;
   Words: TStringList;
 
   procedure Remember(const AName, AType: string);
@@ -4595,6 +4607,23 @@ begin
       end;
       // "<name> [, <name>] As <type>", and the same shape inside a parameter list.
       k := 0;
+      // ⭐ DIVERGENZE 639 - "Dim sg(2) As Single": on a line that declares VARIABLES the parentheses are an array's
+      // DIMENSIONS, and the walk below (written for a procedure's parameter list, where ')' closes the list) stopped at
+      // them, so the array never reached the table and "#print TypeOf(sg(1))" echoed its text. The dimensions are
+      // dropped first; a SUB/FUNCTION/DECLARE line keeps its parentheses. SB_PP_TYPEOF_ELEM=0 is the A/B.
+      if ((W = 'DIM') or (W = 'REDIM') or (W = 'STATIC') or (W = 'COMMON') or (W = 'VAR')) and
+         (GetEnvironmentVariable('SB_PP_TYPEOF_ELEM') <> '0') then
+      begin
+        Depth := 0;
+        i := 0;
+        while i < Words.Count do
+        begin
+          if Words[i] = '(' then begin Inc(Depth); Words.Delete(i); Continue; end;
+          if Words[i] = ')' then begin if Depth > 0 then Dec(Depth); Words.Delete(i); Continue; end;
+          if Depth > 0 then begin Words.Delete(i); Continue; end;
+          Inc(i);
+        end;
+      end;
       for i := 1 to Words.Count - 1 do
         if SameText(Words[i], 'AS') then
         begin

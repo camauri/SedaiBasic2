@@ -17576,6 +17576,12 @@ var
       // 1.10.1, "Const cu = 5u" is a UINTEGER ("cu - 10" answers 18446744073709551611) while
       // "Const cul = 5ul" is a ULong that promotes SIGNED ("cul - 10" answers -5). Reading the ladder for
       // a 64-bit suffix made a small "5u" a ULONG, and the whole expression signed with it.
+      // ⭐ DIVERGENZE 410 - ...and a 32-bit size suffix makes it a LONG or a ULONG whatever the magnitude (the lexer has
+      // already narrowed the value): "Const K = 4294967296UL" is a ULong, SizeOf(K) 4.
+      else if Assigned(V.Token) and V.Token.Long32Suffixed and (GetEnvironmentVariable('SB_LONG_SUFFIX_WIDTH') <> '0') then
+      begin
+        if V.Token.UnsignedSuffixed then Result := 'ULONG' else Result := 'LONG';
+      end
       else if Assigned(V.Token) and V.Token.Unsigned64Suffixed then
         Result := 'ULONGINT'
       else if Assigned(V.Token) and V.Token.UnsignedSuffixed then
