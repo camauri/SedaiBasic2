@@ -15695,6 +15695,10 @@ begin
       begin
         SharedTypeName := 'INTEGER';          // a procedure entry PC, like the named funcptr TYPE alias
         SharedFixedLen := '';
+        // ⭐ DIVERGENZE 632 - "Dim As Sub() Ptr s": the " Ptr" after the procedure type was left in the stream and read as
+        // the VARIABLE's name ("PTR is a FreeBASIC keyword and cannot name a variable"), s then orphaned. Consumed here as
+        // the trailing spelling "Dim s As Sub() Ptr" already absorbs it; the storage is the same integer cell.
+        while AtPointerSuffix do Context.Advance;
       end
       else
       begin

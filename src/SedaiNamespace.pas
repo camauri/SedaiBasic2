@@ -732,6 +732,28 @@ begin
   ChildPrefix := ActivePrefix;
   UseShadow := Shadow;
 
+  // ⭐ DIVERGENZE 223 - A PARAMETER'S TYPE IS A TYPE SLOT, and a parameter NAME never shadows a TYPE there. The procedure
+  // adds its parameter names to the shadow set BEFORE its children are walked, so in "Sub g(ByVal a As A)" inside
+  // "Namespace ns" the parameter a hid ns.A from its OWN type: "As A" stayed bare, named a type that exists nowhere after
+  // flattening, and every field of a read the record's HANDLE (2^61 + an address). Marked here, read by the identifier
+  // arm below. SB_NS_PARAM_TYPESLOT=0 is the A/B.
+  if (Node.NodeType = antParameterList) and (GetEnvironmentVariable('SB_NS_PARAM_TYPESLOT') <> '0') then
+    for i := 0 to Node.ChildCount - 1 do
+      if (Node.GetChild(i).NodeType = antIdentifier) and (Node.GetChild(i).ChildCount >= 1) and
+         (Node.GetChild(i).GetChild(0).NodeType = antIdentifier) then
+        Node.GetChild(i).GetChild(0).Attributes.Values['NSTYPESLOT'] := '1';
+  // ...and the other two TYPE SLOTS a local name must not hide: a FUNCTION's return type (the child of its name) and a
+  // DIM's type ("Function mk(ByVal a As Integer) As A : Dim r As A" answered 16 0 where fbc answers 5 10).
+  if GetEnvironmentVariable('SB_NS_PARAM_TYPESLOT') <> '0' then
+  begin
+    if (Node.NodeType = antProcedureDecl) and (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
+      for i := 0 to Node.GetChild(0).ChildCount - 1 do
+        if Node.GetChild(0).GetChild(i).NodeType = antIdentifier then
+          Node.GetChild(0).GetChild(i).Attributes.Values['NSTYPESLOT'] := '1';
+    if (Node.NodeType = antArrayDecl) and (Node.ChildCount >= 2) and (Node.GetChild(1).NodeType = antIdentifier) then
+      Node.GetChild(1).Attributes.Values['NSTYPESLOT'] := '1';
+  end;
+
   // ⛔⛔ A TYPE ALIAS'S TARGET LIVES IN AN ATTRIBUTE, AND THIS WALK ONLY EVER SAW CHILD NODES.
   // "Type A As A_" inside a namespace kept the bare "A_", so the alias pointed at a type that exists
   // nowhere and every use of A fell back to the default width: SizeOf(A) answered 8 where fbc answers
@@ -1248,7 +1270,7 @@ begin
     if (Pos('.', BaseV) = 0) and (BaseV <> '') and
        ((ActivePrefix <> '') or ((Using <> nil) and (Using.Count > 0))) and
        (Node.Attributes.Values['GLOBALSCOPE'] <> '1') and
-       ((Shadow = nil) or (Shadow.IndexOf(BaseV) < 0)) then
+       ((Shadow = nil) or (Shadow.IndexOf(BaseV) < 0) or (Node.Attributes.Values['NSTYPESLOT'] = '1')) then
     begin
       Mangled := ResolveUnqualified(ActivePrefix, BaseV, Ctx, Using);
       if Mangled <> '' then Node.Value := Mangled + SigV;

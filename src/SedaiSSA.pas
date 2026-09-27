@@ -1084,6 +1084,7 @@ type
     function EmitRecPtrRestamp(const V: TSSAValue; W: Integer): TSSAValue;     // ...a field pointer re-read at another width
     function IsRecordHandleExpr(Node: TASTNode): Boolean;                      // ...a value that is a record handle or VIEW
     function BareVarNotPtrHere(Node: TASTNode): Boolean;   // DIVERGENZE 631
+    procedure RetireUndefConsts(AST: TASTNode);            // DIVERGENZE 633
     function AmbiguousPtrName(Node: TASTNode): Boolean;    // DIVERGENZE 629
     function AmbiguousPtrNameS(const Name: string): Boolean;
     function PtrPointeeOf(Node: TASTNode): string;
@@ -36749,6 +36750,106 @@ begin
     Result := EmitRecPtrRestamp(V, W);
 end;
 
+procedure TSSAGenerator.RetireUndefConsts(AST: TASTNode);
+// ⭐ DIVERGENZE 633 - "#undef" RETIRES A CONST, AND THE NAME IS FREE AGAIN. fbc's #undef removes any symbol, not only a
+// macro: "Const FOO = ""foo"" : #undef FOO : Type FOO ... : Dim As FOO FOO = (1, 2, 3)" is a valid program (fbc's
+// quirk/undef). Our #undef only reached the preprocessor, so the CONST (lowered to a module variable FOO) and the new
+// variable FOO were two declarations of one name, and the registries keyed by name mixed them: every field read an
+// address, and inside a Sub the program died. ⇒ At MODULE level, in source order: a CONST whose name was #undef'd and
+// that a later non-const DIM declares again is RENAMED, together with every reference between the two statements; the
+// new variable is then the only one of that name. A reference in a TYPE slot is left alone - there the name is the type.
+// ⚠️ The position of the "#undef" is not known here (GPPUndefNames is a set): a valid program cannot re-DIM a live
+// CONST, so the re-declaration itself says the #undef came before it. SB_UNDEF_CONST=0 is the A/B.
+var
+  Pending: TStringList;
+  Serial: Integer;
+  X, NewName: string;
+
+  procedure RenameIn(N: TASTNode; const OldU, NewN: string; SkipSelf: Boolean);
+  var c: Integer;
+  begin
+    if N = nil then Exit;
+    if (not SkipSelf) and (N.NodeType = antIdentifier) and (N.ValueUpper = OldU) then N.Value := NewN;
+    for c := 0 to N.ChildCount - 1 do
+    begin
+      // type slots: a DIM's type, a parameter's type, a function's return type
+      if (N.NodeType = antArrayDecl) and (c = 1) then Continue;
+      if (N.NodeType = antIdentifier) and Assigned(N.Parent) and (N.Parent.NodeType = antParameterList) then Continue;
+      if (N.NodeType = antProcedureDecl) and (c = 0) then
+      begin
+        RenameIn(N.GetChild(0), OldU, NewN, True);   // the procedure's own name node, not its return type
+        Continue;
+      end;
+      RenameIn(N.GetChild(c), OldU, NewN, False);
+    end;
+  end;
+
+  // One statement list: the module, or a procedure body (its statements follow the name and the parameter list).
+  procedure RetireInList(List: TASTNode; From: Integer);
+  var
+    ii, kk, jj, mm: Integer;
+    Stmt, Dd: TASTNode;
+  begin
+    Pending.Clear;
+    for ii := From to List.ChildCount - 1 do
+    begin
+      Stmt := List.GetChild(ii);
+      if Stmt.NodeType <> antDim then Continue;
+      for kk := 0 to Stmt.ChildCount - 1 do
+      begin
+        Dd := Stmt.GetChild(kk);
+        if (Dd.NodeType <> antArrayDecl) or (Dd.ChildCount < 1) or (Dd.GetChild(0).NodeType <> antIdentifier) then Continue;
+        X := Dd.GetChild(0).ValueUpper;
+        if GPPUndefNames.IndexOf(X) < 0 then Continue;
+        // ⭐ a name declared AGAIN - as a CONST or as a variable - after one of its declarations: the earlier one was
+        // #undef'd in between (a valid program cannot redeclare a live one), so the earlier one takes a fresh name,
+        // with every reference between the two. "Const FOO : Dim As FOO FOO : #undef FOO : Const FOO = 5" is a chain.
+        if Pending.IndexOf(X) >= 0 then
+        begin
+          Inc(Serial);
+          NewName := X + '__UNDEF' + IntToStr(Serial);
+          jj := PtrInt(Pending.Objects[Pending.IndexOf(X)]);
+          for mm := 0 to List.GetChild(jj).ChildCount - 1 do
+            if (List.GetChild(jj).GetChild(mm).NodeType = antArrayDecl) and
+               (List.GetChild(jj).GetChild(mm).ChildCount >= 1) and
+               (List.GetChild(jj).GetChild(mm).GetChild(0).ValueUpper = X) then
+              List.GetChild(jj).GetChild(mm).GetChild(0).Value := NewName;
+          for mm := jj + 1 to ii - 1 do
+            RenameIn(List.GetChild(mm), X, NewName, False);
+          Pending.Objects[Pending.IndexOf(X)] := TObject(PtrInt(ii));
+        end
+        else
+          Pending.AddObject(X, TObject(PtrInt(ii)));
+      end;
+    end;
+  end;
+
+  procedure WalkProcs(N: TASTNode);
+  var c: Integer;
+  begin
+    if N = nil then Exit;
+    if N.NodeType = antProcedureDecl then
+    begin
+      // name, parameter list, then the body's statements
+      if (N.ChildCount >= 2) and (N.GetChild(1).NodeType = antParameterList) then RetireInList(N, 2)
+      else RetireInList(N, 1);
+    end;
+    for c := 0 to N.ChildCount - 1 do WalkProcs(N.GetChild(c));
+  end;
+
+begin
+  if (AST = nil) or (GPPUndefNames = nil) or (GPPUndefNames.Count = 0) then Exit;
+  if GetEnvironmentVariable('SB_UNDEF_CONST') = '0' then Exit;
+  Pending := TStringList.Create;
+  Serial := 0;
+  try
+    RetireInList(AST, 0);
+    WalkProcs(AST);
+  finally
+    Pending.Free;
+  end;
+end;
+
 function TSSAGenerator.AmbiguousPtrNameS(const Name: string): Boolean;
 // DIVERGENZE 629: is this NAME a pointer only by the FLAT maps' word? Some declaration gives it a non-pointer type
 // (FNonPtrNames, DIVERGENZE 483) and THIS procedure does not declare it a pointer (local or parameter). Then the small-address
@@ -62046,6 +62147,7 @@ begin
   // FreeBASIC NAMESPACE: flatten namespace blocks into mangled, module-level declarations before any
   // pre-scan walks the AST. No-op when the program has no NAMESPACE (keyword is MODERN-only anyway).
   PreMarkStart; FlattenNamespaces(AST); PreMarkEnd('FlattenNamespaces');
+  PreMarkStart; RetireUndefConsts(AST); PreMarkEnd('RetireUndefConsts');   // DIVERGENZE 633
 
   // Which arrays are multi-dimensional, ANYWHERE in the program. Must precede lowering: the rank
   // decides whether a compiled backend may compute UBound natively, and it is asked at the first
