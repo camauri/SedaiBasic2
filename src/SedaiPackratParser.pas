@@ -6247,6 +6247,9 @@ var
   IsAbstract, IsStatic, IsVirtual, IsOverride, IsFinal: Boolean;
   Depth, ParamIdx: Integer;
   Defs, DefExpr: TASTNode;
+  TypeWords: array of string;   // DIVERGENZE 398: the TYPE word of each parameter, for an overload-aware key
+  TW: string;
+  twi: Integer;
 begin
   IsAbstract := ForceAbstract;   // MODERN: every method of an INTERFACE is abstract by construction
   DecoCount := 0;
@@ -6458,8 +6461,17 @@ begin
   Depth := 0;
   ParamIdx := 0;
   Defs := nil;
+  SetLength(TypeWords, 0);
   while not Context.Check(ttEndOfFile) do
   begin
+    // DIVERGENZE 398: note the type word after AS (CONST skipped) - it is what tells two same-named overloads apart
+    if (Depth = 1) and SameText(VarToStr(Context.CurrentToken.Value), 'AS') and Assigned(Context.PeekNext) then
+    begin
+      TW := UpperFast(VarToStr(Context.PeekNext.Value));
+      if (TW = 'CONST') and Assigned(Context.PeekToken(2)) then TW := UpperFast(VarToStr(Context.PeekToken(2).Value));
+      if Length(TypeWords) <= ParamIdx then SetLength(TypeWords, ParamIdx + 1);
+      if TypeWords[ParamIdx] = '' then TypeWords[ParamIdx] := TW;
+    end;
     if Context.Check(ttDelimParOpen) then Inc(Depth)
     else if Context.Check(ttDelimParClose) then Dec(Depth)
     else if (Depth <= 0) and (Context.CheckAny([ttEndOfLine, ttSeparStmt]) or AtEndType) then Break
@@ -6515,6 +6527,18 @@ begin
   if Assigned(Defs) then
   begin
     Key := TypeNode.ValueUpper + '.' + MethName;
+    // ⭐ DIVERGENZE 398 - ...and filed under its SIGNATURE too ("T.CONSTRUCTOR(INTEGER,INTEGER)"): by name alone two
+    // overloads shared one entry and the first declaration's defaults went onto the other's definition - "Type<T>(3)"
+    // of "T(ByVal n As Integer, m = 9)" beside "T(ByRef As B, n = 50)" ran with m = 50. The name key stays, for the
+    // definitions whose signature cannot be read the same way (the first declaration wins there, as before).
+    TW := '';
+    for twi := 0 to ParamIdx do
+    begin
+      if twi > 0 then TW := TW + ',';
+      if twi <= High(TypeWords) then TW := TW + TypeWords[twi];
+    end;
+    if FTypeMethodDefaults.IndexOf(Key + '(' + TW + ')') < 0 then
+      FTypeMethodDefaults.AddObject(Key + '(' + TW + ')', Defs.Clone);
     if FTypeMethodDefaults.IndexOf(Key) >= 0 then Defs.Free   // overload: first declaration wins (v1)
     else FTypeMethodDefaults.AddObject(Key, Defs);
   end;
@@ -6548,8 +6572,28 @@ procedure TPackratParser.ApplyDeclaredDefaults(const QualName: string; ParamList
 var
   Defs, P, D: TASTNode;
   Idx, i, First: Integer;
+  Sig, W: string;
 begin
-  Idx := FTypeMethodDefaults.IndexOf(QualName);
+  // DIVERGENZE 398: the entry of THIS overload first, by the type word of each parameter (THIS skipped)
+  Idx := -1;
+  if ParamList <> nil then
+  begin
+    if SkipThis then First := 1 else First := 0;
+    Sig := '';
+    for i := First to ParamList.ChildCount - 1 do
+    begin
+      if i > First then Sig := Sig + ',';
+      if ParamList.GetChild(i).ChildCount >= 1 then
+      begin
+        W := UpperFast(Trim(VarToStr(ParamList.GetChild(i).GetChild(0).Value)));
+        if Copy(W, 1, 6) = 'CONST ' then W := Trim(Copy(W, 7, MaxInt));
+        if Pos(' ', W) > 0 then W := Copy(W, 1, Pos(' ', W) - 1);
+        Sig := Sig + W;
+      end;
+    end;
+    Idx := FTypeMethodDefaults.IndexOf(QualName + '(' + Sig + ')');
+  end;
+  if Idx < 0 then Idx := FTypeMethodDefaults.IndexOf(QualName);
   if Idx < 0 then Exit;
   Defs := TASTNode(FTypeMethodDefaults.Objects[Idx]);
   if (Defs = nil) or (ParamList = nil) then Exit;

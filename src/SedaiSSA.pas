@@ -916,6 +916,8 @@ type
     function DeclaredPointerTypeOfArg(Node: TASTNode): string;  // the declared "T PTR" type of an argument, or ''
     function ArgUdtSigFromArgs(ArgsNode: TASTNode; WithRank: Boolean = False): string;     // ...and their UDT type tail (every UDT is an int handle)
     function ArgArrayTailOf(Node: TASTNode; WithRank: Boolean): string;  // an ARRAY argument's entry in that tail (DIVERGENZE 471)
+    function CtorDefaultsTakeArgs(const Lbl, Tail, ArgSig, UdtSig: string): Boolean;   // DIVERGENZE 398
+    function NearestBaseWithDefaults(const Lbl, Tail, Sig, UdtSig: string; out Extra: Integer): Boolean;  // DIVERGENZE 398
     function SigBankPart(const Sig: string): string;
     function ArgIsSurelyNotRecord(Node: TASTNode): Boolean;
     function ArgNotRecordMask(ArgsNode: TASTNode): string;
@@ -934,7 +936,8 @@ type
     function CheckArrayOverloadCall(const BaseLabel: string; ArgsNode: TASTNode): string;  // DIVERGENZE 472
     function ResolveCallLabelRaw(const BaseLabel: string; ArgsNode: TASTNode): string;  // ...before the const-array rule
     function ResolveCallLabelWith(const BaseLabel: string; ArgsNode: TASTNode; const UdtSigIn: string): string;  // ...with one spelling of the type tail
-    function FindCtorWithDefaults(const TypeName: string; ArgCount: Integer): string;  // M4.4h: defaulted ctor
+    function FindCtorWithDefaults(const TypeName: string; ArgCount: Integer; const ArgSig: string = '';
+                                  const UdtSig: string = ''): string;  // M4.4h: defaulted ctor
     procedure PreCollectFuncRetTypes(Node: TASTNode);  // FUNCTION name -> return type, before RegisterRecordVars
     function PreProcPtrSigOf(Node: TASTNode): string;   // "ProcPtr(f[,sig])"/"@f" -> f's "FPPARAMS|FPRET", '' if none
     procedure RegisterRecordVars(Node: TASTNode);  // pre-scan DIM..AS (record/explicit-typed vars)
@@ -39228,6 +39231,45 @@ begin
   Result := ResolveCallLabelWith(BaseLabel, ArgsNode, ArgUdtSigFromArgs(ArgsNode, WantRank));
 end;
 
+function TSSAGenerator.NearestBaseWithDefaults(const Lbl, Tail, Sig, UdtSig: string; out Extra: Integer): Boolean;
+// DIVERGENZE 398: may the overload Lbl (its signature tail Tail) take a call of banks Sig and UDT names UdtSig because
+// every parameter past the call's arguments has a DEFAULT? When it may, Extra is the upcast distance over the first
+// Length(Sig) positions, as the equal-arity candidates are weighed.
+var
+  Bank, Names, Cut: string;
+  Decl, Params: TASTNode;
+  NArgs, NParams, Off, i, Commas: Integer;
+begin
+  Result := False;
+  Extra := -1;
+  if GetEnvironmentVariable('SB_OVL_DEFAULTS_NEAREST') = '0' then Exit;
+  Bank := SigBankPart(Tail);
+  NArgs := Length(Sig);
+  NParams := Length(Bank);
+  if (NArgs = 0) or (NParams <= NArgs) or (Copy(Bank, 1, NArgs) <> Sig) then Exit;
+  if not (FProcDecls.TryGetValue(Lbl, Decl) and Assigned(Decl) and (Decl.ChildCount >= 2)) then Exit;
+  Params := Decl.GetChild(1);
+  Off := Params.ChildCount - NParams;                 // 1 when a THIS leads the list (a method, a constructor)
+  if (Off < 0) or (Off > 1) then Exit;
+  for i := NArgs to NParams - 1 do
+    if Params.GetChild(Off + i).Attributes.Values['HASDEFAULT'] <> '1' then Exit;
+  // the first NArgs names of the declaration's tail
+  Names := SigNamePart(Tail);
+  Cut := ''; Commas := 0;
+  for i := 1 to Length(Names) do
+  begin
+    if Names[i] = ',' then
+    begin
+      Inc(Commas);
+      if Commas = NArgs then Break;
+    end;
+    Cut := Cut + Names[i];
+  end;
+  if Commas + 1 < NArgs then Exit;                    // fewer names than arguments: not a tail this can read
+  Extra := TypeTailUpcastDistance(UdtSig, Cut);
+  Result := Extra >= 0;
+end;
+
 function TSSAGenerator.ResolveCallLabelWith(const BaseLabel: string; ArgsNode: TASTNode; const UdtSigIn: string): string;
 // Resolve a call to an OVERLOADED procedure. A name declared once keeps its bare label, so the first
 // test settles every non-overloaded program and this costs nothing. An overload set has no bare label
@@ -39242,7 +39284,7 @@ function TSSAGenerator.ResolveCallLabelWith(const BaseLabel: string; ArgsNode: T
 // Returns '' when nothing matches, and the caller reports it as before.
 var
   Sig, UdtSig, ConstSig, WidthSig, LegacySig, Pref, Cand, Tail, NotRecMask: string;
-  k, j, Extra, BestExtra: Integer;
+  k, j, Extra, BestExtra, DefOff: Integer;
   DeclN, ParamsN: TASTNode;
   OkDef: Boolean;
   RankCost, BestCost: Int64;
@@ -39384,7 +39426,19 @@ begin
       if Copy(FProcedureNames[k], 1, Length(Pref)) = Pref then
       begin
         Tail := Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt);
-        if SigBankPart(Tail) <> Sig then Continue;
+        if SigBankPart(Tail) <> Sig then
+        begin
+          // ⭐ DIVERGENZE 398 - ...OR A LONGER CANDIDATE WHOSE EXTRA PARAMETERS ALL HAVE A DEFAULT. "Type<udt3>(u21)"
+          // with u21 a udt2 is fbc's "udt3(ByRef As udt2, i7 = 0, i8 = 0, i9 = 0)"; this pass wanted the bank part
+          // EQUAL to the call's, so that candidate was never weighed, and the arity fallback took the COPY
+          // constructor "udt3(ByRef As udt3)" - a downcast that copied 72 bytes out of a 48-byte udt2 (garbage in
+          // i31, fbc's structs/udt-init-6; it also was the "layout-dependent verdict" of 195). Weighed on the
+          // first N positions. SB_OVL_DEFAULTS_NEAREST=0 is the A/B.
+          if not NearestBaseWithDefaults(FProcedureNames[k], Tail, Sig, UdtSig, Extra) then Continue;
+          if Extra < BestExtra then begin BestExtra := Extra; Cand := FProcedureNames[k]; OkDef := False; end
+          else if Extra = BestExtra then OkDef := True;
+          Continue;
+        end;
         Extra := TypeTailUpcastDistance(UdtSig, SigNamePart(Tail));
         if Extra < 0 then Continue;
         if Extra < BestExtra then begin BestExtra := Extra; Cand := FProcedureNames[k]; OkDef := False; end
@@ -39589,10 +39643,14 @@ begin
             (DeclN.ChildCount >= 2)) then Continue;
     ParamsN := DeclN.GetChild(1);
     if (ParamsN = nil) or (ParamsN.NodeType <> antParameterList) then Continue;
-    if ParamsN.ChildCount <> Length(Tail) then Continue;
+    // ⭐ DIVERGENZE 634 - ...and a METHOD's list opens with THIS, one node the signature does not count: this pass wanted
+    // the two counts EQUAL, so it never saw a method, and "o.f(1)" of an overloaded "f(a, b = 7)" resolved to nothing and
+    // the call was DROPPED in silence. The offset is 0 for a procedure and 1 for a method. SB_OVL_METHOD_DEFAULTS=0 is the A/B.
+    DefOff := ParamsN.ChildCount - Length(Tail);
+    if (DefOff <> 0) and not ((DefOff = 1) and (GetEnvironmentVariable('SB_OVL_METHOD_DEFAULTS') <> '0')) then Continue;
     OkDef := True;
-    for j := Length(Sig) to ParamsN.ChildCount - 1 do              // every parameter past the call's
-      if ParamsN.GetChild(j).Attributes.Values['HASDEFAULT'] <> '1' then begin OkDef := False; Break; end;
+    for j := Length(Sig) to Length(Tail) - 1 do                   // every parameter past the call's
+      if ParamsN.GetChild(DefOff + j).Attributes.Values['HASDEFAULT'] <> '1' then begin OkDef := False; Break; end;
     if not OkDef then Continue;
     Extra := (Length(Tail) - Length(Sig)) * 2;                     // fewer omitted parameters wins...
     if Copy(Tail, 1, Length(Sig)) <> Sig then Inc(Extra);          // ...and an exact bank prefix wins a tie
@@ -39680,8 +39738,9 @@ function TSSAGenerator.ResolveConstructorLabel(const TypeName, ArgSig: string;
 //      tail is never mistaken for extra parameters.
 // A subtype with no matching ctor inherits the parent's.
 var
-  T, Lbl, Pref: string;
-  Idx, Guard, k: Integer;
+  T, Lbl, Pref, CtorBest, CtorTail: string;
+  Idx, Guard, k, CtorExtra, CtorBestExtra: Integer;
+  CtorTie: Boolean;
 begin
   Result := '';
   T := UpperFast(TypeName);
@@ -39741,6 +39800,32 @@ begin
     // 2) exact bank signature
     Lbl := T + '.CONSTRUCTOR#' + ArgSig;
     if FProcDecls.ContainsKey(Lbl) then Exit(Lbl);
+    // ⭐ 2b) DIVERGENZE 398 - A UDT ARGUMENT TAKES THE NEAREST BASE, and a constructor whose extra parameters all have a
+    //    DEFAULT is a candidate too. "Type<udt3>(u21)" with u21 a udt2 fell to the arity fallback below, whose first
+    //    bank-exact member was the COPY constructor "udt3(ByRef As udt3)": a DOWNCAST, which copied 72 bytes out of a
+    //    48-byte udt2 (garbage in i31: fbc's structs/udt-init-6, and the "layout-dependent verdict" of 195). fbc takes
+    //    "udt3(ByRef As udt2, i7 = 0, i8 = 0, i9 = 0)". The rule ResolveCallLabelWith applies to SUB/FUNCTION sets,
+    //    brought to the constructors' own resolver. A tie declines and the passes below decide, as before.
+    //    SB_OVL_DEFAULTS_NEAREST=0 is the A/B.
+    if (UdtSig <> '') and (GetEnvironmentVariable('SB_OVL_DEFAULTS_NEAREST') <> '0') then
+    begin
+      Pref := T + '.CONSTRUCTOR#';
+      CtorBest := ''; CtorBestExtra := MaxInt; CtorTie := False;
+      for k := 0 to FProcedureNames.Count - 1 do
+        if Copy(FProcedureNames[k], 1, Length(Pref)) = Pref then
+        begin
+          CtorTail := Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt);
+          if SigBankPart(CtorTail) = ArgSig then
+            CtorExtra := TypeTailUpcastDistance(UdtSig, SigNamePart(CtorTail))
+          else if not NearestBaseWithDefaults(FProcedureNames[k], CtorTail, ArgSig, UdtSig, CtorExtra) then
+            Continue;
+          if CtorExtra < 0 then Continue;
+          if CtorExtra < CtorBestExtra then
+          begin CtorBestExtra := CtorExtra; CtorBest := FProcedureNames[k]; CtorTie := False; end
+          else if CtorExtra = CtorBestExtra then CtorTie := True;
+        end;
+      if (CtorBest <> '') and not CtorTie then Exit(CtorBest);
+    end;
     // 3) arity fallback: a ctor of T with the same parameter count - the BANK-exact one first, for the
     //    reason ResolveMethodLabelArgs gives: with a width tail in play a call can arrive here knowing
     //    its bank and not its width, and "the first of that many parameters" may be another bank.
@@ -39777,6 +39862,14 @@ begin
          (Length(SigBankPart(Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt))) = Length(ArgSig)) and
          ((UdtSig <> '') or (Pos(':', Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt)) = 0)) then
         Exit(FProcedureNames[k]);
+    // ⭐ DIVERGENZE 398 - ...and BEFORE that, a constructor whose extra parameters have DEFAULTS and whose first ones
+    // can take these arguments: "Type<T>(3)" beside "T(ByRef As T)" and "T(ByVal n As Integer, m = 9)" is fbc's second,
+    // and the pass below handed the number to the COPY constructor, which dereferenced 3 as a record.
+    if (ArgSig <> '') and (GetEnvironmentVariable('SB_OVL_DEFAULTS_NEAREST') <> '0') then
+    begin
+      Lbl := FindCtorWithDefaults(T, Length(ArgSig), ArgSig, UdtSig);
+      if Lbl <> '' then Exit(Lbl);
+    end;
     // ...and only if THAT finds nothing does a UDT-taking ctor get its turn: a type whose only
     // constructor takes another UDT must still be reachable, or a program that has always worked stops
     // compiling. The order is the whole change; nothing is removed.
@@ -39791,7 +39884,34 @@ begin
   end;
 end;
 
-function TSSAGenerator.FindCtorWithDefaults(const TypeName: string; ArgCount: Integer): string;
+function TSSAGenerator.CtorDefaultsTakeArgs(const Lbl, Tail, ArgSig, UdtSig: string): Boolean;
+// DIVERGENZE 398: can the first Length(ArgSig) parameters of this constructor (label tail Tail) take the call's
+// arguments? The banks must agree position by position; a UDT argument must UPCAST to its parameter; an argument that is
+// not a UDT must not land on a UDT parameter (a handle and a number both sign the bank 'I').
+var
+  Names: TStringList;
+  Extra, i: Integer;
+begin
+  Result := False;
+  if Copy(SigBankPart(Tail), 1, Length(ArgSig)) <> ArgSig then Exit;
+  if (UdtSig <> '') and (Length(SigBankPart(Tail)) > Length(ArgSig)) then
+    Exit(NearestBaseWithDefaults(Lbl, Tail, ArgSig, UdtSig, Extra));
+  if UdtSig <> '' then Exit(TypeTailUpcastDistance(UdtSig, SigNamePart(Tail)) >= 0);
+  // no UDT argument: every one of the first positions must be a non-UDT parameter
+  if SigNamePart(Tail) = '' then Exit(True);
+  Names := TIndexedStringList.Create;
+  try
+    Names.Delimiter := ','; Names.StrictDelimiter := True; Names.DelimitedText := SigNamePart(Tail);
+    for i := 0 to Length(ArgSig) - 1 do
+      if (i < Names.Count) and (Names[i] <> '-') and (Names[i] <> '') then Exit(False);
+  finally
+    Names.Free;
+  end;
+  Result := True;
+end;
+
+function TSSAGenerator.FindCtorWithDefaults(const TypeName: string; ArgCount: Integer; const ArgSig: string;
+                                            const UdtSig: string): string;
 // M4.4h: find a constructor (walking inheritance) callable with ArgCount arguments thanks to default
 // parameters — i.e. it has M >= ArgCount parameters and every parameter beyond the ArgCount-th carries
 // a default value (HASDEFAULT). Prefers the fewest parameters (closest match). Used as a last resort
@@ -39823,6 +39943,12 @@ begin
         pj := ParamList.GetChild(j + 1);              // +1: skip THIS
         if pj.Attributes.Values['HASDEFAULT'] <> '1' then begin ok := False; Break; end;
       end;
+      // ⭐ DIVERGENZE 398 - ...and, when the caller knows the ARGUMENTS, the first ArgCount parameters must be able to
+      // take them: "Type<T>(3)" with "T(ByRef As B, n = 5)" and "T(ByVal n As Integer, m = 9)" took the FIRST by
+      // count alone, and dereferenced 3 as a record. A UDT argument must upcast to its parameter (NearestBaseWithDefaults
+      // weighs it); a non-UDT one must not land on a UDT parameter. SB_OVL_DEFAULTS_NEAREST=0 is the A/B.
+      if ok and (ArgSig <> '') and (GetEnvironmentVariable('SB_OVL_DEFAULTS_NEAREST') <> '0') then
+        ok := CtorDefaultsTakeArgs(Lbl, Copy(Lbl, Length(Pref) + 1, MaxInt), ArgSig, UdtSig);
       if ok and (MParams < BestM) then begin Best := Lbl; BestM := MParams; end;
     end;
     if Best <> '' then Exit(Best);
@@ -43000,7 +43126,7 @@ begin
   UdtSig := ArgUdtSigFromArgs(ArgsNode);
   Lbl := ResolveConstructorLabel(TypeName, ArgSig, UdtSig, ArgWidthSigFromArgs(ArgsNode, True));
   // M4.4h: if no ctor matches the given count, try one that is callable via default parameters.
-  if Lbl = '' then Lbl := FindCtorWithDefaults(TypeName, ArgCount);
+  if Lbl = '' then Lbl := FindCtorWithDefaults(TypeName, ArgCount, ArgSig, UdtSig);
   if Lbl = '' then
   begin
     // FreeBASIC aggregate init: a type with NO matching constructor but given args (e.g. "V3(1,2,3)" /
