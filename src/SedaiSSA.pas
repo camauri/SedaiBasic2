@@ -4933,7 +4933,8 @@ begin
       Result := MakeSSARegister(FuncRetType, DestReg);
       case FuncRetType of
         srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), FloatRefArg(DerefedType(Node.GetChild(0))));
-        srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+        srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone),    // width (538)
+                     MakeSSAConstInt(Ord((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and (Pos('WSTRING', UpperFast(DerefedType(Node.GetChild(0)))) > 0))));
       else
         // ⭐ ...AND THE READ CARRIES ITS OWN WIDTH. Over a PACKED array the elements are contiguous
         // bytes, so "*Cast(ULong Ptr, @a(0))" must take FOUR of them side by side - which the VM can
@@ -5181,7 +5182,8 @@ begin
         // Single inside a native record, and read at eight bytes it took the next field with it.
         case FuncRetType of
           srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), FloatRefArg(AddrParamType(VarName)));
-          srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone),    // width (538)
+                       MakeSSAConstInt(Ord((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and (Pos('WSTRING', UpperFast(AddrParamType(VarName))) > 0))));
         else
           EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), NarrowRefArg(AddrParamType(VarName)));
         end;
@@ -10852,7 +10854,8 @@ begin
           Result := MakeSSARegister(FuncRetType, DestReg);
           case FuncRetType of
             srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), FloatRefArg(PointeeTypeOf(ArrName)));
-            srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone),    // width (538)
+                         MakeSSAConstInt(Ord((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and (Pos('WSTRING', UpperFast(PointeeTypeOf(ArrName))) > 0))));
           else
             EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone),
                             NarrowRefArg(PointeeTypeOf(ArrName)));   // phase 2.3: an address has no array to ask the width
@@ -28281,6 +28284,21 @@ begin
   Result := (Count > 0) and (ElemBytes > 0);
 end;
 
+var
+  GUnionPadOff: Integer = -1;   // DIVERGENZE 399: SB_UNION_PAD=0 read once
+
+function UnionPadRound(V, Al: Integer): Integer;
+// ⭐ DIVERGENZE 399 - C's rule, and fbc's: an anonymous "Type ... End Type" inside a UNION is padded to ITS alignment,
+// and a nested UNION block is padded to ITS alignment before the next member. "Union : Type : a As Short : b As Byte :
+// End Type : End Union : c As Byte" is 6 bytes with c at +4 in fbc; without the padding c landed at +3 and the type was 4.
+// SB_UNION_PAD=0 is the A/B.
+begin
+  Result := V;
+  if GUnionPadOff < 0 then GUnionPadOff := Ord(GetEnvironmentVariable('SB_UNION_PAD') = '0');
+  if (GUnionPadOff = 1) or (Al <= 1) then Exit;
+  if (V mod Al) <> 0 then Result := V + (Al - (V mod Al));
+end;
+
 function TSSAGenerator.UDTCLayoutRaw(UDTIdx: Integer; out Offsets: TInt64Array; out TotalSize: Int64): Boolean;
 // The C byte layout of a type that is being laid OVER RAW MEMORY. Same rule as UDTCLayout, but a
 // fixed-size scalar array member is accepted and occupies its elements INLINE - which is what it is in C,
@@ -28289,7 +28307,7 @@ function TSSAGenerator.UDTCLayoutRaw(UDTIdx: Integer; out Offsets: TInt64Array; 
 var
   i, k, n, GrpCur, RunU, RunS, BitOfs: Integer;
   Sz, Al, MaxAl, Ofs, Cnt, EB, GrpBase, GrpMax, GrpAl, Sz2, Al2, UOfs, USize, AContrib: Int64;
-  SGrpCur, SGrpOfs: Integer;   // anonymous Type run inside a nested UNION block
+  SGrpCur, SGrpOfs, SGrpAl: Integer;   // anonymous Type run inside a nested UNION block
   Run: TBitRunState;
   IsBit, BitCont: Boolean;
 
@@ -28375,6 +28393,13 @@ begin
       RunS := FUDTs[UDTIdx].Fields[i].StructGroup;
       Run.Open := False;
     end;
+    // ⭐ DIVERGENZE 278 - ...and EVERY DIRECT MEMBER OF A UNION IS AN ALTERNATIVE that starts again at bit 0: two bit
+    // fields "b : 1" and "c : 1" of one Union share their bit, so writing b and reading c reads it (fbc). The run stayed
+    // open across them and c took the NEXT bit. A member of an anonymous Type inside the union still continues the run.
+    if (FUDTs[UDTIdx].Fields[i].StructGroup = 0) and
+       ((FUDTs[UDTIdx].Fields[i].UnionGroup <> 0) or FUDTs[UDTIdx].IsUnion) and
+       (GetEnvironmentVariable('SB_UNION_BIT_ALT') <> '0') then
+      Run.Open := False;
     IsBit := FUDTs[UDTIdx].Fields[i].BitWidth > 0;
     if not IsBit then Run.Open := False;
     if FUDTs[UDTIdx].Fields[i].IsArray then
@@ -28412,7 +28437,7 @@ begin
     begin
       if FUDTs[UDTIdx].Fields[i].UnionGroup <> GrpCur then
       begin
-        if GrpCur <> 0 then Ofs := GrpBase + GrpMax;
+        if GrpCur <> 0 then Ofs := GrpBase + UnionPadRound(GrpMax, GrpAl);
         GrpCur := FUDTs[UDTIdx].Fields[i].UnionGroup;
         GrpAl := 1;
         for k := i to n - 1 do
@@ -28441,7 +28466,7 @@ begin
       if FUDTs[UDTIdx].Fields[i].StructGroup <> 0 then
       begin
         if FUDTs[UDTIdx].Fields[i].StructGroup <> SGrpCur then
-        begin SGrpCur := FUDTs[UDTIdx].Fields[i].StructGroup; SGrpOfs := 0; end;
+        begin SGrpCur := FUDTs[UDTIdx].Fields[i].StructGroup; SGrpOfs := 0; SGrpAl := 1; end;
         if IsBit then
         begin
           PlaceBitField(UDTIdx, i, Run, SGrpOfs, UOfs, USize, AContrib, BitOfs, BitCont);
@@ -28452,7 +28477,8 @@ begin
         if (SGrpOfs mod Al) <> 0 then SGrpOfs := SGrpOfs + (Al - (SGrpOfs mod Al));
         Offsets[i] := GrpBase + SGrpOfs;
         SGrpOfs := SGrpOfs + Sz;
-        if SGrpOfs > GrpMax then GrpMax := SGrpOfs;
+        if Al > SGrpAl then SGrpAl := Al;                              // DIVERGENZE 399: the run's own alignment
+        if UnionPadRound(SGrpOfs, SGrpAl) > GrpMax then GrpMax := UnionPadRound(SGrpOfs, SGrpAl);
       end
       else
       begin
@@ -28470,7 +28496,7 @@ begin
     end
     else
     begin
-      if GrpCur <> 0 then begin Ofs := GrpBase + GrpMax; GrpCur := 0; end;
+      if GrpCur <> 0 then begin Ofs := GrpBase + UnionPadRound(GrpMax, GrpAl); GrpCur := 0; end;
       if IsBit then
       begin
         PlaceBitField(UDTIdx, i, Run, Ofs, UOfs, USize, AContrib, BitOfs, BitCont);
@@ -28483,7 +28509,7 @@ begin
       Ofs := Ofs + Sz;
     end;
   end;
-  if GrpCur <> 0 then Ofs := GrpBase + GrpMax;
+  if GrpCur <> 0 then Ofs := GrpBase + UnionPadRound(GrpMax, GrpAl);
   if (Ofs mod MaxAl) <> 0 then Ofs := Ofs + (MaxAl - (Ofs mod MaxAl));
   TotalSize := Ofs;
   Result := n > 0;
@@ -31114,7 +31140,7 @@ function TSSAGenerator.UDTCLayout(UDTIdx: Integer; out Offsets: TInt64Array; out
 var
   i, k, n, GrpCur, RunU, RunS, BitOfs: Integer;
   Sz, Al, MaxAl, Ofs, GrpBase, GrpMax, GrpAl, Sz2, Al2, UOfs, USize, AContrib: Int64;
-  SGrpCur, SGrpOfs: Integer;   // anonymous Type run inside a nested UNION block
+  SGrpCur, SGrpOfs, SGrpAl: Integer;   // anonymous Type run inside a nested UNION block
   Run: TBitRunState;
   IsBit, BitCont: Boolean;
 begin
@@ -31149,6 +31175,13 @@ begin
       RunS := FUDTs[UDTIdx].Fields[i].StructGroup;
       Run.Open := False;
     end;
+    // ⭐ DIVERGENZE 278 - ...and EVERY DIRECT MEMBER OF A UNION IS AN ALTERNATIVE that starts again at bit 0: two bit
+    // fields "b : 1" and "c : 1" of one Union share their bit, so writing b and reading c reads it (fbc). The run stayed
+    // open across them and c took the NEXT bit. A member of an anonymous Type inside the union still continues the run.
+    if (FUDTs[UDTIdx].Fields[i].StructGroup = 0) and
+       ((FUDTs[UDTIdx].Fields[i].UnionGroup <> 0) or FUDTs[UDTIdx].IsUnion) and
+       (GetEnvironmentVariable('SB_UNION_BIT_ALT') <> '0') then
+      Run.Open := False;
     IsBit := FUDTs[UDTIdx].Fields[i].BitWidth > 0;
     if not IsBit then Run.Open := False;
     // ...and the ARRAY exclusion is now narrower: a FIXED-length array of scalars is reproducible
@@ -31178,7 +31211,7 @@ begin
     begin
       if FUDTs[UDTIdx].Fields[i].UnionGroup <> GrpCur then
       begin
-        if GrpCur <> 0 then Ofs := GrpBase + GrpMax;
+        if GrpCur <> 0 then Ofs := GrpBase + UnionPadRound(GrpMax, GrpAl);
         GrpCur := FUDTs[UDTIdx].Fields[i].UnionGroup;
         GrpAl := 1;
         for k := i to n - 1 do
@@ -31207,7 +31240,7 @@ begin
       if FUDTs[UDTIdx].Fields[i].StructGroup <> 0 then
       begin
         if FUDTs[UDTIdx].Fields[i].StructGroup <> SGrpCur then
-        begin SGrpCur := FUDTs[UDTIdx].Fields[i].StructGroup; SGrpOfs := 0; end;
+        begin SGrpCur := FUDTs[UDTIdx].Fields[i].StructGroup; SGrpOfs := 0; SGrpAl := 1; end;
         if IsBit then
         begin
           PlaceBitField(UDTIdx, i, Run, SGrpOfs, UOfs, USize, AContrib, BitOfs, BitCont);
@@ -31217,7 +31250,8 @@ begin
         if (SGrpOfs mod Al) <> 0 then SGrpOfs := SGrpOfs + (Al - (SGrpOfs mod Al));
         Offsets[i] := GrpBase + SGrpOfs;
         SGrpOfs := SGrpOfs + Sz;
-        if SGrpOfs > GrpMax then GrpMax := SGrpOfs;
+        if Al > SGrpAl then SGrpAl := Al;                              // DIVERGENZE 399: the run's own alignment
+        if UnionPadRound(SGrpOfs, SGrpAl) > GrpMax then GrpMax := UnionPadRound(SGrpOfs, SGrpAl);
       end
       else
       begin
@@ -31234,7 +31268,7 @@ begin
     end
     else
     begin
-      if GrpCur <> 0 then begin Ofs := GrpBase + GrpMax; GrpCur := 0; end;
+      if GrpCur <> 0 then begin Ofs := GrpBase + UnionPadRound(GrpMax, GrpAl); GrpCur := 0; end;
       if IsBit then
       begin
         PlaceBitField(UDTIdx, i, Run, Ofs, UOfs, USize, AContrib, BitOfs, BitCont);
@@ -31246,7 +31280,7 @@ begin
       Ofs := Ofs + Sz;
     end;
   end;
-  if GrpCur <> 0 then Ofs := GrpBase + GrpMax;
+  if GrpCur <> 0 then Ofs := GrpBase + UnionPadRound(GrpMax, GrpAl);
   if (Ofs mod MaxAl) <> 0 then Ofs := Ofs + (MaxAl - (Ofs mod MaxAl));
   TotalSize := Ofs;
   Result := n > 0;
@@ -37181,7 +37215,7 @@ procedure TSSAGenerator.ComputeUDTLiveLayout(UDTIdx: Integer);
   record with an array member still cannot be PUT to a file byte-faithfully, and closing that is
   its own piece of work. }
 var
-  i, k, n, WireW, GrpCur, SGrpCur, RunU, RunS, BitOfs: Integer;
+  i, k, n, WireW, GrpCur, SGrpCur, RunU, RunS, BitOfs, SGrpAl: Integer;
   Sz, Al, MaxAl, Ofs, GrpBase, GrpMax, GrpAl, Sz2, Al2, SGrpOfs, UOfs, USize, AContrib: Int64;
   Run: TBitRunState;
   IsBit, BitCont: Boolean;
@@ -37209,6 +37243,13 @@ begin
       RunS := FUDTs[UDTIdx].Fields[i].StructGroup;
       Run.Open := False;
     end;
+    // ⭐ DIVERGENZE 278 - ...and EVERY DIRECT MEMBER OF A UNION IS AN ALTERNATIVE that starts again at bit 0: two bit
+    // fields "b : 1" and "c : 1" of one Union share their bit, so writing b and reading c reads it (fbc). The run stayed
+    // open across them and c took the NEXT bit. A member of an anonymous Type inside the union still continues the run.
+    if (FUDTs[UDTIdx].Fields[i].StructGroup = 0) and
+       ((FUDTs[UDTIdx].Fields[i].UnionGroup <> 0) or FUDTs[UDTIdx].IsUnion) and
+       (GetEnvironmentVariable('SB_UNION_BIT_ALT') <> '0') then
+      Run.Open := False;
     IsBit := FUDTs[UDTIdx].Fields[i].BitWidth > 0;
     if not IsBit then Run.Open := False;
     UDTFieldCShape(UDTIdx, i, Sz, Al);
@@ -37228,7 +37269,7 @@ begin
         // mirror of the nested-union case and the whole point of udt/union.bas: "ul As ULong"
         // overlapping "ub0..ub3", where the four bytes must be at 0,1,2,3 and not all at 0.
         if FUDTs[UDTIdx].Fields[i].StructGroup <> SGrpCur then
-        begin SGrpCur := FUDTs[UDTIdx].Fields[i].StructGroup; SGrpOfs := 0; end;
+        begin SGrpCur := FUDTs[UDTIdx].Fields[i].StructGroup; SGrpOfs := 0; SGrpAl := 1; end;
         if IsBit then
         begin
           PlaceBitField(UDTIdx, i, Run, SGrpOfs, UOfs, USize, AContrib, BitOfs, BitCont);
@@ -37262,7 +37303,7 @@ begin
       // first member can be a Byte and the second a Double, and C aligns the union, not the member.
       if FUDTs[UDTIdx].Fields[i].UnionGroup <> GrpCur then
       begin
-        if GrpCur <> 0 then Ofs := GrpBase + GrpMax;      // close the previous block
+        if GrpCur <> 0 then Ofs := GrpBase + UnionPadRound(GrpMax, GrpAl);      // close the previous block
         GrpCur := FUDTs[UDTIdx].Fields[i].UnionGroup;
         GrpAl := 1;
         for k := i to n - 1 do
@@ -37290,7 +37331,7 @@ begin
       if FUDTs[UDTIdx].Fields[i].StructGroup <> 0 then
       begin
         if FUDTs[UDTIdx].Fields[i].StructGroup <> SGrpCur then
-        begin SGrpCur := FUDTs[UDTIdx].Fields[i].StructGroup; SGrpOfs := 0; end;
+        begin SGrpCur := FUDTs[UDTIdx].Fields[i].StructGroup; SGrpOfs := 0; SGrpAl := 1; end;
         if IsBit then
         begin
           PlaceBitField(UDTIdx, i, Run, SGrpOfs, UOfs, USize, AContrib, BitOfs, BitCont);
@@ -37300,7 +37341,8 @@ begin
         if (SGrpOfs mod Al) <> 0 then SGrpOfs := SGrpOfs + (Al - (SGrpOfs mod Al));
         FUDTs[UDTIdx].Fields[i].ByteOffset := GrpBase + SGrpOfs;
         SGrpOfs := SGrpOfs + Sz;
-        if SGrpOfs > GrpMax then GrpMax := SGrpOfs;
+        if Al > SGrpAl then SGrpAl := Al;                              // DIVERGENZE 399: the run's own alignment
+        if UnionPadRound(SGrpOfs, SGrpAl) > GrpMax then GrpMax := UnionPadRound(SGrpOfs, SGrpAl);
       end
       else
       begin
@@ -37317,7 +37359,7 @@ begin
     end
     else
     begin
-      if GrpCur <> 0 then begin Ofs := GrpBase + GrpMax; GrpCur := 0; end;   // a block just ended
+      if GrpCur <> 0 then begin Ofs := GrpBase + UnionPadRound(GrpMax, GrpAl); GrpCur := 0; end;   // a block just ended
       if IsBit then
       begin
         PlaceBitField(UDTIdx, i, Run, Ofs, UOfs, USize, AContrib, BitOfs, BitCont);
@@ -37393,7 +37435,7 @@ begin
       FUDTs[UDTIdx].Fields[i].BitContinues := False;
     end;
   end;
-  if GrpCur <> 0 then Ofs := GrpBase + GrpMax;        // a block that runs to the end of the type
+  if GrpCur <> 0 then Ofs := GrpBase + UnionPadRound(GrpMax, GrpAl);        // a block that runs to the end of the type
   if (Ofs mod MaxAl) <> 0 then Ofs := Ofs + (MaxAl - (Ofs mod MaxAl));
   // ⛔⛔ THE HANDLE OF A NESTED RECORD MOVES OUT OF THE IMAGE, and this is the half of DIVERGENZE 193
   // that is easy to get wrong. The C image now reserves the nested type's OWN bytes at fbc's offset -
@@ -51092,6 +51134,13 @@ begin
         Result := (NameU = kWSTR) or (NameU = kWCHR) or (NameU = kWSTRING) or (NameU = kWINPUT) or
                   (NameU = kWSPACE) or (NameU = kWHEX) or (NameU = kWOCT) or (NameU = kWBIN) or
                   IsWStringVar(NameU);
+        // ⭐ DIVERGENZE 538 - ...and "p[i]" of a WSTRING PTR, the indexed twin of "*p" above (513): the read took the
+        // cells once the width reached it, and the question ABOUT the value still said narrow, so Print wrote UTF-8
+        // where fbc writes cells. Not for a name that is an ARRAY (its elements answer through IsWStringVar).
+        if (not Result) and (Node.NodeType = antArrayAccess) and (ArrayIndexOf(NameU) < 0) and
+           (GetEnvironmentVariable('SB_REF_WIDE') <> '0') and
+           (UpperFast(Trim(PointeeTypeOf(NameU))) = 'WSTRING') then
+          Result := True;
         // ⛔ ...AND WIDENESS FLOWS THROUGH THE BUILTINS THAT RETURN A PIECE OF THEIR ARGUMENT. Each of
         // these was lowered to its WIDE form correctly - "r = Mid(w, 2)" puts two codepoints in r - and
         // then the RESULT was not known to be wide, so the very next question about it counted bytes:
@@ -53178,7 +53227,13 @@ begin
   else
     case Bank of
       srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), FloatRefArg(Pointee));
-      srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      // ⭐ DIVERGENZE 538 - ...with the WIDTH of the pointee in the immediate, which a MACHINE address needs (a
+      // packed one ignores it): "wp[1]" of a WString Ptr that took its value from an INDIRECT call, or through an
+      // Any Ptr, came down this managed road and read NARROW bytes - "i" where fbc prints the wide "i!". The raw
+      // road (a direct C call's result) always passed it. SB_REF_WIDE=0 is the A/B.
+      srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone),
+                                 MakeSSAConstInt(Ord((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and
+                                                     (Pos('WSTRING', UpperFast(Pointee)) > 0))));
     else
       EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), NarrowRefArg(Pointee));
     end;
@@ -54169,7 +54224,9 @@ begin
     Result := MakeSSARegister(RetRT, FProgram.AllocRegister(RetRT));
     case RetRT of
       srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), FloatRefArg(RetPart));
-      srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone),    // ...its width (538)
+                                 MakeSSAConstInt(Ord((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and
+                                                     (Pos('WSTRING', UpperFast(RetPart)) > 0))));
     else         EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), NarrowRefArg(RetPart));
     end;
     Exit;
@@ -54249,7 +54306,9 @@ begin
     Result := MakeSSARegister(FuncRetType, FProgram.AllocRegister(FuncRetType));
     case FuncRetType of
       srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), FloatRefArg(ByrefRetPointeeType(Name)));
-      srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+      srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone),    // ...its width (538)
+                                 MakeSSAConstInt(Ord((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and
+                                                     (Pos('WSTRING', UpperFast(ByrefRetPointeeType(Name))) > 0))));
     else
       EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), NarrowRefArg(ByrefRetPointeeType(Name)));
     end;
