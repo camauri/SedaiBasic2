@@ -1362,6 +1362,12 @@ var
           1, 2: begin E.EmitBytes([$88, $81]); E.Emit32(LongWord(Ofs)); end;        // mov [rcx+ofs], al
           3, 4: begin E.EmitBytes([$66, $89, $81]); E.Emit32(LongWord(Ofs)); end;   // mov [rcx+ofs], ax
           5, 6: begin E.EmitBytes([$89, $81]); E.Emit32(LongWord(Ofs)); end;        // mov [rcx+ofs], eax
+          // a Boolean (DIVERGENZE 456): the VM's 0/-1 is written as C's 0/1
+          8:    begin
+                  E.EmitBytes([$48, $85, $C0]);                                        // test rax, rax
+                  E.EmitBytes([$0F, $95, $C0]);                                        // setne al
+                  E.EmitBytes([$88, $81]); E.Emit32(LongWord(Ofs));                    // mov [rcx+ofs], al
+                end;
         else    begin E.EmitBytes([$48, $89, $81]); E.Emit32(LongWord(Ofs)); end;   // mov [rcx+ofs], rax
         end;
       end;
@@ -1389,6 +1395,13 @@ var
           4: begin E.EmitBytes([$48, $0F, $B7, $81]); E.Emit32(LongWord(Ofs)); end; // movzx rax, word
           5: begin E.EmitBytes([$48, $63, $81]); E.Emit32(LongWord(Ofs)); end;      // movsxd rax, dword
           6: begin E.EmitBytes([$8B, $81]); E.Emit32(LongWord(Ofs)); end;           // mov eax, dword (zx)
+          // a Boolean (DIVERGENZE 456): any nonzero byte is true, and true is the VM's -1
+          8: begin
+               E.EmitBytes([$80, $B9]); E.Emit32(LongWord(Ofs)); E.EmitBytes([$00]);  // cmp byte [rcx+ofs], 0
+               E.EmitBytes([$0F, $95, $C0]);                                           // setne al
+               E.EmitBytes([$48, $0F, $B6, $C0]);                                      // movzx rax, al
+               E.EmitBytes([$48, $F7, $D8]);                                           // neg rax
+             end;
         else begin E.EmitBytes([$48, $8B, $81]); E.Emit32(LongWord(Ofs)); end;      // mov rax, qword
         end;
         IStore(ValDstReg, RAX);

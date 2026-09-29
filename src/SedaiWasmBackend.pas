@@ -9074,6 +9074,12 @@ begin
               4: B.OpMem(wopI64Load16U, 0, Ofs);
               5: B.OpMem(wopI64Load32S, 0, Ofs);
               6: B.OpMem(wopI64Load32U, 0, Ofs);
+              8: begin                               // a Boolean (DIVERGENZE 456): nonzero byte -> -1
+                   B.OpMem(wopI64Load8U, 0, Ofs);
+                   B.Op(wopI64Eqz); B.Op(wopI32Eqz);
+                   B.I32Const(-1); B.Op(wopI32Mul);
+                   B.Op(wopI64ExtendI32S);
+                 end;
             else
               B.OpMem(wopI64Load, 0, Ofs);
             end;
@@ -9090,6 +9096,10 @@ begin
               1, 2: B.OpMem(wopI64Store8, 0, Ofs);
               3, 4: B.OpMem(wopI64Store16, 0, Ofs);
               5, 6: B.OpMem(wopI64Store32, 0, Ofs);
+              8: begin                               // a Boolean (DIVERGENZE 456): true -> 1
+                   B.Op(wopI64Eqz); B.Op(wopI32Eqz);
+                   B.OpMem(wopI32Store8, 0, Ofs);
+                 end;
             else
               B.OpMem(wopI64Store, 0, Ofs);
             end;

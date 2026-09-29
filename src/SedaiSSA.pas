@@ -6223,8 +6223,15 @@ begin
               // complete - "VarPtr(x) = q", "items(1).socket = s(1)" over an array of pointers - and stripping
               // one side of two tagged addresses made four guards compare unequal (m115 · m572 · m907x · m967).
               // On a real number the strip is a no-op: only the bit pattern 001 in 63..61 is touched.
-              if (ExprIsPointerTyped(Node.GetChild(0)) or (Node.GetChild(0).NodeType = antProcAddress)) <>
-                 (ExprIsPointerTyped(Node.GetChild(1)) or (Node.GetChild(1).NodeType = antProcAddress)) then
+              // ⭐ DIVERGENZE 426 - ...and TWO pointers too: "they carry the same tag" is false for a name of the VM that
+              // C kept and handed back. "@word" of a STRING is 0x100000000, which lies where machine addresses do, so read
+              // back out of C's memory (or given to a callback) it comes home MARKED - and "back = @word" was false while
+              // "Cast(ULongInt, back) = Cast(ULongInt, @word)" was true. Equality now asks what the cast asks.
+              // SB_PTR_EQ_STRIP=0 is the A/B (only the mixed case, as before).
+              if ((ExprIsPointerTyped(Node.GetChild(0)) or (Node.GetChild(0).NodeType = antProcAddress)) <>
+                  (ExprIsPointerTyped(Node.GetChild(1)) or (Node.GetChild(1).NodeType = antProcAddress))) or
+                 ((GetEnvironmentVariable('SB_PTR_EQ_STRIP') <> '0') and
+                  (ExprIsPointerTyped(Node.GetChild(0)) or (Node.GetChild(0).NodeType = antProcAddress))) then
               begin
                 Left := EmitStripForeignTag(Left);
                 Right := EmitStripForeignTag(Right);
@@ -37393,7 +37400,14 @@ begin
       // ⛔ ...and a BOOLEAN (11) is ONE byte in the image, but no decoder knows 11: its "anything else" arm read and wrote
       // eight, so "x.f = True" wrote -1 over the Boolean after it ("f As Boolean : g As Boolean" read g true). As a
       // signed byte the VM's -1/0 comes back unchanged. (A NATIVE type writes C's 0/1 on the raw path instead.)
-      else if WireW = 11 then WireW := 1;
+      // ⭐ DIVERGENZE 456 - ...and since then it has its OWN code, 8: a byte written as C's 0/1 and read back as the VM's
+      // 0/-1, which is what the native path and fbc write. As code 1 the VM's -1 landed as &hFF, so "*Cast(UByte Ptr,
+      // @q.f)" read 255 in a record that is not a C image (a String field, a virtual method, any record in strict).
+      // Every decoder knows 8 now (the VM's five, the C loop, the AOT, the JIT, wasm). SB_BOOL_FIELD_WIRE=0 is the A/B.
+      else if WireW = 11 then
+      begin
+        if GetEnvironmentVariable('SB_BOOL_FIELD_WIRE') = '0' then WireW := 1 else WireW := 8;
+      end;
       // ⭐ A BIT FIELD IS READ THROUGH ITS UNIT, NOT THROUGH ITS DECLARED TYPE, and the width on the
       // wire has to say so: the unit can be NARROWER than the type ("As ULong b:3" one byte into a
       // window is a two-byte unit under FIELD=2), and a load of the declared width would reach past
@@ -49818,8 +49832,18 @@ begin
   while (A.NodeType = antParentheses) and (A.ChildCount >= 1) do A := A.GetChild(0);
   case A.NodeType of
     antProcAddress:
-      Result := (A.ChildCount > 0) and (A.GetChild(0) <> nil) and
-                (A.GetChild(0).NodeType = antArrayAccess);
+      begin
+        Result := (A.ChildCount > 0) and (A.GetChild(0) <> nil) and
+                  (A.GetChild(0).NodeType = antArrayAccess);
+        // ⭐ DIVERGENZE 426 - ...and "@s" of a variable-length STRING: unlike a scalar or a record, it is still a NAME of
+        // the VM (0x100000000), and the runtime now hands it back as that name when C returns it ("memcpy(@word, @word,
+        // 0)"). Taken for C's memory, the receiving "String Ptr" was read as a raw ZString and "*sp" died.
+        // FPreVarDeclType, not FVarDeclTypeName: the second is cleared before the generation runs. SB_STRADDR_HOME=0 is the A/B.
+        // "@name" carries the name in its own Value, with no child.
+        if (not Result) and (A.ChildCount = 0) and (A.ValueUpper <> '') and
+           (GetEnvironmentVariable('SB_STRADDR_HOME') <> '0') then
+          Result := UpperFast(Trim(FPreVarDeclType.Values[A.ValueUpper])) = 'STRING';
+      end;
     antIdentifier:
       // ⛔ ...and not a UDT pointer laid over C's memory either (FRawUDTPtrs): a struct a C call handed
       // back holds an ADDRESS, never an element pointer of the program's array. IsRawPtr does not read

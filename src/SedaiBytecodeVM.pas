@@ -5263,7 +5263,7 @@ function RecWireBytes(Enc: Int64): Integer; inline;
 // How many bytes the width code in Enc's low nibble reads - 0 is the full eight.
 begin
   case Enc and $F of
-    1, 2:    Result := 1;
+    1, 2, 8: Result := 1;                // 8: a Boolean (DIVERGENZE 456)
     3, 4:    Result := 2;
     5, 6, 7: Result := 4;
   else       Result := 8;
@@ -5291,6 +5291,7 @@ begin
     4: Result := PWord(p)^;
     5: Result := PLongInt(p)^;
     6: Result := PLongWord(p)^;
+    8: Result := -Ord(PByte(p)^ <> 0);   // a Boolean: C's 0/1 (any nonzero) -> the VM's 0/-1 (DIVERGENZE 456)
   else Result := PInt64(p)^;
   end;
 end;
@@ -5299,6 +5300,7 @@ procedure SetFieldIntAt(p: PByte; Code, Val: Int64); inline;
 begin
   case Code of
     1, 2: PByte(p)^ := Byte(Val);
+    8:    PByte(p)^ := Ord(Val <> 0);     // a Boolean: the VM's true -> C's 1 (DIVERGENZE 456)
     3, 4: PWord(p)^ := Word(Val);
     5, 6: PLongWord(p)^ := LongWord(Val);
   else PInt64(p)^ := Val;
@@ -5318,6 +5320,7 @@ begin
     4: Result := PWord(p)^;          // u16
     5: Result := PLongInt(p)^;       // s32
     6: Result := PLongWord(p)^;      // u32
+    8: Result := -Ord(PByte(p)^ <> 0);   // Boolean: 0/1 in the bytes, 0/-1 in the VM (DIVERGENZE 456)
   else Result := PInt64(p)^;
   end;
 end;
@@ -5330,6 +5333,7 @@ begin
   if (Enc and $F) = 0 then begin PInt64(p)^ := Val; Exit; end;
   case Enc and $F of
     1, 2: PByte(p)^ := Byte(Val);
+    8:    PByte(p)^ := Ord(Val <> 0);     // Boolean: the VM's true -> 1, as fbc writes it (DIVERGENZE 456)
     3, 4: PWord(p)^ := Word(Val);
     5, 6: PLongWord(p)^ := LongWord(Val);
   else PInt64(p)^ := Val;

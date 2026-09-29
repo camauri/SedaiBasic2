@@ -1394,7 +1394,11 @@ begin
             P := FResolvePtr(ACtx, XferInt[SlotI]);
             PPointer(Vals[i])^ := P;
             // ...and a record-FIELD pointer ("@v.y", negative) resolved to its field: remembered the same way.
-            if (P <> nil) and (XferInt[SlotI] < 0) and (NRec <= High(RecBase)) then
+            // ⭐ DIVERGENZE 426 - ...and so is EVERY pointer of the VM's domain this call resolved: "@word" of a STRING is a
+            // name (0x100000000) that no region and no home map knows, so "memcpy(@word, @word, 0)" came back as C's
+            // tagged address and "rs = @word" was false where fbc says true. An exact match returns the name it left as;
+            // an address C already owned (FGNPTR_TAG) keeps the road below, which answers the same value.
+            if (P <> nil) and ((XferInt[SlotI] and FGNPTR_TAG) = 0) and (NRec <= High(RecBase)) then
             begin
               RecBase[NRec] := PtrUInt(P); RecVM[NRec] := XferInt[SlotI]; Inc(NRec);
             end;

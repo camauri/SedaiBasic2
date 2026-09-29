@@ -343,6 +343,7 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
       case 4:  ireg[I->dest] = *(uint16_t *)p_; break;
       case 5:  ireg[I->dest] = *(int32_t  *)p_; break;
       case 6:  ireg[I->dest] = *(uint32_t *)p_; break;
+      case 8:  ireg[I->dest] = *(uint8_t  *)p_ ? -1 : 0; break;   /* Boolean: 0/1 -> 0/-1 (DIVERGENZE 456) */
       default: ireg[I->dest] = *(int64_t  *)p_; break;
     }
     pc++; } NEXT;
@@ -360,6 +361,7 @@ int sedai_hot_run(const SbInstr *prog, int64_t *ireg, double *freg,
       case 1: case 2: *(uint8_t  *)p_ = (uint8_t )v_; break;
       case 3: case 4: *(uint16_t *)p_ = (uint16_t)v_; break;
       case 5: case 6: *(uint32_t *)p_ = (uint32_t)v_; break;
+      case 8:         *(uint8_t  *)p_ = v_ != 0;      break;   /* Boolean: true -> 1 (DIVERGENZE 456) */
       default:        *(int64_t  *)p_ = v_;           break;
     }
     pc++; } NEXT;
