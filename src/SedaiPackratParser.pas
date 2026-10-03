@@ -1375,6 +1375,11 @@ begin
   // one parameter to differ in.
   CKey := OverloadCollapseKey(ParamList, IsMethod);
   if CKey = '' then CKey := #2;                 // no parameters: never compared, and never compares
+  // ⭐ DIVERGENZE 638 - ...and a name RETIRED by "#undef" is not compared at all: its redefinition is a NEW procedure,
+  // not an overload of the old one ("Private Sub greet(ByVal n As Integer) ... #undef greet ... Private Sub greet Alias
+  // "greet2"(ByVal n As Integer)", which fbc compiles). The SSA retires the earlier one (RetireUndefProcs).
+  if (GPPUndefNames <> nil) and (GPPUndefNames.IndexOf(UpperFast(Base)) >= 0) and
+     (GetEnvironmentVariable('SB_UNDEF_PROC') <> '0') then CKey := #2;
   for k := 0 to FProcOverloadKeys.Count - 1 do
     if (Copy(FProcOverloadKeys[k], 1, Length(FNsPrefix + '|' + Base) + 1) = FNsPrefix + '|' + Base + #1) and
        OverloadKeysCollide(CKey,
@@ -4544,6 +4549,7 @@ procedure TPackratParser.ParseProcParamList(Owner, ParamList: TASTNode; SkipDefa
 var
   ParamMode, ParamTypeName, ParamNameU: string;
   ArrRank, Depth: Integer;
+  FpPtrDepthP: Integer;          // DIVERGENZE 637: " Ptr" after a procedure-type parameter
   Unnamed: Boolean;
   ParamNode, DefExpr: TASTNode;
   RetTok: TLexerToken;
@@ -4634,7 +4640,27 @@ begin
           // FreeBASIC function-pointer parameter "f AS FUNCTION(...) AS ret": the parameter is an int
           // (a procedure entry PC); the signature is recorded on the node, no UDT type child attached.
           if TryParseProcPtrType(ParamNode) then
-            ParamTypeName := ''
+          begin
+            ParamTypeName := '';
+            // ⭐ DIVERGENZE 637 - "ByVal p As Sub() Ptr": a POINTER TO a procedure pointer, as in a DIM. The " Ptr" was
+            // left in the stream and read as the next parameter's name ("PTR is a reserved word"). The parameter is an
+            // integer pointer to the cell holding the entry, and keeps the signature for "(*p)( )".
+            if AtPointerSuffix then
+            begin
+              RetTok := Context.CurrentToken;
+              ParamTypeName := 'INTEGER';
+              FpPtrDepthP := 0;
+              while AtPointerSuffix do
+              begin
+                ParamTypeName := ParamTypeName + ' PTR';
+                Inc(FpPtrDepthP);
+                Context.Advance;
+              end;
+              ParamNode.Attributes.Values['FUNCPTR'] := '';
+              ParamNode.Attributes.Values['FPPTR'] := IntToStr(FpPtrDepthP);
+              ParamNode.AddChild(TASTNode.CreateWithValue(antIdentifier, ParamTypeName, RetTok));
+            end;
+          end
           // ⛔ ...and a PARAMETER's type may carry the global-scope dots too ("ByVal p As ..r.foo.t1").
           // Asking ttIdentifier alone did not fail here - it fell through with an EMPTY type name, so
           // the parameter silently defaulted and the callee read a different object. Same spelling as
@@ -15586,6 +15612,7 @@ var
   DimTypeName, SharedTypeName, SharedFixedLen: string;
   SavedIdx, TupleDepth: Integer;
   SavedTypeOf: Integer;         // scratch: rewind point for "As TypeOf( Sub(...) )"
+  FpPtrDepth, FpPtrK: Integer;  // DIVERGENZE 637: how many " Ptr" follow a procedure type
   TypeOfProcSig: Boolean;       // ...and whether that spelling is the one being read
   Idx: Integer;                 // scratch: the const-pointee registry entry for a redeclared name
 begin
@@ -15696,9 +15723,16 @@ begin
         SharedTypeName := 'INTEGER';          // a procedure entry PC, like the named funcptr TYPE alias
         SharedFixedLen := '';
         // ⭐ DIVERGENZE 632 - "Dim As Sub() Ptr s": the " Ptr" after the procedure type was left in the stream and read as
-        // the VARIABLE's name ("PTR is a FreeBASIC keyword and cannot name a variable"), s then orphaned. Consumed here as
-        // the trailing spelling "Dim s As Sub() Ptr" already absorbs it; the storage is the same integer cell.
-        while AtPointerSuffix do Context.Advance;
+        // the VARIABLE's name ("PTR is a FreeBASIC keyword and cannot name a variable"), s then orphaned. Consumed here.
+        // ⭐ DIVERGENZE 637 - ...and it MEANS something: "Sub() Ptr" is a POINTER TO a procedure pointer, an integer
+        // pointer to the cell that holds the entry, carrying the signature for "(*s)( )" (FPPTR = the depth).
+        FpPtrDepth := 0;
+        while AtPointerSuffix do begin Inc(FpPtrDepth); Context.Advance; end;
+        if FpPtrDepth > 0 then
+        begin
+          SharedFpNode.Attributes.Values['FPPTR'] := IntToStr(FpPtrDepth);
+          for FpPtrK := 1 to FpPtrDepth do SharedTypeName := SharedTypeName + ' PTR';
+        end;
       end
       else
       begin
@@ -15794,6 +15828,11 @@ begin
         ArrayDecl.Attributes.Values['FPRET'] := SharedFpNode.Attributes.Values['FPRET'];
         ArrayDecl.Attributes.Values['FPRETBYREF'] := SharedFpNode.Attributes.Values['FPRETBYREF'];
         ArrayDecl.Attributes.Values['FPDEFAULTS'] := SharedFpNode.Attributes.Values['FPDEFAULTS'];   // (534)
+        if SharedFpNode.Attributes.Values['FPPTR'] <> '' then       // a POINTER TO one, not callable itself (637)
+        begin
+          ArrayDecl.Attributes.Values['FUNCPTR'] := '';
+          ArrayDecl.Attributes.Values['FPPTR'] := SharedFpNode.Attributes.Values['FPPTR'];
+        end;
       end;
       if IsShared then ArrayDecl.Attributes.Values['SHARED'] := '1';
       Result.AddChild(ArrayDecl);
@@ -16070,6 +16109,16 @@ begin
             if TypeOfProcSig and Context.Check(ttDelimParClose) then Context.Advance;   // ')' of TypeOf
             DimTypeName := 'INTEGER';
             TypeTok := NameTok;
+            // ⭐ DIVERGENZE 637 - "Dim hp As Sub() Ptr = @h": the " Ptr" was left in the stream, so the declaration
+            // ended at "Sub()" and "Ptr = @h" became an assignment to a variable named PTR; "(*hp)()" then called
+            // nothing, in silence. It is a POINTER TO a procedure pointer (see the leading-AS spelling).
+            FpPtrDepth := 0;
+            while AtPointerSuffix do begin Inc(FpPtrDepth); Context.Advance; end;
+            if FpPtrDepth > 0 then
+            begin
+              FuncPtrSigNode.Attributes.Values['FPPTR'] := IntToStr(FpPtrDepth);
+              for FpPtrK := 1 to FpPtrDepth do DimTypeName := DimTypeName + ' PTR';
+            end;
           end
           else
           begin
@@ -16207,6 +16256,12 @@ begin
         // the trailing spelling honoured "ByRef As R" and the leading-AS one handed back the address.
         ArrayDecl.Attributes.Values['FPRETBYREF'] := FuncPtrSigNode.Attributes.Values['FPRETBYREF'];
         ArrayDecl.Attributes.Values['FPDEFAULTS'] := FuncPtrSigNode.Attributes.Values['FPDEFAULTS'];   // (534)
+        // ...a POINTER TO one is not callable itself: it keeps the signature for "(*p)( )" (637)
+        if FuncPtrSigNode.Attributes.Values['FPPTR'] <> '' then
+        begin
+          ArrayDecl.Attributes.Values['FUNCPTR'] := '';
+          ArrayDecl.Attributes.Values['FPPTR'] := FuncPtrSigNode.Attributes.Values['FPPTR'];
+        end;
         FuncPtrSigNode.Free; FuncPtrSigNode := nil;
       end
       else if LeadingAS and Assigned(SharedFpNode) then
@@ -16218,6 +16273,11 @@ begin
         // the trailing spelling honoured "ByRef As R" and the leading-AS one handed back the address.
         ArrayDecl.Attributes.Values['FPRETBYREF'] := SharedFpNode.Attributes.Values['FPRETBYREF'];
         ArrayDecl.Attributes.Values['FPDEFAULTS'] := SharedFpNode.Attributes.Values['FPDEFAULTS'];   // (534)
+        if SharedFpNode.Attributes.Values['FPPTR'] <> '' then       // a POINTER TO one, not callable itself (637)
+        begin
+          ArrayDecl.Attributes.Values['FUNCPTR'] := '';
+          ArrayDecl.Attributes.Values['FPPTR'] := SharedFpNode.Attributes.Values['FPPTR'];
+        end;
       end;
       // FreeBASIC reference variable: "DIM BYREF r AS T = target". Require "= target" and store @target
       // as child[2] (an antProcAddress), so the SSA backs the target's stable address and binds r to it;

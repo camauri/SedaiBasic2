@@ -323,6 +323,7 @@ type
     FFuncPtrSigs: TStringList;              // FreeBASIC function pointers in scope: VARNAME -> "paramtypes|rettype"
     FModuleFuncPtrSigs: TStringList;        // ...of those, the MODULE-level ones: they survive every procedure prologue
     FFuncPtrDefs: TStringList;              // ...and the DEFAULTS their TYPE declares: VARNAME -> FPDEFAULTS (534)
+    FFuncPtrPtrSigs: TStringList;           // a POINTER TO a procedure pointer ("Dim p As Sub() Ptr"): VARNAME -> depth:sig (637)
     FModuleFuncPtrDefs: TStringList;        // ...the module-level ones (re-seeded in every prologue, as the sigs are)
     FFuncPtrTypeDefs: TStringList;          // ...and those of a named funcptr TYPE: path+TYPENAME -> FPDEFAULTS (534)
     FIndirectDefaults: string;              // the FPDEFAULTS of the pointer the NEXT indirect call goes through (534)
@@ -1086,6 +1087,7 @@ type
     function IsRecordHandleExpr(Node: TASTNode): Boolean;                      // ...a value that is a record handle or VIEW
     function BareVarNotPtrHere(Node: TASTNode): Boolean;   // DIVERGENZE 631
     procedure RetireUndefConsts(AST: TASTNode);            // DIVERGENZE 633
+    procedure RetireUndefProcs(AST: TASTNode);             // DIVERGENZE 638
     procedure CheckConstRedeclared(AST: TASTNode);         // DIVERGENZE 640
     function AmbiguousPtrName(Node: TASTNode): Boolean;    // DIVERGENZE 629
     function AmbiguousPtrNameS(const Name: string): Boolean;
@@ -2144,6 +2146,7 @@ begin
   FFuncPtrSigs := TIndexedStringList.Create;
   FModuleFuncPtrSigs := TIndexedStringList.Create;
   FFuncPtrDefs := TIndexedStringList.Create;
+  FFuncPtrPtrSigs := TIndexedStringList.Create;
   FModuleFuncPtrDefs := TIndexedStringList.Create;
   FFuncPtrTypeDefs := TIndexedStringList.Create;
   FFuncPtrTypeDefs.CaseSensitive := False;
@@ -2365,6 +2368,7 @@ begin
   FFuncPtrSigs.Free;
   FModuleFuncPtrSigs.Free;
   FFuncPtrDefs.Free;
+  FFuncPtrPtrSigs.Free;
   FModuleFuncPtrDefs.Free;
   FFuncPtrTypeDefs.Free;
   FFuncPtrTypes.Free;
@@ -14690,6 +14694,19 @@ begin
     begin
       CheckPointerConstAssign(ArrayDeclNode);
       FVarPtrQuals.Values[UpperFast(ArrName)] := ArrayDeclNode.Attributes.Values['PTRQUALS'];
+    end;
+
+    // ⭐ DIVERGENZE 637 - "Dim p As Sub() Ptr": a POINTER TO a procedure pointer. The parser typed it as an integer
+    // pointer (the cell that holds the entry is an integer) and kept the signature beside the depth, so "(*p)( )" loads
+    // the entry and calls it (DerefFuncPtrSig). '' deletes a stale entry of the same name.
+    if not ((DimsNode <> nil) and (DimsNode.NodeType = antDimensions)) then
+    begin
+      if ArrayDeclNode.Attributes.Values['FPPTR'] <> '' then
+        FFuncPtrPtrSigs.Values[UpperFast(ArrName)] := ArrayDeclNode.Attributes.Values['FPPTR'] + ':' +
+          ArrayDeclNode.Attributes.Values['FPPARAMS'] + '|' + ArrayDeclNode.Attributes.Values['FPRET'] +
+          Copy('|BYREF', 1, 6 * Ord(ArrayDeclNode.Attributes.Values['FPRETBYREF'] = '1'))
+      else if FFuncPtrPtrSigs.IndexOfName(UpperFast(ArrName)) >= 0 then
+        FFuncPtrPtrSigs.Delete(FFuncPtrPtrSigs.IndexOfName(UpperFast(ArrName)));
     end;
 
     // FreeBASIC function-pointer variable "DIM fp AS FUNCTION(...) AS ret": an ordinary int scalar that
@@ -37003,6 +37020,96 @@ begin
   end;
 end;
 
+procedure TSSAGenerator.RetireUndefProcs(AST: TASTNode);
+// ⭐ DIVERGENZE 638 - "#undef" RETIRES A PROCEDURE TOO, and a later definition of the same name is a NEW procedure.
+// fbc's quirk/undef: "Function f1() ... : #undef f1 : ... : Function f1 Alias "f2"() ... : Print f1()" reaches the SECOND
+// body. The parser took the second for an OVERLOAD of the first with the same signature (both "F1~"), and every call
+// resolved to the first. ⇒ At MODULE level, in source order: a procedure whose name was #undef'd and that is DEFINED
+// again with the very same mangled name (which a valid program can only do after an #undef) retires the earlier one -
+// it is RENAMED, together with every reference from the previous boundary up to the redefinition. A call after the
+// redefinition then reaches the only procedure left under the name. The same renaming as the CONST case (633).
+// ⚠️ The position of the "#undef" is not known (GPPUndefNames is a set): the identical redefinition says it came first.
+// SB_UNDEF_PROC=0 is the A/B.
+var
+  Pending: TStringList;
+  Serial, ii, jj, mm, From, k: Integer;
+  Stmt, NameN: TASTNode;
+  Full, Base, NewBase: string;
+
+  procedure RenameIn(N: TASTNode; const OldU, NewN: string);
+  var c: Integer;
+  begin
+    if N = nil then Exit;
+    if (N.NodeType = antIdentifier) and (N.ValueUpper = OldU) then N.Value := NewN;
+    for c := 0 to N.ChildCount - 1 do
+    begin
+      // type slots are not references to the procedure
+      if (N.NodeType = antArrayDecl) and (c = 1) then Continue;
+      if (N.NodeType = antIdentifier) and Assigned(N.Parent) and (N.Parent.NodeType = antParameterList) then Continue;
+      RenameIn(N.GetChild(c), OldU, NewN);
+    end;
+  end;
+
+  // Does this subtree DECLARE the name (a DIM or a parameter)? Then it names a variable there, not the procedure: a name
+  // declared again after the #undef ("Sub post : Dim f1 As Integer = 777") is out of the renaming.
+  function DeclaresName(N: TASTNode; const NameU: string): Boolean;
+  var c: Integer;
+  begin
+    Result := False;
+    if N = nil then Exit;
+    if (N.NodeType = antArrayDecl) and (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antIdentifier) and
+       (N.GetChild(0).ValueUpper = NameU) then Exit(True);
+    if (N.NodeType = antIdentifier) and Assigned(N.Parent) and (N.Parent.NodeType = antParameterList) and
+       (N.ValueUpper = NameU) then Exit(True);
+    for c := 0 to N.ChildCount - 1 do
+      if DeclaresName(N.GetChild(c), NameU) then Exit(True);
+  end;
+
+begin
+  if (AST = nil) or (GPPUndefNames = nil) or (GPPUndefNames.Count = 0) then Exit;
+  if GetEnvironmentVariable('SB_UNDEF_PROC') = '0' then Exit;
+  Pending := TStringList.Create;      // full mangled name -> index of its live definition; "Base" -> the boundary
+  Serial := 0;
+  try
+    for ii := 0 to AST.ChildCount - 1 do
+    begin
+      Stmt := AST.GetChild(ii);
+      if (Stmt = nil) or (Stmt.NodeType <> antProcedureDecl) or (Stmt.ChildCount < 1) or
+         (Stmt.GetChild(0).NodeType <> antIdentifier) then Continue;
+      NameN := Stmt.GetChild(0);
+      Full := NameN.ValueUpper;
+      if Pos('~', Full) > 0 then Base := Copy(Full, 1, Pos('~', Full) - 1) else Base := Full;
+      if (Base = '') or (Pos('.', Base) > 0) or (GPPUndefNames.IndexOf(Base) < 0) then Continue;
+      k := Pending.IndexOf('D|' + Full);
+      if k < 0 then
+      begin
+        Pending.AddObject('D|' + Full, TObject(PtrInt(ii)));
+        Continue;
+      end;
+      jj := PtrInt(Pending.Objects[k]);
+      From := 0;
+      if Pending.IndexOf('B|' + Base) >= 0 then From := PtrInt(Pending.Objects[Pending.IndexOf('B|' + Base)]);
+      Inc(Serial);
+      NewBase := Base + '__UNDEF' + IntToStr(Serial);
+      // the retired definition keeps its signature suffix under the new name
+      AST.GetChild(jj).GetChild(0).Value := NewBase + Copy(AST.GetChild(jj).GetChild(0).ValueUpper, Length(Base) + 1, MaxInt);
+      for mm := From to ii - 1 do
+      begin
+        // a module DIM of the name: from here on the name is that variable, until the redefinition
+        if (mm <> jj) and (AST.GetChild(mm).NodeType = antDim) and DeclaresName(AST.GetChild(mm), Base) then Break;
+        if (mm <> jj) and (AST.GetChild(mm).NodeType = antProcedureDecl) and DeclaresName(AST.GetChild(mm), Base) then
+          Continue;
+        RenameIn(AST.GetChild(mm), Base, NewBase);
+      end;
+      Pending.Objects[k] := TObject(PtrInt(ii));
+      if Pending.IndexOf('B|' + Base) >= 0 then Pending.Objects[Pending.IndexOf('B|' + Base)] := TObject(PtrInt(ii))
+      else Pending.AddObject('B|' + Base, TObject(PtrInt(ii)));
+    end;
+  finally
+    Pending.Free;
+  end;
+end;
+
 function TSSAGenerator.AmbiguousPtrNameS(const Name: string): Boolean;
 // DIVERGENZE 629: is this NAME a pointer only by the FLAT maps' word? Some declaration gives it a non-pointer type
 // (FNonPtrNames, DIVERGENZE 483) and THIS procedure does not declare it a pointer (local or parameter). Then the small-address
@@ -53858,12 +53965,33 @@ function TSSAGenerator.DerefFuncPtrSig(Node: TASTNode): string;
 // type> Ptr" gives that type's "params|ret". '' when Node is not such a dereference.
 var
   PtrName: string;
+var
+  Depth: Integer;
+  Base: TASTNode;
+  E: string;
 begin
   Result := '';
   if (Node = nil) or (Node.NodeType <> antDeref) or (Node.ChildCount < 1) then Exit;
-  if Node.GetChild(0).NodeType <> antIdentifier then Exit;
-  PtrName := Node.GetChild(0).ValueUpper;
-  Result := FuncPtrTypeSig(FPointerVars.Values[PtrName]);
+  if Node.GetChild(0).NodeType = antIdentifier then
+  begin
+    PtrName := Node.GetChild(0).ValueUpper;
+    Result := FuncPtrTypeSig(FPointerVars.Values[PtrName]);
+    if Result <> '' then Exit;
+  end;
+  // ⭐ DIVERGENZE 637 - ...and the INLINE spelling "Dim p As Sub() Ptr", which names no type: its depth and signature
+  // were filed at the declaration. Only as many dereferences as the declaration has " Ptr" reach the procedure pointer.
+  Depth := 0;
+  Base := Node;
+  while (Base <> nil) and (Base.NodeType in [antDeref, antParentheses]) and (Base.ChildCount >= 1) do
+  begin
+    if Base.NodeType = antDeref then Inc(Depth);
+    Base := Base.GetChild(0);
+  end;
+  if (Base = nil) or (Base.NodeType <> antIdentifier) then Exit;
+  E := FFuncPtrPtrSigs.Values[Base.ValueUpper];
+  if (E = '') or (Pos(':', E) = 0) then Exit;
+  if StrToIntDef(Copy(E, 1, Pos(':', E) - 1), 0) <> Depth then Exit;
+  Result := Copy(E, Pos(':', E) + 1, MaxInt);
 end;
 
 function DynStructByValueOn: Boolean;
@@ -60871,6 +60999,13 @@ begin
             EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(ParamNodeJ.ValueUpper)), ParamReg, MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(ParamNodeJ.ValueUpper))));
           end;
         end;
+        // ⭐ DIVERGENZE 637 - a parameter that is a POINTER TO a procedure pointer ("ByVal p As Sub() Ptr"): depth and
+        // signature, for "(*p)( )" in the body. '' when it is not one, so a name reused by an earlier procedure is cleared.
+        if ParamNodeJ.Attributes.Values['FPPTR'] <> '' then
+          FFuncPtrPtrSigs.Values[ParamNodeJ.ValueUpper] := ParamNodeJ.Attributes.Values['FPPTR'] + ':' +
+            ParamNodeJ.Attributes.Values['FPPARAMS'] + '|' + ParamNodeJ.Attributes.Values['FPRET']
+        else if FFuncPtrPtrSigs.IndexOfName(ParamNodeJ.ValueUpper) >= 0 then
+          FFuncPtrPtrSigs.Delete(FFuncPtrPtrSigs.IndexOfName(ParamNodeJ.ValueUpper));
         // FreeBASIC function-pointer parameter: record its signature so "name(args)" in the body is
         // lowered as an indirect call through the parameter's entry-PC value (int).
         if ParamNodeJ.Attributes.Values['FUNCPTR'] = '1' then
@@ -62368,6 +62503,7 @@ begin
   // pre-scan walks the AST. No-op when the program has no NAMESPACE (keyword is MODERN-only anyway).
   PreMarkStart; FlattenNamespaces(AST); PreMarkEnd('FlattenNamespaces');
   PreMarkStart; RetireUndefConsts(AST); PreMarkEnd('RetireUndefConsts');   // DIVERGENZE 633
+  PreMarkStart; RetireUndefProcs(AST); PreMarkEnd('RetireUndefProcs');     // DIVERGENZE 638
   PreMarkStart; CheckConstRedeclared(AST); PreMarkEnd('CheckConstRedeclared');   // DIVERGENZE 640
 
   // Which arrays are multi-dimensional, ANYWHERE in the program. Must precede lowering: the rank
