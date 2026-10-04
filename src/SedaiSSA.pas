@@ -182,6 +182,7 @@ type
     DefaultExpr: TASTNode;  // FreeBASIC field default "field AS T = expr" (nil if none); applied on every
                             // instantiation before the constructor, overridden by aggregate "= (a,b,...)"
     ArrayDefault: TASTNode; // ...and an ARRAY member's "= { a, b, ... }" (a BRACEINIT list, nil if none) (541)
+    NestedDefault: TASTNode; // ...and a NESTED member's "= <expression of its type>", "one As U1 = U1("solo")" (648)
     FuncPtrSig: string;     // funcptr field ("fn As Function(...) As R" or "fn As <named funcptr type>"):
                             // "paramtypes|rettype" signature; the field is an int handle holding a proc
                             // entry PC. Empty if the field is not a function pointer. "obj.fn(args)" is an
@@ -1092,6 +1093,7 @@ type
     function MethodNameDeclared(const TypeName, MethNm: string): Boolean;   // DIVERGENZE 635
     function FreeProcNameDeclared(const Name: string): Boolean;             // DIVERGENZE 635
     procedure CheckNamesClashWithTypeScopes(AST: TASTNode);               // DIVERGENZE 636
+    procedure CheckParamNamedLikeProc(AST: TASTNode);                     // DIVERGENZE 543
     function IsPlainNumericTypeName(const T: string): Boolean;             // DIVERGENZE 644
     procedure CheckNoDefaultCtorUses(AST: TASTNode);                      // DIVERGENZE 287
     procedure CheckConstRedeclared(AST: TASTNode);         // DIVERGENZE 640
@@ -1476,6 +1478,9 @@ type
     function EnumTypeOfOperand(Node: TASTNode): string;   // enum type name of an enum operand (member/var/param), else '' — for operator overloading
     function ResolveScalarLeftOperatorLabel(LeftNode: TASTNode; const OpMeth: string;
                                             ArgsNode: TASTNode = nil): string; // "2.0 * udt": operator label owned by a builtin scalar type
+    function PowIsConstSquare(Node: TASTNode): Boolean;   // DIVERGENZE 203: "x ^ 2" with a constant 2
+    function PowBaseIsPlainLValue(N: TASTNode): Boolean;  // ...and a base fbc duplicates
+    function ProgramOwnsForeignName(const NameU: string): Boolean;   // DIVERGENZE 553
     function TryFoldConstIntExpr(Node: TASTNode; out Val: Int64): Boolean;
     function TryConstFoldArrayBound(Node: TASTNode; out Val: Int64): Boolean;
     // Resolve a member-access object (a record variable or an array-of-UDT element) to its
@@ -3969,6 +3974,7 @@ var
   CatLen: Integer;                  // (DIVERGENZE 154): its operands are read RAW
   FixWide: Boolean;               // DIVERGENZE 609: an Extern WSTRING * n (else ZSTRING * n)
   NumCast: Boolean;               // arithmetic op: apply a numeric Cast operator to a UDT operand
+  Pow2Single: Boolean;            // DIVERGENZE 203: "s ^ 2" of a Single, a binary32 product typed Double
   RecUDTIdx, RecSlotK, RecFieldIdx: Integer;   // OFFSETOF: UDT index + field scan
   RecFieldNode, RecIdxNode: TASTNode;          // OFFSETOF: the field, and "m(i)"'s index list
   RecLayoutOfs: TInt64Array;     // OFFSETOF: the type's C byte layout (UDTCLayout)
@@ -4037,6 +4043,7 @@ var
   ArgWide: Boolean;   // DIVERGENZE 150: LEN taglia sul lato WIDE
   UndefMsgReg: TSSAValue;   // the message of a call to a declared-never-defined procedure (233)
 begin
+  Pow2Single := False;
   if Node = nil then
   begin
     Result := MakeSSAValue(svkNone);
@@ -6394,6 +6401,20 @@ begin
         end
         // Exponentiation (^): like FreeBASIC, always operates in and returns floating point (there is no
         // integer power opcode). Without this, integer "a ^ b" fell through to ssaAddInt (a + b)!
+        else if (Node.Token.TokenType = ttOpPow) and (Left.RegType = srtFloat) and PowIsConstSquare(Node) and
+                IsSingleExpr(Node.GetChild(0)) and PowBaseIsPlainLValue(Node.GetChild(0)) then
+        begin
+          // ⭐ DIVERGENZE 203 - "s ^ 2" of a Single VARIABLE is fbc's "s * s" computed in binary32, and the expression is still a
+          // DOUBLE: fbc prints 2.722499847412109 (the binary32 product with Double digits) where pow() gives 2.722499921321869.
+          // Only a base fbc can DUPLICATE - a variable, a field, an array element: "f() ^ 2" and "(a + b) ^ 2" stay pow() in
+          // Double, and a literal base is folded in Double ("1.65f ^ 2" = 2.722499921321869). The product is
+          // rounded to 32 bits right after the emit (Pow2Single), and nothing else about the node changes.
+          Right := Left;
+          DestReg := FProgram.AllocRegister(srtFloat);
+          Result := MakeSSARegister(srtFloat, DestReg);
+          OpCode := ssaMulFloat;
+          Pow2Single := True;
+        end
         else if Node.Token.TokenType = ttOpPow then
         begin
           if Left.RegType = srtInt then
@@ -6595,7 +6616,9 @@ begin
         // including ~1.8 M whose result lands in the subnormal range, where the textbook 2p+2 argument
         // stops applying (job/tests/tools/f32_edge.pas). SQRT cannot even reach that range.
         if (Result.Kind = svkRegister) and (Result.RegType = srtFloat) and IsSingleExpr(Node) then
-          Result := ApplyNarrowCode(7, Result);
+          Result := ApplyNarrowCode(7, Result)
+        else if Pow2Single and (Result.Kind = svkRegister) and (Result.RegType = srtFloat) then
+          Result := ApplyNarrowCode(7, Result);   // "s ^ 2": the binary32 product, still a Double (203)
         // ...and the result, for the same reason the operands were.
         if (Result.Kind = svkRegister) and (Result.RegType = srtInt) and Is32BitExpr(Node) then
           Result := ApplyNarrowCode(Narrow32Code(Node), Result);
@@ -9433,6 +9456,22 @@ begin
           // shorthand a few lines above does, and for the same reason.
             Node.GetChild(0).Value := ArrName;
           end;
+        end;
+
+        // ⭐ DIVERGENZE 553 - A C ROUTINE THE PROGRAM DECLARED UNDER A NAME THIS RUNTIME IMPLEMENTS ITSELF IS THE PROGRAM'S.
+        // "Declare Function floor cdecl Alias "ceil" (...)" then "floor(1.5)" is fbc's 2 and was our 1: the built-in branch
+        // below answered first. fbc refuses redeclaring one of ITS builtins, so these names are ours alone (see
+        // ProgramOwnsForeignName for the list and for the header exception).
+        if FModernMode and (ArrayIndexOf(ArrName) < 0) and ProgramOwnsForeignName(UpperFast(ArrName)) and
+           TryForeignCall(UpperFast(ArrName), Node.GetChild(1), Result) then Exit;
+        // ...and the other way round for BIN, HEX, OCT: fbc accepts a program's declaration of them and still calls its own
+        // builtin, so the declared name must not take the call to "declared and never defined" (see TryForeignCall).
+        if FModernMode and (ArrayIndexOf(ArrName) < 0) and
+           ((UpperFast(ArrName) = 'BIN') or (UpperFast(ArrName) = 'HEX') or (UpperFast(ArrName) = 'OCT')) and
+           (ForeignDeclIndexAt(UpperFast(ArrName)) >= 0) and (GetEnvironmentVariable('SB_OWN_NAME_YIELDS') <> '0') then
+        begin
+          EmitBareStringFunc(UpperFast(ArrName), Node, Result);
+          Exit;
         end;
 
         // FreeBASIC's "Type( value )" shorthand whose type was INFERRED from the target, and the target
@@ -13964,6 +14003,62 @@ begin
     end;
     PublishInputTarget(VarName, VarReg);
   end;
+end;
+
+function TSSAGenerator.ProgramOwnsForeignName(const NameU: string): Boolean;
+// DIVERGENZE 553 - the names this runtime implements and fbc does not have as builtins (measured: fbc accepts a program's
+// "Declare Function <name> cdecl Alias ..." for each and calls it), when the program declared a C routine of that name.
+// ⛔ Not when the declaration is one of fbc's OWN headers - file.bi, string.bi, fbio.bi, fbc-int/array.bi all bind their
+// routines to "fb_..." symbols of libfb, which is not linked: there the runtime's own implementation IS the routine.
+// ⛔ And FREE only when the declaration binds ANOTHER symbol: "free" itself is intercepted as DEALLOCATE on purpose, so
+// crt's free(p) also releases a pointer of the VM's domain (--memory=strict), and libc's free must not see that one.
+// SB_OWN_NAME_YIELDS=0 is the A/B.
+const
+  kOwn = ';FLOOR;CEIL;ARRAYLEN;ARRAYSIZE;CSTR;FILEATTR;FILEDATETIME;FILEEXISTS;FILELEN;FORMAT;ISREDIRECTED;FREE;';
+var
+  Idx: Integer;
+  D: TForeignDecl;
+begin
+  Result := False;
+  if Pos(';' + NameU + ';', kOwn) = 0 then Exit;
+  if GetEnvironmentVariable('SB_OWN_NAME_YIELDS') = '0' then Exit;
+  Idx := ForeignDeclIndexAt(NameU);
+  if Idx < 0 then Exit;
+  if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), D) then Exit;
+  Result := not SameText(Copy(D.Symbol, 1, 3), 'fb_');
+  if Result and (NameU = 'FREE') and SameText(D.Symbol, 'free') then Result := False;
+end;
+
+function TSSAGenerator.PowBaseIsPlainLValue(N: TASTNode): Boolean;
+// DIVERGENZE 203 - a base fbc's "x ^ 2 -> x * x" rewrite takes: a plain variable, a field of one, or an element of a
+// declared array - never a call, an expression or a literal (measured: those stay pow() in Double).
+begin
+  Result := False;
+  if N = nil then Exit;
+  case N.NodeType of
+    antIdentifier: Result := (N.ChildCount = 0) and (FProcDecls <> nil) and not FProcDecls.ContainsKey(N.ValueUpper);
+    antMemberAccess: Result := (N.ChildCount >= 1) and PowBaseIsPlainLValue(N.GetChild(0));
+    antArrayAccess: Result := (N.ChildCount >= 1) and (ArrayIndexOf(N.GetChild(0).ValueUpper) >= 0);
+  end;
+end;
+
+function TSSAGenerator.PowIsConstSquare(Node: TASTNode): Boolean;
+// DIVERGENZE 203 - "x ^ 2" with an exponent that is a COMPILE-TIME 2 (2, 2.0, (1 + 1), a Const of 2): fbc rewrites it as
+// "x * x" in the base's width. SB_POW_SQUARE=0 is the A/B.
+var
+  E: TASTNode;
+  V: Int64;
+begin
+  Result := False;
+  if (Node = nil) or (Node.NodeType <> antBinaryOp) or (Node.ChildCount < 2) then Exit;
+  if not (Assigned(Node.Token) and (Node.Token.TokenType = ttOpPow)) then Exit;
+  if GetEnvironmentVariable('SB_POW_SQUARE') = '0' then Exit;
+  E := Node.GetChild(1);
+  while (E <> nil) and (E.NodeType = antParentheses) and (E.ChildCount >= 1) do E := E.GetChild(0);
+  if E = nil then Exit;
+  if (E.NodeType = antLiteral) and VarIsNumeric(E.Value) and VarIsFloat(E.Value) then
+    Exit(Double(E.Value) = 2.0);
+  Result := TryFoldConstIntExpr(E, V) and (V = 2);
 end;
 
 function TSSAGenerator.TryFoldConstIntExpr(Node: TASTNode; out Val: Int64): Boolean;
@@ -30773,6 +30868,14 @@ begin
   case Node.NodeType of
     antIdentifier:
     begin
+      // ⭐ DIVERGENZE 652 - this procedure's own entry FIRST, as a STORE reads it (ApplyScalarNarrow): a PARAMETER's width is
+      // filed under "PROC|NAME" (SetVarWidthScoped), and the bare lookup missed it - "Sub f(ByVal a As Long) : Print Hex(a)"
+      // printed 16 digits for -2 where fbc prints FFFFFFFE. SB_PARAM_WIDTH=0 is the A/B.
+      if FInProcedure and (FCurrentProcName <> '') and (GetEnvironmentVariable('SB_PARAM_WIDTH') <> '0') then
+      begin
+        idx := FVarWidthCode.IndexOf(FCurrentProcName + '|' + Node.ValueUpper);
+        if idx >= 0 then Exit(PtrInt(FVarWidthCode.Objects[idx]));
+      end;
       idx := FVarWidthCode.IndexOf(Node.ValueUpper);
       if idx >= 0 then Result := PtrInt(FVarWidthCode.Objects[idx]);
     end;
@@ -30918,9 +31021,23 @@ procedure TSSAGenerator.UDTFieldReportShape(UDTIdx, FieldIdx: Integer; out Size,
 // anything that allocates, copies or writes an image.
 var
   F: TUDTField;
+  Rank: Integer;
 begin
-  if FixedArrayMemberCShape(UDTIdx, FieldIdx, Size, Align, True) then Exit;
   F := FUDTs[UDTIdx].Fields[FieldIdx];
+  // ⭐ DIVERGENZE 313 - A DYNAMIC ARRAY MEMBER MEASURES fbc's DESCRIPTOR, which lives INSIDE the record: "Dim a(Any) As
+  // Integer" is 72 bytes, "a(Any, Any)" 96 - the FBARRAY header (data, ptr, size, element_len, dimensions, flags = 48)
+  // plus one dimTb entry (elements, lbound, ubound = 24) per dimension, aligned at 8. A "ReDim b(0 To 3)" member is
+  // dynamic too. We keep an 8-byte handle there, and SizeOf/OffsetOf answered it. Only the REPORT moves - the live image
+  // keeps its handle, and the report is never smaller than it. SB_DYNARR_DESC_SIZE=0 is the A/B.
+  if F.IsArray and ((F.ArrayBounds = nil) or F.DeclaredRedim) and (F.BitWidth = 0) and
+     (GetEnvironmentVariable('SB_DYNARR_DESC_SIZE') <> '0') then
+  begin
+    Rank := F.ArrayDimCount;
+    if Rank < 1 then Rank := 1;
+    Size := 48 + 24 * Rank; Align := 8;
+    Exit;
+  end;
+  if FixedArrayMemberCShape(UDTIdx, FieldIdx, Size, Align, True) then Exit;
   // ⭐ A NESTED RECORD MEMBER IS ITS OWN TYPE, INLINE (DIVERGENZE 193). It used to answer the eight
   // bytes of the handle our storage keeps, so "Type Inner: a As Byte: b As Short: End Type" inside
   // "Type Outer: h As Byte: inn As Inner: t As Byte: End Type" made SizeOf(Outer) 24 against fbc's 8
@@ -31225,11 +31342,19 @@ begin
     // INLINE, its own layout inside its parent's, which is what C does and what fbc reports. It
     // declines only when the nested type ITSELF has no reproducible layout - a union, a dynamic array
     // member, a variable-length string - and then the whole parent declines with it, as before.
+    // ⭐ DIVERGENZE 313 - ...and in the REPORT a DYNAMIC array member has a shape: fbc's descriptor (UDTFieldReportShape),
+    // whatever its element type. Declining here sent SizeOf back to eight bytes per field.
     with FUDTs[UDTIdx].Fields[i] do
+      if not (ReportOnly and IsArray and ((ArrayBounds = nil) or DeclaredRedim) and (BitWidth = 0) and
+              (GetEnvironmentVariable('SB_DYNARR_DESC_SIZE') <> '0')) then
       if (IsArray and not ((ReportOnly and FixedArrayMemberCShape(UDTIdx, i, Sz2, Al2, True)) or
                            FieldArrayInline(UDTIdx, i))) or   // an inline array IS its image (226)
          ((NestedType <> '') and (IsArray or not NestedMemberShape(NestedType, ReportOnly, Sz2, Al2))) or
-         ((Bank = srtString) and (StrCapacity <= 0)) then Exit;
+         ((Bank = srtString) and (StrCapacity <= 0) and
+          not (ReportOnly and (not IsArray) and (NestedType = '') and (GetEnvironmentVariable('SB_STRDESC_REPORT') <> '0'))) then Exit;
+    // ⭐ DIVERGENZE 650 - ...and a variable-length STRING member reports fbc's 24-byte descriptor (UDTFieldCShape answers it):
+    // declining sent SizeOf to LiveBytes, which happened to agree, and OffsetOf of every field AFTER it to the handle walk
+    // - "a As Integer : s As String : b As Byte" put b at 16 where fbc says 32.
     if ReportOnly then UDTFieldReportShape(UDTIdx, i, Sz, Al)
     else UDTFieldCShape(UDTIdx, i, Sz, Al);
     if (FUDTs[UDTIdx].FieldAlign > 0) and (Al > FUDTs[UDTIdx].FieldAlign) then
@@ -32543,7 +32668,7 @@ begin
       if Node.ChildCount >= 2 then
       begin
         if Node.Token.TokenType = ttOpPow then
-          Result := False                     // "^" is pow(): always Double
+          Result := False                     // "^" is pow(): always Double (even "s ^ 2", whose VALUE is binary32: 203)
         else if Node.Token.TokenType = ttOpDiv then
           // "/" has no mixed Single/Integer form: an integer operand promotes BOTH to Double. So "s / 2" is
           // a Double where "s * 2" is a Single -- only Single / Single stays single.
@@ -35339,6 +35464,20 @@ begin
       // members, which manage their own storage).
       FUDTs[Idx].Fields[n].DefaultExpr := nil;
       FUDTs[Idx].Fields[n].ArrayDefault := nil;
+      FUDTs[Idx].Fields[n].NestedDefault := nil;
+      // ⭐ DIVERGENZE 648 - a NESTED member initialised by an EXPRESSION of its own type, "one As U1 = U1("solo")": it was
+      // dropped (only the aggregate tuple below was kept), so the member came out default-constructed - empty. Kept apart
+      // from DefaultExpr, whose readers decide nativity and scalar stores; EmitRecordInit copies it into the member.
+      // SB_NESTED_FIELD_DEFAULT=0 is the A/B.
+      if (FieldNode.Attributes.Values['HASDEFAULT'] = '1') and (NestedT <> '') and (not IsArrayField) and
+         (FieldNode.ChildCount >= 2) and
+         not ((FieldNode.GetChild(FieldNode.ChildCount - 1).NodeType in [antArgumentList, antExpressionList]) and
+              (FieldNode.GetChild(FieldNode.ChildCount - 1).Attributes.Values['TUPLEINIT'] = '1')) and
+         // ...but "v As T = Any" asks for NO initialisation: it is not an expression (overload/bop_coercion)
+         not ((FieldNode.GetChild(FieldNode.ChildCount - 1).NodeType = antIdentifier) and
+              (FieldNode.GetChild(FieldNode.ChildCount - 1).ValueUpper = 'ANY')) and
+         (GetEnvironmentVariable('SB_NESTED_FIELD_DEFAULT') <> '0') then
+        FUDTs[Idx].Fields[n].NestedDefault := FieldNode.GetChild(FieldNode.ChildCount - 1);
       if IsArrayField and (FieldNode.Attributes.Values['ARRAYDEFAULT'] = '1') and (FieldNode.ChildCount >= 2) then
         FUDTs[Idx].Fields[n].ArrayDefault := FieldNode.GetChild(FieldNode.ChildCount - 1);   // (541)
       if (FieldNode.Attributes.Values['HASDEFAULT'] = '1') and (NestedT = '') and (not IsArrayField) and
@@ -35671,7 +35810,8 @@ begin
   if (UIdx < 0) or (UIdx > High(FUDTs)) or (Depth > 16) then Exit;
   for i := 0 to High(FUDTs[UIdx].Fields) do
   begin
-    if (FUDTs[UIdx].Fields[i].DefaultExpr <> nil) or (FUDTs[UIdx].Fields[i].ArrayDefault <> nil) then Exit(True);
+    if (FUDTs[UIdx].Fields[i].DefaultExpr <> nil) or (FUDTs[UIdx].Fields[i].ArrayDefault <> nil) or
+       (FUDTs[UIdx].Fields[i].NestedDefault <> nil) then Exit(True);
     if (FUDTs[UIdx].Fields[i].NestedType <> '') and
        RecordTypeHasFieldDefaults(FindUDT(FUDTs[UIdx].Fields[i].NestedType), Depth + 1) then Exit(True);
     if (FUDTs[UIdx].Fields[i].ArrayElemType <> '') and
@@ -37940,6 +38080,46 @@ begin
   Result := False;
 end;
 
+procedure TSSAGenerator.CheckParamNamedLikeProc(AST: TASTNode);
+// ⛔ DIVERGENZE 543 (3) - A PARAMETER NAMED LIKE ITS OWN PROCEDURE is fbc's "error 4: Duplicated definition, at parameter n
+// (x) of X()": "Function N(ByVal n As Integer)" - the name of a FUNCTION is also its result variable. Measured: a Sub, a
+// Function, an overload, a method ("Function T.m(ByVal m ...)"), a property setter, a procedure in a namespace; only a
+// DEFINITION (a Declare's parameter names do not count); a constructor is another error (59) and is left alone.
+// Runs after FlattenNamespaces. SB_PARAM_PROC_NAME=0 is the A/B.
+var
+  ii, j, No: Integer;
+  Stmt, PL, Prm: TASTNode;
+  V: string;
+begin
+  if (AST = nil) or (GetEnvironmentVariable('SB_PARAM_PROC_NAME') = '0') then Exit;
+  for ii := 0 to AST.ChildCount - 1 do
+  begin
+    Stmt := AST.GetChild(ii);
+    if (Stmt = nil) or (Stmt.NodeType <> antProcedureDecl) or (Stmt.ChildCount < 2) then Continue;
+    V := Stmt.GetChild(0).ValueUpper;
+    if Pos('~', V) > 0 then V := Copy(V, 1, Pos('~', V) - 1);
+    if Pos('#', V) > 0 then V := Copy(V, 1, Pos('#', V) - 1);
+    if (Length(V) > 4) and ((Copy(V, Length(V) - 3, 4) = '.SET') or (Copy(V, Length(V) - 3, 4) = '.GET')) then
+      V := Copy(V, 1, Length(V) - 4);
+    while Pos('.', V) > 0 do V := Copy(V, Pos('.', V) + 1, MaxInt);
+    if (V = '') or (V = 'CONSTRUCTOR') or (V = 'DESTRUCTOR') or (Copy(V, 1, 8) = 'OPERATOR') then Continue;
+    PL := nil;
+    for j := 1 to Stmt.ChildCount - 1 do
+      if Stmt.GetChild(j).NodeType = antParameterList then begin PL := Stmt.GetChild(j); Break; end;
+    if PL = nil then Continue;
+    No := 0;
+    for j := 0 to PL.ChildCount - 1 do
+    begin
+      Prm := PL.GetChild(j);
+      if (Prm.NodeType <> antIdentifier) or (Prm.ValueUpper = 'THIS') then Continue;
+      Inc(No);
+      if Prm.ValueUpper = V then
+        raise Exception.CreateFmt('Duplicated definition, at parameter %d (%s) of %s()',
+          [No, LowerCase(VarToStr(Prm.Value)), V]);
+    end;
+  end;
+end;
+
 procedure TSSAGenerator.CheckNamesClashWithTypeScopes(AST: TASTNode);
 // ⛔ DIVERGENZE 636 - A TYPE WITH MEMBERS OF ITS OWN IS A SCOPE, and a variable of the same name beside it is fbc's
 // "error 4: Duplicated definition". Measured against fbc, case-insensitively:
@@ -40129,9 +40309,26 @@ var
   Phase, ArgCount: Integer;
   Pref2, AmbWith: string;
   Ranked: Boolean;
-  ZBank, ZNames: string;      // DIVERGENZE 647
+  ZBank, ZNames, CandLit: string;      // DIVERGENZE 647 · 649
   ZList: TStringList;
-  ZExact, ZFits: Boolean;
+  ZExact, ZFits, ZAllLit, OkLit: Boolean;
+
+  function ArgIsZStringTyped(N: TASTNode): Boolean;
+  // DIVERGENZE 649 - is this argument a ZSTRING for fbc (a literal, a string CONST, a "ZString * n" variable, or "&"/"+"
+  // of such), rather than a STRING (a variable, a function result, anything joined with one)?
+  begin
+    Result := False;
+    if N = nil then Exit;
+    case N.NodeType of
+      antLiteral: Result := VarIsStr(N.Value) and (VarToStr(N.Value) <> '');
+      antIdentifier:
+        Result := (N.ChildCount = 0) and
+                  ((FConstStrBytes.IndexOfName(N.ValueUpper) >= 0) or (FZStringVars.IndexOfName(N.ValueUpper) >= 0));
+      antBinaryOp:
+        Result := (N.ChildCount = 2) and Assigned(N.Token) and (N.Token.TokenType in [ttOpConcat, ttOpAdd]) and
+                  ArgIsZStringTyped(N.GetChild(0)) and ArgIsZStringTyped(N.GetChild(1));
+    end;
+  end;
 
   // The four spellings of one width tail, most specific first: the declared label that matches, or ''.
   function WidthTailLabel(const WT: string): string;
@@ -40296,7 +40493,7 @@ begin
   // only when exactly one candidate fits. SB_STR_TO_ZPTR=0 is the A/B.
   if (Pos('S', Sig) > 0) and (GetEnvironmentVariable('SB_STR_TO_ZPTR') <> '0') then
   begin
-    Cand := ''; OkDef := False; ZExact := False;
+    Cand := ''; OkDef := False; ZExact := False; CandLit := ''; OkLit := False;
     ZList := TStringList.Create;
     try
       ZList.StrictDelimiter := True;
@@ -40306,7 +40503,7 @@ begin
         if Copy(FProcedureNames[k], 1, Length(Pref)) <> Pref then Continue;
         Tail := Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt);
         ZBank := SigBankPart(Tail);
-        if ZBank = Sig then begin ZExact := True; Break; end;
+        if ZBank = Sig then begin ZExact := True; Continue; end;
         if Length(ZBank) <> Length(Sig) then Continue;
         ZNames := SigNamePart(Tail);
         ZList.DelimitedText := ZNames;
@@ -40318,11 +40515,23 @@ begin
             begin ZFits := False; Break; end;
         if not ZFits then Continue;
         if Cand = '' then Cand := FProcedureNames[k] else OkDef := True;
+        // ⭐ DIVERGENZE 649 - ...and where a STRING candidate exists too, a ZSTRING argument (a literal, a string Const,
+        // a "ZString * n") still goes to the ZString Ptr: "g("x")" is fbc's g(ZString Ptr), "g(s)" its g(String).
+        ZAllLit := (ArgsNode <> nil) and (ArgsNode.ChildCount = Length(Sig));
+        if ZAllLit then
+          for j := 1 to Length(Sig) do
+            if (ZBank[j] <> Sig[j]) and
+               ((Trim(ZList[j - 1]) <> 'ZSTRING PTR') or not ArgIsZStringTyped(ArgsNode.GetChild(j - 1))) then
+            begin ZAllLit := False; Break; end;   // a ZSTRING prefers ZString Ptr only; a WString Ptr stays a conversion
+        if ZAllLit then
+          if CandLit = '' then CandLit := FProcedureNames[k] else OkLit := True;
       end;
     finally
       ZList.Free;
     end;
     if (not ZExact) and (Cand <> '') and (not OkDef) and FProcDecls.ContainsKey(Cand) then Exit(Cand);
+    if ZExact and (CandLit <> '') and (not OkLit) and FProcDecls.ContainsKey(CandLit) and
+       (GetEnvironmentVariable('SB_ZSTR_LITERAL_OVL') <> '0') then Exit(CandLit);
     Cand := ''; OkDef := False;
   end;
   // ⭐⭐⭐ ...AND THE RANKING GOES ABOVE THE BANK FILTER, NOT BELOW IT (DIVERGENZE 161). Every pass
@@ -42601,6 +42810,19 @@ begin
       for i := 0 to High(FUDTs[UDTIdx].Fields) do
         if FUDTs[UDTIdx].Fields[i].ArrayDefault <> nil then
           EmitBraceArrayMemberInit(HandleVal, UDTIdx, i, FUDTs[UDTIdx].Fields[i].ArrayDefault);
+    // ...and a NESTED member's "= U1(...)" (DIVERGENZE 648): the value, copied into the member's bytes.
+    if WithDefaults then
+      for i := 0 to High(FUDTs[UDTIdx].Fields) do
+        if (FUDTs[UDTIdx].Fields[i].NestedDefault <> nil) and (i <= High(COfs)) then
+        begin
+          j := FindUDT(FUDTs[UDTIdx].Fields[i].NestedType);
+          if j < 0 then Continue;
+          NestedHandle := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaAddInt, NestedHandle, EnsureIntRegister(HandleVal),
+                          EnsureIntRegister(MakeSSAConstInt(COfs[i])), MakeSSAValue(svkNone));
+          ProcessExpression(FUDTs[UDTIdx].Fields[i].NestedDefault, DefVal);
+          EmitRecordCopy(NestedHandle, EnsureIntRegister(DefVal), j);
+        end;
     Exit;
   end;
   // "As String * n" fields start as n NULs: the buffer exists at full capacity from construction, so a
@@ -42732,6 +42954,17 @@ begin
   // "p1[I].Constructor()" on each element right after the CAllocate, and would have no reason to if
   // the allocation had constructed them. fbc prints '' 0 0 for a CAllocate'd element of a type whose
   // fields all have defaults; NEW and DIM print the defaults.
+  // ⭐ DIVERGENZE 648 - a NESTED member's "= U1(...)": the value, copied into the member allocated above.
+  if WithDefaults then
+    for i := 0 to High(FUDTs[UDTIdx].Fields) do
+      if FUDTs[UDTIdx].Fields[i].NestedDefault <> nil then
+      begin
+        j := FindUDT(FUDTs[UDTIdx].Fields[i].NestedType);
+        if j < 0 then Continue;
+        NestedHandle := NestedMemberHandle(HandleVal, UDTIdx, i);
+        ProcessExpression(FUDTs[UDTIdx].Fields[i].NestedDefault, DefVal);
+        EmitRecordCopy(NestedHandle, EnsureIntRegister(DefVal), j);
+      end;
   if WithDefaults then
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
     if FUDTs[UDTIdx].Fields[i].DefaultExpr <> nil then
@@ -42859,7 +43092,8 @@ begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) or (Depth > 16) then Exit;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
   begin
-    if (FUDTs[UDTIdx].Fields[i].DefaultExpr <> nil) or (FUDTs[UDTIdx].Fields[i].ArrayDefault <> nil) then Exit(True);
+    if (FUDTs[UDTIdx].Fields[i].DefaultExpr <> nil) or (FUDTs[UDTIdx].Fields[i].ArrayDefault <> nil) or
+       (FUDTs[UDTIdx].Fields[i].NestedDefault <> nil) then Exit(True);
     if (FUDTs[UDTIdx].Fields[i].NestedType <> '') and
        TypeHasFieldDefaults(FindUDT(FUDTs[UDTIdx].Fields[i].NestedType), Depth + 1) then Exit(True);
   end;
@@ -60140,6 +60374,11 @@ begin
   // `utf_conv.bi` names a libfb symbol we do not link, and taking it as a C call answered "fb_CharToUTF was not
   // found" where the intercept below does the work (DIVERGENZE 511).
   if IsUtfConvName(NameU, UtfSel) then Exit;
+  // ⭐ DIVERGENZE 553 - ...and BIN, HEX, OCT stay fbc's builtins even when the program declares a C routine of that name:
+  // fbc accepts the declaration (no "Duplicated definition", unlike Sin or Len) and still calls its own - "hex(-3)" prints
+  // FFFFFFFFFFFFFFFD. Measured on every name the SSA treats as its own. SB_OWN_NAME_YIELDS=0 is the A/B.
+  if ((NameU = 'BIN') or (NameU = 'HEX') or (NameU = 'OCT')) and
+     (GetEnvironmentVariable('SB_OWN_NAME_YIELDS') <> '0') then Exit;
   Idx := ForeignDeclIndexAt(NameU);
   if Idx < 0 then Exit;
   if not ParseForeignDecl(FProgram.GetForeignDecl(Idx), Decl) then Exit;
@@ -63076,6 +63315,7 @@ begin
   PreMarkStart; RetireUndefProcs(AST); PreMarkEnd('RetireUndefProcs');     // DIVERGENZE 638
   PreMarkStart; CheckConstRedeclared(AST); PreMarkEnd('CheckConstRedeclared');   // DIVERGENZE 640
   PreMarkStart; CheckNamesClashWithTypeScopes(AST); PreMarkEnd('CheckNamesClashWithTypeScopes');   // DIVERGENZE 636
+  PreMarkStart; CheckParamNamedLikeProc(AST); PreMarkEnd('CheckParamNamedLikeProc');                 // DIVERGENZE 543
   PreMarkStart; CheckNoDefaultCtorUses(AST); PreMarkEnd('CheckNoDefaultCtorUses');   // DIVERGENZE 287
 
   // Which arrays are multi-dimensional, ANYWHERE in the program. Must precede lowering: the rank

@@ -439,6 +439,7 @@ type
     function ParseRandomizeStatement: TASTNode;
     // Shared body for TYPE / UNION (IsUnion tags the node so SSA overlaps same-bank fields).
     procedure CheckFieldNamesAreNotKeywords(TypeNode: TASTNode);   // DIVERGENZE 296 · 316 · 385
+    procedure CheckTypeIsNotEmpty(TypeNode: TASTNode; IsUnion, IsInterface: Boolean);   // DIVERGENZE 651
     function ParseRecordDecl(IsUnion: Boolean; IsInterface: Boolean = False): TASTNode;
     function ParseInterfaceDecl: TASTNode;   // MODERN: Interface ... End Interface
     function ParseRecordFieldType: string;
@@ -6470,6 +6471,10 @@ begin
       TypeNode.Attributes.Values['OVERRIDE' + MethKey] := '1';
     if IsFinal and Assigned(TypeNode) then
       TypeNode.Attributes.Values['FINAL' + MethKey] := '1';
+    // DIVERGENZE 651: a type of the OOP EXTENSIONS (abstract / virtual / override / final members) is exempt from the
+    // "cannot be empty" rule - those extensions are not touched (owner's rule), and fbc refuses that shape anyway.
+    if (IsAbstract or IsVirtual or IsOverride or IsFinal) and Assigned(TypeNode) then
+      TypeNode.Attributes.Values['OOPEXTMEMBER'] := '1';
     if Assigned(TypeNode) then StampMemberAccess(TypeNode, MethName, CurAccess);
     // ...and record that this TYPE DECLARED this member, under the same key, so a definition can ask.
     if Assigned(TypeNode) and (VarToStr(TypeNode.Value) <> '') then
@@ -6648,6 +6653,23 @@ begin
     P.AddChild(D.Clone);                            // last child = default-value expression
     P.Attributes.Values['HASDEFAULT'] := '1';
   end;
+end;
+
+procedure TPackratParser.CheckTypeIsNotEmpty(TypeNode: TASTNode; IsUnion, IsInterface: Boolean);
+// ⛔ DIVERGENZE 651 - A TYPE OR UNION WITH NO DATA FIELD is fbc's "error 256: An ENUM, TYPE or UNION cannot be empty":
+// "Type E : End Type", and equally a type holding only methods, constructors, STATIC fields or Consts (measured). A
+// type that EXTENDS anything is valid without fields of its own. SB_EMPTY_TYPE=0 is the A/B.
+var
+  i: Integer;
+begin
+  if (TypeNode = nil) or IsInterface or (GetEnvironmentVariable('SB_EMPTY_TYPE') = '0') then Exit;
+  if Trim(TypeNode.Attributes.Values['EXTENDS']) <> '' then Exit;
+  // ...and the OOP EXTENSIONS stay as they are (owner's rule): a type with abstract / virtual members or IMPLEMENTS
+  if (TypeNode.Attributes.Values['OOPEXTMEMBER'] = '1') or (TypeNode.Attributes.Values['IMPLEMENTS'] <> '') then Exit;
+  for i := 0 to TypeNode.ChildCount - 1 do
+    if (TypeNode.GetChild(i).NodeType = antIdentifier) and (TypeNode.GetChild(i).Attributes.Values['STATIC'] <> '1') then
+      Exit;
+  HandleError('An ENUM, TYPE or UNION cannot be empty', Context.CurrentToken);
 end;
 
 procedure TPackratParser.CheckFieldNamesAreNotKeywords(TypeNode: TASTNode);
@@ -7473,6 +7495,7 @@ begin
       [TokU, TokU, Result.ValueUpper]), Token);
   end;
   CheckFieldNamesAreNotKeywords(Result);   // DIVERGENZE 296 · 316 · 385
+  CheckTypeIsNotEmpty(Result, IsUnion, IsInterface);   // DIVERGENZE 651
   ConsumeEndType;
   DoNodeCreated(Result);
 end;
@@ -17383,6 +17406,9 @@ begin
     IsFirst := False;
     while Context.CheckAny([ttEndOfLine, ttSeparStmt, ttSeparParam]) do Context.Advance;
   end;
+  // ⛔ DIVERGENZE 651 - ...and an ENUM with no member is fbc's "error 256" too. SB_EMPTY_TYPE=0 is the A/B.
+  if (Result.ChildCount = 0) and (GetEnvironmentVariable('SB_EMPTY_TYPE') <> '0') then
+    HandleError('An ENUM, TYPE or UNION cannot be empty', Context.CurrentToken);
   DoNodeCreated(Result);
 end;
 
