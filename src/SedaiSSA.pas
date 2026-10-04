@@ -1088,6 +1088,12 @@ type
     function BareVarNotPtrHere(Node: TASTNode): Boolean;   // DIVERGENZE 631
     procedure RetireUndefConsts(AST: TASTNode);            // DIVERGENZE 633
     procedure RetireUndefProcs(AST: TASTNode);             // DIVERGENZE 638
+    procedure RetireUndefNamespaces(AST: TASTNode);        // DIVERGENZE 643
+    function MethodNameDeclared(const TypeName, MethNm: string): Boolean;   // DIVERGENZE 635
+    function FreeProcNameDeclared(const Name: string): Boolean;             // DIVERGENZE 635
+    procedure CheckNamesClashWithTypeScopes(AST: TASTNode);               // DIVERGENZE 636
+    function IsPlainNumericTypeName(const T: string): Boolean;             // DIVERGENZE 644
+    procedure CheckNoDefaultCtorUses(AST: TASTNode);                      // DIVERGENZE 287
     procedure CheckConstRedeclared(AST: TASTNode);         // DIVERGENZE 640
     function AmbiguousPtrName(Node: TASTNode): Boolean;    // DIVERGENZE 629
     function AmbiguousPtrNameS(const Name: string): Boolean;
@@ -9327,6 +9333,11 @@ begin
                                 Node.GetChild(1), Result);
               Exit;
             end;
+            // DIVERGENZE 635: the type declares the method and no overload takes these arguments - fbc's error 99,
+            // not a fall-through that drops the call (see MethodNameDeclared).
+            if MethodNameDeclared(MethodOwnerType, VarToStr(Node.GetChild(0).Value)) and
+               (GetEnvironmentVariable('SB_METHOD_NOMATCH') <> '0') then
+              raise Exception.CreateFmt('No matching overloaded function, %s()', [Node.GetChild(0).ValueUpper]);
           end
           // Static member method: "TypeName.method(args)" with no instance (TypeName is a type, not a var).
           else if TryStaticMethodCall(MethodObjNode, VarToStr(Node.GetChild(0).Value),
@@ -37110,6 +37121,129 @@ begin
   end;
 end;
 
+procedure TSSAGenerator.RetireUndefNamespaces(AST: TASTNode);
+// ⭐ DIVERGENZE 643 - "#undef" RETIRES A NAMESPACE TOO, and a later "Namespace N" is a NEW namespace: the old one keeps its
+// members. fbc's quirk/undef: "Namespace N : Dim Shared i = 123 : ... : #undef N : Namespace N Alias "N2" : Dim Shared i = 456"
+// - a reader before the #undef answers 123, one after it 456. FlattenNamespaces merged both blocks into one N.I (456 456).
+// ⇒ Before flattening, at MODULE level in source order: a namespace whose name was #undef'd, opened again and declaring a
+// member the earlier block declares too (which only a retired namespace allows - a plain reopening may not redeclare), is
+// RENAMED with every "N.x" and "Using N" from the previous boundary up to the reopening. The same renaming as 633 and 638.
+// ⚠️ The position of the "#undef" is not known (GPPUndefNames is a set): the redeclared member says it came first.
+// SB_UNDEF_NS=0 is the A/B.
+var
+  Pending: TStringList;
+  Serial, ii, jj, mm, From, k: Integer;
+  Stmt: TASTNode;
+  Base, NewBase: string;
+
+  procedure MemberNames(Ns: TASTNode; L: TStringList);
+  var c, d: Integer; M: TASTNode; V: string;
+  begin
+    for c := 0 to Ns.ChildCount - 1 do
+    begin
+      M := Ns.GetChild(c);
+      if M = nil then Continue;
+      if M.NodeType = antDim then
+      begin
+        for d := 0 to M.ChildCount - 1 do
+          if (M.GetChild(d).NodeType = antArrayDecl) and (M.GetChild(d).ChildCount >= 1) then
+            L.Add(M.GetChild(d).GetChild(0).ValueUpper);
+      end
+      else if (M.NodeType = antProcedureDecl) and (M.ChildCount >= 1) then
+      begin
+        V := M.GetChild(0).ValueUpper;
+        if Pos('~', V) > 0 then V := Copy(V, 1, Pos('~', V) - 1);
+        L.Add(V);
+      end;
+    end;
+  end;
+
+  function SharesMember(A, B: TASTNode): Boolean;
+  var LA, LB: TStringList; c: Integer;
+  begin
+    Result := False;
+    LA := TStringList.Create; LB := TStringList.Create;
+    try
+      MemberNames(A, LA); MemberNames(B, LB);
+      for c := 0 to LB.Count - 1 do
+        if (LB[c] <> '') and (LA.IndexOf(LB[c]) >= 0) then Exit(True);
+    finally
+      LA.Free; LB.Free;
+    end;
+  end;
+
+  procedure RenameIn(N: TASTNode; const OldU, NewN: string);
+  var c: Integer;
+  begin
+    if N = nil then Exit;
+    if N.NodeType = antIdentifier then
+    begin
+      if Copy(N.ValueUpper, 1, Length(OldU) + 1) = OldU + '.' then
+        N.Value := NewN + Copy(N.ValueUpper, Length(OldU) + 1, MaxInt)
+      else if (N.ValueUpper = OldU) and Assigned(N.Parent) and
+              (((N.Parent.NodeType = antMemberAccess) and (N.Parent.ChildCount >= 1) and (N.Parent.GetChild(0) = N)) or
+               (N.Parent.NodeType = antPrintUsing)) then
+        N.Value := NewN;
+    end;
+    for c := 0 to N.ChildCount - 1 do
+      RenameIn(N.GetChild(c), OldU, NewN);
+  end;
+
+  // A DIM or a parameter of the name makes it a variable there: "N.x" is then a field, not the namespace.
+  function DeclaresName(N: TASTNode; const NameU: string): Boolean;
+  var c: Integer;
+  begin
+    Result := False;
+    if N = nil then Exit;
+    if (N.NodeType = antArrayDecl) and (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antIdentifier) and
+       (N.GetChild(0).ValueUpper = NameU) then Exit(True);
+    if (N.NodeType = antIdentifier) and Assigned(N.Parent) and (N.Parent.NodeType = antParameterList) and
+       (N.ValueUpper = NameU) then Exit(True);
+    for c := 0 to N.ChildCount - 1 do
+      if DeclaresName(N.GetChild(c), NameU) then Exit(True);
+  end;
+
+begin
+  if (AST = nil) or (GPPUndefNames = nil) or (GPPUndefNames.Count = 0) then Exit;
+  if GetEnvironmentVariable('SB_UNDEF_NS') = '0' then Exit;
+  Pending := TStringList.Create;      // namespace name -> index of its live block; "B|" + name -> the boundary
+  Serial := 0;
+  try
+    for ii := 0 to AST.ChildCount - 1 do
+    begin
+      Stmt := AST.GetChild(ii);
+      if (Stmt = nil) or (Stmt.NodeType <> antNamespace) then Continue;
+      Base := UpperFast(VarToStr(Stmt.Value));
+      if (Base = '') or (Pos('.', Base) > 0) or (GPPUndefNames.IndexOf(Base) < 0) then Continue;
+      k := Pending.IndexOf('D|' + Base);
+      if k < 0 then
+      begin
+        Pending.AddObject('D|' + Base, TObject(PtrInt(ii)));
+        Continue;
+      end;
+      jj := PtrInt(Pending.Objects[k]);
+      if not SharesMember(AST.GetChild(jj), Stmt) then Continue;   // a plain reopening of the live namespace
+      From := 0;
+      if Pending.IndexOf('B|' + Base) >= 0 then From := PtrInt(Pending.Objects[Pending.IndexOf('B|' + Base)]);
+      Inc(Serial);
+      NewBase := Base + '__UNDEF' + IntToStr(Serial);
+      AST.GetChild(jj).Value := NewBase;
+      for mm := From to ii - 1 do
+      begin
+        if (mm <> jj) and (AST.GetChild(mm).NodeType = antDim) and DeclaresName(AST.GetChild(mm), Base) then Break;
+        if (mm <> jj) and (AST.GetChild(mm).NodeType = antProcedureDecl) and DeclaresName(AST.GetChild(mm), Base) then
+          Continue;
+        RenameIn(AST.GetChild(mm), Base, NewBase);
+      end;
+      Pending.Objects[k] := TObject(PtrInt(ii));
+      if Pending.IndexOf('B|' + Base) >= 0 then Pending.Objects[Pending.IndexOf('B|' + Base)] := TObject(PtrInt(ii))
+      else Pending.AddObject('B|' + Base, TObject(PtrInt(ii)));
+    end;
+  finally
+    Pending.Free;
+  end;
+end;
+
 function TSSAGenerator.AmbiguousPtrNameS(const Name: string): Boolean;
 // DIVERGENZE 629: is this NAME a pointer only by the FLAT maps' word? Some declaration gives it a non-pointer type
 // (FNonPtrNames, DIVERGENZE 483) and THIS procedure does not declare it a pointer (local or parameter). Then the small-address
@@ -37762,6 +37896,334 @@ begin
     if Idx < 0 then Break;
     T := FUDTs[Idx].Parent;
     Inc(Guard);
+  end;
+end;
+
+function TSSAGenerator.MethodNameDeclared(const TypeName, MethNm: string): Boolean;
+// DIVERGENZE 635: does the type (or a base) DECLARE a method of this NAME, under any signature? An identifier only: the
+// operator words (Cast, Let, For, Next, Step, New, Delete, and the symbol operators) are probed by sites that expect a
+// silent miss.
+var
+  T, M, K: string;
+  Idx, Guard, c: Integer;
+begin
+  Result := False;
+  M := UpperFast(MethNm);
+  if M = '' then Exit;
+  for c := 1 to Length(M) do
+    if not (M[c] in ['A'..'Z', '0'..'9', '_']) then Exit;
+  if (M = 'CAST') or (M = 'LET') or (M = 'FOR') or (M = 'NEXT') or (M = 'STEP') or (M = 'NEW') or (M = 'DELETE') or
+     (Copy(M, 1, 8) = 'OPERATOR') then Exit;
+  T := UpperFast(TypeName);
+  Guard := 0;
+  while (T <> '') and (Guard < 64) do
+  begin
+    if FProcDecls.ContainsKey(T + '.' + M) then Exit(True);
+    for K in FProcDecls.Keys do
+      if Copy(K, 1, Length(T) + Length(M) + 2) = T + '.' + M + '~' then Exit(True);
+    Idx := FindUDT(T);
+    if Idx < 0 then Break;
+    T := FUDTs[Idx].Parent;
+    Inc(Guard);
+  end;
+end;
+
+function TSSAGenerator.FreeProcNameDeclared(const Name: string): Boolean;
+// Is there a module-level (non-method) procedure of this name, under any signature?
+var
+  M, K: string;
+begin
+  M := UpperFast(Name);
+  if FProcDecls.ContainsKey(M) then Exit(True);
+  for K in FProcDecls.Keys do
+    if Copy(K, 1, Length(M) + 1) = M + '~' then Exit(True);
+  Result := False;
+end;
+
+procedure TSSAGenerator.CheckNamesClashWithTypeScopes(AST: TASTNode);
+// ⛔ DIVERGENZE 636 - A TYPE WITH MEMBERS OF ITS OWN IS A SCOPE, and a variable of the same name beside it is fbc's
+// "error 4: Duplicated definition". Measured against fbc, case-insensitively:
+//   - the type has a method, a constructor, an operator, a STATIC field or an EXTENDS (a plain type does not clash);
+//   - the variable is a module DIM or a PARAMETER / DIM of a FREE procedure, in the SAME namespace as the type;
+//   - it comes AFTER the type in the source (before it, fbc accepts);
+//   - inside a METHOD body - of any type - nothing clashes, and a Declare's parameter names do not count.
+// Runs after FlattenNamespaces, in source order: a type and a free procedure are then "NS.NAME", and the namespace is
+// the part before the last dot. SB_TYPE_NAME_CLASH=0 is the A/B.
+var
+  Scoped, TypeNames: TStringList;
+  ii, c: Integer;
+  Stmt: TASTNode;
+  V, Pfx, Base, ProcNm: string;
+
+  procedure SplitName(const Full: string; out P, B: string);
+  var k: Integer;
+  begin
+    P := ''; B := Full;
+    for k := Length(Full) downto 1 do
+      if Full[k] = '.' then
+      begin
+        P := Copy(Full, 1, k - 1); B := Copy(Full, k + 1, MaxInt); Exit;
+      end;
+  end;
+
+  function OwnsMembers(T: TASTNode): Boolean;
+  var k: Integer;
+  begin
+    if T.Attributes.Values['HASMEMBERPROC'] = '1' then Exit(True);
+    if Trim(T.Attributes.Values['EXTENDS']) <> '' then Exit(True);     // any EXTENDS, measured: a plain base too
+    for k := 0 to T.ChildCount - 1 do
+      if T.GetChild(k).Attributes.Values['STATIC'] = '1' then Exit(True);
+    Result := False;
+  end;
+
+  function Clashes(const P, NameU: string): Boolean;
+  begin
+    Result := (NameU <> '') and (Scoped.IndexOf(P + '|' + NameU) >= 0);
+  end;
+
+  procedure CheckDims(N: TASTNode; const P: string);
+  var k: Integer; D: TASTNode;
+  begin
+    if N = nil then Exit;
+    if (N.NodeType = antArrayDecl) and (N.ChildCount >= 1) and (N.GetChild(0).NodeType = antIdentifier) then
+    begin
+      D := N.GetChild(0);
+      if Clashes(P, D.ValueUpper) then
+        raise Exception.CreateFmt('Duplicated definition, %s', [VarToStr(D.Value)]);
+    end;
+    // "For b As Integer = ..." declares its counter too
+    if (N.NodeType = antForLoop) and (N.Attributes.Values['VARTYPE'] <> '') and (N.ChildCount >= 1) and
+       (N.GetChild(0).NodeType = antIdentifier) and Clashes(P, N.GetChild(0).ValueUpper) then
+      raise Exception.CreateFmt('Duplicated definition, %s', [VarToStr(N.GetChild(0).Value)]);
+    for k := 0 to N.ChildCount - 1 do
+      CheckDims(N.GetChild(k), P);
+  end;
+
+  procedure CheckParams(Proc: TASTNode; const P, Nm: string);
+  var k, j, No: Integer; PL, Prm: TASTNode;
+  begin
+    for k := 0 to Proc.ChildCount - 1 do
+      if Proc.GetChild(k).NodeType = antParameterList then
+      begin
+        PL := Proc.GetChild(k);
+        No := 0;
+        for j := 0 to PL.ChildCount - 1 do
+        begin
+          Prm := PL.GetChild(j);
+          Inc(No);
+          if (Prm.NodeType = antIdentifier) and Clashes(P, Prm.ValueUpper) then
+            raise Exception.CreateFmt('Duplicated definition, at parameter %d (%s) of %s()',
+              [No, LowerCase(VarToStr(Prm.Value)), Nm]);
+        end;
+      end;
+  end;
+
+begin
+  if (AST = nil) or (GetEnvironmentVariable('SB_TYPE_NAME_CLASH') = '0') then Exit;
+  Scoped := TStringList.Create;
+  TypeNames := TStringList.Create;
+  try
+    Scoped.Sorted := True; Scoped.Duplicates := dupIgnore;
+    TypeNames.Sorted := True; TypeNames.Duplicates := dupIgnore;
+    for ii := 0 to AST.ChildCount - 1 do
+      if (AST.GetChild(ii).NodeType = antTypeDecl) and (VarToStr(AST.GetChild(ii).Value) <> '') then
+        TypeNames.Add(AST.GetChild(ii).ValueUpper);
+    for ii := 0 to AST.ChildCount - 1 do
+    begin
+      Stmt := AST.GetChild(ii);
+      if Stmt = nil then Continue;
+      case Stmt.NodeType of
+        antTypeDecl:
+          if (VarToStr(Stmt.Value) <> '') and OwnsMembers(Stmt) then
+          begin
+            SplitName(Stmt.ValueUpper, Pfx, Base);
+            Scoped.Add(Pfx + '|' + Base);
+          end;
+        antDim:
+          if Scoped.Count > 0 then
+            for c := 0 to Stmt.ChildCount - 1 do
+              if (Stmt.GetChild(c).NodeType = antArrayDecl) and (Stmt.GetChild(c).ChildCount >= 1) then
+              begin
+                SplitName(Stmt.GetChild(c).GetChild(0).ValueUpper, Pfx, Base);
+                if Clashes(Pfx, Base) then
+                  raise Exception.CreateFmt('Duplicated definition, %s', [VarToStr(Stmt.GetChild(c).GetChild(0).Value)]);
+              end;
+        antForLoop:
+          if Scoped.Count > 0 then CheckDims(Stmt, '');
+        antProcedureDecl:
+          if (Scoped.Count > 0) and (Stmt.ChildCount >= 1) then
+          begin
+            V := Stmt.GetChild(0).ValueUpper;
+            if Pos('~', V) > 0 then V := Copy(V, 1, Pos('~', V) - 1);
+            SplitName(V, Pfx, ProcNm);
+            if (Pfx <> '') and (TypeNames.IndexOf(Pfx) >= 0) then Continue;   // a METHOD: nothing clashes there
+            CheckParams(Stmt, Pfx, ProcNm);
+            for c := 1 to Stmt.ChildCount - 1 do
+              if Stmt.GetChild(c).NodeType <> antParameterList then CheckDims(Stmt.GetChild(c), Pfx);
+          end;
+      end;
+    end;
+  finally
+    Scoped.Free;
+    TypeNames.Free;
+  end;
+end;
+
+function TSSAGenerator.IsPlainNumericTypeName(const T: string): Boolean;
+// DIVERGENZE 644: a builtin numeric or Boolean type, with no PTR - the parameter types a string argument cannot reach.
+var
+  U: string;
+begin
+  U := UpperFast(Trim(T));
+  Result := (U = 'INTEGER') or (U = 'UINTEGER') or (U = 'LONG') or (U = 'ULONG') or (U = 'LONGINT') or
+            (U = 'ULONGINT') or (U = 'SHORT') or (U = 'USHORT') or (U = 'BYTE') or (U = 'UBYTE') or
+            (U = 'SINGLE') or (U = 'DOUBLE') or (U = 'BOOLEAN');
+end;
+
+procedure TSSAGenerator.CheckNoDefaultCtorUses(AST: TASTNode);
+// ⛔ DIVERGENZE 287 - A TYPE WITH NO DEFAULT CONSTRUCTOR CANNOT BE BUILT WITHOUT ARGUMENTS, and fbc says where. A type
+// whose constructors ALL want an argument (none, or each one with a parameter that has no default) - measured on fbc:
+//   183 "TYPE or CLASS has no default constructor" - a DIM of it with no initialiser (scalar or array), or a FIELD of it;
+//   186 "Missing default constructor implementation" - a type EXTENDING it that declares no constructor of its own;
+//   188 "Missing UDT.constructor(byref as const UDT) implementation" - ...that declares constructors but no COPY one
+//       (a copy constructor alone is accepted);
+//   185 "Missing BASE() initializer" - a constructor of the derived type whose body never calls Base(...).
+// All of them were accepted here, and the object came out with its base never constructed.
+// The constructor bodies are module-level "T.CONSTRUCTOR#<sig>" procedures. SB_NODEFCTOR_CHECK=0 is the A/B.
+const
+  kWhy = ' (base UDT without default constructor requires manual initialization)';
+var
+  CtorCount, HasDefault, HasCopy, NonCopy: TStringList;   // per type name (upper)
+  ii, k, c: Integer;
+  Stmt, PL, Prm, Last: TASTNode;
+  Nm, T, Base: string;
+  AllDef, IsCopy: Boolean;
+
+  function NoDefault(const TypeU: string): Boolean;
+  begin
+    Result := (CtorCount.IndexOf(TypeU) >= 0) and (HasDefault.IndexOf(TypeU) < 0);
+  end;
+
+  function CallsBase(N: TASTNode): Boolean;
+  var j: Integer;
+  begin
+    Result := False;
+    if N = nil then Exit;
+    if (N.NodeType = antProcedureCall) and (N.ValueUpper = 'BASE') then Exit(True);
+    for j := 0 to N.ChildCount - 1 do
+      if CallsBase(N.GetChild(j)) then Exit(True);
+  end;
+
+  procedure CheckDims(N: TASTNode);
+  var j: Integer; L: TASTNode;
+  begin
+    if N = nil then Exit;
+    if (N.NodeType = antArrayDecl) and (N.ChildCount >= 2) and (N.Attributes.Values['CTORNAME'] <> '1') then
+    begin
+      L := N.GetChild(N.ChildCount - 1);
+      if (L.NodeType = antIdentifier) and (L.ChildCount = 0) and NoDefault(L.ValueUpper) then
+        raise Exception.Create('TYPE or CLASS has no default constructor');
+    end;
+    if N.NodeType = antParameterList then Exit;
+    for j := 0 to N.ChildCount - 1 do
+      CheckDims(N.GetChild(j));
+  end;
+
+begin
+  if (AST = nil) or (GetEnvironmentVariable('SB_NODEFCTOR_CHECK') = '0') then Exit;
+  CtorCount := TStringList.Create; HasDefault := TStringList.Create;
+  HasCopy := TStringList.Create; NonCopy := TStringList.Create;
+  try
+    CtorCount.Sorted := True; CtorCount.Duplicates := dupIgnore;
+    HasDefault.Sorted := True; HasDefault.Duplicates := dupIgnore;
+    HasCopy.Sorted := True; HasCopy.Duplicates := dupIgnore;
+    NonCopy.Sorted := True; NonCopy.Duplicates := dupIgnore;
+    // 1. what each type's constructors are
+    for ii := 0 to AST.ChildCount - 1 do
+    begin
+      Stmt := AST.GetChild(ii);
+      if (Stmt.NodeType <> antProcedureDecl) or (Stmt.ValueUpper <> 'CONSTRUCTOR') or (Stmt.ChildCount < 2) then Continue;
+      Nm := Stmt.GetChild(0).ValueUpper;
+      k := Pos('.CONSTRUCTOR', Nm);
+      if k <= 1 then Continue;
+      T := Copy(Nm, 1, k - 1);
+      PL := Stmt.GetChild(1);
+      if PL.NodeType <> antParameterList then Continue;
+      CtorCount.Add(T);
+      AllDef := True; IsCopy := False;
+      for c := 0 to PL.ChildCount - 1 do
+      begin
+        Prm := PL.GetChild(c);
+        if Prm.ValueUpper = 'THIS' then Continue;
+        if Prm.Attributes.Values['HASDEFAULT'] <> '1' then AllDef := False;
+      end;
+      if (PL.ChildCount = 2) and (PL.GetChild(1).ChildCount >= 1) and
+         (UpperFast(Trim(PL.GetChild(1).GetChild(0).ValueUpper)) = T) and
+         (PL.GetChild(1).Attributes.Values['HASDEFAULT'] <> '1') then IsCopy := True;
+      if AllDef then HasDefault.Add(T);
+      if IsCopy then HasCopy.Add(T) else NonCopy.Add(T);
+    end;
+    // ...and what each TYPE declares, body or not (a copy constructor fbc only needs to see DECLARED: virtual/virtual.bas)
+    for ii := 0 to AST.ChildCount - 1 do
+    begin
+      Stmt := AST.GetChild(ii);
+      if Stmt.NodeType <> antTypeDecl then Continue;
+      if Stmt.Attributes.Values['DECLDEFCTOR'] = '1' then
+      begin CtorCount.Add(Stmt.ValueUpper); HasDefault.Add(Stmt.ValueUpper); end;
+      if Stmt.Attributes.Values['DECLCOPYCTOR'] = '1' then
+      begin CtorCount.Add(Stmt.ValueUpper); HasCopy.Add(Stmt.ValueUpper); end;
+    end;
+    if CtorCount.Count = 0 then Exit;
+    // 2. derived types, fields, and every DIM
+    for ii := 0 to AST.ChildCount - 1 do
+    begin
+      Stmt := AST.GetChild(ii);
+      if Stmt.NodeType = antTypeDecl then
+      begin
+        T := Stmt.ValueUpper;
+        Base := UpperFast(Trim(Stmt.Attributes.Values['EXTENDS']));
+        if (Base <> '') and NoDefault(Base) then
+        begin
+          if CtorCount.IndexOf(T) < 0 then
+            raise Exception.Create('Missing default constructor implementation' + kWhy);
+          if (NonCopy.IndexOf(T) >= 0) and (HasCopy.IndexOf(T) < 0) then
+            raise Exception.Create('Missing UDT.constructor(byref as const UDT) implementation' + kWhy);
+        end;
+        for c := 0 to Stmt.ChildCount - 1 do
+        begin
+          Prm := Stmt.GetChild(c);
+          // ...unless the field carries its own initialiser, "t(0 To 2) As UDT1 = { UDT1("a"), ... }" (fbc suite
+          // structs/obj_global_with_temp2): that is the construction, and fbc accepts it.
+          if (Prm.NodeType = antIdentifier) and (Prm.ChildCount >= 1) and
+             (Prm.Attributes.Values['HASDEFAULT'] <> '1') and (Prm.Attributes.Values['ARRAYDEFAULT'] <> '1') then
+          begin
+            Last := Prm.GetChild(0);
+            if (Last.NodeType = antIdentifier) and NoDefault(Last.ValueUpper) then
+              raise Exception.CreateFmt('TYPE or CLASS has no default constructor, in field %s', [Prm.ValueUpper]);
+          end;
+        end;
+      end
+      else if (Stmt.NodeType = antProcedureDecl) and (Stmt.ValueUpper = 'CONSTRUCTOR') and (Stmt.ChildCount >= 2) then
+      begin
+        Nm := Stmt.GetChild(0).ValueUpper;
+        k := Pos('.CONSTRUCTOR', Nm);
+        if k > 1 then
+        begin
+          T := Copy(Nm, 1, k - 1);
+          Base := '';
+          for c := 0 to AST.ChildCount - 1 do
+            if (AST.GetChild(c).NodeType = antTypeDecl) and (AST.GetChild(c).ValueUpper = T) then
+              Base := UpperFast(Trim(AST.GetChild(c).Attributes.Values['EXTENDS']));
+          if (Base <> '') and NoDefault(Base) and not CallsBase(Stmt) then
+            raise Exception.Create('Missing BASE() initializer' + kWhy);
+        end;
+        CheckDims(Stmt);
+      end
+      else
+        CheckDims(Stmt);
+    end;
+  finally
+    CtorCount.Free; HasDefault.Free; HasCopy.Free; NonCopy.Free;
   end;
 end;
 
@@ -39667,6 +40129,9 @@ var
   Phase, ArgCount: Integer;
   Pref2, AmbWith: string;
   Ranked: Boolean;
+  ZBank, ZNames: string;      // DIVERGENZE 647
+  ZList: TStringList;
+  ZExact, ZFits: Boolean;
 
   // The four spellings of one width tail, most specific first: the declared label that matches, or ''.
   function WidthTailLabel(const WT: string): string;
@@ -39823,6 +40288,43 @@ begin
     if (Cand <> '') and (not OkDef) then Exit(Cand);
   end;
   Pref := BaseLabel + '~';
+  // ⭐ DIVERGENZE 647 - A STRING ARGUMENT GOES TO A ZSTRING PTR / WSTRING PTR PARAMETER. "f("7")" against
+  // f(ByVal As Integer) and f(ByVal As ZString Ptr) is fbc's second: a string converts to a ZString Ptr and never to an
+  // Integer. Both candidates sign the bank 'I' (a pointer is an integer), so nothing below could tell them apart and the
+  // ARITY fallback took the first one declared - "b.v = "2"" ran the Integer setter on Val("2") (m525, which printed the
+  // right digits by luck). Asked only when NO candidate takes a string at that position (the exact bank key exists), and
+  // only when exactly one candidate fits. SB_STR_TO_ZPTR=0 is the A/B.
+  if (Pos('S', Sig) > 0) and (GetEnvironmentVariable('SB_STR_TO_ZPTR') <> '0') then
+  begin
+    Cand := ''; OkDef := False; ZExact := False;
+    ZList := TStringList.Create;
+    try
+      ZList.StrictDelimiter := True;
+      ZList.Delimiter := ',';
+      for k := 0 to FProcedureNames.Count - 1 do
+      begin
+        if Copy(FProcedureNames[k], 1, Length(Pref)) <> Pref then Continue;
+        Tail := Copy(FProcedureNames[k], Length(Pref) + 1, MaxInt);
+        ZBank := SigBankPart(Tail);
+        if ZBank = Sig then begin ZExact := True; Break; end;
+        if Length(ZBank) <> Length(Sig) then Continue;
+        ZNames := SigNamePart(Tail);
+        ZList.DelimitedText := ZNames;
+        ZFits := True;
+        for j := 1 to Length(Sig) do
+          if ZBank[j] <> Sig[j] then
+            if not ((Sig[j] = 'S') and (ZBank[j] = 'I') and (j - 1 < ZList.Count) and
+                    ((Trim(ZList[j - 1]) = 'ZSTRING PTR') or (Trim(ZList[j - 1]) = 'WSTRING PTR'))) then
+            begin ZFits := False; Break; end;
+        if not ZFits then Continue;
+        if Cand = '' then Cand := FProcedureNames[k] else OkDef := True;
+      end;
+    finally
+      ZList.Free;
+    end;
+    if (not ZExact) and (Cand <> '') and (not OkDef) and FProcDecls.ContainsKey(Cand) then Exit(Cand);
+    Cand := ''; OkDef := False;
+  end;
   // ⭐⭐⭐ ...AND THE RANKING GOES ABOVE THE BANK FILTER, NOT BELOW IT (DIVERGENZE 161). Every pass
   // from here down requires the label's BANK part to match the call's EXACTLY, and the bank is a
   // COARSER type key than the ranking: it says "integer or float", where the ranking knows the twelve
@@ -47241,7 +47743,11 @@ begin
       if IsFbReservedVarName(NameU) and ((GPPUndefNames = nil) or (GPPUndefNames.IndexOf(NameU) < 0)) and
          (GetEnvironmentVariable('SB_PP_LAX_DEFINE') <> '1') then
         raise Exception.CreateFmt('Duplicated definition: "%s" is a FreeBASIC keyword and cannot name a variable', [NameU]);
-      if (FindUDT(NameU) >= 0) and TypeNameIsAScope(NameU) then
+      // ⛔ DIVERGENZE 636: CheckNamesClashWithTypeScopes now asks this with fbc's rule - in source ORDER, in the type's
+      // NAMESPACE, and never inside a METHOD body ("Sub B.show : Dim b" is accepted by fbc, and was refused here). This
+      // older whole-tree form stays only as the A/B (SB_TYPE_NAME_CLASH=0).
+      if (FindUDT(NameU) >= 0) and TypeNameIsAScope(NameU) and
+         (GetEnvironmentVariable('SB_TYPE_NAME_CLASH') = '0') then
         raise Exception.CreateFmt('Duplicated definition: "%s" is already the name of a TYPE that has ' +
                                   'member procedures, and BASIC does not tell the two apart', [NameU]);
       { ⛔⛔⛔ AND THE SAME NAME AS A PROCEDURE, which is the one that used to MISCOMPILE IN SILENCE.
@@ -56197,6 +56703,13 @@ begin
   // through the dispatcher below (MethodNeedsDispatch answers True for exactly this case).
   if MethodLabel = '' then
     MethodLabel := AnyOverrideLabel(ObjType, MethNm);
+  // ⛔ DIVERGENZE 635 - ...and a NAMED method whose overloads all refuse these arguments is an ERROR, not a call to drop:
+  // "o.f(1)" with only f(Integer, Integer) and f(String, Integer) printed the lines around it and exited 0, where fbc
+  // answers "error 99: No matching overloaded function". The silent exit stays for a name the type does NOT declare
+  // (an operator site probing for an operator that is not there must keep falling through) and for the operator words.
+  if (MethodLabel = '') and MethodNameDeclared(ObjType, MethNm) and
+     (GetEnvironmentVariable('SB_METHOD_NOMATCH') <> '0') then
+    raise Exception.CreateFmt('No matching overloaded function, %s()', [UpperFast(MethNm)]);
   if MethodLabel = '' then Exit;
   // ⛔ A METHOD ON A TRULY RAW POINTER IS AN ACCESS VIOLATION, AND A NAMED REFUSAL IS BETTER THAN THAT.
   // "Dim As T Ptr p = CAllocate(SizeOf(T)) : p->Method()" passes THIS as a RAW ADDRESS (RAWPTR_TAG),
@@ -57235,7 +57748,15 @@ begin
   if FCurrentProcName = UpperFast(FCurrentThisType) + '.' + UpperFast(VarName) then Exit;  // own result
   if ResolveExisting(VarName, Existing) then Exit;           // a parameter / local DIM shadows it
   if ArrayIndexOf(VarName) >= 0 then Exit;                   // a real array of that name wins
-  if ResolveMethodLabelArgs(FCurrentThisType, VarName, ArgsNode) = '' then Exit;   // no such method
+  if ResolveMethodLabelArgs(FCurrentThisType, VarName, ArgsNode) = '' then
+  begin
+    // DIVERGENZE 635: a method of the type, called bare with arguments none of its overloads takes - fbc's error 99.
+    // Not when a free procedure of the name exists too: that one may still take the call.
+    if MethodNameDeclared(FCurrentThisType, VarName) and (not FreeProcNameDeclared(VarName)) and
+       (GetEnvironmentVariable('SB_METHOD_NOMATCH') <> '0') then
+      raise Exception.CreateFmt('No matching overloaded function, %s()', [UpperFast(VarName)]);
+    Exit;                                                    // no such method
+  end;
 
   ThisNode := TASTNode.CreateWithValue(antIdentifier, 'THIS', Tok);
   try
@@ -58246,6 +58767,18 @@ begin
      (ArgListNode.NodeType in [antArgumentList, antExpressionList]) and Assigned(ParamList)) then Exit;
 
   NArgs := ArgListNode.ChildCount;
+  // ⛔ DIVERGENZE 644 - THE ARGUMENT COUNT IS CHECKED, as fbc's "error 1: Argument count mismatch". A procedure with ONE
+  // declaration resolves to its bare label whatever the arguments, and from here a surplus argument was cut off and a
+  // missing one (with no default) staged nothing: "Sub f(a, b) : f 1" ran. A variadic tail ("...") takes any surplus.
+  if GetEnvironmentVariable('SB_ARGCOUNT_CHECK') <> '0' then
+  begin
+    if (NArgs > ParamList.ChildCount) and (Decl.Attributes.Values['VARIADIC'] <> '1') and
+       (ParamList.Attributes.Values['VARIADIC'] <> '1') then
+      raise Exception.CreateFmt('Argument count mismatch, %s()', [UpperFast(ParamOwnerName)]);
+    for i := NArgs to ParamList.ChildCount - 1 do
+      if ParamList.GetChild(i).Attributes.Values['HASDEFAULT'] <> '1' then
+        raise Exception.CreateFmt('Argument count mismatch, %s()', [UpperFast(ParamOwnerName)]);
+  end;
   if NArgs > ParamList.ChildCount then NArgs := ParamList.ChildCount;
   SetLength(StageSlots, ParamList.ChildCount);
   SetLength(StageRTs, ParamList.ChildCount);
@@ -58279,6 +58812,29 @@ begin
     if ParamList.GetChild(i).Attributes.Values['ARRAY'] = '1' then Continue;
     ArgExpr := ArgListNode.GetChild(i);
     Slot := ParamBankAndSlot(ParamList, i, RT);
+    // ⛔ DIVERGENZE 645 - A SKIPPED ARGUMENT TAKES THE DEFAULT: "d3(1, , 9)" arrives with an EMPTY literal in the middle,
+    // and it was staged as 0 where fbc passes the parameter's default value. The same evaluation the trailing defaults get.
+    ParamI := ParamList.GetChild(i);
+    if (ArgExpr.NodeType = antLiteral) and (ArgExpr.ChildCount = 0) and
+       (VarIsEmpty(ArgExpr.Value) or VarIsNull(ArgExpr.Value)) and
+       (ParamI.Attributes.Values['HASDEFAULT'] = '1') and (ParamI.ChildCount >= 1) and
+       (GetEnvironmentVariable('SB_SKIPPED_ARG_DEFAULT') <> '0') then
+    begin
+      ParamUdtDef := ByvalUdtParamIndex(ParamList, i);
+      ProcessDefaultValue(ParamI, ParamI.GetChild(ParamI.ChildCount - 1), ArgVal);
+      if ParamIsAddressCarrier(Decl, ParamI) then
+        ArgVal := EmitTempCellFor(ArgVal, ParamDeclaredTypeName(ParamI));
+      if ParamUdtDef >= 0 then
+        ArgVal := EmitByvalUdtCopyOf(ArgVal, ParamUdtDef);
+      case RT of
+        srtFloat:  ArgVal := EnsureFloatRegister(ArgVal);
+        srtString: ArgVal := EnsureStringRegister(ArgVal);
+      else         ArgVal := EnsureIntRegister(ArgVal);
+      end;
+      StageSlots[NStage] := Slot; StageRTs[NStage] := RT; StageVals[NStage] := ArgVal;
+      Inc(NStage);
+      Continue;
+    end;
     // "test( Type(1, 2) )": the temporary's type is INFERRED, and here it comes from the PARAMETER's
     // declared type. Without it the constructor had an empty type name and died as "Array not declared".
     if (ArgExpr.NodeType = antArrayAccess) and (ArgExpr.Attributes.Values['INFERTYPE'] = '1') and
@@ -58440,6 +58996,19 @@ begin
     end
     else
       ProcessExpression(ArgExpr, ArgVal);
+    // ⛔ DIVERGENZE 644 - A STRING for a NUMERIC parameter is fbc's "error 58: Type mismatch". It was converted in silence
+    // ("o.g("s")" with g(ByVal As Integer) answered as if given 0). Asked of the EVALUATED value, which is certain, and
+    // only for a plain numeric/Boolean type: a ZString Ptr takes a string (fbc accepts), a UDT may have a constructor.
+    if (ArgVal.RegType = srtString) and (RT <> srtString) and
+       (GetEnvironmentVariable('SB_ARGCOUNT_CHECK') <> '0') and
+       not ((ArgExpr.NodeType = antLiteral) and (VarIsEmpty(ArgExpr.Value) or VarIsNull(ArgExpr.Value))) and
+       IsPlainNumericTypeName(ParamDeclaredTypeName(ParamList.GetChild(i))) then
+    begin
+      // a method's list starts with THIS, which fbc does not count
+      if (ParamList.ChildCount > 0) and (ParamList.GetChild(0).ValueUpper = 'THIS') then
+        raise Exception.CreateFmt('Type mismatch, at parameter %d of %s()', [i, UpperFast(ParamOwnerName)]);
+      raise Exception.CreateFmt('Type mismatch, at parameter %d of %s()', [i + 1, UpperFast(ParamOwnerName)]);
+    end;
     // Materialize into the parameter's bank register now, so the value survives a nested call in a later
     // argument (a raw transfer slot would be clobbered; a live bank register is preserved).
     case RT of
@@ -62501,10 +63070,13 @@ begin
 
   // FreeBASIC NAMESPACE: flatten namespace blocks into mangled, module-level declarations before any
   // pre-scan walks the AST. No-op when the program has no NAMESPACE (keyword is MODERN-only anyway).
+  PreMarkStart; RetireUndefNamespaces(AST); PreMarkEnd('RetireUndefNamespaces');   // DIVERGENZE 643
   PreMarkStart; FlattenNamespaces(AST); PreMarkEnd('FlattenNamespaces');
   PreMarkStart; RetireUndefConsts(AST); PreMarkEnd('RetireUndefConsts');   // DIVERGENZE 633
   PreMarkStart; RetireUndefProcs(AST); PreMarkEnd('RetireUndefProcs');     // DIVERGENZE 638
   PreMarkStart; CheckConstRedeclared(AST); PreMarkEnd('CheckConstRedeclared');   // DIVERGENZE 640
+  PreMarkStart; CheckNamesClashWithTypeScopes(AST); PreMarkEnd('CheckNamesClashWithTypeScopes');   // DIVERGENZE 636
+  PreMarkStart; CheckNoDefaultCtorUses(AST); PreMarkEnd('CheckNoDefaultCtorUses');   // DIVERGENZE 287
 
   // Which arrays are multi-dimensional, ANYWHERE in the program. Must precede lowering: the rank
   // decides whether a compiled backend may compute UBound natively, and it is asked at the first

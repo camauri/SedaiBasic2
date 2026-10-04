@@ -438,6 +438,7 @@ type
     // RANDOMIZE [seed] : seed the RNG (the optional seed expression becomes child0).
     function ParseRandomizeStatement: TASTNode;
     // Shared body for TYPE / UNION (IsUnion tags the node so SSA overlaps same-bank fields).
+    procedure CheckFieldNamesAreNotKeywords(TypeNode: TASTNode);   // DIVERGENZE 296 · 316 · 385
     function ParseRecordDecl(IsUnion: Boolean; IsInterface: Boolean = False): TASTNode;
     function ParseInterfaceDecl: TASTNode;   // MODERN: Interface ... End Interface
     function ParseRecordFieldType: string;
@@ -6550,6 +6551,19 @@ begin
     TypeNode.Attributes.Values['MEMALIAS' + IntToStr(MemAliasN)] :=
       KindU + '|' + MethName + '|' + IntToStr(Ord(SawParam)) + '|' + AliasStr;
   end;
+  // ⭐ DIVERGENZE 287 - WHICH CONSTRUCTORS THE TYPE DECLARES, body or not: the default one (no parameter, or a default
+  // on every one) and the COPY one ("Declare Constructor( ByRef As Const B )" in fbc's virtual/virtual.bas is declared
+  // and never defined - fbc only needs to know it exists). The SSA's check read the bodies alone and refused that type.
+  if Assigned(TypeNode) and (MethName = kCONSTRUCTOR) then
+  begin
+    if (not SawParam) or (Assigned(Defs) and (Defs.ChildCount = ParamIdx + 1) and
+                          (Defs.GetChild(0).Attributes.Values['NODEF'] <> '1')) then
+      TypeNode.Attributes.Values['DECLDEFCTOR'] := '1';
+    if SawParam and (ParamIdx = 0) and (Length(TypeWords) > 0) and (Defs = nil) and
+       ((TypeWords[0] = TypeNode.ValueUpper) or
+        (Copy(TypeNode.ValueUpper, Length(TypeNode.ValueUpper) - Length(TypeWords[0]), MaxInt) = '.' + TypeWords[0])) then
+      TypeNode.Attributes.Values['DECLCOPYCTOR'] := '1';
+  end;
   if Assigned(Defs) then
   begin
     Key := TypeNode.ValueUpper + '.' + MethName;
@@ -6633,6 +6647,75 @@ begin
     if P.Attributes.Values['HASDEFAULT'] = '1' then Continue;
     P.AddChild(D.Clone);                            // last child = default-value expression
     P.Attributes.Values['HASDEFAULT'] := '1';
+  end;
+end;
+
+procedure TPackratParser.CheckFieldNamesAreNotKeywords(TypeNode: TASTNode);
+// ⛔ DIVERGENZE 296 · 316 · 385 - A FIELD NAMED LIKE A KEYWORD, which fbc refuses in two measured ways (every word of
+// BASIC.md tried as a field name against fbc 1.10.1, in a plain type and in a type with a method):
+//   - ALWAYS (error 14 / 17 and friends): the operators, the declaration words, the access words and the intrinsic
+//     macros - "Type holder : mod As t Ptr" (385), "and As Long" (296);
+//   - in a TYPE THAT CONTAINS MEMBER FUNCTIONS, or that EXTENDS anything, or that has a STATIC field: fbc's error 238,
+//     "Fields cannot be named as keywords in TYPE's that contain member functions or in CLASS'es" (316) - the reserved
+//     words, not the quirk statements (Print, Len, Open, Line ... stay accepted). A member of a UNION is exempt.
+// Both lists are fbc's answer, not a guess; a word not in them was accepted by fbc in both shapes. SB_FIELD_KEYWORD=0 is the A/B.
+// ⭐ And the "As T name" SHAPE answers differently, measured the same way (every word of both lists, plain type and type
+// with a method): in a plain type only the operators, CONST/NEW/DELETE and the intrinsic macros are refused there -
+// "As Long rem" (xcb's iterators) and "As Any Ptr Private" (gif_lib5.bi) are fields - while in a type with methods
+// every word of both lists is refused except REDIM.
+const
+  kAlways =
+    ' __DATE__ __DATE_ISO__ __FB_64BIT__ __FB_ASM__ __FB_BACKEND__ __FB_BUILD_DATE__ __FB_BUILD_DATE_ISO__ ' +
+    ' __FB_BUILD_SHA1__ __FB_DEBUG__ __FB_ERR__ __FB_FPMODE__ __FB_FPU__ __FB_GCC__ __FB_GUI__ __FB_LANG__ ' +
+    ' __FB_LINUX__ __FB_MAIN__ __FB_MT__ __FB_OPTIMIZE__ __FB_OPTION_BYVAL__ __FB_OPTION_DYNAMIC__ ' +
+    ' __FB_OPTION_ESCAPE__ __FB_OPTION_EXPLICIT__ __FB_OPTION_GOSUB__ __FB_OPTION_PRIVATE__ __FB_OUT_DLL__ ' +
+    ' __FB_OUT_EXE__ __FB_OUT_LIB__ __FB_OUT_OBJ__ __FB_SIGNATURE__ __FB_UNIX__ __FB_VECTORIZE__ ' +
+    ' __FB_VER_MAJOR__ __FB_VER_MINOR__ __FB_VER_PATCH__ __FB_VERSION__ __FB_X86__ __FILE__ __FUNCTION__ ' +
+    ' __LINE__ __PATH__ __TIME__ AND ANDALSO AS CONST DECLARE DELETE DIM ENUM EQV IMP MOD NEW NOT OR ' +
+    ' ORELSE PRIVATE PROTECTED PUBLIC REDIM REM SHL SHR STATIC XOR ' +
+    '';
+  kInClass =
+    ' ABS ABSTRACT ALIAS ANY BASE BOOLEAN BYREF BYTE BYVAL CALL CAST CBOOL CBYTE CDBL CDECL CINT CLASS ' +
+    ' CLNG CLNGINT COMMON CONSTRUCTOR CONTINUE CPTR CSHORT CSIGN CSNG CUBYTE CUINT CULNG CUNSG CUSHORT ' +
+    ' DESTRUCTOR DO DOUBLE ELSE END EXIT EXPORT EXTENDS EXTERN FIX FOR FRAC FUNCTION GOTO IF IIF ' +
+    ' IMPLEMENTS IMPORT INT INTEGER IS LET LIB LONG LONGINT LOOP NAMESPACE NEXT OPERATOR OVERLOAD PASCAL ' +
+    ' PEEK POINTER POKE PROCPTR PROPERTY RETURN SCOPE SELECT SGN SHARED SHORT SINGLE STDCALL STEP STRING ' +
+    ' SUB SWAP THEN TO TYPE TYPEOF UINTEGER UNION UNSIGNED UNTIL USING VA_FIRST VAR VIRTUAL WEND WHILE ' +
+    ' WITH WSTRING ZSTRING ' +
+    '';
+  // kAlways without the declaration and access words, which the "As T name" shape accepts as names
+  kLeadAlways = ' AND ANDALSO CONST DELETE EQV IMP MOD NEW NOT OR ORELSE SHL SHR XOR ';   // + every __MACRO__ of kAlways
+var
+  i: Integer;
+  F: TASTNode;
+  Strict238: Boolean;
+begin
+  if (TypeNode = nil) or (GetEnvironmentVariable('SB_FIELD_KEYWORD') = '0') then Exit;
+  Strict238 := (TypeNode.Attributes.Values['HASMEMBERPROC'] = '1') or (Trim(TypeNode.Attributes.Values['EXTENDS']) <> '');
+  for i := 0 to TypeNode.ChildCount - 1 do
+    if (TypeNode.GetChild(i).NodeType = antIdentifier) and (TypeNode.GetChild(i).Attributes.Values['STATIC'] = '1') then
+      Strict238 := True;
+  for i := 0 to TypeNode.ChildCount - 1 do
+  begin
+    F := TypeNode.GetChild(i);
+    if (F.NodeType <> antIdentifier) or (F.ValueUpper = '') then Continue;
+    if F.Attributes.Values['LEADTYPE'] = '1' then
+    begin
+      if (Pos(' ' + F.ValueUpper + ' ', kLeadAlways) > 0) or
+         ((Copy(F.ValueUpper, 1, 2) = '__') and (Pos(' ' + F.ValueUpper + ' ', ' ' + kAlways) > 0)) then
+        HandleError(Format('Expected identifier, found ''%s'' (a keyword cannot name a field)', [LowerCase(F.ValueUpper)]), F.Token)
+      else if Strict238 and (F.Attributes.Values['UNIONGRP'] = '') and (F.Attributes.Values['STRUCTGRP'] = '') and
+              (F.ValueUpper <> 'REDIM') and
+              ((Pos(' ' + F.ValueUpper + ' ', ' ' + kAlways) > 0) or (Pos(' ' + F.ValueUpper + ' ', ' ' + kInClass) > 0)) then
+        HandleError(Format('Fields cannot be named as keywords in TYPE''s that contain member functions or in ' +
+          'CLASS''es, found ''%s''', [LowerCase(F.ValueUpper)]), F.Token);
+    end
+    else if Pos(' ' + F.ValueUpper + ' ', ' ' + kAlways) > 0 then
+      HandleError(Format('Expected identifier, found ''%s'' (a keyword cannot name a field)', [LowerCase(F.ValueUpper)]), F.Token)
+    else if Strict238 and (F.Attributes.Values['UNIONGRP'] = '') and (F.Attributes.Values['STRUCTGRP'] = '') and
+            (Pos(' ' + F.ValueUpper + ' ', ' ' + kInClass) > 0) then
+      HandleError(Format('Fields cannot be named as keywords in TYPE''s that contain member functions or in ' +
+        'CLASS''es, found ''%s''', [LowerCase(F.ValueUpper)]), F.Token);
   end;
 end;
 
@@ -7133,6 +7216,12 @@ begin
       IsStaticField := True;
       TokU := UpperFast(VarToStr(Context.CurrentToken.Value));   // re-read: a DIM may follow STATIC
     end;
+    // ⛔ DIVERGENZE 284: "Static Shared As Integer counter" is fbc's "error 4: Duplicated definition, found 'Shared'" - SHARED
+    // is a module-variable word, and a static member is already one storage for every instance. It was taken as a field
+    // NAMED Shared, and the member then answered different values through "D.counter" and "v.counter".
+    if IsStaticField and (TokU = 'SHARED') and (GetEnvironmentVariable('SB_FIELD_KEYWORD') <> '0') then
+      HandleError('Duplicated definition, found ''Shared'' (a STATIC member is already shared by every instance)',
+        Context.CurrentToken);
     // ⛔ "Static ByRef As T1 R1" (DIVERGENZE 269): a static REFERENCE member. BYREF was never consumed, so
     // it became the member's NAME - a static field called BYREF of type T1, and a typeless R1 after it.
     // The member is one reference for the whole program, bound by its definition ("Dim ByRef As T1
@@ -7264,6 +7353,7 @@ begin
       end;
       if IsStaticField then FieldNode.Attributes.Values['STATIC'] := '1';
       if IsStaticByref then FieldNode.Attributes.Values['BYREF'] := '1';
+      if LeadingType then FieldNode.Attributes.Values['LEADTYPE'] := '1';   // "As T name": fbc reads the name differently
       if BitWidth > 0 then FieldNode.Attributes.Values['BITWIDTH'] := IntToStr(BitWidth);
       // "As String * n": the declared capacity. Storage stays variable-length (advisory), but the
       // BINARY layout needs it — fbc gives such a field n+1 bytes on file (the NUL terminator).
@@ -7342,6 +7432,7 @@ begin
           FieldNode.AddChild(TASTNode.CreateWithValue(antIdentifier, FieldTypeName, FieldTok));
           if IsStaticField then FieldNode.Attributes.Values['STATIC'] := '1';
           if IsStaticByref then FieldNode.Attributes.Values['BYREF'] := '1';
+          FieldNode.Attributes.Values['LEADTYPE'] := '1';
           if Assigned(ArrDimNode) then
           begin
             FieldNode.Attributes.Values['ARRAYFIELD'] := '1';
@@ -7381,6 +7472,7 @@ begin
     HandleError(Format('Expected END %s: the end of the source was reached inside %s %s',
       [TokU, TokU, Result.ValueUpper]), Token);
   end;
+  CheckFieldNamesAreNotKeywords(Result);   // DIVERGENZE 296 · 316 · 385
   ConsumeEndType;
   DoNodeCreated(Result);
 end;
