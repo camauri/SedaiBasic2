@@ -560,6 +560,16 @@ type
                               IsPtr: Boolean;   // the call site knew the value is an ADDRESS (DIVERGENZE 551)
                        end;
     FVarArgFrames: array of Integer;   // stack of frame bases; the top one is what CVA_START answers
+    // ⭐ DIVERGENZE 424 - a procedure of the program that C calls with "..." has no BASIC caller to stage its tail: the
+    // tail is in C's registers and stack, saved by the closure. RunClosureBody pushes one of these and a NEGATIVE entry
+    // -(index+1) on FVarArgFrames; CVA_START then answers a TAGGED cursor, and CVA_ARG reads from C by REPLAYING the
+    // kinds asked so far (SysV keeps integers and doubles in separate sequences, so position n depends on 0..n-1).
+    FCVaFrames: array of record
+                  Valid: Boolean;                  // the closure's TAbiVaTail, in plain fields (SedaiAbi is an
+                  Saved, StackArgs: PByte;         // implementation-only unit here)
+                  NGP, NSS, NStack: Integer;
+                  Kinds: array of Byte;   // 1 = integer/pointer, 2 = double; one per tail argument already asked
+                end;
     // ⭐ DIVERGENZE 551: the C va_lists built from a CVA_LIST at a foreign call (ForeignVaList). A small RING, so a
     // callback that builds one while C still reads the caller's does not overwrite it.
     FVaSlots: array[0..7] of array of Int64;
@@ -983,6 +993,7 @@ type
     procedure FilePrintColSet(Handle, Col: Integer);
     function FilePrintColGet(Handle: Integer): Integer;
     function RawLoadZStrVal(RawPtr: Int64; Wide: Boolean): string;      // C string at the raw address, up to NUL
+    procedure CVaArgFromC(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);   // DIVERGENZE 424
     function RawLoadBytesVal(RawPtr: Int64; Count: Integer): string;    // exactly Count bytes at the raw address
     procedure RawStoreZStrVal(RawPtr: Int64; const S: string; Wide: Boolean);  // chars + NUL at the raw address
     function RawStrCellGet(RawPtr: Int64): string;                             // managed String cell at a raw address
@@ -1076,6 +1087,9 @@ type
     // ⛔ Una procedura BASIC e' finita in mano a C, che puo' richiamarla DOPO la fine del programma
     // (DIVERGENZE 517): il front end lo chiede per decidere come uscire.
     property GaveClosureToC: Boolean read FGaveClosureToC;
+    // ⭐ DIVERGENZE 475: the program's atexit handlers, run once at the end of the program (the front end calls it before
+    // deciding whether to tear the VM down; Destroy calls it too, and the list is emptied as it runs).
+    procedure RunProgramExitHandlers;
     property ProgramFile: string read FProgramFile;
     property ProgramDir: string read FProgramDir;
     property InvokeDir: string read FInvokeDir;
@@ -1220,6 +1234,9 @@ uses
   SedaiForeignRuntime, SedaiAbi
   {$IFDEF UNIX}, BaseUnix, Unix{$ENDIF}   // fpgettimeofday (unit Unix): TIMER's microsecond clock (HighResSecondsOfDay)
   {$IFDEF WINDOWS}, Windows{$ENDIF};
+
+const
+  CVA_C_TAG = Int64(1) shl 60;   // DIVERGENZE 424: a CVA_LIST cursor into a frame C opened (frame index << 32 | n)
 
 type
   PSbClosureCtx = ^TSbClosureCtx;
@@ -2098,6 +2115,16 @@ begin
   {$ENDIF}
 end;
 
+procedure TBytecodeVM.RunProgramExitHandlers;
+begin
+  try
+    ForeignRunAtexitHandlers;
+  except
+    on E: Exception do WriteLn(ErrOutput, 'atexit handler: ', E.Message);
+  end;
+  if GetCurrentThreadId = MainThreadID then CStdoutSync;
+end;
+
 destructor TBytecodeVM.Destroy;
 var
   JitI: Integer;
@@ -2111,6 +2138,11 @@ begin
   // m56_threadops.bas simply printed its (correct) output and nobody ever knew a thread had been
   // shot. 📊 Measured before the fix: 33 dead workers in 200 runs at 32-way parallelism.
   // ⭐ Order is the whole fix. Nothing above CleanupWorkers may free anything a worker can reach.
+  // ⭐ DIVERGENZE 475 - ...and before ANYTHING, the program's atexit handlers: they are procedures of the program, and
+  // they run while the VM, its compiled code and the closures' trampolines are all still standing (fbc runs them after
+  // the last line, before the process goes). Every callback re-enters through RunClosureBody, which runs a body even
+  // after the program has ended (517).
+  RunProgramExitHandlers;
   CleanupWorkers;
   for JitI := 0 to High(FNativeLoops) do FNativeLoops[JitI].Free;   // JIT: release executable pages
   for JitI := 0 to High(FNativeFuncs) do FNativeFuncs[JitI].Free;   // AOT: release executable pages
@@ -7790,6 +7822,82 @@ begin
   Move(P^, Result[1], Count);
 end;
 
+procedure TBytecodeVM.CVaArgFromC(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
+// ⭐ DIVERGENZE 424 - CVA_ARG on a cursor CVA_START answered for a call C made: the argument at position n of the C
+// call's variadic tail. SysV keeps integers and doubles in SEPARATE register sequences, so where argument n lives
+// depends on the kinds of 0..n-1: they are REPLAYED from the kinds this frame was asked (an earlier position never
+// asked counts as an integer). Immediate = the asked type's width code (+16 for a pointer): C promotes a narrow
+// integer to int and a float to double, and the upper half of an int's register is undefined, so it is narrowed.
+var
+  Cur: Int64;
+  Fi, N, k, PosGP, PosSS, PosSt, W: Integer;
+  IsF: Boolean;
+  P: PByte;
+  T: TAbiVaTail;
+  V: Int64;
+begin
+  Cur := Ctx.IntRegs[Instr.Src1] and not CVA_C_TAG;
+  Fi := Integer(Cur shr 32);
+  N := Integer(Cur and $FFFFFFFF);
+  IsF := Instr.OpCode = bcVarArgGetFloat;
+  if (Fi < 0) or (Fi > High(FCVaFrames)) or (not FCVaFrames[Fi].Valid) or (N < 0) or (N > 4096) then
+  begin
+    case Instr.OpCode of
+      bcVarArgGetFloat: Ctx.FloatRegs[Instr.Dest] := 0;
+      bcVarArgGetStr:   Ctx.StringRegs[Instr.Dest] := '';
+    else Ctx.IntRegs[Instr.Dest] := 0;
+    end;
+    Exit;
+  end;
+  with FCVaFrames[Fi] do
+  begin
+    if Length(Kinds) <= N then
+    begin
+      k := Length(Kinds);
+      SetLength(Kinds, N + 1);
+      while k <= N do begin Kinds[k] := 1; Inc(k); end;
+    end;
+    if IsF then Kinds[N] := 2 else Kinds[N] := 1;
+    T.Valid := Valid; T.Saved := Saved; T.StackArgs := StackArgs; T.NGP := NGP; T.NSS := NSS; T.NStack := NStack;
+    PosGP := 0; PosSS := 0; PosSt := 0; P := nil;
+    for k := 0 to N do
+      P := AbiVaTailWord(T, Kinds[k] = 2, PosGP, PosSS, PosSt);
+  end;
+  W := Integer(Instr.Immediate and 15);
+  case Instr.OpCode of
+    bcVarArgGetFloat:
+      Ctx.FloatRegs[Instr.Dest] := PDouble(P)^;      // a float travels promoted to double
+    bcVarArgGetStr:
+      // "*Cva_Arg(args, ZString Ptr)": the string at the address C passed
+      if PQWord(P)^ = 0 then Ctx.StringRegs[Instr.Dest] := ''
+      else
+      begin
+        ForeignNoteRegion(Ctx, PtrUInt(PQWord(P)^), 0, True, False);
+        Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(Int64(PQWord(P)^) or FGNPTR_TAG, False);
+      end;
+  else
+    begin
+      V := PInt64(P)^;
+      case W of
+        1: V := ShortInt(V);
+        2: V := Byte(V);
+        3: V := SmallInt(V);
+        4: V := Word(V);
+        5: V := LongInt(V);
+        6: V := LongWord(V);
+      end;
+      // a POINTER C passed is an address of C's memory
+      // ...and readable, as memory C handed over: the same note a DECLARED pointer parameter of a closure gets (239).
+      if ((Instr.Immediate and 16) <> 0) and (V <> 0) then
+      begin
+        ForeignNoteRegion(Ctx, PtrUInt(V), 0, True, False);
+        V := V or FGNPTR_TAG;
+      end;
+      Ctx.IntRegs[Instr.Dest] := V;
+    end;
+  end;
+end;
+
 function TBytecodeVM.RawLoadZStrVal(RawPtr: Int64; Wide: Boolean): string;
 // "*p" where p is a ZSTRING PTR (Wide=False) or WSTRING PTR (Wide=True): the C string AT the
 // pointed address, read up to the NUL terminator - never past the end of the byte heap (a block
@@ -8436,6 +8544,8 @@ var
   SavePC: Int64;
   Instrs: PBytecodeInstruction;
   NInstr: Integer;
+  SaveVaFrames: Integer;   // DIVERGENZE 424
+  VaTail: TAbiVaTail;
 begin
   if (AEntryPC <= 0) or (AEntryPC >= FProgram.GetInstructionCount) then Exit;
   SlotI := 0; SlotF := 0;
@@ -8522,6 +8632,18 @@ begin
   // corpo la rimette a False da se' e ferma questo ciclo, che e' il comportamento voluto.
   SaveRunning := ACtx.Running;
   ACtx.Running := True;
+  // ⭐ DIVERGENZE 424 - the C call's variadic tail, for a body that reads one (cva_start / cva_arg).
+  SetLength(FCVaFrames, Length(FCVaFrames) + 1);
+  VaTail := AbiCurrentVaTail;
+  with FCVaFrames[High(FCVaFrames)] do
+  begin
+    Valid := VaTail.Valid; Saved := VaTail.Saved; StackArgs := VaTail.StackArgs;
+    NGP := VaTail.NGP; NSS := VaTail.NSS; NStack := VaTail.NStack;
+    SetLength(Kinds, 0);
+  end;
+  SetLength(FVarArgFrames, Length(FVarArgFrames) + 1);
+  FVarArgFrames[High(FVarArgFrames)] := -Length(FCVaFrames);
+  SaveVaFrames := Length(FVarArgFrames) - 1;
   try
     while (ACtx.CallStackPtr > SaveDepth) and ACtx.Running and
           (ACtx.PC >= 0) and (ACtx.PC < NInstr) do
@@ -8530,6 +8652,8 @@ begin
       ACtx.PC := ACtx.PC + 1;
     end;
   finally
+    if Length(FVarArgFrames) > SaveVaFrames then SetLength(FVarArgFrames, SaveVaFrames);
+    if Length(FCVaFrames) > 0 then SetLength(FCVaFrames, Length(FCVaFrames) - 1);
     ACtx.Running := SaveRunning;
     ACtx.PC := SavePC;
     // ⛔ Se il corpo e' uscito per un'altra strada (un errore, un END), la pila va comunque rimessa
@@ -12876,8 +13000,15 @@ begin
       end;
     bcVarArgBase:
       // CVA_START: the cursor at the first argument of the frame this call opened.
+      // ⭐ ...and for a frame C opened (DIVERGENZE 424) a TAGGED cursor: the frame's index above bit 32, the position
+      // below. "args + 1" still walks it, and nothing a BASIC caller stages can reach that range.
       if Length(FVarArgFrames) > 0 then
-        Ctx.IntRegs[Instr.Dest] := FVarArgFrames[High(FVarArgFrames)]
+      begin
+        if FVarArgFrames[High(FVarArgFrames)] < 0 then
+          Ctx.IntRegs[Instr.Dest] := CVA_C_TAG or (Int64(-FVarArgFrames[High(FVarArgFrames)] - 1) shl 32)
+        else
+          Ctx.IntRegs[Instr.Dest] := FVarArgFrames[High(FVarArgFrames)];
+      end
       else
         Ctx.IntRegs[Instr.Dest] := 0;
     bcVarArgGetInt, bcVarArgGetFloat, bcVarArgGetStr:
@@ -12885,6 +13016,11 @@ begin
         // CVA_ARG: the slot AT the cursor, converted to the type the callee named. Reading past the
         // end answers a zero/empty value rather than faulting: C would be undefined here, and a
         // diagnosable nothing is the better of the two.
+        if (Ctx.IntRegs[Instr.Src1] and CVA_C_TAG) = CVA_C_TAG then
+        begin
+          CVaArgFromC(Ctx, Instr);   // DIVERGENZE 424: the tail of a call C made
+          Exit;
+        end;
         VaIdx := Integer(Ctx.IntRegs[Instr.Src1]);
         if (VaIdx < 0) or (VaIdx > High(FVarArgs)) then
         begin

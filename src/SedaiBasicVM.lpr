@@ -2334,6 +2334,9 @@ begin
         // ⛔ NIENTE SI SMONTA SE C PUO' ANCORA CHIAMARCI (DIVERGENZE 517): non la VM, e non il bytecode
         // che il suo gestore eseguirebbe. Si esce da libc in fondo al programma e il sistema si riprende
         // tutto un istante dopo - l'unico momento in cui un mancato rilascio non e' un difetto.
+        // ⭐ DIVERGENZE 475 - the program's atexit handlers run HERE, after its last line and before the VM is either
+        // torn down or left for the system: on the second road Destroy never runs.
+        VM.RunProgramExitHandlers;
         GExitThroughLibc := GExitThroughLibc or VM.GaveClosureToC;
         if not GExitThroughLibc then
         begin
@@ -2621,6 +2624,9 @@ begin
         // ⛔ NIENTE SI SMONTA SE C PUO' ANCORA CHIAMARCI (DIVERGENZE 517): non la VM, e non il bytecode
         // che il suo gestore eseguirebbe. Si esce da libc in fondo al programma e il sistema si riprende
         // tutto un istante dopo - l'unico momento in cui un mancato rilascio non e' un difetto.
+        // ⭐ DIVERGENZE 475 - the program's atexit handlers run HERE, after its last line and before the VM is either
+        // torn down or left for the system: on the second road Destroy never runs.
+        VM.RunProgramExitHandlers;
         GExitThroughLibc := GExitThroughLibc or VM.GaveClosureToC;
         if not GExitThroughLibc then
         begin

@@ -200,7 +200,7 @@ command, the v7 meaning is kept in CLASSIC (see SWAP, MID$).
 | `STRING(n,ch)` | ✓ | N copies of a character (also `STRING$`, both dialects) |
 | `IIF(cond, a, b)` | ✓ | Short-circuit conditional expression (only the taken branch is evaluated) |
 | `ENUM ... END ENUM` | ✓ | Named integer constants (auto-increment; member with no value = previous + 1) |
-| `DEFINT`/`DEFLNG`/`DEFBYTE`/`DEFSHORT`/`DEFLNGINT`/`DEFSNG`/`DEFDBL`/`DEFSTR` | ✓ | Default variable type by initial letter, e.g. `DEFINT I-N` |
+| `DEFINT`/`DEFLNG`/`DEFBYTE`/`DEFSHORT`/`DEFLNGINT`/`DEFSNG`/`DEFDBL`/`DEFSTR` | ✓ | Default variable type by initial letter, e.g. `DEFINT I-N`. In MODERN only under `#lang "fblite"`/`"qb"`/`"deprecated"`: in `-lang fb` it is refused, as fbc does (*error 146*), since every declaration states its type there. |
 | `&` / `&=` | ✓ | String concatenation operator and compound assignment |
 | Conversions `CINT`/`CLNG`/`CSHORT`/`CBYTE`/`CDBL`/`CSNG`/`VALINT`/`OCT`/`BIN`... | ✓ | FreeBASIC type conversions (B1.3) |
 | `LBOUND`/`UBOUND`/`ERASE`/`REDIM [PRESERVE]` | ✓ | FreeBASIC array operations (B1.4) |
@@ -804,11 +804,15 @@ BASIC v7); otherwise it is **MODERN** (SedaiBasic's own dialect, FreeBASIC-compa
 overlap; `-lang fb`). A `.fb`/`.fbas` extension forces MODERN.
 
 - **CLASSIC**: every variable is global by name (v7 semantics) — unchanged.
-- **MODERN**: lexical scope. Only **explicit declarations** are scoped; implicit (never-`DIM`'d)
-  variables remain global-by-name at procedure/module level (so classic-style code keeps working).
-  - A plain module-level `DIM` is **not** visible inside a `SUB`/`FUNCTION`. Use `DIM SHARED` to make it
-    visible (a UDT instance is shared by its handle; arrays live in global storage), or pass it as a
-    parameter. A UDT/array follows the same rule as a scalar.
+- **MODERN**: lexical scope, and **every variable is declared**, as in `fbc -lang fb`. A name the program
+  never declares is refused at compile time with `Variable not declared, <name>` (fbc's *error 42*) instead
+  of becoming a variable that reads 0 (changed 4 Oct 2026). A source that asks for `#lang "qb"`, `"fblite"`
+  or `"deprecated"` keeps implicit variables. ⚠ The check covers the whole program, not the ORDER of its
+  declarations: a use before its `DIM`, or outside the scope of a `FOR i AS <type>`, is not yet refused.
+  - A plain module-level `DIM` is **not** visible inside a `SUB`/`FUNCTION`: reading it there is the same
+    *error 42*. Use `DIM SHARED` to make it visible (a UDT instance is shared by its handle; arrays live in
+    global storage), pass it as a parameter, or declare a local of the same name, which shadows it. A
+    UDT/array follows the same rule as a scalar.
   - A `DIM` inside a block (`IF`/`ELSE` branch, `FOR`/`DO`/`WHILE` body, `BEGIN`/`BEND`) is **block-local**:
     it shadows an outer same-name variable for the rest of the block and is destroyed (UDT destructor
     runs) at the block end. `EXIT`/`RETURN` unwind block-local objects innermost-first before the frame.

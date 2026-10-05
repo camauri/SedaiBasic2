@@ -132,6 +132,7 @@ type
     FConstRetProcs: TStringList;   // DIVERGENZE 590: FUNCTIONs / DECLAREs whose result is "As Const <type>"
     FForeignDefaults: TStringList;   // DIVERGENZE 557: NAME=encoded defaults of a foreign declaration's parameters
     FForeignRedecls: TStringList;   // DIVERGENZE 552: "<line>=<row>" of a foreign name declared again after #undef
+    FExternNames: TStringList;         // every name a single-line EXTERN mentions (DIVERGENZE 324/465: not an implicit)
     FForeignDataArrays: TStringList;   // DIVERGENZE 441: "NAME=symbol|T|lb:ub,..." - the data ARRAYS of C libraries
     // ⛔ EVERY TYPE NAME A "DECLARE" NAMES, with the line it stands on. fbc's single pass refuses a
     // declaration whose return or parameter type has not been declared ("error 14: Expected
@@ -172,6 +173,7 @@ type
     // and taking its address (@T.f) yields a procedure whose arity does not match the call.
     // FreeBASIC requires the declaration to precede the definition, so a single forward pass suffices.
     FTypeStaticMethods: TStringList;
+    FAllStaticMethods: TStringList;      // DIVERGENZE 661: "TYPE.METHOD" of EVERY static method (any access)
     FStaticMemberProcs: TStringList;   // "TYPE.NAME" of every "Declare Static Sub|Function" seen in a TYPE body.
     // ⭐ Every TYPE name a TYPE/UNION/CLASS declaration introduced, and every MEMBER PROCEDURE each of
     // them DECLARED, as "TYPE.MEMBERKEY". A member may only be DEFINED out of line if its type
@@ -377,6 +379,8 @@ type
     function ParseProgram: TASTNode;
     procedure DedupNumberedLines(ProgramNode: TASTNode);
     function ParseStatement: TASTNode;
+    function ParseStatementBody: TASTNode;
+    function StatementEndsHere: Boolean;   // DIVERGENZE 646
 
     function ParseAssignmentStatement: TASTNode;
 
@@ -494,6 +498,9 @@ type
     function ParseRemStatement: TASTNode;
     function StaticMemberBodyRestatesNamespace(const DottedName: string): Boolean;  // DIVERGENZE 93
     function ParseDimStatement: TASTNode;
+    function DottedNameThenParen: Boolean;   // "A.b.c(" ahead? (DIVERGENZE 659)
+    function LeadAsStaticArrayDef(Decl: TASTNode; Tok: TLexerToken): TASTNode;   // (659)
+    function NameTokOf(Decl: TASTNode): TLexerToken;
     // VAR x = expr (FreeBASIC): declare a variable with type inferred from the initializer (SSA side).
     function ParseVarStatement: TASTNode;
     // STATIC x AS t [= expr] (FreeBASIC): a local with persistent storage across calls.
@@ -719,6 +726,9 @@ begin
   FForeignDefaults := TStringList.Create;
   FForeignRedecls := TStringList.Create;
   FForeignDataArrays := TStringList.Create;
+  FExternNames := TStringList.Create;
+  FExternNames.Sorted := True;
+  FExternNames.Duplicates := dupIgnore;
   FDeclTypeUses := TStringList.Create;
   FForwardDeclNames := TStringList.Create;
   FForwardDeclNames.CaseSensitive := False;
@@ -772,6 +782,10 @@ begin
   FConstIntValues := TIndexedStringList.Create;
   FConstIntValues.CaseSensitive := False;
   FTypeStaticMethods := TStringList.Create;
+  FAllStaticMethods := TStringList.Create;
+  FAllStaticMethods.CaseSensitive := False;
+  FAllStaticMethods.Sorted := True;
+  FAllStaticMethods.Duplicates := dupIgnore;
   FTypeStaticMethods.CaseSensitive := False;
   FTypeStaticMethods.Sorted := True;
   FTypeNamesSeen := TStringList.Create;       FTypeNamesSeen.CaseSensitive := False;
@@ -827,6 +841,7 @@ begin
   FHeaderRoutines.Free;
   FGatedDeclared.Free;
   FForeignDataArrays.Free;
+  FExternNames.Free;
   FDeclTypeUses.Free;
   FForwardDeclNames.Free;
   FProcSeen.Free;
@@ -844,6 +859,7 @@ begin
   FConstTypes.Free;
   FConstIntValues.Free;
   FTypeStaticMethods.Free;
+  FAllStaticMethods.Free;
   FTypeNamesSeen.Free;
   FTypeAliasOf.Free;
   FEnumNamesSeen.Free;
@@ -1582,6 +1598,7 @@ begin
   // so one parser, for the whole session - LOAD, NEW, LOAD again all go through it.
   FConstIntValues.Clear;
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
+  FAllStaticMethods.Clear;
   FTypeNamesSeen.Clear; FEnumNamesSeen.Clear; FTypeDeclaredMembers.Clear; FTypesInNamespace.Clear;
   FTypeAliasOf.Clear;
   FStaticMemberProcs.Clear;
@@ -1687,6 +1704,7 @@ begin
   // so one parser, for the whole session - LOAD, NEW, LOAD again all go through it.
   FConstIntValues.Clear;
   FTypeStaticMethods.Clear;  // ...and the static-member map (per-program, parser instance is reused)
+  FAllStaticMethods.Clear;
   FTypeNamesSeen.Clear; FEnumNamesSeen.Clear; FTypeDeclaredMembers.Clear; FTypesInNamespace.Clear;
   FTypeAliasOf.Clear;
   FStaticMemberProcs.Clear;
@@ -1867,6 +1885,8 @@ begin
  if FForeignRedecls.Count > 0 then
    Result.Attributes.Values['FGNREDECL'] := StringReplace(FForeignRedecls.Text, sLineBreak, ';', [rfReplaceAll]);
  // ...and the data ARRAYS of C libraries (DIVERGENZE 441), which have no node either.
+ if FExternNames.Count > 0 then
+   Result.Attributes.Values['EXTERNNAMES'] := StringReplace(FExternNames.Text, sLineBreak, ';', [rfReplaceAll]);
  if FForeignDataArrays.Count > 0 then
    Result.Attributes.Values['FGNDATAARRS'] := StringReplace(FForeignDataArrays.Text, sLineBreak, ';', [rfReplaceAll]);
  // ⭐ ...and so do the TYPE NAMES every DECLARE mentions: the SSA is the only pass that knows which
@@ -1988,7 +2008,43 @@ begin
   end;
 end;
 
+function TPackratParser.StatementEndsHere: Boolean;
+// Does the statement just parsed END here, as -lang fb requires? End of line, ':', end of file, a comment, or the
+// ELSE of a single-line IF.
+begin
+  Result := (Context.CurrentToken = nil) or
+    (Context.CurrentToken.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse,
+                                        ttCommentRemark, ttCommentStart, ttCommentText]) or
+    // ...or the statement consumed its own terminator: "While c :" and "Dim a = 1 :" eat the ':' themselves, and what
+    // follows is the next statement.
+    (Assigned(Context.PeekToken(-1)) and (Context.PeekToken(-1).TokenType in [ttEndOfLine, ttSeparStmt]));
+end;
+
 function TPackratParser.ParseStatement: TASTNode;
+// ⛔ DIVERGENZE 646 (with 315 and 322) - in MODERN a COMPLETE statement followed by more tokens on the same line, with no
+// ':', is fbc's "error 3: Expected End-of-Line": "y = 5 z", "Print 7 x", "Return 4 k". Here the rest was read as ANOTHER
+// statement - most often an implicit variable - and the line ran. And "7ui", "7s", "300B" are this rule too: a number
+// against a KEYWORD is valid in fbc ("7Mod 2"), what it refuses is the identifier left over after the expression.
+// CLASSIC is untouched: in Commodore BASIC "PRINT 7 X" is valid. STMTEOL_DIAG=1 PRINTS each case and refuses nothing
+// (the census); SB_STMT_EOL=0 is the A/B.
+var
+  StartIdx: Integer;
+begin
+  StartIdx := Context.CurrentIndex;
+  Result := ParseStatementBody;
+  if (not FModernMode) or (Context.CurrentIndex = StartIdx) or StatementEndsHere then Exit;
+  // "If cond" and its "Then" are two statements of this parser (ParseIfStatement / ParseThenStatement).
+  if Assigned(Result) and (Result.NodeType = antIf) and Context.Check(ttConditionalThen) then Exit;
+  if SourceDeclaresNonFbDialect then Exit;
+  if GetEnvironmentVariable('STMTEOL_DIAG') <> '' then
+  begin
+    WriteLn(ErrOutput, 'STMTEOL ', Context.CurrentToken.Line, ':', Context.CurrentToken.Column, ' found "',
+            VarToStr(Context.CurrentToken.Value), '" type=', Ord(Context.CurrentToken.TokenType));
+    Exit;
+  end;
+end;
+
+function TPackratParser.ParseStatementBody: TASTNode;
 var
   Token: TLexerToken;
   ErrorToken: TLexerToken;
@@ -2182,6 +2238,14 @@ begin
    FgnByVal := False; FgnLastDecl := -1;
    if Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) then
      FgnIsFunc := UpperFast(VarToStr(Context.PeekNext.Value)) = kFUNCTION;
+   // ⛔ DIVERGENZE 657 - "Declare Sub|Function" is followed by a NAME. A function-like macro of the same name, defined
+   // above, has already been expanded by the preprocessor and left "Declare Function (byval ...)": fbc's "error 14:
+   // Expected identifier, found '('". The line used to be skipped whole. SB_DECLARE_NAME=0 is the A/B.
+   if FModernMode and Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttProcedureStart) and
+      Assigned(Context.PeekToken(2)) and (Context.PeekToken(2).TokenType = ttDelimParOpen) and
+      (GetEnvironmentVariable('SB_DECLARE_NAME') <> '0') then
+     HandleError('Expected identifier, found ''('': a DECLARE names its procedure (a function-like macro of that ' +
+       'name, defined above, expands here)', Context.PeekToken(2));
    FgnNameRaw := '';
    if Assigned(Context.PeekToken(2)) then
    begin
@@ -2507,7 +2571,14 @@ begin
      // and REWINDS; the skip below is unchanged, so not one token of the old behaviour moves.
      FPendingExternArray := nil;
      if AtModuleLevel and (SameText(Token.Value, 'EXTERN')) then ScanModuleLevelExtern;
-     while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do Context.Advance;
+     // ...and every name the line mentions is remembered: the declaration is thrown away, so a read of the name reaches
+     // the SSA's variable fallback, and that is where an UNDECLARED name is refused (DIVERGENZE 324/465). Over-collecting
+     // (the type names) only makes that rule more lenient.
+     while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+     begin
+       if Context.Check(ttIdentifier) then FExternNames.Add(UpperFast(VarToStr(Context.CurrentToken.Value)));
+       Context.Advance;
+     end;
      // ...and the ONE thing a lone EXTERN cannot throw away with the rest of the line: the storage an
      // EXTERN ARRAY the module never defines still owes the SSA. See ScanModuleLevelExtern.
      if Assigned(FPendingExternArray) then
@@ -5112,6 +5183,7 @@ begin
         // did not - the same shape the comment above already names for the parse.
         NameNode.Attributes.Values['FUNCPTR']     := ProcPtrRet.Attributes.Values['FUNCPTR'];
         NameNode.Attributes.Values['FPPARAMS']    := ProcPtrRet.Attributes.Values['FPPARAMS'];
+        NameNode.Attributes.Values['FPMODES'] := ProcPtrRet.Attributes.Values['FPMODES'];
         NameNode.Attributes.Values['FPRET']       := ProcPtrRet.Attributes.Values['FPRET'];
         NameNode.Attributes.Values['FPRETBYREF']  := ProcPtrRet.Attributes.Values['FPRETBYREF'];
         NameNode.Attributes.Values['FPDEFAULTS'] := ProcPtrRet.Attributes.Values['FPDEFAULTS'];   // (534)
@@ -5169,6 +5241,8 @@ begin
   // only the METHOD had nowhere to read the answer from.
   if (MethodType <> '') and Assigned(Result) and (FStaticMemberProcs.IndexOf(QualName) >= 0) then
     Result.Attributes.Values['STATICMETH'] := '1';
+  if (MethodType <> '') and Assigned(Result) and (FAllStaticMethods.IndexOf(QualName) >= 0) then
+    Result.Attributes.Values['STATICANY'] := '1';   // DIVERGENZE 661, any access
 
   if (Kind = kCONSTRUCTOR) and Assigned(NameNode) then
     NameNode.Value := QualName + '#' + ProcSigFromParams(ParamList, True, True, True);   // True: skip the implicit THIS
@@ -5841,6 +5915,7 @@ function TPackratParser.TryParseProcPtrType(Node: TASTNode): Boolean;
 // holds a procedure entry PC), so no type child is attached. Returns False (consuming nothing) if the
 // current token is not FUNCTION/SUB.
 var
+  ParamMode, Modes: string;   // DIVERGENZE 201: 'V' BYVAL, 'R' BYREF, '-' unstated, one per parameter
   IsFunc, AnyDefault: Boolean;
   KindU, PT, ParamTypes, Defaults, Def: string;
   LoopMark, TypeOfMark: Integer;
@@ -5906,6 +5981,7 @@ begin
          (SameText(VarToStr(Context.CurrentToken.Value), 'THISCALL'))) do
     Context.Advance;
   ParamTypes := '';
+  Modes := '';
   if Context.Check(ttDelimParOpen) then
   begin
     Context.Advance;                                 // (
@@ -5919,7 +5995,13 @@ begin
       // ⇒ The cursor is remembered here and forced forward at the bottom of the body. A shape nobody
       // thought of then produces a DIAGNOSTIC downstream instead of a hang, which is the safe direction.
       LoopMark := Context.CurrentIndex;
-      if Context.Check(ttParamMode) then Context.Advance;  // optional BYVAL/BYREF
+      // ...and WHICH one is remembered (FPMODES, DIVERGENZE 201): an incomplete type is fbc's error 71 only BYVAL.
+      ParamMode := '-';
+      if Context.Check(ttParamMode) then
+      begin
+        if SameText(VarToStr(Context.CurrentToken.Value), 'BYVAL') then ParamMode := 'V' else ParamMode := 'R';
+        Context.Advance;                             // optional BYVAL/BYREF
+      end;
       // Optional parameter name before AS (FB allows both "as integer" and "x as integer").
       if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
          (UpperFast(VarToStr(Context.PeekNext.Value)) = kAS) then
@@ -5978,6 +6060,7 @@ begin
         end;
         ParamTypes := ParamTypes + PT;
         Defaults := Defaults + Def;
+        Modes := Modes + ParamMode;
       end;
       if Context.Check(ttSeparParam) then Context.Advance;   // ,
       // ...and the guarantee itself: nothing recognised this token, so step over it rather than spin.
@@ -5987,6 +6070,7 @@ begin
   end;
   Node.Attributes.Values['FUNCPTR'] := '1';
   Node.Attributes.Values['FPPARAMS'] := ParamTypes;
+  Node.Attributes.Values['FPMODES'] := Modes;
   if AnyDefault then Node.Attributes.Values['FPDEFAULTS'] := Defaults;
   Node.Attributes.Values['FPRET'] := '';
   // "Function(...) ByRef As R": the RETURN may be a reference, and the word stands between the parameter
@@ -6485,6 +6569,10 @@ begin
     // four. The access of this very declaration is in hand here; nothing else has to be asked.
     if IsStatic and Assigned(TypeNode) and ((CurAccess = '') or (CurAccess = 'PUBLIC')) then
       FStaticMemberProcs.Add(TypeNode.ValueUpper + '.' + MethName);
+    // ...and EVERY static method, of any access (DIVERGENZE 661): its ADDRESS needs an entry without THIS, and a
+    // Private one is no less static. Kept apart from the set above, whose PUBLIC-only rule is about module ctors.
+    if IsStatic and Assigned(TypeNode) then
+      FAllStaticMethods.Add(TypeNode.ValueUpper + '.' + MethName);
   end;
   // Walk what is left of the declaration, collecting the parameters' DEFAULT values on the way — they
   // are stated here and nowhere else, and the definition needs them. Parenthesis depth is tracked so a
@@ -6749,7 +6837,7 @@ var
   NoDeclKey: string;    // the member key of a CONSTRUCTOR/DESTRUCTOR/OPERATOR/PROPERTY written with no DECLARE
   PrevIdx, NestedUnionDepth, UnionGrpSeq, UnionGrpCur, BitWidth: Integer;
   NestedStructDepth, StructGrpCur: Integer;
-  FieldTypeName, TokU, AliasType, FpParams, FpRet: string;
+  FieldTypeName, TokU, AliasType, FpParams, FpRet, FpModes, FpRetByRef: string;
   AliasNode: TASTNode;   // "Type a As Integer, b As Double": the extra aliases of a comma list
   IsStaticField, IsStaticByref, LeadingType, FpIsFP, IsRedimField: Boolean;
   CurAccess: string;   // the Public:/Private:/Protected: section currently in force
@@ -7265,7 +7353,7 @@ begin
     FieldTypeName := '';                            // empty => infer by suffix
     FLastFieldFixedLen := 0;                        // "As String * n" capacity of THIS field (0 = none)
     LeadingType := False;
-    FpIsFP := False; FpParams := ''; FpRet := '';   // funcptr field ("fn As Function(...) As R")
+    FpIsFP := False; FpParams := ''; FpRet := ''; FpModes := ''; FpRetByRef := '';   // funcptr field ("fn As Function(...) As R")
     ArrDimNode := nil;
     // "As-first" form: "As <type> name(dims)" (the common FB form). Read the type before the name.
     if Context.Check(ttAsType) then
@@ -7289,6 +7377,8 @@ begin
         begin
           FpIsFP := True;
           FpParams := FpTmp.Attributes.Values['FPPARAMS'];
+          FpModes := FpTmp.Attributes.Values['FPMODES'];
+          FpRetByRef := FpTmp.Attributes.Values['FPRETBYREF'];
           FpRet := FpTmp.Attributes.Values['FPRET'];
           FieldTypeName := 'INTEGER';               // the field slot holds the procedure entry PC
           while AtPointerSuffix do Context.Advance;
@@ -7347,6 +7437,8 @@ begin
           begin
             FpIsFP := True;
             FpParams := FpTmp.Attributes.Values['FPPARAMS'];
+          FpModes := FpTmp.Attributes.Values['FPMODES'];
+          FpRetByRef := FpTmp.Attributes.Values['FPRETBYREF'];
             FpRet := FpTmp.Attributes.Values['FPRET'];
             FieldTypeName := 'INTEGER';             // the field slot holds the procedure entry PC
             // ⛔ "TypeOf( Sub(...) ) PTR" leaves its PTR suffix standing: a pointer to a procedure
@@ -7371,6 +7463,8 @@ begin
       begin
         FieldNode.Attributes.Values['FUNCPTR'] := '1';
         FieldNode.Attributes.Values['FPPARAMS'] := FpParams;
+        FieldNode.Attributes.Values['FPMODES'] := FpModes;
+        if FpRetByRef <> '' then FieldNode.Attributes.Values['FPRETBYREF'] := FpRetByRef;
         FieldNode.Attributes.Values['FPRET'] := FpRet;
       end;
       if IsStaticField then FieldNode.Attributes.Values['STATIC'] := '1';
@@ -15224,6 +15318,7 @@ begin
             AddCLibraryData('INTEGER');                 // what a procedure pointer is stored as, as for a Dim
             Decl.Attributes.Values['FUNCPTR'] := '1';
             Decl.Attributes.Values['FPPARAMS'] := FpNode.Attributes.Values['FPPARAMS'];
+            Decl.Attributes.Values['FPMODES'] := FpNode.Attributes.Values['FPMODES'];
             Decl.Attributes.Values['FPRET'] := FpNode.Attributes.Values['FPRET'];
             Decl.Attributes.Values['FPRETBYREF'] := FpNode.Attributes.Values['FPRETBYREF'];
             Decl.Attributes.Values['FPDEFAULTS'] := FpNode.Attributes.Values['FPDEFAULTS'];
@@ -15708,6 +15803,75 @@ begin
             (UpperFast(Copy(DottedName, 1, Length(FNsPrefix) + 1)) = UpperFast(FNsPrefix) + '.');
 end;
 
+function TPackratParser.DottedNameThenParen: Boolean;
+// Is the cursor on "name.seg[.seg...](" - a qualified name followed by a dimension list? Looks ahead only.
+var
+  k: Integer;
+  T: TLexerToken;
+begin
+  Result := False;
+  k := 1;
+  while True do
+  begin
+    T := Context.PeekToken(k);
+    if (T = nil) or (T.TokenType <> ttOpDot) then Break;
+    T := Context.PeekToken(k + 1);
+    if (T = nil) or (Length(VarToStr(T.Value)) = 0) or not (UpCase(VarToStr(T.Value)[1]) in ['A'..'Z', '_']) then Exit;
+    Inc(k, 2);
+  end;
+  if k = 1 then Exit;
+  T := Context.PeekToken(k);
+  Result := (T <> nil) and (T.TokenType = ttDelimParOpen);
+end;
+
+function TPackratParser.NameTokOf(Decl: TASTNode): TLexerToken;
+begin
+  Result := Decl.Token;
+  if (Decl.ChildCount >= 1) and Assigned(Decl.GetChild(0).Token) then Result := Decl.GetChild(0).Token;
+end;
+
+function TPackratParser.LeadAsStaticArrayDef(Decl: TASTNode; Tok: TLexerToken): TASTNode;
+// "Dim As T UDT.arr(lb To ub) = { v0, v1, ... }" (DIVERGENZE 659): an antBlock of "UDT.arr(lb + k) = vk", the shape the
+// name-first spelling builds. nil when there is no initializer (the member array already exists) or when its shape is
+// not one dimension with a constant lower bound - then nothing is emitted, as for the bare definition.
+var
+  Dims, Init, Rng, Idx, Elem, Asg, Ma: TASTNode;
+  k: Integer;
+  Lb: Int64;
+begin
+  Result := nil;
+  Dims := nil; Init := nil;
+  for k := 1 to Decl.ChildCount - 1 do
+    if Decl.GetChild(k).NodeType = antDimensions then Dims := Decl.GetChild(k)
+    else if (Decl.GetChild(k).NodeType = antArgumentList) and (Decl.Attributes.Values['ARRAYINIT'] = '1') then
+      Init := Decl.GetChild(k);
+  if (Init = nil) or (Dims = nil) or (Dims.ChildCount <> 1) then Exit;
+  Rng := Dims.GetChild(0);
+  Lb := 0;
+  if Rng.NodeType = antDimRange then
+  begin
+    if (Rng.ChildCount < 1) or (Rng.GetChild(0).NodeType <> antLiteral) or
+       not TryStrToInt64(VarToStr(Rng.GetChild(0).Value), Lb) then Exit;
+  end;
+  Ma := Decl.GetChild(0);
+  if (Ma.ChildCount >= 1) and (Ma.GetChild(0).NodeType = antIdentifier) then
+    Ma.GetChild(0).Attributes.Values['STATICMEMBERDEF'] := '1';
+  Result := TASTNode.Create(antBlock, Tok);
+  for k := 0 to Init.ChildCount - 1 do
+  begin
+    Idx := TASTNode.Create(antArgumentList, Tok);
+    Idx.AddChild(TASTNode.CreateWithValue(antLiteral, Lb + k, Tok));
+    Elem := TASTNode.Create(antArrayAccess, Tok);
+    Elem.AddChild(Ma.Clone);
+    Elem.AddChild(Idx);
+    Asg := TASTNode.Create(antAssignment, Tok);
+    Asg.AddChild(Elem);
+    Asg.AddChild(Init.GetChild(k).Clone);
+    Result.AddChild(Asg);
+  end;
+  DoNodeCreated(Result);
+end;
+
 function TPackratParser.ParseDimStatement: TASTNode;
 var
   StaticLB, StaticK: Integer;        // DIVERGENZE 94: the member array's lower bound, and the element index
@@ -15722,6 +15886,7 @@ var
   ArrayDecl, VarNameNode, TypeNode, CtorArgs, ArgExpr, InitExpr, AddrNode, FuncPtrSigNode, LeadingTypeOfExpr: TASTNode;
   TrailingTypeOfExpr: TASTNode;   // "name As TypeOf(expr)": the operand, consumed per declared name
   SharedFpNode: TASTNode;   // leading-AS "Dim As Sub(...) g": the shared funcptr signature
+  LeadStaticDef: TASTNode;   // DIVERGENZE 659: "Dim As T UDT.arr(dims) = {...}"
   MemberAccess, StaticDef: TASTNode;   // "Dim As T Type.member = init": static member definition
   IsShared, IsByref, LeadingAS, IsTuple, HadComma: Boolean;
   DimTypeName, SharedTypeName, SharedFixedLen: string;
@@ -15918,8 +16083,12 @@ begin
     // Leading-AS array declaration: "DIM [SHARED] AS type name(dims)". Route to ParseArrayDeclaration
     // (which handles the dimension list, including "lo TO hi" ranges and negative lower bounds) and
     // inject the shared type when no explicit "AS type" follows the array.
+    // ⭐ DIVERGENZE 659 - ...and a DOTTED name too, "Dim As Integer UDT.tbl(0 To 2) = {...}": the definition of a static
+    // member array. Only "name(" was asked, so the dotted one fell to the scalar branch and its dimensions were read as
+    // an expression ("Expected ')' after expression"); the name-first spelling already went through ParseArrayDeclaration.
     if LeadingAS and Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
-       (Context.PeekNext.TokenType = ttDelimParOpen) then
+       ((Context.PeekNext.TokenType = ttDelimParOpen) or
+        ((GetEnvironmentVariable('SB_LEADAS_DOTTED') <> '0') and DottedNameThenParen)) then
     begin
       ArrayDecl := ParseArrayDeclaration;
       if not Assigned(ArrayDecl) then Break;
@@ -15940,6 +16109,7 @@ begin
       begin
         ArrayDecl.Attributes.Values['FUNCPTR'] := '1';
         ArrayDecl.Attributes.Values['FPPARAMS'] := SharedFpNode.Attributes.Values['FPPARAMS'];
+        ArrayDecl.Attributes.Values['FPMODES'] := SharedFpNode.Attributes.Values['FPMODES'];
         ArrayDecl.Attributes.Values['FPRET'] := SharedFpNode.Attributes.Values['FPRET'];
         ArrayDecl.Attributes.Values['FPRETBYREF'] := SharedFpNode.Attributes.Values['FPRETBYREF'];
         ArrayDecl.Attributes.Values['FPDEFAULTS'] := SharedFpNode.Attributes.Values['FPDEFAULTS'];   // (534)
@@ -15950,6 +16120,25 @@ begin
         end;
       end;
       if IsShared then ArrayDecl.Attributes.Values['SHARED'] := '1';
+      // ⭐ DIVERGENZE 659 - a DOTTED name is the DEFINITION of a static member array, which already exists (the TYPE
+      // declared it): not a Dim of anything. Its "= { ... }" becomes one assignment per element, exactly what the
+      // name-first spelling builds (DIVERGENZE 94); without one there is nothing to emit.
+      if (ArrayDecl.ChildCount >= 1) and (ArrayDecl.GetChild(0).NodeType = antMemberAccess) then
+      begin
+        LeadStaticDef := LeadAsStaticArrayDef(ArrayDecl, NameTokOf(ArrayDecl));
+        ArrayDecl.Free;
+        // The definition alone on its line IS the statement (a block, as the name-first spelling answers): the SSA
+        // reads only declarations inside a Dim.
+        if Assigned(LeadStaticDef) and (Result.ChildCount = 0) and not Context.Check(ttSeparParam) then
+        begin
+          Result.Free;
+          Result := LeadStaticDef;
+          Exit;
+        end;
+        if Assigned(LeadStaticDef) then Result.AddChild(LeadStaticDef);
+        if Context.Check(ttSeparParam) then begin Context.Advance; Continue; end;
+        Break;
+      end;
       Result.AddChild(ArrayDecl);
       if Context.Check(ttSeparParam) then begin Context.Advance; Continue; end;
       Break;
@@ -16366,6 +16555,7 @@ begin
       begin
         ArrayDecl.Attributes.Values['FUNCPTR'] := '1';
         ArrayDecl.Attributes.Values['FPPARAMS'] := FuncPtrSigNode.Attributes.Values['FPPARAMS'];
+        ArrayDecl.Attributes.Values['FPMODES'] := FuncPtrSigNode.Attributes.Values['FPMODES'];
         ArrayDecl.Attributes.Values['FPRET'] := FuncPtrSigNode.Attributes.Values['FPRET'];
         // ...and WHETHER that return is a reference. Carried beside FPRET at BOTH copy sites, or
         // the trailing spelling honoured "ByRef As R" and the leading-AS one handed back the address.
@@ -16383,6 +16573,7 @@ begin
       begin
         ArrayDecl.Attributes.Values['FUNCPTR'] := '1';
         ArrayDecl.Attributes.Values['FPPARAMS'] := SharedFpNode.Attributes.Values['FPPARAMS'];
+        ArrayDecl.Attributes.Values['FPMODES'] := SharedFpNode.Attributes.Values['FPMODES'];
         ArrayDecl.Attributes.Values['FPRET'] := SharedFpNode.Attributes.Values['FPRET'];
         // ...and WHETHER that return is a reference. Carried beside FPRET at BOTH copy sites, or
         // the trailing spelling honoured "ByRef As R" and the leading-AS one handed back the address.
@@ -16728,6 +16919,8 @@ var
   DeclNode, NameNode, TypeNd, Init, Dims: TASTNode;
   StaticTypeName, StaticFixedLen, StaticDottedName: string;
   StaticAddrNd: TASTNode;
+  StaticArgs: TASTNode;    // DIVERGENZE 486 (2): "= T( args )" read as the constructor shorthand
+  k: Integer;
   IsShared: Boolean;   // "Static Shared ...": both modifiers on one declaration
   IsByrefStatic: Boolean;  // ...and "Static Shared ByRef As T r = target"
   StaticVarIdx: Integer;   // "Static Var v = e": stamping the modifiers onto what VAR produced
@@ -16863,8 +17056,21 @@ begin
       if not Context.Check(ttIdentifier) then Break;
       NameTok := Context.CurrentToken;
       Context.Advance;                               // name
+      // ⭐ DIVERGENZE 659 - ...and the DEFINITION of a static member, "Static As Integer UDT.tbl(0 To 2) = {...}", has a
+      // dotted name here too, as the name-first spelling below has always read: the '.' was left behind and the
+      // dimensions were read as an expression ("Expected ')' after array indices"). SB_LEADAS_DOTTED=0 is the A/B.
+      StaticDottedName := UpperFast(VarToStr(NameTok.Value));
+      if GetEnvironmentVariable('SB_LEADAS_DOTTED') <> '0' then
+        while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
+              (Length(VarToStr(Context.PeekNext.Value)) > 0) and
+              (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
+        begin
+          Context.Advance;                           // '.'
+          StaticDottedName := StaticDottedName + '.' + UpperFast(VarToStr(Context.CurrentToken.Value));
+          Context.Advance;                           // segment
+        end;
       DeclNode := TASTNode.Create(antArrayDecl, NameTok);
-      DeclNode.AddChild(TASTNode.CreateWithValue(antIdentifier, UpperFast(NameTok.Value), NameTok));
+      DeclNode.AddChild(TASTNode.CreateWithValue(antIdentifier, StaticDottedName, NameTok));
       Dims := ParseStaticDims;                       // "STATIC AS type a(dims)": array with static storage
       if Assigned(Dims) then
       begin
@@ -16911,6 +17117,7 @@ begin
       begin
         DeclNode.Attributes.Values['FUNCPTR'] := '1';
         DeclNode.Attributes.Values['FPPARAMS'] := StaticFpNode.Attributes.Values['FPPARAMS'];
+        DeclNode.Attributes.Values['FPMODES'] := StaticFpNode.Attributes.Values['FPMODES'];
         DeclNode.Attributes.Values['FPRET'] := StaticFpNode.Attributes.Values['FPRET'];
         DeclNode.Attributes.Values['FPRETBYREF'] := StaticFpNode.Attributes.Values['FPRETBYREF'];
         DeclNode.Attributes.Values['FPDEFAULTS'] := StaticFpNode.Attributes.Values['FPDEFAULTS'];   // (534)
@@ -17031,6 +17238,23 @@ begin
           end;
           Init := StaticAddrNd;
         end;
+        // ⭐ DIVERGENZE 486 (2) - "Static s As T = T( args )" is the CONSTRUCTOR shorthand, as it is for a Dim: fbc builds s
+        // in place. Read as an ordinary initializer it went through a TEMPORARY - default constructor, the constructor
+        // with the value, the temporary's destructor: " c0 c 10 d 10" where fbc prints " c 10". Given the Dim's own form
+        // (CTORNAME + the argument list). SB_STATIC_INPLACE=0 is the A/B.
+        if Assigned(Init) and (not IsByrefStatic) and (Init.NodeType = antArrayAccess) and (Init.ChildCount >= 1) and
+           (Init.GetChild(0).NodeType = antIdentifier) and (Init.GetChild(0).ValueUpper = UpperFast(StaticTypeName)) and
+           (not IsBuiltinTypeName(UpperFast(StaticTypeName))) and
+           (GetEnvironmentVariable('SB_STATIC_INPLACE') <> '0') then
+        begin
+          StaticArgs := TASTNode.Create(antArgumentList, NameTok);
+          if Init.ChildCount >= 2 then
+            for k := 0 to Init.GetChild(1).ChildCount - 1 do
+              StaticArgs.AddChild(Init.GetChild(1).GetChild(k).Clone);
+          Init.Free;
+          Init := StaticArgs;
+          DeclNode.Attributes.Values['CTORNAME'] := '1';
+        end;
         if Assigned(Init) then
           DeclNode.AddChild(Init);                   // child[2] = once-only initializer expression
       end;
@@ -17043,6 +17267,7 @@ begin
     begin
       DeclNode.Attributes.Values['FUNCPTR'] := '1';
       DeclNode.Attributes.Values['FPPARAMS'] := StaticFpNode.Attributes.Values['FPPARAMS'];
+      DeclNode.Attributes.Values['FPMODES'] := StaticFpNode.Attributes.Values['FPMODES'];
       DeclNode.Attributes.Values['FPRET'] := StaticFpNode.Attributes.Values['FPRET'];
       DeclNode.Attributes.Values['FPRETBYREF'] := StaticFpNode.Attributes.Values['FPRETBYREF'];
       DeclNode.Attributes.Values['FPDEFAULTS'] := StaticFpNode.Attributes.Values['FPDEFAULTS'];   // (534)
@@ -17425,6 +17650,12 @@ var
 begin
   Token := Context.CurrentToken;
   KwU := UpperFast(Token.Value);
+  // ⛔ DIVERGENZE 656 - a letter rule for DEFAULT types belongs with implicit variables, and -lang fb has neither: fbc
+  // answers "error 146: Only valid in -lang deprecated or fblite or qb, found 'DEFINT'". A source that asks for one of
+  // those dialects keeps it, as for OPTION and the bare Dim. SB_DEFTYPE_FB=1 is the A/B.
+  if FModernMode and (not SourceDeclaresNonFbDialect) and (GetEnvironmentVariable('SB_DEFTYPE_FB') <> '1') then
+    HandleError(Format('%s is only valid in -lang deprecated, fblite or qb: in -lang fb every declaration states ' +
+      'its type. Add ''#lang "fblite"'' to keep the letter rule.', [KwU]), Token);
   if KwU = 'DEFSTR' then Bank := 2
   else if (KwU = 'DEFSNG') or (KwU = 'DEFDBL') then Bank := 1
   else Bank := 0;   // DEFINT/DEFLNG/DEFBYTE/DEFSHORT/DEFLNGINT -> int bank

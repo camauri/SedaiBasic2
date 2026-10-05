@@ -396,9 +396,13 @@ begin
         // away and "Static As T v = (11, 22)" hoisted a declaration with NO initializer: the fields
         // read 0 in silence, while the identical "Dim Shared" one line above was right. The mark is
         // what tells the two apart, and it was already there to be asked.
+        // ⭐ ...AND NEITHER IS THE CONSTRUCTOR SHORTHAND "= T( args )" (DIVERGENZE 486 (2)): the parser marks it
+        // CTORNAME and hands the arguments as an antArgumentList, as for a Dim; the hoisted Dim Shared reads them the
+        // same way. Dropping them built the static with the DEFAULT constructor.
         if (Decl.ChildCount >= 3) and
            ((Decl.GetChild(2).NodeType <> antArgumentList) or
-            (Decl.GetChild(2).Attributes.Values['TUPLEINIT'] = '1')) then
+            (Decl.GetChild(2).Attributes.Values['TUPLEINIT'] = '1') or
+            (Decl.Attributes.Values['CTORNAME'] = '1')) then
           InitClone := Decl.GetChild(2).Clone
         else
           InitClone := nil;

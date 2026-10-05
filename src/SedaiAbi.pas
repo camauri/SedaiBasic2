@@ -128,6 +128,24 @@ function AbiUnavailableReason: string;
 procedure AbiCall(Fn: Pointer; ARet: TAbiType; const AArgs: array of TAbiType;
                   const AValues: array of Pointer; ARetBuf: Pointer);
 
+type
+  { ⭐ DIVERGENZE 424 - THE VARIADIC TAIL OF THE C CALL THAT ENTERED A CLOSURE: where the saved argument registers and
+    the stack arguments are, and how many of each the DECLARED parameters used. A procedure of the program that C calls
+    with "..." reads its tail from here (cva_arg), because no BASIC caller staged one. Valid only while the closure's
+    handler runs, on that thread. }
+  TAbiVaTail = record
+    Valid: Boolean;
+    Saved, StackArgs: PByte;
+    NGP, NSS, NStack: Integer;   // registers / stack words the declared parameters consumed
+  end;
+
+{ The tail of the C call this thread is answering inside a closure handler; Valid = False outside one. }
+function AbiCurrentVaTail: TAbiVaTail;
+{ The I-th word of a variadic tail, for a value of the given register class (Float = SSE). SysV keeps two sequences
+  (6 integer, 8 SSE registers) and then ONE stack; Win64 one positional sequence of 4 then the stack. Pos* are the
+  counters of what earlier tail arguments consumed, advanced here. Answers the ADDRESS of the 8 bytes. }
+function AbiVaTailWord(const T: TAbiVaTail; IsFloat: Boolean; var PosGP, PosSS, PosStack: Integer): PByte;
+
 implementation
 
 uses
@@ -519,7 +537,10 @@ asm
   movq [rsp + $20 + 56], xmm3
   mov  rcx, r10
   lea  rdx, [rsp + $20]
-  lea  r8,  [rsp + $80]        // $78 + 8 = past the return address: the first stack argument
+  // ⛔ DIVERGENZE 424 - $78 + 8 is past the return address, and on Win64 that is the caller's 32-byte HOME area, not the
+  // first stack argument: the fifth argument is 32 bytes higher. Read from $80, a closure's fifth and later
+  // parameters - and a variadic tail past the fourth slot - were the home area's contents.
+  lea  r8,  [rsp + $A0]        // $78 + 8 + 32: the first stack argument, above the home area
   call AbiClosureEntry
   mov  rax,  [rsp + $20 + 64]
   movq xmm0, [rsp + $20 + 72]
@@ -565,6 +586,45 @@ end;
 {$ENDIF}
 {$ENDIF}
 
+threadvar
+  GAbiVaTail: TAbiVaTail;
+
+function AbiCurrentVaTail: TAbiVaTail;
+begin
+  Result := GAbiVaTail;
+end;
+
+function AbiVaTailWord(const T: TAbiVaTail; IsFloat: Boolean; var PosGP, PosSS, PosStack: Integer): PByte;
+var
+  Slot: Integer;
+begin
+{$IFDEF WINDOWS}
+  // Win64: one positional sequence. A variadic double is ALSO in the integer register, so either file answers it.
+  Slot := T.NGP + PosGP;
+  Inc(PosGP);
+  if Slot < CLO_NGP then
+  begin
+    if IsFloat then Result := T.Saved + CLO_SSE + Slot * 8
+    else Result := T.Saved + CLO_GP + Slot * 8;
+  end
+  else
+    Result := T.StackArgs + (Slot - CLO_NGP) * 8;   // positional: NGP already counts the declared stack words
+{$ELSE}
+  if IsFloat then
+  begin
+    Slot := T.NSS + PosSS;
+    if Slot < CLO_NSSE then begin Inc(PosSS); Exit(T.Saved + CLO_SSE + Slot * 8); end;
+  end
+  else
+  begin
+    Slot := T.NGP + PosGP;
+    if Slot < CLO_NGP then begin Inc(PosGP); Exit(T.Saved + CLO_GP + Slot * 8); end;
+  end;
+  Result := T.StackArgs + (T.NStack + PosStack) * 8;
+  Inc(PosStack);
+{$ENDIF}
+end;
+
 procedure AbiClosureEntry(Ctx: PClosureCtx; Saved: PByte; StackArgs: PByte); cdecl;
 // Undo, for ONE call, exactly what AbiCall does when it makes one: walk the declared arguments in
 // order, following the same register-allocation rules, and hand the user a pointer to each.
@@ -584,6 +644,7 @@ var
   RetN: Integer;
   RetInMem: Boolean;
   MemRet: Pointer;
+  PrevTail: TAbiVaTail;
 begin
   C := Ctx^.Owner;
   NGP := 0; NSS := 0; NStack := 0;
@@ -662,8 +723,20 @@ begin
   end;
 {$ENDIF}
 
-  if RetInMem then C.FHandler(MemRet, @Ptrs[0], C.FUser)
-  else C.FHandler(@RetBuf[0], @Ptrs[0], C.FUser);
+  // ⭐ DIVERGENZE 424 - the tail starts where the declared parameters stopped; published for the handler's duration.
+  PrevTail := GAbiVaTail;
+  GAbiVaTail.Valid := True;
+  GAbiVaTail.Saved := Saved;
+  GAbiVaTail.StackArgs := StackArgs;
+  GAbiVaTail.NGP := NGP;
+  GAbiVaTail.NSS := NSS;
+  GAbiVaTail.NStack := NStack;
+  try
+    if RetInMem then C.FHandler(MemRet, @Ptrs[0], C.FUser)
+    else C.FHandler(@RetBuf[0], @Ptrs[0], C.FUser);
+  finally
+    GAbiVaTail := PrevTail;
+  end;
 
   // Put the result where the ABI says the caller will look for it. The trampoline reloads RAX and XMM0
   // from these two slots on its way out.

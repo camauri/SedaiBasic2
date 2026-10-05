@@ -653,6 +653,55 @@ begin
   Result := Result + '.' + VarToStr(Node.Value);
 end;
 
+function FbcVisibleHere(const ActivePrefix: string; Ctx: TNsContext; Using: TStringList): Boolean;
+// DIVERGENZE 543 (2): can a bare name reach namespace FBC from here - written inside it, or imported by a "Using"?
+var
+  Closure: TStringList;
+  u: Integer;
+begin
+  Result := (UpperCase(ActivePrefix) = 'FBC') or (Copy(UpperCase(ActivePrefix), 1, 4) = 'FBC.');
+  if Result or (Using = nil) then Exit;
+  Closure := TStringList.Create;
+  try
+    Closure.Assign(Using);
+    for u := 0 to Using.Count - 1 do Ctx.AddUsingClosure(Using[u], Closure);
+    for u := 0 to Closure.Count - 1 do
+      if UpperCase(Closure[u]) = 'FBC' then Exit(True);
+  finally
+    Closure.Free;
+  end;
+end;
+
+function ResolveNamespacedEnum(const ActivePrefix, Base: string; Ctx: TNsContext; Using: TStringList): string;
+// DIVERGENZE 655: the namespaced ENUM a bare name designates, "NS.E", or ''. The enclosing chain first (innermost
+// out), then what a "Using" brings in with its closure - the order every other unqualified name keeps.
+var
+  P: string;
+  DotPos, u: Integer;
+  Closure: TStringList;
+begin
+  Result := '';
+  P := ActivePrefix;
+  while P <> '' do
+  begin
+    if Ctx.EnumNames.IndexOf(P + '.' + Base) >= 0 then Exit(P + '.' + Base);
+    DotPos := LastDelimiter('.', P);
+    if DotPos = 0 then Break;
+    P := Copy(P, 1, DotPos - 1);
+  end;
+  if Using = nil then Exit;
+  Closure := TStringList.Create;
+  try
+    Closure.Assign(Using);
+    for u := 0 to Using.Count - 1 do Ctx.AddUsingClosure(Using[u], Closure);
+    for u := 0 to Closure.Count - 1 do
+      if Ctx.EnumNames.IndexOf(UpperCase(Closure[u]) + '.' + Base) >= 0 then
+        Exit(UpperCase(Closure[u]) + '.' + Base);
+  finally
+    Closure.Free;
+  end;
+end;
+
 function ResolveNamespacePrefix(const ActivePrefix, Base: string; Ctx: TNsContext;
                                 Using: TStringList): string;
 // The full name of a namespace referred to by the PARTIAL name Base - through the enclosing chain
@@ -731,6 +780,14 @@ begin
   // Determine the prefix/shadow for descending into children.
   ChildPrefix := ActivePrefix;
   UseShadow := Shadow;
+
+  // ⭐ DIVERGENZE 543 (2) - fbc-int/math.bi "#undef"s ..RND and ..RANDOMIZE and redeclares them in namespace FBC, so after
+  // it a BARE Rnd()/Randomize is undeclared - unless FBC is visible here ("Using FBC", or inside Namespace FBC). Both stay
+  // builtin nodes this walk does not rename, so it MARKS the ones that can see FBC and the SSA refuses the others.
+  if (Ctx <> nil) and (((Node.NodeType = antFunctionCall) and
+       ((UpperCase(VarToStr(Node.Value)) = 'RND') or (UpperCase(VarToStr(Node.Value)) = 'RANDOMIZE'))) or
+      (Node.NodeType = antRandomize)) and FbcVisibleHere(ActivePrefix, Ctx, Using) then
+    Node.Attributes.Values['FBCSEEN'] := '1';
 
   // ⭐ DIVERGENZE 223 - A PARAMETER'S TYPE IS A TYPE SLOT, and a parameter NAME never shadows a TYPE there. The procedure
   // adds its parameter names to the shadow set BEFORE its children are walked, so in "Sub g(ByVal a As A)" inside
@@ -1133,7 +1190,20 @@ begin
       if (Ctx.NamespaceNames.IndexOf(BaseName) < 0) and (Pos('.', BaseName) = 0) then
       begin
         Qual := ResolveNamespacePrefix(ActivePrefix, BaseName, Ctx, Using);
-        if Qual <> '' then BaseName := Qual;
+        if Qual <> '' then BaseName := Qual
+        // ⭐ DIVERGENZE 655 - ...and the base may be an ENUM a "Using" (or the enclosing chain) brings in: after
+        // "Using M", "duplicateEnum.nb" names M.duplicateEnum's nb. Resolved as a TYPE name (an enum is one), and
+        // only when what it resolves to IS a namespaced enum, so the rule just below drops the enum's name and finds
+        // the member. Here the base stayed bare, the chain read as a record field, and the member answered 0 at
+        // any depth. SB_NS_ENUM_USING=0 is the A/B.
+        // ⛔ ...unless a local, a parameter or a module-level name of the program's own takes that spelling: a variable
+        // "e" with a field "a" stays a record access ("e.a = 9" was written into the enum member's storage).
+        else if (GetEnvironmentVariable('SB_NS_ENUM_USING') <> '0') and
+                ((Shadow = nil) or (Shadow.IndexOf(BaseName) < 0)) and (not GlobalNameVisibleAt(Ctx, BaseName)) then
+        begin
+          Qual := ResolveNamespacedEnum(ActivePrefix, BaseName, Ctx, Using);
+          if Qual <> '' then BaseName := Qual;
+        end;
       end;
       // ⛔ ...and the ENUM'S NAME IN THE MIDDLE. "NS.E1.B" names the same member as "NS.B" once the
       // enum's members are members of NS: the base has already collapsed to "NS.E1", which is not a
@@ -1344,7 +1414,10 @@ begin
       begin
         GrandChild := TASTNode(Child.Children[0]);
         Child.Children.Extract(GrandChild);
-        Node.Children.Insert(Base + k, GrandChild);
+        // ⛔ InsertChild, not Children.Insert: the hoisted node's PARENT must become Node. The list insert left it naming
+        // the wrapper freed below, and a pre-pass that climbs parents (NsContextOf) read freed memory - harmless while the
+        // block stayed intact, an access violation once a string reused it (fbc suite quirk/len-sizeof-udt-member).
+        Node.InsertChild(Base + k, GrandChild);
         Inc(k);
       end;
       Child.Free;                             // empty wrapper

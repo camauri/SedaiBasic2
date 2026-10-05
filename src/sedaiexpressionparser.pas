@@ -3288,7 +3288,10 @@ var
   CastHadConst: Boolean;   // the cast's type named CONST (DIVERGENZE 602)
   Depth: Integer;
   ValExpr, TypeOfExpr: TASTNode;
+  IsProcCast, FpInType: Boolean;     // DIVERGENZE 660: a cast to a procedure type, and its signature
+  FpPar, FpRet, FpCur: string;
 begin
+  IsProcCast := False; FpPar := ''; FpRet := '';
   Context.Advance;   // consume '('
   TypeStr := '';
   TypeOfExpr := nil;
@@ -3340,14 +3343,51 @@ begin
              (SameText(VarToStr(Context.CurrentToken.Value), 'FASTCALL')) or
              (SameText(VarToStr(Context.CurrentToken.Value), 'THISCALL'))) do
         Context.Advance;
+      // ⭐ DIVERGENZE 660 - ...and the SIGNATURE is kept (FPPARAMS / FPRET, the "params|ret" every indirect call reads),
+      // so that a call made ON the cast - "CPtr(Function(ByVal As Integer) As Integer, p)(21)" - can be lowered as one.
+      // It was skipped: the call became an index into an "Any Ptr" (a crash), and one returning a String printed the
+      // pointer. Each parameter's type is the run of words after its top-level AS.
+      IsProcCast := True;
+      FpPar := ''; FpRet := ''; FpCur := ''; FpInType := False;
       if Context.Check(ttDelimParOpen) then
       begin
         Depth := 1;
         Context.Advance;
         while (Depth > 0) and (not Context.IsAtEnd) do
         begin
-          if Context.Check(ttDelimParOpen) then Inc(Depth)
-          else if Context.Check(ttDelimParClose) then Dec(Depth);
+          if Context.Check(ttDelimParOpen) then
+          begin
+            Inc(Depth);
+            if FpInType and (Depth = 2) then FpCur := '#P';   // a procedure-pointer parameter, as the DIM reader marks it
+          end
+          else if Context.Check(ttDelimParClose) then
+          begin
+            Dec(Depth);
+            if Depth = 0 then
+            begin
+              if FpInType and (FpCur <> '') then
+              begin if FpPar <> '' then FpPar := FpPar + ','; FpPar := FpPar + Trim(FpCur); end;
+              FpInType := False;
+            end;
+          end
+          else if (Depth = 1) and Context.Check(ttSeparParam) then
+          begin
+            if FpInType and (FpCur <> '') then
+            begin if FpPar <> '' then FpPar := FpPar + ','; FpPar := FpPar + Trim(FpCur); end;
+            FpCur := ''; FpInType := False;
+          end
+          else if (Depth = 1) and Context.Check(ttAsType) then
+          begin
+            FpInType := True; FpCur := '';
+          end
+          else if (Depth = 1) and FpInType and Context.Check(ttOpEq) then
+            FpInType := False                                  // "= default": the type is complete
+          else if (Depth = 1) and FpInType and (FpCur <> '#P') then
+          begin
+            if AtPointerSuffix then FpCur := FpCur + ' ' + kPTR
+            else if not SameText(VarToStr(Context.CurrentToken.Value), 'CONST') then
+              FpCur := FpCur + ' ' + UpperCase(VarToStr(Context.CurrentToken.Value));
+          end;
           Context.Advance;
         end;
       end;
@@ -3357,8 +3397,12 @@ begin
       if Context.Check(ttAsType) then
       begin
         Context.Advance;
-        if Context.Check(ttIdentifier) then Context.Advance;
-        while AtPointerSuffix do Context.Advance;
+        if Context.Check(ttIdentifier) or Assigned(Context.CurrentToken) then
+        begin
+          FpRet := UpperCase(VarToStr(Context.CurrentToken.Value));
+          Context.Advance;
+        end;
+        while AtPointerSuffix do begin FpRet := FpRet + ' ' + kPTR; Context.Advance; end;
       end;
     end;
     // ⛔ DIVERGENZE 403 - AN ENTRY ADDRESS IS A POINTER, and the rest of the pipeline reads the type NAME to
@@ -3425,6 +3469,12 @@ begin
   end;
   Result := TASTNode.CreateWithValue(antCast, Trim(TypeStr), Token);
   if CastHadConst then Result.Attributes.Values['CASTCONST'] := '1';
+  if IsProcCast and (GetEnvironmentVariable('SB_CALL_ON_CAST') <> '0') then
+  begin
+    Result.Attributes.Values['FPCAST'] := '1';
+    Result.Attributes.Values['FPPARAMS'] := FpPar;
+    Result.Attributes.Values['FPRET'] := FpRet;
+  end;
   Result.AddChild(ValExpr);
   if Assigned(TypeOfExpr) then
   begin

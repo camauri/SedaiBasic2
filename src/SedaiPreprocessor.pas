@@ -495,6 +495,12 @@ end;
 
 function SubstituteMacros(const Line: string; Defs, FnDefs: TStringList; Depth: Integer): string; forward;
 
+var
+  // ⭐ DIVERGENZE 653 - a macro PARAMETER is matched without regard to case, as every FreeBASIC identifier is:
+  // "#macro mk( T ) ... destructor W_##t" names the argument in fbc, and here "t" stayed "t" - the destructor went to
+  // a type "W_t" nobody declared. SB_PP_PARAM_CASE=0 is the A/B (read once: the lookup runs per body word).
+  GPPParamCaseKnob: Integer = -1;
+
 // Expand a function-like macro body by replacing each whole-identifier parameter with its argument.
 // ParamsBody is "p1,p2,..."#1"body"; ArgsStr is the raw argument text between the parentheses.
 // Defs/FnDefs/Depth are needed ONLY by the stringize operator - see the comment at its site.
@@ -515,8 +521,10 @@ var
   var n: Integer;
   begin
     Result := -1;
+    if GPPParamCaseKnob < 0 then
+      if GetEnvironmentVariable('SB_PP_PARAM_CASE') = '0' then GPPParamCaseKnob := 0 else GPPParamCaseKnob := 1;
     for n := 0 to PCount - 1 do
-      if Params[n] = W then begin Result := n; Exit; end;
+      if (Params[n] = W) or ((GPPParamCaseKnob = 1) and SameText(Params[n], W)) then begin Result := n; Exit; end;
   end;
 
   function Stringize(const S: string): string;
@@ -965,8 +973,17 @@ begin
     if S[i] in [' ', #9] then begin Inc(i); Continue; end;
     if WantOp then
     begin
-      if (S[i] <> '+') and (S[i] <> '&') then Exit;   // not a pure concatenation
-      WantOp := False; Inc(i); Continue;
+      // ⭐ DIVERGENZE 654 - two string terms SIDE BY SIDE concatenate as well: fbc folds __FB_EVAL__( "#define " "X" " 1" )
+      // to "#define X 1" (and "ab" Y, Y "ef" with a string macro Y). Read as a new term with no operator in between;
+      // here the fold refused and the text came out as ab "cd". SB_PP_JUXTAPOSE=0 is the A/B.
+      if ((S[i] = '"') or (S[i] in ['A'..'Z', 'a'..'z', '_'])) and
+         (GetEnvironmentVariable('SB_PP_JUXTAPOSE') <> '0') then
+        WantOp := False
+      else
+      begin
+        if (S[i] <> '+') and (S[i] <> '&') then Exit;   // not a pure concatenation
+        WantOp := False; Inc(i); Continue;
+      end;
     end;
     if (S[i] = '"') or (((S[i] = '$') or (S[i] = '!')) and (i < Length(S)) and (S[i + 1] = '"')) then
     begin

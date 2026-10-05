@@ -903,11 +903,14 @@ Function Fits( ByVal txt As String, ByVal extra As String ) As String
   Return txt
 End Function
 
+'' Declared on BOTH builds: the main loop reads it either way, and a name that is never declared
+'' is an error in -lang fb. In the browser build it stays 0 unless "h" is pressed.
+Dim Shared As Integer helpVisible
+
 #if __SB_WASM__
   '' The browser build's help is the page around it - `Draw String` is not covered by the WASM
   '' backend, and the backend refuses an opcode for being PRESENT rather than for being reached.
 #else
-Dim Shared As Integer helpVisible
 
 ''  ⭐ THE KEYS ARE CHOSEN FOR THE KEYBOARD, NOT FOR THE ALPHABET. The tone curve used to be on
 ''  `[` and `]`, which on an Italian layout need AltGr - a chord for something you nudge back and

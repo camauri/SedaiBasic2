@@ -734,6 +734,9 @@ type
                                          //   Kept apart from FArrayPtrPointee, whose readers all assume a UDT (a record HANDLE);
                                          //   this one only says what "*a(i)" dereferences TO.
     FNeededDispatchers: TStringList;     // M4.3: "TYPE|METHOD" pairs needing a virtual dispatcher
+    FDefProcDepth: Integer;              // CheckDefinedProcTypes: inside a procedure body (201)
+    FImplicitMode: Integer;              // -1 not read yet · 0 SB_NO_IMPLICIT=0 · 1 refuse · 2 IMPLICIT_DIAG census (324/465)
+    FMoreDeclaredNames: TStringList;      // names declared where FDeclaredNames does not look: "For i As T", Enum members, Const lists, Extern (324/465)
     FDeclaredNames: TStringList;         // names introduced by an EXPLICIT declaration (DIM/VAR/STATIC/CONST,
                                          //   procedure parameters). Distinct from FVarMap, which also holds
                                          //   names bound by PreAllocateVariables merely because they appear
@@ -757,6 +760,11 @@ type
     procedure PreAllocateVariables(Node: TASTNode);  // Pre-scan AST to allocate all variable registers
     procedure CollectDeclaredNames(Node: TASTNode);  // Pre-scan AST for names an explicit declaration introduces
     function IsDeclaredName(const VarName: string): Boolean;
+    function BuiltinRetiredByUndef(Node: TASTNode; const NameU: string): Boolean;  // 543 (2)
+    function AddrOfRawUDTField(E: TASTNode): Boolean;   // "@x->f", x over C's memory (377)
+    procedure WrapStaticMethodAddresses(AST: TASTNode);   // "@T.staticMethod" without THIS (661)
+    function ModuleRecordVarDeclared(const NameU: string): Boolean;   // a module-scope Dim'd record of that name (655)
+    procedure CheckImplicitUse(const VarName: string; Node: TASTNode; const Site: string);  // refuse an undeclared name (324/465)
     function BareCallableFunction(const NameU: string): Boolean;  // a FUNCTION invocable with no arguments
     function DeclaredReturnBank(const NameU: string; out Bank: TSSARegisterType): Boolean;
     function ProcReturnPtrUDT(const NameU: string): string;       // pointee UDT of a "FUNCTION f(...) AS T PTR", else ''
@@ -1900,6 +1908,8 @@ type
     function DeclaredTypeNameIsKnown(const TypeName: string): Boolean;
     function DeclaredTypeNameIsKnownUncached(const TypeName: string): Boolean;
     function TypeNameIsIncomplete(const TypeName: string): Boolean;
+    procedure NoteIncompleteByValue(TypeNode: TASTNode; const What: string);   // 201
+    procedure IncompleteByValueName(const TypeName, What: string);           // 201
     function TypeBaseName(const TypeName: string): string;
     property Program_: TSSAProgram read FProgram;
     // FB scope dialect gate: True = MODERN (FreeBASIC lexical scope), False = CLASSIC (BASIC v7
@@ -2322,6 +2332,9 @@ begin
   FBlockHandledVars.CaseSensitive := False;
   FCurrentTopLevelLabels := TIndexedStringList.Create;
   FCurrentTopLevelLabels.CaseSensitive := False;
+  FMoreDeclaredNames := TIndexedStringList.Create;
+  FMoreDeclaredNames.Sorted := True;
+  FMoreDeclaredNames.Duplicates := dupIgnore;
   FDeclaredNames := TIndexedStringList.Create;
   FDeclaredNames.CaseSensitive := False;
   FDeclaredNames.Sorted := True;
@@ -2365,6 +2378,7 @@ begin
   FArrayPtrPointee.Free;
   FNeededDispatchers.Free;
   FDeclaredNames.Free;
+  FMoreDeclaredNames.Free;
   FCurrentProcLocalRecs.Free;
   FCurrentProcNonRecs.Free;
   FDefinedLabels.Free;
@@ -2784,9 +2798,36 @@ begin
         end;
       end;
 
+    // "For i As T": the counter is declared by the loop. Kept apart from FDeclaredNames (whose readers decide what a bare
+    // name means) and read only by the IMPLICIT_DIAG census of 324/465.
+    antForLoop:
+      if (Node.Attributes.Values['VARTYPE'] <> '') and (Node.ChildCount >= 1) and
+         (Node.GetChild(0).NodeType = antIdentifier) then
+        FMoreDeclaredNames.Add(Node.GetChild(0).ValueUpper);
+
+    // ...and so are an ENUM's members and EVERY item of a "Const a = 1, b = 2" list: inside a procedure both are lowered
+    // as assignments to a variable, which is the path an implicit variable takes too.
+    antEnum:
+      for i := 0 to Node.ChildCount - 1 do
+        if (Node.GetChild(i).NodeType = antAssignment) and (Node.GetChild(i).ChildCount >= 1) and
+           (Node.GetChild(i).GetChild(0).NodeType = antIdentifier) then
+        begin
+          FMoreDeclaredNames.Add(Node.GetChild(i).GetChild(0).ValueUpper);
+          // ...and by its LAST segment: a member of an Enum inside a Namespace is spelled qualified here, and read
+          // bare through "Using" (DIVERGENZE 655 - that read is a wrong answer of its own, not an implicit variable).
+          Nm := Node.GetChild(i).GetChild(0).ValueUpper;
+          while Pos('.', Nm) > 0 do Delete(Nm, 1, Pos('.', Nm));
+          FMoreDeclaredNames.Add(Nm);
+          FMoreDeclaredNames.Add(Node.ValueUpper);   // and the enum's own name, "duplicateEnum.nb" reads it first
+        end;
+
     antConst:
       if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antAssignment) then
       begin
+        for i := 0 to Node.ChildCount - 1 do
+          if (Node.GetChild(i).NodeType = antAssignment) and (Node.GetChild(i).ChildCount >= 1) and
+             (Node.GetChild(i).GetChild(0).NodeType = antIdentifier) then
+            FMoreDeclaredNames.Add(Node.GetChild(i).GetChild(0).ValueUpper);
         AssignNode := Node.GetChild(0);
         if (AssignNode.ChildCount >= 1) and (AssignNode.GetChild(0).NodeType = antIdentifier) then
         begin
@@ -2816,6 +2857,234 @@ end;
 function TSSAGenerator.IsDeclaredName(const VarName: string): Boolean;
 begin
   Result := FDeclaredNames.IndexOf(UpperFast(VarName)) >= 0;
+end;
+
+function TSSAGenerator.BuiltinRetiredByUndef(Node: TASTNode; const NameU: string): Boolean;
+// DIVERGENZE 543 (2): a BARE builtin Rnd/Randomize after a "#undef ..NAME" (fbc-int/math.bi moves them into namespace FBC)
+// is undeclared - unless the namespace pass marked FBC as visible at this node (FBCSEEN). SB_RND_NAMES=0 is the A/B.
+begin
+  Result := FModernMode and (GPPUndefNames <> nil) and
+    ((GPPUndefNames.IndexOf('..' + NameU) >= 0) or (GPPUndefNames.IndexOf(NameU) >= 0)) and
+    (Node.Attributes.Values['FBCSEEN'] <> '1') and (not IsDeclaredProcName(NameU)) and
+    (GetEnvironmentVariable('SB_RND_NAMES') <> '0');
+end;
+
+function TSSAGenerator.AddrOfRawUDTField(E: TASTNode): Boolean;
+// ⛔ DIVERGENZE 377 - "@x->f" where x is a UDT pointer laid over C's memory (FRawUDTPtrs) is a BYTE address into that
+// memory, so the pointer it is stored in is raw: "r = @x->a : r[10]" read element 10 of nothing in strict (0; fbc 7),
+// while "*r" worked. A pointer CAST around it changes nothing. SB_CAST_RAWUDT=0 is the A/B.
+var
+  M: TASTNode;
+begin
+  Result := False;
+  if GetEnvironmentVariable('SB_CAST_RAWUDT') = '0' then Exit;
+  while (E <> nil) and (E.NodeType in [antCast, antParentheses]) and (E.ChildCount >= 1) do
+    E := E.GetChild(E.ChildCount - 1);
+  if (E = nil) or (E.NodeType <> antProcAddress) or (E.ChildCount < 1) then Exit;
+  M := E.GetChild(0);
+  if (M = nil) or (M.NodeType <> antMemberAccess) or (M.ChildCount < 1) then Exit;
+  if M.Attributes.Values['ARROW'] <> '1' then Exit;
+  if M.GetChild(0).NodeType <> antIdentifier then Exit;
+  Result := RawUDTPtrType(VarToStr(M.GetChild(0).Value)) <> '';
+end;
+
+procedure TSSAGenerator.WrapStaticMethodAddresses(AST: TASTNode);
+// ⭐ DIVERGENZE 661 - A STATIC METHOD IS COMPILED WITH A DUMMY THIS IN FRONT (TryStaticMethodCall passes handle 0), so an
+// INDIRECT call through "@T.m" - a procedure-pointer variable, a call on a cast, a callback C makes - put its first
+// argument where THIS belongs: "Dim f As Function(ByVal As Integer) As Integer = @T.sq : f(7)" answered 0 (fbc 49),
+// and a ByRef record argument arrived as handle 0, unless an earlier DIRECT call had left the right value in the slot.
+// ⇒ "@T.m" names a generated entry with the DECLARED parameters, whose body is the direct call: "SADDR$T$M(p...)"
+// calls "T.m(p...)". Only for a non-overloaded static method whose parameters are all named, and only where its
+// address is taken. SB_STATIC_ADDR=0 is the A/B.
+var
+  Statics, Done: TStringList;
+
+  procedure CollectStatics(N: TASTNode);
+  var
+    i: Integer;
+    Nm: string;
+  begin
+    if N = nil then Exit;
+    if (N.NodeType = antProcedureDecl) and ((N.Attributes.Values['STATICMETH'] = '1') or
+       (N.Attributes.Values['STATICANY'] = '1')) and (N.ChildCount >= 2) and
+       (N.GetChild(0).NodeType = antIdentifier) then
+    begin
+      Nm := N.GetChild(0).ValueUpper;
+      if (Pos('~', Nm) = 0) and (Pos('#', Nm) = 0) and (Statics.IndexOf(Nm) < 0) then Statics.AddObject(Nm, N);
+    end;
+    for i := 0 to N.ChildCount - 1 do CollectStatics(N.GetChild(i));
+  end;
+
+  function SafeName(const Key: string): string;
+  begin
+    Result := 'SADDR$' + StringReplace(Key, '.', '$', [rfReplaceAll]);
+  end;
+
+  function BuildWrapper(Key: string; Decl: TASTNode): Boolean;
+  var
+    W, NameN, PL, OrigPL, Prm, Call, Ma, Args, Ret: TASTNode;
+    i, Dot: Integer;
+    TypeU, MethU: string;
+  begin
+    Result := False;
+    OrigPL := nil;
+    for i := 1 to Decl.ChildCount - 1 do
+      if Decl.GetChild(i).NodeType = antParameterList then begin OrigPL := Decl.GetChild(i); Break; end;
+    if OrigPL = nil then Exit;
+    if Decl.Attributes.Values['RETBYREF'] = '1' then Exit;
+    for i := 0 to OrigPL.ChildCount - 1 do
+      if (OrigPL.GetChild(i).NodeType <> antIdentifier) or (OrigPL.GetChild(i).ValueUpper = '') then Exit;
+    Dot := LastDelimiter('.', Key);
+    if Dot <= 1 then Exit;
+    TypeU := Copy(Key, 1, Dot - 1);
+    MethU := Copy(Key, Dot + 1, MaxInt);
+    W := TASTNode.CreateWithValue(antProcedureDecl, VarToStr(Decl.Value), Decl.Token);
+    W.Attributes.Values['STATICADDROWNER'] := TypeU;   // lowered from T's side: a Private static method is T's
+    NameN := TASTNode.CreateWithValue(antIdentifier, SafeName(Key), Decl.Token);
+    for i := 0 to Decl.GetChild(0).ChildCount - 1 do NameN.AddChild(Decl.GetChild(0).GetChild(i).Clone);   // return type
+    W.AddChild(NameN);
+    PL := TASTNode.Create(antParameterList, OrigPL.Token);
+    Args := TASTNode.Create(antExpressionList, Decl.Token);
+    for i := 0 to OrigPL.ChildCount - 1 do
+    begin
+      Prm := OrigPL.GetChild(i);
+      if Prm.ValueUpper = 'THIS' then Continue;
+      PL.AddChild(Prm.Clone);
+      Args.AddChild(TASTNode.CreateWithValue(antIdentifier, Prm.ValueUpper, Decl.Token));
+    end;
+    W.AddChild(PL);
+    Ma := TASTNode.CreateWithValue(antMemberAccess, MethU, Decl.Token);
+    Ma.AddChild(TASTNode.CreateWithValue(antIdentifier, TypeU, Decl.Token));
+    Call := TASTNode.Create(antArrayAccess, Decl.Token);
+    Call.AddChild(Ma);
+    Call.AddChild(Args);
+    if UpperFast(VarToStr(Decl.Value)) = 'FUNCTION' then
+    begin
+      Ret := TASTNode.CreateWithValue(antReturn, 'RETURN', Decl.Token);
+      Ret.AddChild(Call);
+      W.AddChild(Ret);
+    end
+    else
+      W.AddChild(Call);
+    AST.AddChild(W);
+    Result := True;
+  end;
+
+  procedure Rewrite(N: TASTNode);
+  var
+    i: Integer;
+    Ma: TASTNode;
+    Key: string;
+    k: Integer;
+  begin
+    if N = nil then Exit;
+    if (N.NodeType = antProcAddress) and (N.ChildCount = 1) and (N.GetChild(0).NodeType = antMemberAccess) and
+       (N.GetChild(0).ChildCount >= 1) and (N.GetChild(0).GetChild(0).NodeType = antIdentifier) then
+    begin
+      Ma := N.GetChild(0);
+      Key := Ma.GetChild(0).ValueUpper + '.' + Ma.ValueUpper;
+      k := Statics.IndexOf(Key);
+      if k >= 0 then
+      begin
+        if (Done.IndexOf(Key) >= 0) or BuildWrapper(Key, TASTNode(Statics.Objects[k])) then
+        begin
+          if Done.IndexOf(Key) < 0 then Done.Add(Key);
+          N.Value := SafeName(Key);
+          N.RemoveChild(Ma);             // the list OWNS its children: this frees Ma
+          Exit;
+        end;
+      end;
+    end;
+    for i := 0 to N.ChildCount - 1 do Rewrite(N.GetChild(i));
+  end;
+
+begin
+  if AST = nil then Exit;
+  Statics := TStringList.Create;
+  Done := TStringList.Create;
+  try
+    CollectStatics(AST);
+    if Statics.Count = 0 then Exit;
+    Statics.Sorted := True;
+    Rewrite(AST);
+  finally
+    Done.Free;
+    Statics.Free;
+  end;
+end;
+
+function TSSAGenerator.ModuleRecordVarDeclared(const NameU: string): Boolean;
+var
+  i: Integer;
+begin
+  Result := False;
+  for i := 0 to FModuleRecordVars.Count - 1 do
+    if SameText(Copy(FModuleRecordVars[i], 1, Pos('|', FModuleRecordVars[i]) - 1), NameU) then Exit(True);
+end;
+
+procedure TSSAGenerator.CheckImplicitUse(const VarName: string; Node: TASTNode; const Site: string);
+// ⛔ DIVERGENZE 324 · 465 (decided by the owner on 27 Sep 2026: "per le variabili implicite allineamoci a fbc"). In MODERN a
+// name nobody declared is fbc's "error 42: Variable not declared", not a variable that reads 0. Asked where a bare name
+// reaches the VARIABLE fallback - a read, a plain assignment, a FOR counter without AS - in two kinds:
+//   NODECL  no declaration of the name anywhere in the program (Dim/Var/Static/ReDim/Const/parameter, "For i As T", an
+//           Enum member, an Extern);
+//   HIDDEN  inside a procedure, a declared VARIABLE that is not visible from it: a module Dim without Shared - the form
+//           that bit silently, "Dim v As Integer = 7 : Sub s() : Print v" printed 0 - or a local used before its Dim.
+// CLASSIC never comes here, and a source that asks for #lang "qb"/"fblite"/"deprecated" keeps its implicit variables.
+// SB_NO_IMPLICIT=0 is the A/B; IMPLICIT_DIAG=1 PRINTS each hit and refuses nothing (the census used to size the work).
+var
+  Probe: TSSAValue;
+  Kind, NameU, Own: string;
+  Line: Integer;
+begin
+  if FImplicitMode < 0 then
+  begin
+    if GetEnvironmentVariable('IMPLICIT_DIAG') <> '' then FImplicitMode := 2
+    else if GetEnvironmentVariable('SB_NO_IMPLICIT') = '0' then FImplicitMode := 0
+    else FImplicitMode := 1;
+  end;
+  if FImplicitMode = 0 then Exit;
+  Kind := '';
+  if Copy(VarName, 1, 2) = '__' then Exit;   // the lowering's own temporaries (__IIF0%, __BRWTMP$, ...)
+  // ...and the other names the lowering makes up: GET's "_GETBIN$n", a foreign element's "FGNEL_n", and the "Any" of a
+  // scalar field's "= Any", which reaches the default path as an identifier.
+  if (Copy(VarName, 1, 8) = '_GETBIN$') or (Copy(UpperFast(VarName), 1, 6) = 'FGNEL_') or SameText(VarName, 'ANY') then Exit;
+  // ...and what is not an implicit variable at all: a dialect where implicit variables are legal (#lang "qb"/"fblite"),
+  // a qualified name (the namespace path resolves elsewhere), a suffixed name, and a TYPE name read as an operand
+  // ("Len(ZString * 10)").
+  if SourceDeclaresNonFbDialect then Exit;
+  NameU := UpperFast(VarName);
+  if (NameU = '') or (Pos('.', NameU) > 0) or (NameU[Length(NameU)] in ['$', '%', '&', '!', '#', '@']) then Exit;
+  if (NameU = 'STRING') or (NameU = 'ZSTRING') or (NameU = 'WSTRING') or (NameU = 'INTEGER') or
+     (NameU = 'UINTEGER') or (NameU = 'LONG') or (NameU = 'ULONG') or (NameU = 'LONGINT') or
+     (NameU = 'ULONGINT') or (NameU = 'SHORT') or (NameU = 'USHORT') or (NameU = 'BYTE') or
+     (NameU = 'UBYTE') or (NameU = 'SINGLE') or (NameU = 'DOUBLE') or (NameU = 'BOOLEAN') or
+     (FindUDT(NameU) >= 0) then Exit;
+  if NameU = FCurrentProcName then Exit;   // the function's result
+  // ...and a PROPERTY's or a method's own name inside it, "title = p_title" in "Property window.title": its result too.
+  Own := FCurrentProcName;
+  while Pos('.', Own) > 0 do Delete(Own, 1, Pos('.', Own));
+  while (Own <> '') and (Own[Length(Own)] in ['~', '#']) do Delete(Own, Length(Own), 1);
+  if (Own <> '') and (NameU = Own) then Exit;
+  if (not IsDeclaredName(NameU)) and (FMoreDeclaredNames.IndexOf(NameU) < 0) then Kind := 'NODECL'
+  // HIDDEN is asked of VARIABLES only: a Const, an Enum member and an Extern are lowered inside a procedure as a first
+  // write that binds them, and an array is not a scalar binding.
+  // An @-taken local lives in the frame, not in a binding (m990).
+  else if FInProcedure and (FMoreDeclaredNames.IndexOf(NameU) < 0) and (ArrayIndexOf(NameU) < 0) and
+          (not IsAddrLocal(VarName)) and not ResolveExisting(VarName, Probe, Node.Attributes.Values['GLOBALSCOPE'] = '1') then Kind := 'HIDDEN';
+  if Kind = '' then Exit;
+  if FImplicitMode = 2 then
+  begin
+    if Node.Token <> nil then Line := Node.Token.Line else Line := FCurrentLineNumber;
+    WriteLn(ErrOutput, 'IMPLICIT ', Kind, ' ', Site, ' ', NameU, ' line=', Line, ' proc=', FCurrentProcName);
+    Exit;
+  end;
+  if Kind = 'HIDDEN' then
+    raise Exception.CreateFmt('Variable not declared, %s (in %s: a module-level Dim is visible inside a procedure ' +
+      'only when it is Dim Shared)', [LowerCase(VarName), FCurrentProcName]);
+  if FInProcedure then
+    raise Exception.CreateFmt('Variable not declared, %s (in %s)', [LowerCase(VarName), FCurrentProcName]);
+  raise Exception.CreateFmt('Variable not declared, %s', [LowerCase(VarName)]);
 end;
 
 function PrintKindOfType(const TypeU: string): Integer;
@@ -3942,6 +4211,9 @@ begin
   if FCurrentThisType <> '' then Exit;
   if IsAddrParam(VarName) or IsRefVar(VarName) or IsAddrLocal(VarName) or
      IsRawModuleScalar(VarName) or IsSharedScalar(VarName) then Exit;
+  // ⛔ ...and a DECLARED name can still be an undeclared one HERE: a module Dim without Shared read inside a procedure
+  // (DIVERGENZE 465). This fast path is where such a read is resolved, so the check is asked here as in the full branch.
+  if FModernMode and FInProcedure then CheckImplicitUse(VarName, Node, 'read');
   Res := GetOrAllocateVariable(VarName);
   // A fixed-length string ("Dim s As String * n") is stored NUL-padded to its capacity; reading it in
   // an ordinary (variable-length) context stops at the first NUL. No-op for every other variable.
@@ -5353,6 +5625,7 @@ begin
         // variable-length form here (see TryFixedLenStore's header); no-op for every other variable.
         // ⭐ A LEADING DOT asks for the MODULE-LEVEL variable: past every local, every enclosing
         // scope and every import. See ResolveExisting.
+        if FModernMode then CheckImplicitUse(VarName, Node, 'read');
         Result := GetOrAllocateVariable(VarName, Node.Attributes.Values['GLOBALSCOPE'] = '1');
         if AnyFixedLen then Result := MaybeFixedLenRead(Node, Result);
       end;
@@ -6632,6 +6905,8 @@ begin
       begin
         FuncName := Node.ValueUpper;
         ArgListNode := Node.GetChild(0);
+        if (FuncName = 'RND') and BuiltinRetiredByUndef(Node, 'RND') then
+          raise Exception.Create('Variable not declared, rnd');
 
         // FreeBASIC GETKEY is a FUNCTION returning the key CODE (-1 when no key can be had), and it
         // takes no parentheses. It was registered as a statement keyword only, so "Dim As Integer k =
@@ -9000,6 +9275,7 @@ begin
         // byte-heap pointer scales the index by SizeOf(pointee), a managed one advances one element.
         if (Node.GetChild(0) <> nil) and (Node.GetChild(0).NodeType = antCast) and
            (Node.GetChild(0).ChildCount >= 1) and
+           (Node.GetChild(0).Attributes.Values['FPCAST'] <> '1') and   // a CALL on a procedure-type cast (660)
            (Node.GetChild(1).NodeType in [antExpressionList, antArgumentList]) and
            (Node.GetChild(1).ChildCount = 1) and
            (Length(Node.GetChild(0).ValueUpper) > 4) and
@@ -9134,6 +9410,20 @@ begin
             Result := EmitIndirectCall(EnsureIntRegister(Left), TempStr, Node.GetChild(1));
             Exit;
           end;
+        end;
+
+        // ⭐ DIVERGENZE 660 - a call made ON a cast to a procedure type, "CPtr(Function(...) As R, p)(args)": the cast
+        // carries its signature (FPCAST, FPPARAMS / FPRET, recorded by the parser), so it is an indirect call through
+        // the value. It used to be an INDEX into an "Any Ptr": a crash for an Integer result, the pointer printed for a
+        // String one. SB_CALL_ON_CAST=0 is the A/B (the parser does not mark the cast).
+        if (Node.ChildCount >= 2) and (Node.GetChild(0).NodeType = antCast) and
+           (Node.GetChild(0).Attributes.Values['FPCAST'] = '1') then
+        begin
+          ProcessExpression(Node.GetChild(0).GetChild(0), Left);   // the entry address the cast reinterprets
+          Result := EmitIndirectCall(EnsureIntRegister(Left),
+                      Node.GetChild(0).Attributes.Values['FPPARAMS'] + '|' + Node.GetChild(0).Attributes.Values['FPRET'],
+                      Node.GetChild(1));
+          Exit;
         end;
 
         // Dispatch table "arr(i)(args)": child0 is itself an array access into an array of function
@@ -9427,6 +9717,18 @@ begin
         end;
 
         ArrName := VarToStr(Node.GetChild(0).Value);
+        // ⛔ DIVERGENZE 543 (1)(2) - "rnd32()" BARE does not exist in fbc: it is only "fbc.rnd32", from fbc-int/math.bi
+        // ("error 42: Variable not declared, rnd32"); and that header "#undef"s ..RND and ..RANDOMIZE to redeclare them in
+        // namespace FBC, so after it a bare Rnd() is undeclared too. With "Using FBC" or inside "Namespace FBC" the
+        // namespace pass has already qualified the name, so what arrives here BARE is the undeclared one. A program's
+        // own procedure of that name is its own. SB_RND_NAMES=0 is the A/B.
+        if FModernMode and (Pos('.', ArrName) = 0) and (ArrayIndexOf(ArrName) < 0) and
+           (not IsDeclaredProcName(UpperFast(ArrName))) and
+           ((UpperFast(ArrName) = 'RND32') or
+            ((UpperFast(ArrName) = 'RND') and (GPPUndefNames <> nil) and
+             ((GPPUndefNames.IndexOf('..RND') >= 0) or (GPPUndefNames.IndexOf('RND') >= 0)))) and
+           (GetEnvironmentVariable('SB_RND_NAMES') <> '0') then
+          raise Exception.CreateFmt('Variable not declared, %s', [LowerCase(ArrName)]);
         // ⭐ A ROUTINE fbc's OWN HEADERS DECLARE IN `extern "rtlib"` IS OURS: the qualifier is dropped
         // here, once, and every built-in branch below sees the bare name it already knows. Doing it at
         // the name is what keeps this to one place instead of one branch per routine - and it is why
@@ -12060,6 +12362,7 @@ begin
   {$ENDIF}
 
   // Get or allocate register for this variable
+  if FModernMode and (VarNode.NodeType = antIdentifier) then CheckImplicitUse(VarName, VarNode, 'write');
   VarReg := GetOrAllocateVariable(VarName);
   {$IFDEF DEBUG_SSAPROF}
   ProfQPC(ProfAllocT1);
@@ -20005,7 +20308,10 @@ begin
       DeclareForCounterHome(Node, VarName);
   end
   else
+  begin
+    if FModernMode and (Node.GetChild(0).NodeType = antIdentifier) then CheckImplicitUse(VarName, Node.GetChild(0), 'for');
     VarReg := GetOrAllocateVariable(VarName);
+  end;
 
   // Evaluate start, end, and step values
   ProcessExpression(Node.GetChild(1), StartValue);
@@ -27516,6 +27822,7 @@ function TSSAGenerator.EmitCvaArg(A0, A1: TASTNode; Tok: TLexerToken; ForceStrin
 // and the fetch are ONE step and the answer is simply that slot. Splitting them would mean inventing an
 // address for a value the VM keeps in a string register.
 var
+  CvaW: Integer;   // DIVERGENZE 424
   TypeU: string;
   Bank: TSSARegisterType;
   CurVal, TmpVal: TSSAValue;
@@ -27533,7 +27840,12 @@ begin
   else         Op := ssaVarArgGetInt;
   end;
   TmpVal := MakeSSARegister(Bank, FProgram.AllocRegister(Bank));
-  EmitInstruction(Op, TmpVal, CurVal, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  // ⭐ DIVERGENZE 424 - the asked type's width (+16 for a pointer) rides in the Immediate: a tail C passed has no tagged
+  // slot to say what it is, so the VM narrows an int and marks an address by what the callee NAMES.
+  CvaW := TypeNameWidthCode(TypeU);
+  if (CvaW < 0) or (CvaW > 15) then CvaW := 0;
+  if (Length(TypeU) > 4) and (Copy(TypeU, Length(TypeU) - 3, 4) = ' PTR') then CvaW := CvaW or 16;
+  EmitInstruction(Op, TmpVal, CurVal, MakeSSAValue(svkNone), MakeSSAConstInt(CvaW));
   // ...and the cursor moves on. Written as the assignment the programmer never had to write, so it
   // goes through the ordinary store path and works for a local, a SHARED, or a BYREF parameter alike.
   // The synthesised "+" carries A0's OWN token, not the caller's: a binary-op node whose token is an
@@ -28142,7 +28454,12 @@ begin
   Result := False; Why := '';
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then begin Why := 'it is not a declared type'; Exit; end;
   if Depth > 6 then begin Why := 'it nests deeper than this classification follows'; Exit; end;
-  if FUDTs[UDTIdx].IsUnion then begin Why := 'it is a UNION'; Exit; end;
+  // ⭐ DIVERGENZE 446 (1) - A UNION IS ITS MEMBERS' LEAVES, ALL AT THE SAME OFFSET. The SysV classification merges what
+  // overlaps in one eightbyte (INTEGER beats SSE, MergeClass), which is the ABI's own rule for a union, and the registers
+  // are loaded from the record's BYTES, so overlapping leaves cannot disagree about a value. Refused, it kept fontconfig's
+  // FcValue (a tag and a union) from being passed by value at all. SB_SVAL_UNION=0 is the A/B.
+  if FUDTs[UDTIdx].IsUnion and (GetEnvironmentVariable('SB_SVAL_UNION') = '0') then
+    begin Why := 'it is a UNION'; Exit; end;
   if not UDTCLayoutRaw(UDTIdx, Offsets, TotalSize) then begin Why := 'it has no C byte layout'; Exit; end;
   if TotalSize <= 0 then begin Why := 'it has no C byte layout'; Exit; end;
   n := Length(FUDTs[UDTIdx].Fields);
@@ -28156,7 +28473,9 @@ begin
       begin Why := 'field "' + F^.Name + '" is a bit field'; Exit; end;
     if F^.IsCvaList then
       begin Why := 'field "' + F^.Name + '" is a CVA_LIST'; Exit; end;
-    if (F^.UnionGroup <> 0) or (F^.StructGroup <> 0) then
+    // ...and the same for a member of an inline "Union ... End Union" block: its offset is the layout's, overlapping its
+    // siblings. A nested anonymous TYPE block inside one keeps its own offsets too.
+    if ((F^.UnionGroup <> 0) or (F^.StructGroup <> 0)) and (GetEnvironmentVariable('SB_SVAL_UNION') = '0') then
       begin Why := 'field "' + F^.Name + '" is inside a nested UNION or TYPE block'; Exit; end;
     if (F^.Bank = srtString) or F^.IsWString or F^.IsZString or (F^.StrCapacity > 0) then
       begin Why := 'field "' + F^.Name + '" is a string'; Exit; end;
@@ -49849,8 +50168,9 @@ var
   procedure WantProcPtrTypes(N: TASTNode; const What: string);
   var
     Lst: string;
-    b, i: Integer;
+    b, i, PNo: Integer;
   begin
+    PNo := 0;
     if N.Attributes.Values['FUNCPTR'] <> '1' then Exit;
     // ⛔⛔ NON DENTRO UN NAMESPACE. Li' ogni tipo e' registrato col PREFISSO
     // (win/GdiPlus.bi apre "namespace Gdiplus", e "type X as ..." diventa GDIPLUS.X), mentre questa
@@ -49878,10 +50198,18 @@ var
         // puntatore a procedura annidato (sqlite3.bi, xFindFunction). Si guarda se il '#' c'e', non
         // se la stringa e' esattamente "#P".
         if Pos('#', Copy(Lst, b, i - b)) = 0 then
+        begin
           WantNameIn(Copy(Lst, b, i - b), 'a parameter of ' + What, NsContextOf(N));
+          // ⛔ DIVERGENZE 201 - ...and BYVAL it must be COMPLETE (fbc's error 71); BYREF or unstated it may not be.
+          Inc(PNo);
+          if Copy(N.Attributes.Values['FPMODES'], PNo, 1) = 'V' then
+            IncompleteByValueName(Trim(Copy(Lst, b, i - b)), 'a BYVAL parameter of ' + What);
+        end;
         b := i + 1;
       end;
     WantNameIn(N.Attributes.Values['FPRET'], 'the result of ' + What, NsContextOf(N));
+    if N.Attributes.Values['FPRETBYREF'] <> '1' then   // "Function() ByRef As T" may name an incomplete T
+      IncompleteByValueName(Trim(N.Attributes.Values['FPRET']), 'the result of ' + What);
   end;
 
 begin
@@ -49927,8 +50255,15 @@ begin
             'later - a single pass compiler has not seen it here',
             [VarToStr(TypeNode.Value), VarToStr(ParamNode.Value), VarToStr(Node.Value),
              TypeNode.SourceLine]);
+        NoteIncompleteByValue(TypeNode, 'the field "' + VarToStr(ParamNode.Value) + '" of "' + VarToStr(Node.Value) + '"');
       end;
     end;
+  // ...and a module-level DIM of one, "Dim v As H" (201): fbc's "error 71: Incomplete type".
+  if (Node.NodeType = antDim) and (FDefProcDepth = 0) then
+    for i := 0 to Node.ChildCount - 1 do
+      if (Node.GetChild(i).NodeType = antArrayDecl) and (Node.GetChild(i).ChildCount >= 2) and
+         (Node.GetChild(i).GetChild(1).NodeType = antIdentifier) then
+        NoteIncompleteByValue(Node.GetChild(i).GetChild(1), 'the variable "' + VarToStr(Node.GetChild(i).GetChild(0).Value) + '"');
   if Node.NodeType = antProcedureDecl then
   begin
     if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) and
@@ -49954,12 +50289,56 @@ begin
             ((Node.NodeType = antProcedureDecl) and (Node.ChildCount >= 1) and
              (Pos('.', NodeTextUpper(Node.GetChild(0))) > 0));
   if Inside then Inc(FDefNsDepth);
+  if Node.NodeType = antProcedureDecl then Inc(FDefProcDepth);
   try
     for i := 0 to Node.ChildCount - 1 do
       CheckDefinedProcTypes(Node.GetChild(i));
   finally
     if Inside then Dec(FDefNsDepth);
+    if Node.NodeType = antProcedureDecl then Dec(FDefProcDepth);
   end;
+end;
+
+procedure TSSAGenerator.IncompleteByValueName(const TypeName, What: string);
+// The same question as NoteIncompleteByValue, asked of a type NAME the parser left in an attribute (a procedure-pointer
+// signature has no type nodes, only FPPARAMS / FPRET text). No line to quote: the message names the pointer instead.
+var
+  T: string;
+begin
+  if FDefNsDepth > 0 then Exit;
+  T := UpperFast(Trim(TypeName));
+  if (T = '') or (Pos(' PTR', T) > 0) or (Pos('.', T) > 0) or (Pos('#', T) > 0) then Exit;
+  if not TypeNameIsIncomplete(T) then Exit;
+  if GetEnvironmentVariable('SB_INCOMPLETE_DECL') = '0' then Exit;
+  if GetEnvironmentVariable('INCOMPLETE_DIAG') <> '' then
+  begin
+    WriteLn(ErrOutput, 'INCOMPLETE ', T, ' ', What);
+    Exit;
+  end;
+  raise Exception.CreateFmt('Incomplete type: "%s" names a type with no size, and %s cannot hold one by value',
+    [TypeName, What]);
+end;
+
+procedure TSSAGenerator.NoteIncompleteByValue(TypeNode: TASTNode; const What: string);
+// ⛔ DIVERGENZE 201 - a FIELD or a module-level DIM of an INCOMPLETE type (an alias whose chain ends at nothing:
+// "type H as H_") BY VALUE is fbc's "error 71: Incomplete type", as a parameter and a result already were here. Through
+// a POINTER it is fine ("p as H ptr"). Asked only outside a namespace, where the type question is exact (see
+// WantProcPtrTypes). INCOMPLETE_DIAG=1 prints instead of refusing (the census); SB_INCOMPLETE_DECL=0 is the A/B.
+var
+  T: string;
+begin
+  if (TypeNode = nil) or (FDefNsDepth > 0) then Exit;
+  T := UpperFast(Trim(VarToStr(TypeNode.Value)));
+  if (T = '') or (Pos(' PTR', T) > 0) or (Pos('.', T) > 0) then Exit;
+  if not TypeNameIsIncomplete(T) then Exit;
+  if GetEnvironmentVariable('SB_INCOMPLETE_DECL') = '0' then Exit;
+  if GetEnvironmentVariable('INCOMPLETE_DIAG') <> '' then
+  begin
+    WriteLn(ErrOutput, 'INCOMPLETE ', T, ' ', What, ' line=', TypeNode.SourceLine);
+    Exit;
+  end;
+  raise Exception.CreateFmt('Incomplete type: "%s" names a type with no size, and %s cannot hold one by value ' +
+    '(line %d)', [VarToStr(TypeNode.Value), What, TypeNode.SourceLine]);
 end;
 
 procedure TSSAGenerator.CheckDeclaredProcTypes(AST: TASTNode);
@@ -51047,10 +51426,18 @@ var
            // the cast is the spelling a C API forces.
            IsRawPtrFieldExpr(Rhs.GetChild(0)) or IsRawPtrCellExpr(Rhs.GetChild(0)) or
            ((Rhs.GetChild(0).NodeType = antIdentifier) and IsRawPtr(VarToStr(Rhs.GetChild(0).Value))) or
+           // ⛔ DIVERGENZE 377 - ...and a UDT pointer laid over C's memory, which lives in the OTHER registry
+           // (FRawUDTPtrs): "raw = Cast(Long Ptr, x)" with x from calloc read element 10 at offset 10 in strict (0;
+           // fbc 7). The same two-registries shape as 249. SB_CAST_RAWUDT=0 is the A/B.
+           ((Rhs.GetChild(0).NodeType = antIdentifier) and (RawUDTPtrType(VarToStr(Rhs.GetChild(0).Value)) <> '') and
+            (GetEnvironmentVariable('SB_CAST_RAWUDT') <> '0')) or
+           AddrOfRawUDTField(Rhs.GetChild(0)) or
            ((Rhs.GetChild(0).NodeType = antProcAddress) and (Rhs.GetChild(0).ChildCount = 0) and
             (FAddrTakenScalars.IndexOfName(Rhs.GetChild(0).ValueUpper) >= 0)) then
           MarkRaw(TargetU);
     end
+    else if AddrOfRawUDTField(Rhs) then
+      MarkRaw(TargetU)   // p = @x->f [through a pointer CAST], x a UDT pointer over C's memory: a byte address (377)
     else if (Rhs.NodeType = antProcAddress) and (Rhs.ChildCount = 0) and
             (FAddrTakenScalars.IndexOfName(Rhs.ValueUpper) >= 0) then
     begin
@@ -54752,6 +55139,7 @@ function TSSAGenerator.ForeignDynEntry(const Sig: string): string;
 var
   Bar, i, k: Integer;
   Ret, Params, T, Rest, Tail: string;
+  DynWhy: string;   // DIVERGENZE 661
 begin
   Result := '';
   Bar := Pos('|', Sig);
@@ -54785,6 +55173,12 @@ begin
     if (ForeignKindOf(T) = fkLongDouble) or
        ((ForeignKindOf(T) = fkUnknown) and not ((FEnumNames <> nil) and (FEnumNames.IndexOf(T) >= 0)) and
         ((FindUDT(T) < 0) or not DynStructByValueOn)) then Exit;
+    // ⛔ DIVERGENZE 661 - ...and a record with NO C image (a String field, a handle member) is no C parameter at all: no
+    // C function can take one, so the call stays the BASIC one. Asked of it, the classification refused the whole
+    // PROGRAM at compile time ("... has no C byte layout") as soon as the program declared anything foreign - an
+    // "#include crt.bi" was enough to stop "g(*p)" through a "Sub(ByRef As dog)". SB_DYN_NOIMAGE=0 is the A/B.
+    if (FindUDT(T) >= 0) and (GetEnvironmentVariable('SB_DYN_NOIMAGE') <> '0') and
+       (ForeignStructRetSpec(FindUDT(T), DynWhy) = '') then Exit;
     if Params <> '' then Params := Params + ',';
     Params := Params + T;
   end;
@@ -57722,6 +58116,7 @@ procedure TSSAGenerator.ProcessMemberAccess(Node: TASTNode; out Result: TSSAValu
 // member is not a field but a (no-arg) method of the object's type, lower a method call.
 var
   TypeName, NestedT, MethodLbl, SMBack, QualKey, EnumQual: string;
+  EnumProbe: TSSAValue;   // DIVERGENZE 655: is the base a variable visible here?
   UDTIdx, Slot, QualIdx: Integer;
   Bank: TSSARegisterType;
   HandleVal, DestVal, TempV: TSSAValue;
@@ -57755,7 +58150,18 @@ begin
   // bar" BEFORE the enum) is the point of the test. Asked through CanonicalType, the funnel every other
   // reader of an alias already uses, and only when the written name is not itself an enum.
   EnumQual := Node.GetChild(0).ValueUpper;
-  if (EnumQual <> '') and (FEnumNames.IndexOf(EnumQual) < 0) then
+  // ⛔ DIVERGENZE 655 - ...but a base the program DECLARES as a variable is that variable: "Dim Shared e As R" beside a
+  // "Namespace M : Enum E" read "e.a" as M.E's member (CanonicalType found M.E for "E"), so "e.a = 9 : Print e.a"
+  // printed 0. fbc refuses a variable named like an enum it can SEE, so the variable winning is the only reading left.
+  // Asked of the scope HERE (ResolveExisting), not of the program: a "color" parameter in some other Sub must not hide
+  // "Color.Red" everywhere.
+  // At module level every name is pre-bound, so there the question is a module-level RECORD declaration.
+  if (Node.GetChild(0).NodeType = antIdentifier) and FModernMode and IsDeclaredName(EnumQual) and
+     (GetEnvironmentVariable('SB_NS_ENUM_USING') <> '0') and
+     ((FInProcedure and ResolveExisting(EnumQual, EnumProbe, False)) or
+      ((not FInProcedure) and ModuleRecordVarDeclared(EnumQual))) then
+    EnumQual := ''
+  else if (EnumQual <> '') and (FEnumNames.IndexOf(EnumQual) < 0) then
     EnumQual := UpperFast(CanonicalType(EnumQual));
   if ((Node.GetChild(0).NodeType = antIdentifier) or (Node.GetChild(0).NodeType = antMemberAccess)) and
      (FEnumNames.IndexOf(EnumQual) >= 0) then
@@ -61716,6 +62122,11 @@ begin
     // assignment was dropped - the method ran and wrote nothing. For an ordinary "TYPE.METHOD" the two
     // readings coincide, which is why it went unnoticed.
     FCurrentThisType := OwnerTypeOfLabel(Name);
+    // ⭐ DIVERGENZE 661 - the entry generated for "@T.m" of a static method calls it from T's own side: a PRIVATE static
+    // method is reachable from T, and the call came back with garbage from outside it. It has no THIS (none is in its
+    // parameter list), so nothing below rewrites a field of one.
+    if (FCurrentThisType = '') and (Proc.Attributes.Values['STATICADDROWNER'] <> '') then
+      FCurrentThisType := Proc.Attributes.Values['STATICADDROWNER'];
     // ...and "pq[i].v" / "arr(i).v" over a field of THIS, rewritten before anything asks (526). Only
     // where there IS a THIS: a static method has none to offer.
     if (FCurrentThisType <> '') and (Proc.ChildCount >= 3) and (Proc.GetChild(1) <> nil) and
@@ -62284,6 +62695,8 @@ begin
 
     antRandomize:
     begin
+      if BuiltinRetiredByUndef(Node, 'RANDOMIZE') then
+        raise Exception.Create('Variable not declared, randomize');
       // RANDOMIZE [seed] — seed the RNG. With a seed expression: Src1 = seed reg, Immediate = 1.
       // Without: seed from the system timer (Immediate = 0); Src1 holds a dummy 0 register so
       // register compaction always sees a valid Src1.
@@ -63328,6 +63741,9 @@ begin
   // global (persistent across calls, initialised once). No-op without STATIC declarations.
   PreMarkStart; LowerStaticLocals(AST); PreMarkEnd('LowerStaticLocals');
 
+  // ⭐ DIVERGENZE 661 - the ADDRESS of a static method is an entry with no THIS (see WrapStaticMethodAddresses).
+  if GetEnvironmentVariable('SB_STATIC_ADDR') <> '0' then WrapStaticMethodAddresses(AST);
+
   // FB lexical scope: reset the scope stack (module scope is FVarMap itself; the stack holds only
   // proc-root and block frames, pushed during lowering in MODERN mode). Inert in CLASSIC.
   while Length(FScopeStack) > 0 do ScopePopFrame;
@@ -63613,6 +64029,14 @@ begin
   // Names an explicit declaration introduces, collected BEFORE any lowering: the MODERN bare-name
   // intercepts (TRUE/FALSE, M_*, CURDIR, EXEPATH, COMMAND, ...) must know them to stand aside.
   FDeclaredNames.Clear;
+  FImplicitMode := -1;
+  FMoreDeclaredNames.Clear;
+  if AST.Attributes.Values['EXTERNNAMES'] <> '' then
+  begin
+    FMoreDeclaredNames.Delimiter := ';';
+    FMoreDeclaredNames.StrictDelimiter := True;
+    FMoreDeclaredNames.DelimitedText := AST.Attributes.Values['EXTERNNAMES'];
+  end;
   CollectDeclaredNames(AST);
 
   PreAllocateVariables(AST);

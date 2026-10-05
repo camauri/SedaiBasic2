@@ -204,6 +204,12 @@ function ForeignMappedExtentFresh(A: PtrUInt): PtrUInt;
 
 function ForeignIsMachineAddress(A: PtrUInt): Boolean;   // may C's mark go on this value? (DIVERGENZE 451)
 
+{ ⭐ DIVERGENZE 475 - the handlers a program registered with atexit, run in REVERSE order. atexit exists in glibc only as
+  a static-link stub (libc_nonshared.a), so dlsym cannot find it and the runtime answers it with a shim of its own that
+  keeps the list; the VM calls this at the end of the program, while it can still run them (fbc runs them after the last
+  line, before the process goes). }
+procedure ForeignRunAtexitHandlers;
+
 implementation
 
 { ⭐ THE CALLS THAT SAY HOW BIG THE MEMORY THEY RETURN IS, and the ones that take it back (DIVERGENZE
@@ -659,6 +665,47 @@ const
   C_LC_CTYPE = 0;                        // glibc
 {$ENDIF}
 
+var
+  GAtexitHandlers: array of Pointer;   // DIVERGENZE 475: what the program handed to atexit, in registration order
+  GAtexitLock: TRTLCriticalSection;
+
+function SbAtexitShim(F: Pointer): LongInt; cdecl;
+begin
+  Result := 0;
+  if F = nil then Exit(-1);
+  EnterCriticalSection(GAtexitLock);
+  try
+    SetLength(GAtexitHandlers, Length(GAtexitHandlers) + 1);
+    GAtexitHandlers[High(GAtexitHandlers)] := F;
+  finally
+    LeaveCriticalSection(GAtexitLock);
+  end;
+end;
+
+type
+  TAtexitProc = procedure; cdecl;
+
+procedure ForeignRunAtexitHandlers;
+var
+  F: Pointer;
+begin
+  if GetEnvironmentVariable('ATEXIT_DIAG') <> '' then WriteLn(ErrOutput, '[ATEXIT] handlers ', Length(GAtexitHandlers));
+  // one at a time, from the LAST: a handler may register another, which then runs next, as C's exit does
+  while True do
+  begin
+    EnterCriticalSection(GAtexitLock);
+    try
+      if Length(GAtexitHandlers) = 0 then Exit;
+      F := GAtexitHandlers[High(GAtexitHandlers)];
+      SetLength(GAtexitHandlers, Length(GAtexitHandlers) - 1);
+    finally
+      LeaveCriticalSection(GAtexitLock);
+    end;
+    if GetEnvironmentVariable('ATEXIT_DIAG') <> '' then WriteLn(ErrOutput, '[ATEXIT] calling ', HexStr(F));
+    TAtexitProc(F)();
+  end;
+end;
+
 function TForeignTable.ResolveSymbol(var B: TForeignBinding): Pointer;
 // Where to look, in order: the library the DECLARATION named, then each "#inclib", then the process
 // itself. The last one is what makes a symbol from the host executable or from an already-loaded
@@ -755,6 +802,12 @@ begin
     Result := FFISymbol(GLibcHandle, B.Decl.Symbol);
     if Result <> nil then Exit;
   end;
+  {$ENDIF}
+  {$IFDEF LINUX}
+  // ⭐ DIVERGENZE 475 - "atexit" is in no .so (glibc keeps it in libc_nonshared.a, for the static linker): answered by a
+  // shim that keeps the list, run by the VM at the end of the program. SB_ATEXIT_SHIM=0 is the A/B.
+  if (B.Decl.Symbol = 'atexit') and (GetEnvironmentVariable('SB_ATEXIT_SHIM') <> '0') then
+    Exit(Pointer(@SbAtexitShim));
   {$ENDIF}
   if Tried = '' then
     raise EForeignCallError.CreateFmt('%s: the symbol "%s" was not found, and no library was named ' +
@@ -1842,10 +1895,15 @@ begin
   end;
 end;
 
-{$IFNDEF WINDOWS}
 initialization
+  // ⛔ GAtexitLock on EVERY target (DIVERGENZE 475): a zeroed Windows CRITICAL_SECTION reads as already held, and the
+  // first EnterCriticalSection at program end waited forever - sb.exe printed nothing and never exited.
+  InitCriticalSection(GAtexitLock);
+  {$IFNDEF WINDOWS}
   InitCriticalSection(GMapLock);
+  {$ENDIF}
 finalization
+  {$IFNDEF WINDOWS}
   DoneCriticalSection(GMapLock);
-{$ENDIF}
+  {$ENDIF}
 end.
