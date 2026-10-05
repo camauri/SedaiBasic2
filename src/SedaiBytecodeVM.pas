@@ -728,7 +728,8 @@ type
     function GfxViewH: Integer;
     procedure RecomputeGfxWindow;            // rebuild the WINDOW coefficients against the current viewport
     function DrawSurface: Integer;           // FreeBASIC per-statement image draw target (else the work page)
-    function NextConsoleField: string;             // MODERN INPUT: the next field of the stdin stream
+    function NextConsoleField: string;
+    function NextConsoleLine: string;     // LINE INPUT: the whole line (DIVERGENZE 646)             // MODERN INPUT: the next field of the stdin stream
     procedure SetupGfxScreen(W, H, NumPages: Integer; Depth: Integer = 0);  // SCREENRES/SCREEN: resize + (re)build pages
     // Group-specific dispatch handlers
     procedure ExecuteStringOp(Ctx: TExecutionContext; const Instr: TBytecodeInstruction);
@@ -12647,7 +12648,8 @@ begin
         Ctx.Running := False;
         Ctx.Stopped := False;  // END clears stopped state
         // "End n": n is what the PROCESS answers with. 0 is both "no code" and "End 0".
-        if Instr.Immediate <> 0 then FProgramExitCode := Instr.Immediate;
+        if Instr.Immediate = END_CODE_IN_SRC1 then FProgramExitCode := Ctx.IntRegs[Instr.Src1] and 255
+        else if Instr.Immediate <> 0 then FProgramExitCode := Instr.Immediate;
       end;
     bcAssert:
       begin
@@ -20503,12 +20505,18 @@ begin
         if Assigned(FOutputDevice) and
            (GStdinIsTerminal or not (Assigned(FProgram) and FProgram.ModernMode)) then
         begin
-          if ((Instr.Immediate = -1) or (Instr.Src1 > 0)) and (Instr.Src1 < Length(Ctx.StringRegs)) then
+          if ((Instr.Immediate = -1) or (Instr.Immediate = INPUT_LINE_PROMPT) or (Instr.Src1 > 0)) and
+             (Instr.Src1 < Length(Ctx.StringRegs)) then
             FOutputDevice.Print(Ctx.StringRegs[Instr.Src1]);
         end;
         // MODERN: the field stream, with the field rule (leading blanks off, trailing kept, quotes).
         // This arm had no MODERN branch at all: it read a whole line per variable, prompt included.
-        if Assigned(FProgram) and FProgram.ModernMode then
+        // ⭐ ...and LINE INPUT takes the WHOLE line, commas included (DIVERGENZE 646): the rest of a line an INPUT left
+        // half read, else the next one.
+        if Assigned(FProgram) and FProgram.ModernMode and
+           ((Instr.Immediate = INPUT_LINE_PROMPT) or (Instr.Immediate = INPUT_LINE)) then
+          Ctx.StringRegs[Instr.Dest] := NextConsoleLine
+        else if Assigned(FProgram) and FProgram.ModernMode then
           Ctx.StringRegs[Instr.Dest] := NextConsoleField
         else
           Ctx.StringRegs[Instr.Dest] := FInputDevice.ReadLine('? ', False, False, False);
@@ -20679,6 +20687,21 @@ begin
   else
     raise Exception.CreateFmt('Unknown special variable opcode %d at PC=%d', [Instr.OpCode, Ctx.PC]);
   end;
+end;
+
+function TBytecodeVM.NextConsoleLine: string;
+// LINE INPUT from the console (DIVERGENZE 646): the rest of the line an INPUT left half read, else the next line, whole -
+// commas are text here, not field separators. Shares the buffer with NextConsoleField, so the two interleave as fbc's do.
+begin
+  if (FConInPos >= 1) and (FConInPos <= Length(FConInBuf)) then
+  begin
+    Result := Copy(FConInBuf, FConInPos, MaxInt);
+    FConInPos := Length(FConInBuf) + 1;
+    Exit;
+  end;
+  Result := FInputDevice.ReadLine('', False, False, True);
+  FConInBuf := '';
+  FConInPos := 0;
 end;
 
 function TBytecodeVM.NextConsoleField: string;
@@ -21396,6 +21419,10 @@ begin
         DrawMode := ImgHandleOf(Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]);   // dst image handle
         if GetX2 < GetX1 then begin SwapTmp := GetX1; GetX1 := GetX2; GetX2 := SwapTmp; end;
         if GetY2 < GetY1 then begin SwapTmp := GetY1; GetY1 := GetY2; GetY2 := SwapTmp; end;
+        // ⭐ DIVERGENZE 646 - the image TAKES the rectangle's size: fbc writes the buffer's header (width, height, pitch)
+        // from the rectangle, so a 20x20 buffer filled by a 10x10 GET reports 10x10 and PUTs 10x10. It kept its size.
+        if (DrawMode <> GFX_SCREEN_SURFACE) and (DrawMode > 0) then
+          FGraphics.ResizeSurface(DrawMode, GetX2 - GetX1 + 1, GetY2 - GetY1 + 1);
         for GetSy := 0 to (GetY2 - GetY1) do
           for GetSx := 0 to (GetX2 - GetX1) do
             FGraphics.SetPixel(DrawMode, GetSx, GetSy,
@@ -21407,11 +21434,16 @@ begin
         //  it, and blitted onto the screen anyway. DrawSurface is the same funnel PSET/LINE/CIRCLE/
         //  PAINT/POINT read, and it is the work page whenever no target is active.
       if Assigned(FGraphics) then
+      begin
         // Immediate [0-15]=src handle reg, [16-31]=mode ordinal, [32-47]=blend-value reg (-1 = none).
         FGraphics.Blit(DrawSurface, GfxMapX(Ctx.IntRegs[Instr.Src1]), GfxMapY(Ctx.IntRegs[Instr.Src2]),
                        ImgHandleOf(Ctx.IntRegs[Instr.Immediate and $FFFF]),
                        TGfxBlitMode((Instr.Immediate shr 16) and $FFFF),
                        Ctx.IntRegs[(Instr.Immediate shr 32) and $FFFF]);
+        // ...and the corner becomes the current graphics point, as fbc's PUT leaves it: "Put Step( 4, 4 )" after
+        // "Put ( 2, 2 )" lands at ( 6, 6 ) there (DIVERGENZE 646)
+        FDrawPenX := Ctx.IntRegs[Instr.Src1]; FDrawPenY := Ctx.IntRegs[Instr.Src2];
+      end;
     41: // bcGfxScreenInfo - __SCRINFO(which): screen w/h/depth/bpp/pitch/rate
       // ⭐⭐ WITH NO SCREEN SET, SCREENINFO REPORTS THE DESKTOP - and answering 0 there is not a
       // conservative silence, it is a wrong number a program divides by. fbc answers the desktop it

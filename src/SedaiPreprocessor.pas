@@ -4819,6 +4819,8 @@ var
     Canon: string;   // the include path, canonicalised - the identity every "once" question asks about
     Raw, Trimmed, DName, DRest, MacroName, MacroVal, FileName, FullPath, PathHit: string;
     Params, MacroBody, BodyTrim, EName, ERest, LineFile: string;
+    LastSeg: string;     // the last line of a #macro body so far, for a continuation (646)
+    ContCut: Integer;
     LineNum: Integer;
     IsFn: Boolean;
     OptParen: Boolean;   // "#macro name ? (params)": the parentheses are optional at the call site
@@ -5493,8 +5495,21 @@ var
               BodyTrim := Trim(StripDirectiveComment(Lines[li]));
               if BodyTrim <> '' then
               begin
-                if MacroBody <> '' then MacroBody := MacroBody + cVirtualEOL;
-                MacroBody := MacroBody + BodyTrim;
+                // ⭐ DIVERGENZE 646 - a body line that ends in '_' CONTINUES on the next one, inside a #macro as anywhere
+                // (fbc joins at token level): "__FB_UNQUOTE__( __FB_EVAL__( _" / "...args _" / ") )" is ONE call, and
+                // kept as three segments it was evaluated cut in half - the "#define" it builds came out as code.
+                LastSeg := MacroBody;
+                if Pos(cVirtualEOL, LastSeg) > 0 then
+                  LastSeg := Copy(LastSeg, LastDelimiter(cVirtualEOL, LastSeg) + 1, MaxInt);
+                ContCut := LineContinuationCut(LastSeg);
+                if (MacroBody <> '') and (ContCut > 0) and (GetEnvironmentVariable('SB_PP_MACRO_CONT') <> '0') then
+                  MacroBody := Copy(MacroBody, 1, Length(MacroBody) - Length(LastSeg)) +
+                               TrimRight(Copy(LastSeg, 1, ContCut - 1)) + ' ' + BodyTrim
+                else
+                begin
+                  if MacroBody <> '' then MacroBody := MacroBody + cVirtualEOL;
+                  MacroBody := MacroBody + BodyTrim;
+                end;
               end;
               Output.Add('');   // blank placeholder preserves line numbers
               Inc(li);

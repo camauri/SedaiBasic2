@@ -1573,7 +1573,8 @@ EventPollCounter := 0;
         // Termination. "End n" carries the PROCESS exit code in the Immediate; bcStop has none.
         bcEnd:
           begin
-            if Instr^.Immediate <> 0 then FProgramExitCode := Instr^.Immediate;
+            if Instr^.Immediate = END_CODE_IN_SRC1 then FProgramExitCode := Ctx.IntRegs[Instr^.Src1] and 255
+            else if Instr^.Immediate <> 0 then FProgramExitCode := Instr^.Immediate;
             Break;
           end;
         bcStop: Break;

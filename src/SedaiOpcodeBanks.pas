@@ -285,6 +285,7 @@ begin
     bcPrintFileFloat, bcPrintFileInt,        // Src1 = handle (int)
     bcFileQuery, bcFileAttr, bcFileSetEof, bcSeekSet, bcInputFileLine, // Src1 = handle (int)
     bcAssert,        // ASSERT/ASSERTWARN: Src1 = condition (int)
+    bcEnd,           // END <expr>: Src1 = the computed exit code (int) when Immediate = END_CODE_IN_SRC1
     bcGetBinInt, bcGetBinFloat, bcPutBinInt, bcPutBinFloat,  // Src1 = handle (int)
     bcGetBinStr, bcPutBinStr,                                // Src1 = handle (int)
     // Counted/whole-array/padding binary transfers: Src1 = handle (int)

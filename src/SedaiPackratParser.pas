@@ -381,6 +381,7 @@ type
     function ParseStatement: TASTNode;
     function ParseStatementBody: TASTNode;
     function StatementEndsHere: Boolean;   // DIVERGENZE 646
+    function AtParenArgList: Boolean;      // DIVERGENZE 646: "Sleep(18, 1)" - a parenthesised list of ARGUMENTS
 
     function ParseAssignmentStatement: TASTNode;
 
@@ -2008,6 +2009,41 @@ begin
   end;
 end;
 
+function IsWordToken(T: TLexerToken): Boolean;
+// A token spelled as a WORD (a keyword or a name), not punctuation or a literal.
+var
+  W: string;
+begin
+  Result := False;
+  if (T = nil) or (T.TokenType in [ttStringLiteral, ttNumber, ttInteger, ttFloat]) then Exit;
+  W := VarToStr(T.Value);
+  Result := (W <> '') and (UpCase(W[1]) in ['A'..'Z', '_']);
+end;
+
+function TPackratParser.AtParenArgList: Boolean;
+// Is the cursor at "(a, b, ...)" that closes the statement - the call spelling of a statement with several arguments
+// ("Sleep(18, 1)", "Reset(0)")? A '(' that only opens the FIRST argument ("Sleep (a + b) * 2, 1") answers False: the
+// statement does not end at its ')'. DIVERGENZE 646: read as one parenthesised expression, the comma was a syntax error.
+var
+  k, Depth: Integer;
+  T: TLexerToken;
+begin
+  Result := False;
+  if not Context.Check(ttDelimParOpen) then Exit;
+  Depth := 0;
+  k := 0;
+  repeat
+    T := Context.PeekToken(k);
+    if (T = nil) or (T.TokenType in [ttEndOfLine, ttEndOfFile, ttSeparStmt]) then Exit;
+    if T.TokenType = ttDelimParOpen then Inc(Depth)
+    else if T.TokenType = ttDelimParClose then Dec(Depth);
+    Inc(k);
+  until Depth = 0;
+  T := Context.PeekToken(k);
+  Result := (T = nil) or (T.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse,
+                                          ttCommentRemark, ttCommentStart, ttCommentText]);
+end;
+
 function TPackratParser.StatementEndsHere: Boolean;
 // Does the statement just parsed END here, as -lang fb requires? End of line, ':', end of file, a comment, or the
 // ELSE of a single-line IF.
@@ -2029,19 +2065,35 @@ function TPackratParser.ParseStatement: TASTNode;
 // (the census); SB_STMT_EOL=0 is the A/B.
 var
   StartIdx: Integer;
+
+  function TokText(k: Integer): string;   // STMTEOL_DIAG: the text around the leftover, nil-safe
+  begin
+    if Assigned(Context.PeekToken(k)) then Result := VarToStr(Context.PeekToken(k).Value) else Result := '';
+  end;
+
 begin
   StartIdx := Context.CurrentIndex;
   Result := ParseStatementBody;
   if (not FModernMode) or (Context.CurrentIndex = StartIdx) or StatementEndsHere then Exit;
   // "If cond" and its "Then" are two statements of this parser (ParseIfStatement / ParseThenStatement).
   if Assigned(Result) and (Result.NodeType = antIf) and Context.Check(ttConditionalThen) then Exit;
+  // "If c Then k = 1 End If" on ONE line (fbc accepts it; guards m758 · m760 come from its suite): END IF closes the
+  // single-line IF, as ELSE does.
+  if SameText(VarToStr(Context.CurrentToken.Value), 'END') and Assigned(Context.PeekNext) and
+     SameText(VarToStr(Context.PeekNext.Value), 'IF') then Exit;
   if SourceDeclaresNonFbDialect then Exit;
   if GetEnvironmentVariable('STMTEOL_DIAG') <> '' then
   begin
     WriteLn(ErrOutput, 'STMTEOL ', Context.CurrentToken.Line, ':', Context.CurrentToken.Column, ' found "',
-            VarToStr(Context.CurrentToken.Value), '" type=', Ord(Context.CurrentToken.TokenType));
+            VarToStr(Context.CurrentToken.Value), '" type=', Ord(Context.CurrentToken.TokenType), ' prev="',
+            TokText(-2), ' ', TokText(-1), '" next="', TokText(1), ' ', TokText(2), '"');
     Exit;
   end;
+  // ⭐ The REFUSAL, switched on once the census came back clean over the corpus, the library probes, the 1306 headers
+  // and the valid programs of fbc's manual and suite (5 Oct 2026): every statement that left tokens behind there was
+  // a construct read short, and each was taught to read its whole shape first.
+  if GetEnvironmentVariable('SB_STMT_EOL') = '0' then Exit;
+  HandleError('Expected End-of-Line, found "' + VarToStr(Context.CurrentToken.Value) + '"', Context.CurrentToken);
 end;
 
 function TPackratParser.ParseStatementBody: TASTNode;
@@ -2086,6 +2138,23 @@ begin
 
   if not HasValidContext or Context.IsAtEnd then
     Exit;
+
+  // ⭐ DIVERGENZE 646 - ".ThreadWait( p )" / "..ThreadWait( ._pt )": the GLOBAL-scope dots before a BUILTIN statement,
+  // which is how a method named like it reaches the builtin (manual proguide/multithreading). ".name" is global outside
+  // a WITH, "..name" always; before a keyword they only say "not the member", so they are stepped over. A dotted NAME is
+  // left to the expression parser, which already resolves it (GLOBALSCOPE).
+  if FModernMode and Context.Check(ttOpDot) and Assigned(Context.PeekNext) then
+  begin
+    if (Context.PeekNext.TokenType = ttOpDot) and Assigned(Context.PeekToken(2)) and
+       (Context.PeekToken(2).TokenType <> ttIdentifier) and IsWordToken(Context.PeekToken(2)) then
+    begin
+      Context.Advance;                              // '.'
+      Context.Advance;                              // '.'
+    end
+    else if (FExpressionParser.WithObject = nil) and (Context.PeekNext.TokenType <> ttIdentifier) and
+            (Context.PeekNext.TokenType <> ttOpDot) and IsWordToken(Context.PeekNext) then
+      Context.Advance;                              // '.'
+  end;
 
   Token := Context.CurrentToken;
   if not Assigned(Token) then
@@ -2963,7 +3032,10 @@ begin
         // '(' (vs '#') selects the graphics blit form, and so does the image-target form
         // "PUT img, (x,y), src", which LINE/CIRCLE/PAINT/PSET have taken since the target work.
         else if (UpperFast(Token.Value) = kPUT) and Assigned(Context.PeekNext) and
-                ((Context.PeekNext.TokenType = ttDelimParOpen) or LooksLikeImageTarget) then
+                ((Context.PeekNext.TokenType = ttDelimParOpen) or LooksLikeImageTarget or
+                 // "Put Step( x, y ), src" (DIVERGENZE 646)
+                 ((UpperFast(VarToStr(Context.PeekNext.Value)) = kSTEP) and Assigned(Context.PeekToken(2)) and
+                  (Context.PeekToken(2).TokenType = ttDelimParOpen))) then
           Result := ParseGfxPutStatement
         // FreeBASIC binary "PUT #n, [pos], var" — PUT is a bare identifier; the `#` selects it.
         else if (UpperFast(Token.Value) = kPUT) and Assigned(Context.PeekNext) and
@@ -3673,6 +3745,10 @@ begin
       // If not at end of statement, insert implicit semicolon and continue
       if Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
         Break;
+      // ⛔ ...Commodore's, not FreeBASIC's (DIVERGENZE 646): fbc refuses "Print 7 x" with "Expected End-of-Line". In
+      // MODERN the list ends here and the statement-end rule says so.
+      if FModernMode and (GetEnvironmentVariable('SB_STMT_EOL') <> '0') then
+        Break;
       SeparatorNode := TASTNode.CreateWithValue(antSeparator, ';', Context.CurrentToken);
       Result.AddChild(SeparatorNode);
     end;
@@ -3713,6 +3789,10 @@ begin
     Exit;
   end;
 
+  // FreeBASIC "Input ; "prompt", v": the ';' right after INPUT keeps the cursor on the line once the answer is typed
+  // (manual console/input2.bas). Headless there is no echo to keep, so it is consumed; left in place, the whole
+  // statement was the separator and the variables were read as other statements (DIVERGENZE 646).
+  if FModernMode and Context.Check(ttSeparOutput) then Context.Advance;
   while not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) do
   begin
     // Parse expression (prompt string or variable)
@@ -3782,16 +3862,30 @@ begin
 
   // FreeBASIC graphics "GET (x1,y1)-(x2,y2), dst" — capture a screen rectangle into an image surface.
   // The leading '(' disambiguates from "GET A$" and "GET #n,...".
-  if Context.Check(ttDelimParOpen) then
+  if Context.Check(ttDelimParOpen) or
+     ((UpperFast(VarToStr(Context.CurrentToken.Value)) = kSTEP) and Assigned(Context.PeekNext) and
+      (Context.PeekNext.TokenType = ttDelimParOpen)) then
   begin
     Result.Free;
     Result := TASTNode.Create(antGfxGet, Token);
+    // STEP on either corner (manual gfx/bsave2.bas, DIVERGENZE 646): the second one was left on the line, so the
+    // rectangle's size became a second statement and the buffer was never named.
+    if UpperFast(VarToStr(Context.CurrentToken.Value)) = kSTEP then
+    begin
+      Result.Attributes.Values['STEP1'] := '1';
+      Context.Advance;                                          // STEP
+    end;
     Context.Advance;                                            // '('
     Result.AddChild(ParseExpression);                           // x1
     if Context.Check(ttSeparParam) then Context.Advance;        // ','
     Result.AddChild(ParseExpression);                           // y1
     if Context.Check(ttDelimParClose) then Context.Advance;     // ')'
     if Context.Check(ttOpSub) then Context.Advance;             // '-'
+    if UpperFast(VarToStr(Context.CurrentToken.Value)) = kSTEP then
+    begin
+      Result.Attributes.Values['STEP2'] := '1';
+      Context.Advance;                                          // STEP
+    end;
     if Context.Check(ttDelimParOpen) then Context.Advance;      // '('
     Result.AddChild(ParseExpression);                           // x2
     if Context.Check(ttSeparParam) then Context.Advance;        // ','
@@ -5310,12 +5404,21 @@ begin
   // local variables in the body persistent between calls (marked ALLSTATIC; the STATIC-locals lowering
   // treats each scalar local as static). EXPORT is accepted and ignored. Placed here (after the return
   // type) so it is on the signature line, before the body — distinct from a body-level "Static name AS T".
+  // ...and "Option( "fpu" )" (fbc's optimizations/vector: "Function aux1f() As Single Option("fpu")"), which picks the
+  // FPU over SSE for the procedure in fbc's own backend - nothing to choose here, so it is consumed (DIVERGENZE 646).
   while (Context.CurrentToken <> nil) and
         ((SameText(VarToStr(Context.CurrentToken.Value), 'STATIC')) or
-         (SameText(VarToStr(Context.CurrentToken.Value), 'EXPORT'))) do
+         (SameText(VarToStr(Context.CurrentToken.Value), 'EXPORT')) or
+         (SameText(VarToStr(Context.CurrentToken.Value), 'OPTION') and Assigned(Context.PeekNext) and
+          (Context.PeekNext.TokenType = ttDelimParOpen))) do
   begin
     if SameText(VarToStr(Context.CurrentToken.Value), 'STATIC') then
       Result.Attributes.Values['ALLSTATIC'] := '1';
+    if SameText(VarToStr(Context.CurrentToken.Value), 'OPTION') then
+    begin
+      Context.Advance;                            // OPTION
+      while not Context.CheckAny([ttDelimParClose, ttEndOfLine, ttEndOfFile]) do Context.Advance;
+    end;
     Context.Advance;
   end;
 
@@ -5781,6 +5884,7 @@ function TPackratParser.ParseDottedName: string;
 // must be on the first identifier. Segments after a '.' may be reserved words (member names).
 var
   BaseU: string;
+  AliasBase: string;   // "unsigned <alias>": the alias's first word, followed to its base
 
   // FreeBASIC EXPLICIT-WIDTH integer: "Integer<8>" / "UInteger<16>" name the same types BYTE..LONGINT
   // by their bit count. Read at the central type-name reader, for the same reason UNSIGNED is: every
@@ -5865,7 +5969,27 @@ begin
       Result := BaseU;
     end
     else
-      Result := 'UINTEGER';                          // bare UNSIGNED = UNSIGNED INTEGER
+    begin
+      // ⭐ DIVERGENZE 646 - "unsigned <alias>": fbc's cpp/mangle-fbc declares "Type cxxlongint As Long Alias "long"" and
+      // then writes "unsigned cxxlongint". The alias is followed to its integer base and made unsigned; left unread, its
+      // name stayed in the stream and was read as a second statement.
+      AliasBase := '';
+      if (Context.CurrentToken.TokenType = ttIdentifier) and (FTypeAliasOf.IndexOfName(BaseU) >= 0) then
+      begin
+        AliasBase := ResolvedTypeAlias(BaseU) + ' ';
+        AliasBase := Copy(AliasBase, 1, Pos(' ', AliasBase) - 1);
+      end;
+      if (AliasBase = 'BYTE') or (AliasBase = 'UBYTE') then Result := 'UBYTE'
+      else if (AliasBase = 'SHORT') or (AliasBase = 'USHORT') then Result := 'USHORT'
+      else if (AliasBase = 'LONG') or (AliasBase = 'ULONG') then Result := 'ULONG'
+      else if (AliasBase = 'LONGINT') or (AliasBase = 'ULONGINT') then Result := 'ULONGINT'
+      else if (AliasBase = 'INTEGER') or (AliasBase = 'UINTEGER') then Result := 'UINTEGER'
+      else AliasBase := '';
+      if AliasBase <> '' then
+        Context.Advance                              // consume the alias
+      else
+        Result := 'UINTEGER';                        // bare UNSIGNED = UNSIGNED INTEGER
+    end;
     ApplyWidthSuffix(Result);                        // "unsigned integer<16>"
     Exit;
   end;
@@ -5920,6 +6044,7 @@ var
   KindU, PT, ParamTypes, Defaults, Def: string;
   LoopMark, TypeOfMark: Integer;
   NestedFp, DefExpr: TASTNode;
+  ArrDepth: Integer;   // the parentheses of an array parameter (646)
 
   // ⭐ DIVERGENZE 534 - a DEFAULT of the procedure TYPE ("Function(ByVal As Long = 0)") fills an argument a call through
   // the pointer leaves out, as fbc does. The SSA never sees this type's parameter nodes, so the default travels as TEXT
@@ -6002,10 +6127,29 @@ begin
         if SameText(VarToStr(Context.CurrentToken.Value), 'BYVAL') then ParamMode := 'V' else ParamMode := 'R';
         Context.Advance;                             // optional BYVAL/BYREF
       end;
+      // "ByDesc As Any" (fbc's warnings/rtl-prototypes, DIVERGENZE 646): an ARRAY passed by descriptor, BYREF here.
+      if SameText(VarToStr(Context.CurrentToken.Value), 'BYDESC') then
+      begin
+        ParamMode := 'R';
+        Context.Advance;                             // BYDESC
+      end;
       // Optional parameter name before AS (FB allows both "as integer" and "x as integer").
+      // ...and before the dimensions of an ARRAY parameter: "array() As Integer", "a(Any, Any) As T".
       if Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
-         (UpperFast(VarToStr(Context.PeekNext.Value)) = kAS) then
+         ((UpperFast(VarToStr(Context.PeekNext.Value)) = kAS) or (Context.PeekNext.TokenType = ttDelimParOpen)) then
         Context.Advance;                             // skip the parameter name
+      // An array parameter's dimensions - "()", "(Any)", "(Any, Any)" - with or without a name (warnings/ptr-mode-param
+      // writes "(any) as integer"): the signature keeps the element type, as for a named procedure. DIVERGENZE 646.
+      if Context.Check(ttDelimParOpen) then
+      begin
+        ArrDepth := 0;
+        repeat
+          if Context.Check(ttDelimParOpen) then Inc(ArrDepth)
+          else if Context.Check(ttDelimParClose) then Dec(ArrDepth);
+          Context.Advance;
+        until (ArrDepth = 0) or Context.CheckAny([ttEndOfLine, ttEndOfFile]);
+        ParamMode := 'R';
+      end;
       PT := '';
       if Context.Check(ttAsType) then
       begin
@@ -6991,6 +7135,14 @@ begin
       begin
         Context.Advance;                            // '*'
         FExpressionParser.ParseExpression(precCall).Free;
+      end;
+      // "Type cxxlongint As Long Alias "long"" (fbc's cpp/mangle-fbc): the ALIAS names the C++ type for MANGLING only,
+      // which nothing here does; it is consumed. Left in the stream it became a call to a procedure ALIAS (646).
+      if SameText(VarToStr(Context.CurrentToken.Value), 'ALIAS') and Assigned(Context.PeekNext) and
+         (Context.PeekNext.TokenType = ttStringLiteral) then
+      begin
+        Context.Advance;                            // ALIAS
+        Context.Advance;                            // "name"
       end;
     end;
     Result.Attributes.Values['ALIAS'] := UpperFast(AliasType);
@@ -8242,12 +8394,21 @@ begin
      (not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse])) then
     ExitArg := ParseExpression
   else if FModernMode and Context.CheckAny([ttNumber, ttInteger, ttFloat, ttOpSub, ttDelimParOpen]) then
+    ExitArg := ParseExpression
+  // ⭐ DIVERGENZE 646 - "End main()", "End rc": any expression is fbc's exit code (manual control/end.bas). Only a
+  // number was read, so "main()" stayed on the line and became a second statement that never ran before the halt.
+  else if FModernMode and not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse,
+                                                ttCommentRemark, ttCommentStart, ttCommentText]) then
     ExitArg := ParseExpression;
   if Assigned(ExitArg) then
   begin
     if TryConstIntExpr(ExitArg, ExitCodeVal) then
+    begin
       Result.Attributes.Values['EXITCODE'] := IntToStr(ExitCodeVal and 255);
-    ExitArg.Free;
+      ExitArg.Free;
+    end
+    else
+      Result.AddChild(ExitArg);     // a COMPUTED code: evaluated at the END, in a register (SSA antEnd)
   end;
   DoNodeCreated(Result);
 end;
@@ -8421,8 +8582,19 @@ begin
   Result := TASTNode.Create(antSleep, Token);
   Context.Advance; // Consume SLEEP
 
+  // "Sleep(18, 1)": the call spelling, both arguments inside one pair of parentheses (DIVERGENZE 646)
+  if AtParenArgList then
+  begin
+    Context.Advance;                                  // '('
+    Param := ParseExpression;
+    if Assigned(Param) then
+      Result.AddChild(Param);
+    if Context.Match(ttSeparParam) then
+      ParseExpression.Free;                           // wakeup flag: discard, as below
+    Context.Match(ttDelimParClose);
+  end
   // Parse optional parameter (milliseconds to sleep)
-  if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+  else if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
   begin
     Param := ParseExpression;
     if Assigned(Param) then
@@ -8881,6 +9053,7 @@ var
   Saved: Integer;
   TypeStr: string;
   PtrExpr, ValExpr, CastNode, DerefNode, TypeOfExpr: TASTNode;
+  PokeDepth, PokeCommas, PokeK: Integer;   // the top-level arguments of the statement (646)
 begin
   Result := nil;
   Context.SavePosition(Saved);
@@ -8921,6 +9094,29 @@ begin
     begin
       Context.RestorePosition(Saved);                 // a variable that happens to be named like a type
       Exit;
+    end;
+  end;
+  // ⭐ "Type pb As UByte : Poke pb, @b, 123" (fbc's quirk/peek-poke, DIVERGENZE 646): with THREE arguments the first one
+  // can only be the TYPE, even when a variable has the same name. It was read as the pointer, and ", 123" was left over.
+  if (TypeStr = '') and Context.Check(ttIdentifier) and Assigned(Context.PeekNext) and
+     (Context.PeekNext.TokenType = ttSeparParam) and (FTypeAliasOf.IndexOfName(UpperFast(VarToStr(Context.CurrentToken.Value))) >= 0) then
+  begin
+    PokeDepth := 0; PokeCommas := 0; PokeK := 0;
+    while Assigned(Context.PeekToken(PokeK)) and
+          not (Context.PeekToken(PokeK).TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile]) do
+    begin
+      case Context.PeekToken(PokeK).TokenType of
+        ttDelimParOpen: Inc(PokeDepth);
+        ttDelimParClose: Dec(PokeDepth);
+        ttSeparParam: if PokeDepth = 0 then Inc(PokeCommas);
+      end;
+      Inc(PokeK);
+    end;
+    if PokeCommas = 2 then
+    begin
+      TypeStr := ResolvedTypeAlias(UpperFast(VarToStr(Context.CurrentToken.Value)));
+      Context.Advance;                                // the type's name
+      Context.Advance;                                // ','
     end;
   end;
   if TypeStr = '' then TypeStr := 'UBYTE';
@@ -9026,6 +9222,7 @@ var
   Param: TASTNode;
   ParamCount, MaxParams: Integer;
   CircleArgIdx: Integer;
+  InParens: Boolean;          // "Color( fg, bg )": the call spelling (DIVERGENZE 646)
   TargetNode: TASTNode;
   CmdName: string;
 begin
@@ -9457,7 +9654,11 @@ begin
   // omitted ("COLOR fg", "COLOR fg, bg", "COLOR , bg"). HASFG/HASBG attributes record which are present.
   if Result.NodeType = antGfxColor then
   begin
-    if not Context.CheckAny([ttSeparParam, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+    // "Color( fg, bg )" - the call spelling of the statement, both arguments in one pair of parentheses (manual
+    // proguide/multithreading, DIVERGENZE 646): read as "(fg, bg)" it was a parenthesised expression with a comma.
+    InParens := AtParenArgList;
+    if InParens then Context.Advance;                             // '('
+    if not Context.CheckAny([ttSeparParam, ttDelimParClose, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
     begin
       Result.AddChild(ParseExpression);                           // fg
       Result.Attributes.Values['HASFG'] := '1';
@@ -9465,12 +9666,13 @@ begin
     if Context.Check(ttSeparParam) then
     begin
       Context.Advance;                                            // ','
-      if not Context.CheckAny([ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
+      if not Context.CheckAny([ttDelimParClose, ttEndOfLine, ttSeparStmt, ttEndOfFile, ttConditionalElse]) then
       begin
         Result.AddChild(ParseExpression);                         // bg
         Result.Attributes.Values['HASBG'] := '1';
       end;
     end;
+    if InParens then Context.Match(ttDelimParClose);
     DoNodeCreated(Result);
     Exit;
   end;
@@ -9732,7 +9934,11 @@ begin
   else if CmdName = 'SETCOLOR' then
     MaxParams := 5  // SETCOLOR index, R, G, B [, A]
   else if CmdName = 'WIDTH' then
-    MaxParams := 1  // WIDTH n
+  begin
+    // WIDTH n; FreeBASIC's is "Width [cols] [, rows]" (DIVERGENZE 646: the rows were left on the line and read as
+    // another statement). The rows are evaluated and, headless, set nothing - fbc's redirected output is the same.
+    if FModernMode then MaxParams := 2 else MaxParams := 1;
+  end
   else if CmdName = 'SCALE' then
     MaxParams := 3  // SCALE n [,xmax, ymax]
   else if CmdName = 'PAINT' then
@@ -10091,6 +10297,7 @@ var
   C64Name, C64Rest, C64Base: string;   // C64 OPEN lf,dev,sa,"name[,type][,mode]" decoding
   C64Dev, C64Sa, C64FileName: TASTNode;
   IsPipe: Boolean;                     // "Open Pipe <cmd> ...": the file is a PROCESS (DIVERGENZE 180)
+  DevWordU: string;                    // "Open Com/Lpt <name>": a device this runtime does not drive (646)
   C64CommaPos: Integer;
   AccessRead: Boolean;
   ClosedParen: Boolean;   // "Close(fileNum)": the FreeBASIC parenthesised handle
@@ -10204,12 +10411,23 @@ begin
     // fact that it is a pipe travels in the MODE string as a 'P' marker, which the runtime reads the
     // way it already reads 'L' and the encoding markers. DIVERGENZE 180.
     IsPipe := False;
+    DevWordU := '';
     if (SameText(VarToStr(Context.CurrentToken.Value), 'PIPE')) and Assigned(Context.PeekNext) and
        (Context.PeekNext.TokenType <> ttDelimParOpen) and
        (Context.PeekNext.TokenType <> ttOpEq) then
     begin
       Context.Advance;                      // PIPE
       IsPipe := True;
+    end
+    // "Open Com "COM1:9600,N,8,1" As #1", "Open Lpt "LPT1:" For Output As #1" (DIVERGENZE 646): the device word is
+    // followed by its NAME; the name is opened as a file, which fails without the device, as fbc's open does. Left in
+    // place, COM was the filename (an undeclared variable) and the rest of the line another statement.
+    else if FModernMode and ((SameText(VarToStr(Context.CurrentToken.Value), 'COM')) or
+            (SameText(VarToStr(Context.CurrentToken.Value), 'LPT'))) and Assigned(Context.PeekNext) and
+            (Context.PeekNext.TokenType = ttStringLiteral) then
+    begin
+      DevWordU := UpperFast(VarToStr(Context.CurrentToken.Value));
+      Context.Advance;                      // COM / LPT
     end;
     if ((SameText(VarToStr(Context.CurrentToken.Value), 'CONS')) or
         (SameText(VarToStr(Context.CurrentToken.Value), 'SCRN')) or
@@ -10220,6 +10438,9 @@ begin
     begin
       Param := TASTNode.CreateWithValue(antLiteral,
                  UpperFast(VarToStr(Context.CurrentToken.Value)) + ':', Context.CurrentToken);
+      // "Open Cons As #1" with no FOR is a RANDOM open of the console: fbc's Err is 1 (DIVERGENZE 646)
+      if SameText(VarToStr(Context.CurrentToken.Value), 'CONS') and
+         (UpperFast(VarToStr(Context.PeekNext.Value)) = kAS) then DevWordU := 'COM';
       Context.Advance;            // the device name
     end
     else
@@ -10370,6 +10591,8 @@ begin
     Result.AddChild(HandleNode);                            // child 0 = handle
     Result.AddChild(Param);                                 // child 1 = filename
     if IsPipe then ModeStr := ModeStr + 'P';                // ...and the runtime opens a PROCESS
+    if DevWordU = 'LPT' then ModeStr := ModeStr + 'Y'       // a printer, a serial port: fbc's errors 2 and 1
+    else if DevWordU = 'COM' then ModeStr := ModeStr + 'Z';
     Result.AddChild(TASTNode.CreateWithValue(antLiteral, ModeStr, Token));  // child 2 = mode$
     // child 3 = record length expression (RANDOM only; the SSA appends it to the "L" mode).
     if LenExpr <> nil then
@@ -10597,7 +10820,17 @@ begin
   // Syntax: DCLEAR  (FreeBASIC RESET is the same: unbind all file numbers)
   if (CmdName = 'DCLEAR') or (CmdName = 'RESET') then
   begin
-    // No parameters needed
+    // ⭐ DIVERGENZE 646 - FreeBASIC "Reset(streamno)" is ANOTHER statement: it re-attaches stdin (0) or stdout (1) to
+    // the console and closes nothing (manual fileio/resetio.bas). Read as the bare RESET, it closed every file and left
+    // "(0)" on the line. The stream number is kept, evaluated, and - headless, with no console to return to - is all.
+    if FModernMode and (CmdName = 'RESET') and AtParenArgList then
+    begin
+      Context.Advance;                                // '('
+      Param := ParseExpression;
+      if Assigned(Param) then Result.AddChild(Param);
+      Context.Match(ttDelimParClose);
+      Result.Attributes.Values['STREAMRESET'] := '1';
+    end;
     DoNodeCreated(Result);
     Exit;
   end;
@@ -10952,7 +11185,35 @@ begin
       Context.Advance;   // ';' or ','
     end;
     P := ParseExpression;   // destination string variable
+    // "Line Input; prompt; s" (manual proguide/multithreading, DIVERGENZE 646): the prompt may be any string
+    // EXPRESSION - here a Const - and a ';' or ',' after the first operand says it was the prompt.
+    if FModernMode and Assigned(P) and Context.CheckAny([ttSeparOutput, ttSeparParam]) and
+       Assigned(Context.PeekNext) and
+       not (Context.PeekNext.TokenType in [ttEndOfLine, ttSeparStmt, ttEndOfFile, ttNumber, ttInteger]) then
+    begin
+      Result.Attributes.Values['PROMPTIDX'] := IntToStr(Result.ChildCount);
+      Result.AddChild(P);
+      Result.AddChild(TASTNode.CreateWithValue(antSeparator, Context.CurrentToken.Value, Context.CurrentToken));
+      Context.Advance;   // ';' or ','
+      P := ParseExpression;
+    end;
     if Assigned(P) then Result.AddChild(P);
+    // ⭐ DIVERGENZE 646 - the WHOLE line (commas are text), and "*pz, maxlength": the size of the ZSTRING buffer the
+    // pointer names, terminator included (manual console/lineinput.bas). Left unread, ", maxlength" was a second
+    // statement and the line was split at its first comma.
+    if FModernMode then
+    begin
+      Result.Attributes.Values['LINEINPUT'] := '1';
+      if Context.Match(ttSeparParam) then
+      begin
+        P := ParseExpression;
+        if Assigned(P) then
+        begin
+          Result.AddChild(P);
+          Result.Attributes.Values['MAXLEN'] := '1';
+        end;
+      end;
+    end;
     DoNodeCreated(Result);
     Exit;
   end;
@@ -11106,6 +11367,13 @@ begin
   begin
     TargetNode := ParseExpression;                            // image handle
     if Context.Check(ttSeparParam) then Context.Advance;      // ','
+  end;
+  // "Put Step( 16, 20 ), sprite" (manual gfx/put-all.bas, DIVERGENZE 646): relative to the current graphics point.
+  // STEP was excluded from the target test above and then never consumed, so the statement did not parse.
+  if UpperFast(VarToStr(Context.CurrentToken.Value)) = kSTEP then
+  begin
+    Result.Attributes.Values['STEP'] := '1';
+    Context.Advance;                                          // STEP
   end;
   if Context.Check(ttDelimParOpen) then Context.Advance;      // '('
   Result.AddChild(ParseExpression);                           // x
@@ -11335,9 +11603,10 @@ begin
   // pointer). They were passing because the parser refused the whole shape - a rejection for the wrong
   // reason - so the parse and the check had to land TOGETHER or one of them was a regression.
   // ⇒ ImageExprIsCertainlyNotAPointer is that check (DIVERGENZE 149), and this is its other half.
+  // ...and so is a leading '.' - a WITH member, "Line .img, (0,0)-(..)" (manual proguide/multithreading, DIVERGENZE 646).
   k := 1;
   while Assigned(Context.PeekToken(k)) and
-        (Context.PeekToken(k).TokenType in [ttOpAt, ttOpMul]) do Inc(k);
+        (Context.PeekToken(k).TokenType in [ttOpAt, ttOpMul, ttOpDot]) do Inc(k);
   if (Context.PeekToken(k) = nil) or
      (Context.PeekToken(k).TokenType = ttDelimParOpen) then Exit;
   // Walk "name ( index | '.' name )*": k lands on the token after the target.
@@ -15888,6 +16157,7 @@ var
   SharedFpNode: TASTNode;   // leading-AS "Dim As Sub(...) g": the shared funcptr signature
   LeadStaticDef: TASTNode;   // DIVERGENZE 659: "Dim As T UDT.arr(dims) = {...}"
   MemberAccess, StaticDef: TASTNode;   // "Dim As T Type.member = init": static member definition
+  StaticDefs: TASTNode;                // ...several of them on one line (DIVERGENZE 646)
   IsShared, IsByref, LeadingAS, IsTuple, HadComma: Boolean;
   DimTypeName, SharedTypeName, SharedFixedLen: string;
   SavedIdx, TupleDepth: Integer;
@@ -15972,6 +16242,15 @@ begin
           if Context.Check(ttDelimParClose) then Context.Advance;   // ')' of TypeOf
           SharedTypeName := 'INTEGER';        // a procedure entry PC, as the explicit spelling gives
           SharedFixedLen := '';
+          // "Dim As TypeOf( Function( ) As Integer ) Ptr q" (DIVERGENZE 646): the " Ptr" means what it means after the
+          // explicit "Sub() Ptr" below (637). Left in the stream, "q" became a second statement - an implicit variable.
+          FpPtrDepth := 0;
+          while AtPointerSuffix do begin Inc(FpPtrDepth); Context.Advance; end;
+          if FpPtrDepth > 0 then
+          begin
+            SharedFpNode.Attributes.Values['FPPTR'] := IntToStr(FpPtrDepth);
+            for FpPtrK := 1 to FpPtrDepth do SharedTypeName := SharedTypeName + ' PTR';
+          end;
         end
         else
         begin
@@ -16168,39 +16447,53 @@ begin
         // exactly its initializer: an assignment to that member, or nothing at all.
         if Context.Check(ttOpDot) and (Result.ChildCount = 0) then
         begin
-          Context.Advance;                     // '.'
-          if Context.Check(ttIdentifier) or
-             ((Length(VarToStr(Context.CurrentToken.Value)) > 0) and
-              (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_'])) then
-          begin
-            MemberAccess := TASTNode.CreateWithValue(antMemberAccess,
-                              UpperFast(VarToStr(Context.CurrentToken.Value)), Context.CurrentToken);
-            MemberAccess.AddChild(TASTNode.CreateWithValue(antIdentifier,
-                              UpperFast(VarToStr(NameTok.Value)), NameTok));
+          // ⭐ DIVERGENZE 646 - ...and the definitions are a LIST, each name DOTTED as deep as it goes: fbc's suite writes
+          // "dim as integer UDT.c, UDT.d" and "dim as integer varA.varB.j1, varA.j2" (namespace variables). Only the first
+          // name, one dot deep, was read; the rest of the line was a second statement. Several definitions travel in a
+          // BLOCK node, one keeps the shape it always had.
+          StaticDefs := nil;
+          repeat
+            MemberAccess := TASTNode.CreateWithValue(antIdentifier, UpperFast(VarToStr(NameTok.Value)), NameTok);
             // ⛔ THIS IS THE DEFINITION, NOT AN ACCESS. It lowers to a store through the member, and the
             // visibility rule would then refuse "Dim T.x As Integer = 123" for a PRIVATE static member -
             // which is how FreeBASIC's own suite writes the storage of one ("visibility/private-var-
             // public-init" is a COMPILE_ONLY_OK). The mark rides on the BASE identifier, which is the
             // node the lowering's funnel is handed.
-            MemberAccess.GetChild(0).Attributes.Values['STATICMEMBERDEF'] := '1';
-            Context.Advance;                   // field name
+            MemberAccess.Attributes.Values['STATICMEMBERDEF'] := '1';
+            while Context.Check(ttOpDot) and Assigned(Context.PeekNext) and
+                  (Length(VarToStr(Context.PeekNext.Value)) > 0) and
+                  (UpCase(VarToStr(Context.PeekNext.Value)[1]) in ['A'..'Z', '_']) do
+            begin
+              Context.Advance;                 // '.'
+              StaticDef := TASTNode.CreateWithValue(antMemberAccess,
+                             UpperFast(VarToStr(Context.CurrentToken.Value)), Context.CurrentToken);
+              StaticDef.AddChild(MemberAccess);
+              MemberAccess := StaticDef;
+              Context.Advance;                 // member name
+            end;
+            if MemberAccess.NodeType <> antMemberAccess then
+            begin
+              MemberAccess.Free;
+              Break;
+            end;
+            StaticDef := nil;
             // ⭐ "Dim ByRef As T1 T2.R1 = x" defines a STATIC REFERENCE member (DIVERGENZE 269): it is
             // written as the Shared reference it is - "Dim Shared ByRef As T1 <T2.R1> = x" - so the
             // whole reference machinery binds it, and the member funnel reads it through that name.
-            if IsByref and Context.Check(ttOpEq) then
+            if IsByref and Context.Check(ttOpEq) and (MemberAccess.GetChild(0).NodeType = antIdentifier) then
             begin
               Context.Advance;                 // '='
               InitExpr := FExpressionParser.ParseExpression;
               if Assigned(InitExpr) then
               begin
-                Result.AddChild(MakeStaticRefDef(MemberAccess.GetChild(0).ValueUpper + '.' +
-                                  MemberAccess.ValueUpper, SharedTypeName, InitExpr, NameTok));
-                MemberAccess.Free;
-                DoNodeCreated(Result);
-                Exit;
+                // the reference definition is a CHILD of the Dim, as it always was (m907zl)
+                StaticDef := TASTNode.Create(antDim, NameTok);
+                StaticDef.AddChild(MakeStaticRefDef(MemberAccess.GetChild(0).ValueUpper + '.' +
+                                   MemberAccess.ValueUpper, SharedTypeName, InitExpr, NameTok));
               end;
-            end;
-            if Context.Check(ttOpEq) then
+              MemberAccess.Free;
+            end
+            else if Context.Check(ttOpEq) then
             begin
               Context.Advance;                 // '='
               InitExpr := FExpressionParser.ParseExpression;
@@ -16209,17 +16502,36 @@ begin
                 StaticDef := TASTNode.Create(antAssignment, NameTok);
                 StaticDef.AddChild(MemberAccess);
                 StaticDef.AddChild(InitExpr);
-                Result.Free;
-                Result := StaticDef;
-                DoNodeCreated(Result);
-                Exit;
-              end;
+              end
+              else
+                MemberAccess.Free;
+            end
+            else
+              MemberAccess.Free;               // no initializer: the declaration alone emits nothing
+            if Assigned(StaticDef) then
+            begin
+              if StaticDefs = nil then StaticDefs := TASTNode.Create(antBlock, NameTok);
+              StaticDefs.AddChild(StaticDef);
             end;
-            MemberAccess.Free;                 // no initializer: the declaration alone emits nothing
-            Result.Free;
-            Result := nil;
-            Exit;
-          end;
+            // the next definition of the list: "<name>.<member>" again
+            if not (Context.Check(ttSeparParam) and Assigned(Context.PeekNext) and Assigned(Context.PeekToken(2)) and
+                    (Context.PeekToken(2).TokenType = ttOpDot)) then Break;
+            Context.Advance;                   // ','
+            NameTok := Context.CurrentToken;
+            Context.Advance;                   // the next owner name
+          until False;
+          Result.Free;
+          if StaticDefs = nil then
+            Result := nil
+          else if StaticDefs.ChildCount = 1 then
+          begin
+            Result := StaticDefs.GetChild(0).Clone;
+            StaticDefs.Free;
+          end
+          else
+            Result := StaticDefs;
+          if Assigned(Result) then DoNodeCreated(Result);
+          Exit;
         end;
         DimTypeName := SharedTypeName;
         TypeTok := SharedTypeTok;
@@ -18501,6 +18813,15 @@ begin
       // the literal grammar have it. Rewinding is what makes this addition unable to LOSE an item.
       if Assigned(ExprNode) then ExprNode.Free;
       Context.CurrentIndex := SavedIdx;
+    end;
+    // 🕳️ DIVERGENZE 662 - an ADDRESS in DATA ("Data @"fOObAR", @mydbl", fbc's quirk/casting): fbc stores the link-time
+    // address and READ hands it to a pointer. The pool here holds literal values only, so it is refused by NAME rather
+    // than left on the line (where it was a second statement and the pointers read back 0).
+    if FModernMode and Context.Check(ttOpAt) then
+    begin
+      HandleError('DATA of an address ("@name") is not supported: the DATA pool holds literal values (DIVERGENZE 662)',
+                  Context.CurrentToken);
+      Break;
     end;
     // Parse data item - can be number, string, or unquoted identifier (treated as string)
     if Context.Check(ttNumber) or Context.Check(ttInteger) or Context.Check(ttFloat) then

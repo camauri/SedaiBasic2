@@ -325,6 +325,7 @@ type
     function  GBScreenSurface: TGfxSurface;
     function  GBImageMem(Surface: TGfxSurface): TGraphicsMemory;   // image memory for a surface id, nil if invalid
     function  GBCreateSurface(W, H: Integer; Fill: TGfxColor): TGfxSurface;
+    procedure GBResizeSurface(Surface: TGfxSurface; W, H: Integer);
     procedure GBDestroySurface(Surface: TGfxSurface);
     function  GBSurfaceWidth(Surface: TGfxSurface): Integer;
     function  GBSurfaceHeight(Surface: TGfxSurface): Integer;
@@ -359,6 +360,7 @@ type
     procedure IGraphicsBackend.Present = GBPresent;
     function  IGraphicsBackend.ScreenSurface = GBScreenSurface;
     function  IGraphicsBackend.CreateSurface = GBCreateSurface;
+    procedure IGraphicsBackend.ResizeSurface = GBResizeSurface;
     procedure IGraphicsBackend.DestroySurface = GBDestroySurface;
     function  IGraphicsBackend.SurfaceWidth = GBSurfaceWidth;
     function  IGraphicsBackend.SurfaceHeight = GBSurfaceHeight;
@@ -3905,6 +3907,22 @@ begin
   end;
   FImageSurfaces[Slot] := Img;
   Result := Slot + 1;   // id 0 = screen
+end;
+
+procedure TVideoController.GBResizeSurface(Surface: TGfxSurface; W, H: Integer);
+// GET into an existing image takes the rectangle's size (DIVERGENZE 646), as the software backend does.
+var
+  Old, Img: TGraphicsMemory;
+begin
+  if (W <= 0) or (H <= 0) or (Surface < 1) or (Surface > Length(FImageSurfaces)) then Exit;
+  Old := FImageSurfaces[Surface - 1];
+  if (Old = nil) or ((Old.State.Width = W) and (Old.State.Height = H)) then Exit;
+  Img := TGraphicsMemory.Create;
+  Img.AllocateBuffers(W, H, False, gmSDL2Dynamic);
+  Img.ClearCurrentMode(0);
+  if Img.Depth <> Old.Depth then Img.SetDepth(Old.Depth);
+  FImageSurfaces[Surface - 1] := Img;
+  Old.Free;
 end;
 
 procedure TVideoController.GBDestroySurface(Surface: TGfxSurface);

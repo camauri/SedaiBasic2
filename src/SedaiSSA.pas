@@ -1398,7 +1398,8 @@ type
     function ArrayMemberElemShape(UDTIdx, FieldIdx: Integer; out ElemSz, ElemAl: Int64;
                                   ReportOnly: Boolean): Boolean;  // ...and the shape of ONE of its elements
     function ArrayMemberElemOffset(UDTIdx, FieldIdx: Integer; IdxNode: TASTNode): Int64;  // OffsetOf(T, m(i,j)): the element's byte offset within the member
-    procedure UDTFieldReportShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);  // what fbc SAYS a field measures
+    procedure UDTFieldReportShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);
+    procedure ArrayMemberElemShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);  // SizeOf/Len of an array member (646)  // what fbc SAYS a field measures
     // A NESTED record member is laid out INLINE, like C and like fbc (DIVERGENZE 193): its size and
     // alignment are the nested type's own, not the eight bytes of the handle our storage keeps.
     // ⛔ Recursive through UDTCLayout, hence the depth guard: a type that contained itself by value
@@ -1702,7 +1703,8 @@ type
     procedure ProcessGfxCircle(Node: TASTNode);   // CIRCLE (x, y), r [, color]
     procedure ProcessPalette(Node: TASTNode);      // PALETTE [GET] [index, r, g, b] / reset
     function  ScalePaletteComponent(const PackedReg: TSSAValue; Shift: Integer): TSSAValue;  // ((c shr n) and 63)*255 div 63
-    procedure ProcessGfxColor(Node: TASTNode);     // COLOR [fg][,bg] (FreeBASIC draw colour)
+    procedure ProcessGfxColor(Node: TASTNode);
+    procedure EmitStatementFromArgs(Kind: TASTNodeType; FuncNode, ArgList: TASTNode);   // 646     // COLOR [fg][,bg] (FreeBASIC draw colour)
     function  DefaultDrawColorReg: TSSAValue;       // omitted-colour default = current draw foreground
     procedure EmitStepRelative(var XReg, YReg: TSSAValue; const BaseX, BaseY: TSSAValue);  // STEP: coord += base
     procedure EmitPenCoordRegs(out PenX, PenY: TSSAValue);  // read the current graphics point (POINTCOORD 0/1)
@@ -8751,6 +8753,33 @@ begin
           DestReg := FProgram.AllocRegister(srtInt);
           Result := MakeSSARegister(srtInt, DestReg);
           EmitInstruction(ssaBitwiseOr, Result, LoPart, RVal, MakeSSAValue(svkNone));
+          // "Color( fg, bg )" (DIVERGENZE 646): the colours BEFORE are the answer, and then the new ones are set by the
+          // statement's own lowering.
+          if (FuncName = '__COLORPACK') and ((Node.Attributes.Values['HASFG'] = '1') or
+             (Node.Attributes.Values['HASBG'] = '1')) and (ArgListNode <> nil) then
+            EmitStatementFromArgs(antGfxColor, Node, ArgListNode);
+        end
+        else if FuncName = '__LOCATEPACK' then
+        begin
+          // "Locate( [row] [, col] )" (DIVERGENZE 646): move as the statement does, then answer where the cursor IS -
+          // column in the low byte, row in the next, the visibility bit 16 (the cursor is shown) - as fbc on a terminal.
+          if (ArgListNode <> nil) and (ArgListNode.ChildCount > 0) then
+            EmitStatementFromArgs(antLocate, Node, ArgListNode);
+          LoPart := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaGraphicPos, LoPart, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          HiPart := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaCsrlin, HiPart, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          ShiftAmt := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, ShiftAmt, MakeSSAConstInt(8), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          RVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaShl, RVal, HiPart, ShiftAmt, MakeSSAValue(svkNone));
+          ArgReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaBitwiseOr, ArgReg, LoPart, RVal, MakeSSAValue(svkNone));
+          ShiftAmt := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, ShiftAmt, MakeSSAConstInt($10000), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          DestReg := FProgram.AllocRegister(srtInt);
+          Result := MakeSSARegister(srtInt, DestReg);
+          EmitInstruction(ssaBitwiseOr, Result, ArgReg, ShiftAmt, MakeSSAValue(svkNone));
         end
         else if FuncName = 'PMAP' then
         begin
@@ -14172,10 +14201,17 @@ var
   InCopyOp: TSSAOpCode;
   PromptRegIdx: Integer;
   VarName: string;
-  VarNames: array of string;
+  Targets: array of TASTNode;   // the destinations, in order: a name, or any other lvalue (DIVERGENZE 646)
   VarCount: Integer;
   InFixCap: Integer;   // fixed-length capacity of a string target (0 = variable-length)
   IsMultiple: Boolean;
+  IsLine: Boolean;     // LINE INPUT: the whole line, commas included
+  MaxLenNode: TASTNode;  // "Line Input "p"; *pz, maxlength": the buffer size, terminator included
+  Probe, LenVal, LenReg, OneReg, CutTmp: TSSAValue;
+  TmpName: string;
+  StoreNode: TASTNode;
+  InImm: Int64;
+  PromptIdx: Integer;  // the child that is a prompt EXPRESSION, -1 when the prompt is a literal or absent
 begin
   // INPUT has structure: optional prompt string, separator, variable names
   // Examples:
@@ -14188,32 +14224,42 @@ begin
   // - Single variable: "? " on same line, cursor waits
   // - Multiple variables: each "?" on separate line, starting from NEXT line
   // - Prompt is printed before the "?" (on same line for single, then newline for multiple)
+  //
+  // ⭐ DIVERGENZE 646 - A DESTINATION IS ANY LVALUE. Only a bare NAME was ever collected here, so "Input a(1)",
+  // "Input t.s, t.n" and "Input *pz" read the field and threw it away, the destination untouched (fbc fills them). A
+  // name keeps its direct path below; anything else is read into a temporary of its bank and STORED through the
+  // ordinary assignment, so a field, an element, a ZSTRING buffer or a narrow type gets the store it always gets.
+  // ⭐ And LINE INPUT (attribute LINEINPUT) reads the WHOLE line: it was the field stream, so "a, b ,c" answered "a" and
+  // left the rest to the next statement.
 
   PromptStr := '';
-  SetLength(VarNames, 0);
+  SetLength(Targets, 0);
   VarCount := 0;
+  IsLine := Node.Attributes.Values['LINEINPUT'] = '1';
+  MaxLenNode := nil;
+  if (Node.Attributes.Values['MAXLEN'] = '1') and (Node.ChildCount > 0) then
+    MaxLenNode := Node.GetChild(Node.ChildCount - 1);
 
-  // Scan children to find prompt (if any) and all variable names
+  // Scan children to find prompt (if any) and all destinations
+  PromptIdx := StrToIntDef(Node.Attributes.Values['PROMPTIDX'], -1);
   for i := 0 to Node.ChildCount - 1 do
   begin
     Child := Node.GetChild(i);
-
+    if (Child = MaxLenNode) or (i = PromptIdx) then Continue;
     case Child.NodeType of
       antLiteral:
-      begin
         // This is the prompt string
         PromptStr := VarToStr(Child.Value);
-      end;
-      antIdentifier:
-      begin
-        // This is a variable to store input - collect all of them
-        Inc(VarCount);
-        SetLength(VarNames, VarCount);
-        VarNames[VarCount - 1] := VarToStr(Child.Value);
-      end;
       antSeparator:
         // Skip separators
         Continue;
+    else
+      if (Child.NodeType = antIdentifier) or FModernMode then
+      begin
+        Inc(VarCount);
+        SetLength(Targets, VarCount);
+        Targets[VarCount - 1] := Child;
+      end;
     end;
   end;
 
@@ -14231,16 +14277,48 @@ begin
     EmitInstruction(ssaLoadConstString, PromptReg, MakeSSAConstString(PromptStr),
                    MakeSSAValue(svkNone), MakeSSAValue(svkNone));
   end
+  else if (PromptIdx >= 0) and (PromptIdx < Node.ChildCount) then
+  begin
+    // a prompt EXPRESSION ("Line Input; prompt; s", DIVERGENZE 646)
+    ProcessExpression(Node.GetChild(PromptIdx), Probe);
+    PromptReg := EnsureStringRegister(Probe);
+  end
   else
     PromptReg := MakeSSAValue(svkNone);
 
   // Process each variable
   for i := 0 to VarCount - 1 do
   begin
-    VarName := VarNames[i];
-
-    // Get or allocate register for the target variable
-    VarReg := GetOrAllocateVariable(VarName);
+    Child := Targets[i];
+    TmpName := '';
+    if Child.NodeType = antIdentifier then
+    begin
+      VarName := VarToStr(Child.Value);
+      // Get or allocate register for the target variable
+      VarReg := GetOrAllocateVariable(VarName);
+    end
+    else
+    begin
+      // Any other lvalue: its BANK, read off the destination itself, and a temporary of that bank to read into.
+      VarName := '';
+      ProcessExpression(Child, Probe);
+      if (Probe.Kind = svkRegister) and (Probe.RegType in [srtInt, srtFloat, srtString]) then
+        VarReg := MakeSSARegister(Probe.RegType, 0)
+      else if Probe.Kind = svkConstString then
+        VarReg := MakeSSARegister(srtString, 0)
+      else if Probe.Kind = svkConstFloat then
+        VarReg := MakeSSARegister(srtFloat, 0)
+      else
+        VarReg := MakeSSARegister(srtInt, 0);
+      case VarReg.RegType of
+        srtString: TmpName := '__INPUTTMP$';
+        srtFloat:  TmpName := '__INPUTTMP#';
+      else         TmpName := '__INPUTTMP%';
+      end;
+      VarReg := BindOrResolve(TmpName, True, True, VarReg.RegType);
+    end;
+    // LINE INPUT reads text: a numeric destination is read as a field, as before.
+    if IsLine and (VarReg.RegType <> srtString) then IsLine := False;
 
     // For multiple variables: newline only BEFORE the FIRST "?"
     // After first input, ReadLine already moves to new line after ENTER
@@ -14272,15 +14350,35 @@ begin
                          MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       srtString:
         begin
+          // Immediate: -1 prompt + field, -2 prompt + whole LINE, 2 whole line without the prompt marker
           if i = 0 then
+          begin
+            if IsLine then InImm := INPUT_LINE_PROMPT else InImm := -1;
             EmitInstruction(ssaInputString, VarReg, PromptReg,
-                           MakeSSAValue(svkNone), MakeSSAConstInt(-1))
+                           MakeSSAValue(svkNone), MakeSSAConstInt(InImm));
+          end
+          else if IsLine then
+            EmitInstruction(ssaInputString, VarReg, MakeSSAValue(svkNone),
+                           MakeSSAValue(svkNone), MakeSSAConstInt(INPUT_LINE))
           else
             EmitInstruction(ssaInputString, VarReg, MakeSSAValue(svkNone),
                            MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          // "Line Input "p"; *pz, maxlength": at most maxlength-1 characters reach the buffer (fbc's
+          // fb_LineInput with a size). Cut BEFORE the store, so a long line never writes past it.
+          if Assigned(MaxLenNode) then
+          begin
+            ProcessExpression(MaxLenNode, LenVal);
+            LenReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            OneReg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, OneReg, MakeSSAConstInt(1), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EmitInstruction(ssaSubInt, LenReg, EnsureIntRegister(LenVal), OneReg, MakeSSAValue(svkNone));
+            CutTmp := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+            EmitInstruction(ssaStrLeft, CutTmp, VarReg, LenReg, MakeSSAValue(svkNone));
+            EmitInstruction(ssaCopyString, VarReg, CutTmp, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          end;
           // INPUT writes the variable's register directly, bypassing the assignment path: a
           // fixed-length target must still end up padded/cut to its capacity.
-          if AnyFixedLen and not (IsSharedScalar(VarName) or IsAddrLocal(VarName)) then
+          if (VarName <> '') and AnyFixedLen and not (IsSharedScalar(VarName) or IsAddrLocal(VarName)) then
           begin
             InFixCap := StrCapOf(FFixedLenVars, VarName, 0);
             if InFixCap > 0 then
@@ -14288,6 +14386,19 @@ begin
                               MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           end;
         end;
+    end;
+    if TmpName <> '' then
+    begin
+      // ...and the temporary is STORED into the destination by the assignment every other store takes.
+      StoreNode := TASTNode.Create(antAssignment, Node.Token);
+      try
+        StoreNode.AddChild(Child.Clone);
+        StoreNode.AddChild(TASTNode.CreateWithValue(antIdentifier, TmpName, Node.Token));
+        ProcessAssignment(StoreNode);
+      finally
+        StoreNode.Free;
+      end;
+      Continue;
     end;
     // ⭐ ...AND A NARROW NUMERIC DESTINATION IS NARROWED HERE TOO. INPUT writes the variable's
     // register directly, bypassing the assignment path, so nothing had applied the declared width:
@@ -22583,6 +22694,28 @@ begin
     EmitInstruction(ssaGfxPset, MakeSSAValue(svkNone), XReg, YReg, CReg);
 end;
 
+procedure TSSAGenerator.EmitStatementFromArgs(Kind: TASTNodeType; FuncNode, ArgList: TASTNode);
+// The FUNCTION form of a statement ("Color( 3, 4 )", "Locate( 5 )") runs the statement's own lowering on a copy of its
+// arguments, so the two spellings cannot drift apart (DIVERGENZE 646).
+var
+  St: TASTNode;
+  k: Integer;
+begin
+  St := TASTNode.Create(Kind, FuncNode.Token);
+  try
+    St.Attributes.Values['HASFG'] := FuncNode.Attributes.Values['HASFG'];
+    St.Attributes.Values['HASBG'] := FuncNode.Attributes.Values['HASBG'];
+    for k := 0 to ArgList.ChildCount - 1 do
+      if (Kind <> antGfxColor) or (ArgList.GetChild(k).NodeType <> antLiteral) or
+         (VarToStr(ArgList.GetChild(k).Value) <> '0') or
+         ((k = 0) and (St.Attributes.Values['HASFG'] = '1')) or ((k = 1) and (St.Attributes.Values['HASBG'] = '1')) then
+        St.AddChild(ArgList.GetChild(k).Clone);
+    if Kind = antGfxColor then ProcessGfxColor(St) else ProcessLocate(St);
+  finally
+    St.Free;
+  end;
+end;
+
 procedure TSSAGenerator.ProcessGfxColor(Node: TASTNode);
 // COLOR [fg] [, bg] (FreeBASIC): set the current draw foreground/background colour. Either may be
 // omitted; the HASFG/HASBG attributes (and Immediate flag bits) tell the VM which to update.
@@ -22809,7 +22942,7 @@ procedure TSSAGenerator.ProcessGfxGet(Node: TASTNode);
 // GET (x1,y1)-(x2,y2), dst : capture a screen rectangle into image surface dst. Children x1,y1,x2,y2,dst.
 // Packed as Src1=x1, Src2=y1, Src3=x2, PhiSources[0]=y2, PhiSources[1]=dst handle.
 var
-  X1V, Y1V, X2V, Y2V, DV, X1R, Y1R, X2R, Y2R, DR: TSSAValue;
+  X1V, Y1V, X2V, Y2V, DV, X1R, Y1R, X2R, Y2R, DR, PenX, PenY: TSSAValue;
   Instr: TSSAInstruction;
   HasSrc: Boolean;
 begin
@@ -22820,8 +22953,17 @@ begin
   HasSrc := EmitDrawTargetBegin(Node);
   ProcessExpression(Node.GetChild(0), X1V); X1R := EnsureIntRegister(X1V);
   ProcessExpression(Node.GetChild(1), Y1V); Y1R := EnsureIntRegister(Y1V);
+  // "Get Step( x, y )-Step( w, h ), dst" (DIVERGENZE 646): the first corner relative to the current graphics point, the
+  // second relative to the FIRST - LINE's STEP1 / STEP2.
+  if Node.Attributes.Values['STEP1'] = '1' then
+  begin
+    EmitPenCoordRegs(PenX, PenY);
+    EmitStepRelative(X1R, Y1R, PenX, PenY);
+  end;
   ProcessExpression(Node.GetChild(2), X2V); X2R := EnsureIntRegister(X2V);
   ProcessExpression(Node.GetChild(3), Y2V); Y2R := EnsureIntRegister(Y2V);
+  if Node.Attributes.Values['STEP2'] = '1' then
+    EmitStepRelative(X2R, Y2R, X1R, Y1R);
   ProcessExpression(Node.GetChild(4), DV);  DR  := EnsureIntRegister(DV);
   EmitInstruction(ssaGfxGet, MakeSSAValue(svkNone), X1R, Y1R, X2R);
   Instr := FCurrentBlock.Instructions[FCurrentBlock.Instructions.Count - 1];
@@ -22834,7 +22976,7 @@ procedure TSSAGenerator.ProcessGfxPut(Node: TASTNode);
 // PUT (x,y), src [, mode] : blit image src onto the screen at (x,y). Children x,y,src; MODE attribute =
 // blit-mode ordinal. Packed as Src1=x, Src2=y, Src3=src handle, PhiSources[0]=mode (constant).
 var
-  XV, YV, SV, VV, XR, YR, SR, VR: TSSAValue;
+  XV, YV, SV, VV, XR, YR, SR, VR, PenX, PenY: TSSAValue;
   Instr: TSSAInstruction;
   Mode: Int64;
   HasTarget: Boolean;
@@ -22857,6 +22999,12 @@ begin
   HasTarget := EmitDrawTargetBegin(Node);
   ProcessExpression(Node.GetChild(0), XV); XR := EnsureIntRegister(XV);
   ProcessExpression(Node.GetChild(1), YV); YR := EnsureIntRegister(YV);
+  // "Put Step( dx, dy ), src" (DIVERGENZE 646): relative to the current graphics point, as PSET's STEP
+  if Node.Attributes.Values['STEP'] = '1' then
+  begin
+    EmitPenCoordRegs(PenX, PenY);
+    EmitStepRelative(XR, YR, PenX, PenY);
+  end;
   ProcessExpression(Node.GetChild(2), SV); SR := EnsureIntRegister(SV);
   if Mode = 7 then Mode := 0;                   // CUSTOM without a function: PSET, as the backend does
   // The 0..255 blend value ALPHA and ADD take. ⭐ -1 means "the statement named none", which is NOT the
@@ -24042,6 +24190,9 @@ begin
   // Emit ssaGraphicWidth: Src1=width
   EmitInstruction(ssaGraphicWidth, MakeSSAValue(svkNone),
                  WidthReg, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+  // FreeBASIC "Width cols, rows" (DIVERGENZE 646): the rows are evaluated for their effects and set nothing here.
+  if (Node.ChildCount > 1) and Assigned(Node.GetChild(1)) then
+    ProcessExpression(Node.GetChild(1), WidthVal);
 end;
 
 { ProcessScale - Handle SCALE command for coordinate scaling
@@ -26182,8 +26333,18 @@ begin
 end;
 
 procedure TSSAGenerator.ProcessDclear(Node: TASTNode);
+var
+  StreamVal: TSSAValue;
 begin
   if FCurrentBlock = nil then Exit;
+  // "Reset(streamno)" (DIVERGENZE 646): re-attach a standard stream to the console. Headless there is no console to
+  // return to; the argument is evaluated for its effects and no file is closed.
+  if Node.Attributes.Values['STREAMRESET'] = '1' then
+  begin
+    if (Node.ChildCount > 0) and Assigned(Node.GetChild(0)) then
+      ProcessExpression(Node.GetChild(0), StreamVal);
+    Exit;
+  end;
 
   { DCLEAR - close all open file handles
     No parameters needed
@@ -31333,6 +31494,38 @@ begin
   Align := Size;
 end;
 
+procedure TSSAGenerator.ArrayMemberElemShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);
+// What fbc answers for SizeOf / Len of an ARRAY member: one element, as the reported shape of the same member written
+// without its dimensions (DIVERGENZE 646). The field is restored before returning.
+var
+  Saved: TUDTField;
+begin
+  // The element's declared type, when the field kept it: a record, a pointer, a scalar or a string by NAME.
+  with FUDTs[UDTIdx].Fields[FieldIdx] do
+  begin
+    Align := 8;
+    if ArrayElemPtrPointee <> '' then begin Size := 8; Exit; end;
+    if ArrayElemType <> '' then begin Size := TypeSizeBytes(ArrayElemType); Exit; end;
+    if (ArrayElemBank = srtString) and (StrCapacity <= 0) and not (IsZString or IsWString) then
+    begin
+      Size := TypeSizeBytes('STRING'); Exit;
+    end;
+    if (ArrayElemScalarType <> '') and (StrCapacity <= 0) then
+    begin
+      Size := TypeSizeBytes(ArrayElemScalarType); Exit;
+    end;
+  end;
+  Saved := FUDTs[UDTIdx].Fields[FieldIdx];
+  try
+    FUDTs[UDTIdx].Fields[FieldIdx].IsArray := False;
+    FUDTs[UDTIdx].Fields[FieldIdx].ArrayBounds := nil;
+    FUDTs[UDTIdx].Fields[FieldIdx].DeclaredRedim := False;
+    UDTFieldReportShape(UDTIdx, FieldIdx, Size, Align);
+  finally
+    FUDTs[UDTIdx].Fields[FieldIdx] := Saved;
+  end;
+end;
+
 procedure TSSAGenerator.UDTFieldReportShape(UDTIdx, FieldIdx: Integer; out Size, Align: Int64);
 // What fbc SAYS a field measures, as against what our live image holds for it (UDTFieldCShape).
 // The two differ in exactly one place: a FIXED-LENGTH array member, which fbc lays out inline and we
@@ -35185,7 +35378,16 @@ begin
         // the wide IMAGE stayed two bytes wide and the honest number ran past the end of storage
         // (wstring/midstmt from CUPASS to "Raw pointer dereference out of bounds"). WIDE_CELL_BYTES now
         // sizes the image and the report from ONE constant, so the two cannot disagree again.
-        UDTFieldReportShape(UIdx, k, Size, Align);
+        if FUDTs[UIdx].Fields[k].IsArray then ArrayMemberElemShape(UIdx, k, Size, Align)
+        else UDTFieldReportShape(UIdx, k, Size, Align);
+        Exit(True);
+      end;
+      // ⭐ DIVERGENZE 646 - an ARRAY member, fixed or dynamic, measures ONE ELEMENT: fbc answers SizeOf and Len of "v.a"
+      // with the element's size (8 for "a(3) As Integer", 2 for a Short, 24 for a String), not the array's bytes nor the
+      // descriptor. We said 32 for the fixed one, 72 for the dynamic one (313 had moved it there) and Len 1.
+      if FUDTs[UIdx].Fields[k].IsArray then
+      begin
+        ArrayMemberElemShape(UIdx, k, Size, Align);
         Exit(True);
       end;
       // LEN of an instance field: the value's length.
@@ -62662,6 +62864,7 @@ var
   i: Integer;
   PrevBlock, NewBlock: TSSABasicBlock;  // PHASE 3 TIER 3: CFG construction
   SecondsVal: TSSAValue;  // For SLEEP command
+  EndCodeVal: TSSAValue;  // END <expr>: a computed exit code (DIVERGENZE 646)
   FPSReg: TSSAValue;  // For FRAME command
   ArgReg: TSSAValue;      // For SETDATE/SETTIME string argument
   SelImm: Integer;        // For SETDATE/SETTIME selector
@@ -63223,15 +63426,28 @@ begin
       // order), before the ssaEnd. V5e: an END *inside a procedure* runs them too, but the globals'
       // module registers are hidden under the active frame, so it reads each handle from its reserved
       // frame-independent slot (UseSlots=True).
+      // "End n" / "System n": n is the PROCESS exit code, and it rides in the opcode's Immediate.
+      // Zero is both "no code given" and "End 0", which answer the same thing, so no marker is needed.
+      // ⭐ DIVERGENZE 646 - a COMPUTED code ("End main()") is the node's child: evaluated BEFORE the destructors, as
+      // fbc evaluates its argument before calling fb_End, and handed over in Src1 with END_CODE_IN_SRC1 as Immediate.
+      if (Node.ChildCount > 0) and Assigned(Node.GetChild(0)) then
+      begin
+        ProcessExpression(Node.GetChild(0), EndCodeVal);
+        EndCodeVal := EnsureIntRegister(EndCodeVal);
+      end
+      else
+        EndCodeVal := MakeSSAValue(svkNone);
       if not FInProcedure then
         EmitModuleDestructors(False)
       else
         EmitModuleDestructors(True);
       EmitModuleProcDestructors;   // FB: module destructors run on an explicit END too
-      // "End n" / "System n": n is the PROCESS exit code, and it rides in the opcode's Immediate.
-      // Zero is both "no code given" and "End 0", which answer the same thing, so no marker is needed.
-      EmitInstruction(ssaEnd, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone),
-                     MakeSSAConstInt(StrToInt64Def(Node.Attributes.Values['EXITCODE'], 0)));
+      if EndCodeVal.Kind = svkRegister then
+        EmitInstruction(ssaEnd, MakeSSAValue(svkNone), EndCodeVal, MakeSSAValue(svkNone),
+                        MakeSSAConstInt(END_CODE_IN_SRC1))
+      else
+        EmitInstruction(ssaEnd, MakeSSAValue(svkNone), MakeSSAValue(svkNone), MakeSSAValue(svkNone),
+                       MakeSSAConstInt(StrToInt64Def(Node.Attributes.Values['EXITCODE'], 0)));
       // PHASE 3 TIER 3: END terminates the current block - no fall-through
       FCurrentBlock := nil;
     end;

@@ -451,6 +451,13 @@ begin
       EncName := Copy(EncMode, TildePos + 1, MaxInt);
       EncMode := Copy(EncMode, 1, TildePos - 1) + EncodingModeMarker(EncName);
     end;
+    // "Open Lpt" / "Open Com" (DIVERGENZE 646): a printer and a serial port this runtime does not drive. fbc on Linux
+    // answers 2 (file not found) for LPT and 1 (illegal function call) for COM, and creates nothing; here the name used
+    // to be opened as a FILE, and "Open Lpt "LPT1:" For Output" left a file called LPT1: behind.
+    TildePos := Pos('~', EncMode);
+    if TildePos = 0 then TildePos := Length(EncMode) + 1;
+    if Pos('Y', Copy(EncMode, 1, TildePos - 1)) > 0 then begin ErrorCode := 62; Exit; end;   // the VM's fbc 2
+    if Pos('Z', Copy(EncMode, 1, TildePos - 1)) > 0 then begin ErrorCode := 64; Exit; end;   // the VM's fbc 1
     // A FreeBASIC standard device, marked as such by the parser. No file is opened: the handle is bound
     // to the process's own streams. This must come BEFORE the reserved-name refusal below, which exists
     // to stop a PROGRAM from reaching the printer or a serial port by naming a DOS device in a string -

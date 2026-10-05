@@ -82,6 +82,13 @@ const
   // 24 bits allows a megabyte per record and still leaves 38 bits of handle index, which is more
   // records than the address space holds.
   RECPTR_SLOT_BITS = 24;
+  // ssaEnd / bcEnd: an Immediate of END_CODE_IN_SRC1 says the PROCESS exit code is COMPUTED and sits in the int register
+  // Src1 ("End main()", DIVERGENZE 646); any other Immediate is the constant code itself (0..255).
+  END_CODE_IN_SRC1 = 256;
+  // ssaInputString / bcInputString Immediate: -1 = the prompt in Src1 + a FIELD (INPUT); these two read the WHOLE line
+  // (LINE INPUT, DIVERGENZE 646), with and without the prompt marker. 0 = a field, no prompt.
+  INPUT_LINE_PROMPT = -2;
+  INPUT_LINE        = 2;
   RECPTR_SLOT_MASK = (Int64(1) shl RECPTR_SLOT_BITS) - 1;
   // bits [RECPTR_SLOT_BITS..61] hold the index, so this must shrink by exactly what the low field
   // grew: 62 - 24 = 38. Leaving it at 46 would let a large handle spill into the shared flag.

@@ -1654,8 +1654,49 @@ function TExpressionParser.ParseGraphicsCommandForm(Token: TLexerToken): TASTNod
 var
   Cmd: string;
   ArgList: TASTNode;
+  ArgK: Integer;
 begin
   Cmd := UpperCase(Token.Value);
+  // ⭐ DIVERGENZE 646 - "Color( fg [, bg] )" and "Locate( [row] [, col] )" are FUNCTIONS too: each SETS what it is given
+  // and answers a packed Long - Color the colours from BEFORE the call (fg low word, bg high word), Locate the cursor
+  // AFTER it (column in the low byte, row in the next, visibility in bit 16; measured on a terminal, manual
+  // proguide/multithreading). Only the nullary Color() parsed; the arguments were a syntax error or a second statement.
+  if ModernMode and ((Cmd = kCOLOR) or (Cmd = 'LOCATE')) and Context.Check(ttDelimParOpen) and
+     not (Assigned(Context.PeekNext) and (Context.PeekNext.TokenType = ttDelimParClose) and (Cmd = kCOLOR)) then
+  begin
+    Context.Advance;                                  // '('
+    ArgList := TASTNode.Create(antArgumentList, Token);
+    if Cmd = kCOLOR then
+      Result := TASTNode.CreateWithValue(antGraphicsFunction, '__COLORPACK', Token)
+    else
+      Result := TASTNode.CreateWithValue(antGraphicsFunction, '__LOCATEPACK', Token);
+    ArgK := 0;
+    while not Context.Check(ttDelimParClose) do
+    begin
+      if Context.Check(ttSeparParam) then
+        ArgList.AddChild(TASTNode.CreateWithValue(antLiteral, 0, Context.CurrentToken))    // omitted: 0 = leave it
+      else
+      begin
+        ArgList.AddChild(ParseExpression);
+        if Cmd = kCOLOR then
+        begin
+          if ArgK = 0 then Result.Attributes.Values['HASFG'] := '1'
+          else if ArgK = 1 then Result.Attributes.Values['HASBG'] := '1';
+        end;
+      end;
+      Inc(ArgK);
+      if not Context.Match(ttSeparParam) then Break;
+    end;
+    if not Context.Match(ttDelimParClose) then
+    begin
+      HandleError(Format('Expected ")" after %s arguments', [Cmd]), Context.CurrentToken);
+      ArgList.Free; Result.Free; Result := nil;
+      Exit;
+    end;
+    Result.AddChild(ArgList);
+    DoNodeCreated(Result);
+    Exit;
+  end;
   if ModernMode and ((Cmd = kCOLOR) or (Cmd = kWIDTH)) then
   begin
     if Context.Check(ttDelimParOpen) then
@@ -1811,6 +1852,8 @@ var
   Param, HandleNode, LenExpr, EncExpr: TASTNode;
   ModeStr, MW, EncMark: string;
   AccessRead: Boolean;
+  DevWord: string;     // PIPE / COM / LPT between OPEN and '(' (DIVERGENZE 646)
+  SawFor: Boolean;     // a FOR <mode> clause was written
 
   procedure SkipClauseComma;
   begin
@@ -1880,13 +1923,34 @@ begin
     Result.AddChild(Param);
     Exit;
   end;
+  // ⭐ DIVERGENZE 646 - "Open Pipe( cmd For Input As #p )", "Open Com( "com1:..." For Binary As #1 )": the device word
+  // stands between OPEN and '(' in the function form as in the statement. A pipe is a PROCESS ('P' on the mode, as the
+  // statement marks it); COM and LPT open their name as a file, which fails without the device - fbc's answer too.
+  DevWord := '';
+  if ModernMode and (UpperCase(Token.Value) = kOPEN) and Assigned(Context.PeekNext) and
+     (Context.PeekNext.TokenType = ttDelimParOpen) and
+     ((UpperCase(VarToStr(Context.CurrentToken.Value)) = 'PIPE') or
+      (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'COM') or
+      (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'LPT') or
+      (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'CONS') or
+      (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'SCRN') or
+      (UpperCase(VarToStr(Context.CurrentToken.Value)) = 'ERR')) then
+  begin
+    DevWord := UpperCase(VarToStr(Context.CurrentToken.Value));
+    Context.Advance;                                // PIPE / COM / LPT
+  end;
   if (not ModernMode) or (UpperCase(Token.Value) <> kOPEN) or (not Context.Check(ttDelimParOpen)) then
   begin
     HandleError(Format('Unexpected token "%s"', [Token.Value]), Token);
     Exit;
   end;
   Context.Advance;                                  // '('
-  Param := ParseExpression;                         // filename
+  // "Open Cons( As #1 )", "Open Err( For Output As #2 )", "Open Scrn( ... )": the STANDARD device is the file, named
+  // as the statement form names it ("CONS:", see ParseFileOperationStatement), and no filename follows inside.
+  if (DevWord = 'CONS') or (DevWord = 'SCRN') or (DevWord = 'ERR') then
+    Param := TASTNode.CreateWithValue(antLiteral, DevWord + ':', Token)
+  else
+    Param := ParseExpression;                       // filename
   if not Assigned(Param) then
   begin
     HandleError('Expected a filename in OPEN(...)', Context.CurrentToken);
@@ -1895,6 +1959,7 @@ begin
 
   ModeStr := 'R';
   SkipClauseComma;
+  SawFor := AtWord(kFOR);
   if AtWord(kFOR) then
   begin
     Context.Advance;                                // FOR
@@ -1977,6 +2042,12 @@ begin
     LenExpr := ParseExpression;
   end;
 
+  // "Open Cons( As #n )" with no FOR is a RANDOM open of the console, which fbc refuses with 1 (measured; ERR and SCRN
+  // open). DIVERGENZE 646.
+  if (DevWord = 'CONS') and not SawFor then ModeStr := ModeStr + 'Z';
+  if DevWord = 'PIPE' then ModeStr := ModeStr + 'P'                      // the file is a PROCESS
+  else if DevWord = 'LPT' then ModeStr := ModeStr + 'Y'                   // a printer: fbc's error 2 (SedaiFileIO)
+  else if DevWord = 'COM' then ModeStr := ModeStr + 'Z';                  // a serial port: fbc's error 1
   Result := TASTNode.CreateWithValue(antOpenFunc, kOPEN, Token);
   Result.AddChild(HandleNode);                                            // 0 = handle
   Result.AddChild(Param);                                                 // 1 = filename
@@ -2551,7 +2622,9 @@ begin
      (Length(VarToStr(Context.CurrentToken.Value)) > 0) and
      (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_']) then
     Context.CurrentToken.TokenType := ttIdentifier;
-  if not Context.Check(ttIdentifier) then
+  // "@.a( 1 )" inside a WITH, "@..g" for the global one (manual proguide/multithreading, DIVERGENZE 646): the dots are
+  // the start of the NAME, read by the same prefix rule an operand without "@" takes.
+  if not Context.Check(ttIdentifier) and not (ModernMode and Context.Check(ttOpDot)) then
   begin
     HandleError('Expected a name after "@"', Context.CurrentToken);
     Result := nil;
@@ -4007,6 +4080,15 @@ begin
       Result.Attributes.Values['GLOBALSCOPE'] := '1';
       Context.Advance;
       DoNodeCreated(Result);
+      Exit;
+    end;
+    // ".ThreadCreate( ... )", "..Len( s )": the global scope before a BUILTIN, written where a method of the same name
+    // would otherwise be found (DIVERGENZE 646). The builtin is parsed as it would be without the dots.
+    if (VarToStr(Context.CurrentToken.Value) <> '') and
+       (UpCase(VarToStr(Context.CurrentToken.Value)[1]) in ['A'..'Z', '_']) and
+       not (Context.CurrentToken.TokenType in [ttStringLiteral, ttNumber, ttInteger, ttFloat]) then
+    begin
+      Result := ParseExpression(precCall);
       Exit;
     end;
     HandleError('"." with no object (outside a WITH block)', Token);

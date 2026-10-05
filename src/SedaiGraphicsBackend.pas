@@ -62,6 +62,9 @@ type
     function  ScreenSurface: TGfxSurface;
     function  CreateSurface(W, H: Integer; Fill: TGfxColor): TGfxSurface;
     procedure DestroySurface(Surface: TGfxSurface);
+    // GET into an existing image gives it the RECTANGLE's size, as fbc rewrites the buffer's header (DIVERGENZE 646).
+    // Same id, same depth, contents undefined until the copy.
+    procedure ResizeSurface(Surface: TGfxSurface; W, H: Integer);
     function  SurfaceWidth(Surface: TGfxSurface): Integer;
     function  SurfaceHeight(Surface: TGfxSurface): Integer;
     { ⭐ The surface's pixel DEPTH in fbc's terms (1/2/4/8/16/32) and the bytes one pixel occupies at
@@ -141,6 +144,9 @@ type
     function  ScreenSurface: TGfxSurface;
     function  CreateSurface(W, H: Integer; Fill: TGfxColor): TGfxSurface;
     procedure DestroySurface(Surface: TGfxSurface);
+    // GET into an existing image gives it the RECTANGLE's size, as fbc rewrites the buffer's header (DIVERGENZE 646).
+    // Same id, same depth, contents undefined until the copy.
+    procedure ResizeSurface(Surface: TGfxSurface; W, H: Integer);
     function  SurfaceWidth(Surface: TGfxSurface): Integer;
     function  SurfaceHeight(Surface: TGfxSurface): Integer;
     { ⭐ The surface's pixel DEPTH in fbc's terms (1/2/4/8/16/32) and the bytes one pixel occupies at
@@ -322,6 +328,21 @@ begin
     FImages[Surface - 1].Free;
     FImages[Surface - 1] := nil;   // leave the slot for reuse (ids stay stable)
   end;
+end;
+
+procedure TSoftwareGraphicsBackend.ResizeSurface(Surface: TGfxSurface; W, H: Integer);
+var
+  Old, Img: TGraphicsMemory;
+begin
+  if (W <= 0) or (H <= 0) or (Surface < 1) or (Surface > Length(FImages)) then Exit;
+  Old := FImages[Surface - 1];
+  if (Old = nil) or ((Old.State.Width = W) and (Old.State.Height = H)) then Exit;
+  Img := TGraphicsMemory.Create;
+  Img.AllocateBuffers(W, H, False, gmSDL2Dynamic);
+  Img.ClearCurrentMode(0);
+  if Img.Depth <> Old.Depth then Img.SetDepth(Old.Depth);
+  FImages[Surface - 1] := Img;
+  Old.Free;
 end;
 
 function TSoftwareGraphicsBackend.SurfaceWidth(Surface: TGfxSurface): Integer;

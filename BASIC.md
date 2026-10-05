@@ -149,7 +149,7 @@ Legend: ✓ = Implemented | ◐ = Partial | ✗ = Not implemented
 | Command | Status | Description |
 |---------|--------|-------------|
 | `CONT` | ✓ | Continue program execution after STOP |
-| `END` | ✓ | Ends program execution |
+| `END` | ✓ | Ends program execution. In the FreeBASIC dialect `END <expression>` is the process exit code for any expression (`End main()`), computed at run time (5 October 2026, divergence 646). |
 | `FAST` | ✓ | Set fast speed clock (shows black overlay) |
 | `FRAME` | ✓ | Wait for frame sync (FRAME for 60fps, FRAME n for n fps) |
 | `RUN` | ✓ | Execute program (RUN, RUN "filename") |
@@ -2836,7 +2836,7 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 
 | Keyword | Status | Description |
 |---|---|---|
-| `DATA` | ✓ |  |
+| `DATA` | ✓ | 🕳️ **Divergence 662**: an ADDRESS (`Data @x`, `Data @"text"`) is refused by name — the DATA pool holds literal values. |
 | `READ` | ✓ | Reads into a `Shared` scalar from inside a procedure, into an @-taken local and into a narrow numeric (`Byte`, `Short`, …) exactly as an assignment would — a `Read b` over a DATA 300 leaves 44 in a `Byte` (7 September 2026, guard m879; the same holds for `INPUT`, `LINE INPUT`, `INPUT #`, `GET #`). |
 | `RESTORE` | ✓ |  |
 
@@ -2896,7 +2896,7 @@ it out. Fixed 26 Aug 2026, guard `m585`.
 |---|---|---|
 | `END (Block)` | ✓ |  |
 | `OFFSETOF` | ✓ | `OFFSETOF(type, field)` — a field's byte offset (compile-time), read off the type's C layout, which is fbc's byte for byte: narrow fields, `FIELD = n`, nested `Union`/`Type` blocks and **runs of bit fields** included. ⛔ A **bit field has no offset** — it has no address — so `OffsetOf` of one is REFUSED, as fbc refuses it (guard `m835`); the run's own packing is guard `m836`. |
-| `SIZEOF` | ✓ | The type may carry the `Const` qualifier (`SizeOf(Const T)`), as it may in `Len`, `type<Const T>()` and `New Const T` — const binds to the type and changes neither its size nor its identity (guard `m586`). `SizeOf(scalar-type / UDT / expression)` byte size — an expression is sized by its DECLARED width (`SizeOf(CULng(0))` = 4, `SizeOf(RGB(...))` = 4), never evaluated; `Allocate(n * SizeOf(T))`. Also `CAST`/`CPTR(type, expr)`, whose type may be a pointer or a procedure-pointer type (`CPtr(Sub(), 0)`). A string **literal** or a string `CONST` sizes as a `ZSTRING`: its length + 1, as in fbc. 🕳️ **Divergence 202**: `SizeOf` of a *typed* CONST answers the default width, not the declared one (`Const b As Byte` sizes 8 here, 1 in fbc); the VALUE of that constant is already narrowed correctly. |
+| `SIZEOF` | ✓ | The type may carry the `Const` qualifier (`SizeOf(Const T)`), as it may in `Len`, `type<Const T>()` and `New Const T` — const binds to the type and changes neither its size nor its identity (guard `m586`). `SizeOf(scalar-type / UDT / expression)` byte size — an expression is sized by its DECLARED width (`SizeOf(CULng(0))` = 4, `SizeOf(RGB(...))` = 4), never evaluated; `Allocate(n * SizeOf(T))`. Also `CAST`/`CPTR(type, expr)`, whose type may be a pointer or a procedure-pointer type (`CPtr(Sub(), 0)`). A string **literal** or a string `CONST` sizes as a `ZSTRING`: its length + 1, as in fbc. 🕳️ **Divergence 202**: `SizeOf` of a *typed* CONST answers the default width, not the declared one (`Const b As Byte` sizes 8 here, 1 in fbc); the VALUE of that constant is already narrowed correctly. `SizeOf`/`Len` of an ARRAY member (`SizeOf(T.a)`, `Len(v.a)`), fixed or dynamic, is the size of ONE element, as in fbc (5 October 2026, divergence 666); the containing type still counts a dynamic member's 72-byte descriptor (313). |
 | `TYPEOF` | ~ | `DIM AS TypeOf(expr) name` declares a variable with the type inferred from an expression/variable/literal (like VAR without an initializer). `#if TypeOf(x) = <type>` is **answered**, from the declarations that appear ABOVE the directive: fbc's preprocessor is a single top-down pass, so a `#if` at line N needs only lines 1..N-1, and ours collects them as it emits. The result is an UPPER-cased type name, as fbc's own tests spell out (`#assert typeof( pi ) = "INTEGER PTR"`). Two names neither declared nor known as types compare EQUAL to each other and differ from every real type — measured against fbc, not chosen. |
 | `LET` | ✓ |  |
 | `REM` | ✓ |  |
@@ -3086,17 +3086,17 @@ End Function
 | Keyword | Status | Description |
 |---|---|---|
 | `CLS` | ✓ | Clears the screen and homes the cursor (alias of `SCNCLR`; resets `POS`/`CSRLIN` to 0). |
-| `WIDTH` | ✓ | Sets or returns the number of rows and columns of the console display. |
+| `WIDTH` | ✓ | Sets or returns the number of rows and columns of the console display. `WIDTH cols, rows` reads both (the rows were left on the line until 5 October 2026); headless neither changes anything. |
 | `VIEW PRINT` | ✓ | `VIEW PRINT [firstrow TO lastrow]` sets the console's text print area, and so its scroll region: text wraps at its right edge and scrolls at its bottom, `CLS` clears only it, and the cursor moves to the start of `firstrow`. Rows are 1-based; a bare `VIEW PRINT` restores the whole screen. Shares the print-area machinery with the Commodore v7 `WINDOW` command. |
 
 #### Cursor Color and Positioning
 
 | Keyword | Status | Description |
 |---|---|---|
-| `COLOR` | ✓ | Changes the foreground and background color of text to be written. |
+| `COLOR` | ✓ | Changes the foreground and background color of text to be written. `COLOR(fg, bg)` with parentheses is the same statement, and `COLOR(fg, bg)` as a FUNCTION sets the colours and answers the previous ones (5 October 2026). 🕳️ **Divergence 668**: the packed values follow this runtime's console model (with output redirected fbc answers 0; its initial foreground is 7, here 0). |
 | `CSRLIN` | ✓ | Returns the row position of the cursor (VM-tracked, parallels `POS`). |
 | `POS` | ✓ | Returns the column position of the cursor. |
-| `LOCATE` | ✓ | Sets the row and column position of the cursor (1-based). Dialect-aware: in MODERN it moves the **text** cursor, as FreeBASIC defines it; in CLASSIC, `LOCATE x, y` keeps the Commodore v7 meaning and moves the bit-map **pixel** cursor. Cursor visibility (the `state` argument) is not modelled. |
+| `LOCATE` | ✓ | Sets the row and column position of the cursor (1-based). Dialect-aware: in MODERN it moves the **text** cursor, as FreeBASIC defines it; in CLASSIC, `LOCATE x, y` keeps the Commodore v7 meaning and moves the bit-map **pixel** cursor. Cursor visibility (the `state` argument) is not modelled. `LOCATE(...)` is also a FUNCTION: it moves as the statement does and answers the cursor, column in the low byte, row in the next, bit 16 = visible (5 October 2026). 🕳️ **Divergence 668**: with output redirected fbc answers 0 and keeps `CSRLIN`/`POS` at 1; here they follow what was printed. |
 | `SCREEN (Console)` | ✓ | Gets the character or color attribute at a given location. `SCREEN(row, col)` yields the character code; a non-zero `colorflag` yields the colour attribute, packed as FreeBASIC packs it for a palette console of up to 4 bits per pixel (background in the high nibble, foreground in the low). |
 
 #### Writing Text to the Console
@@ -3178,7 +3178,7 @@ End Function
 | Keyword | Status | Description |
 |---|---|---|
 | `FREEFILE` | ✓ | Lowest unused file number (1..15). Bare `FREEFILE` or `FREEFILE()`. |
-| `OPEN` | ✓ | `OPEN "f" FOR {INPUT\|OUTPUT\|APPEND\|BINARY\|RANDOM} AS [#]n` (FreeBASIC) and legacy `OPEN #n,"f",mode$`. Works headless (CLI) and in the console. |
+| `OPEN` | ✓ | `OPEN "f" FOR {INPUT\|OUTPUT\|APPEND\|BINARY\|RANDOM} AS [#]n` (FreeBASIC) and legacy `OPEN #n,"f",mode$`. Works headless (CLI) and in the console. Device words: `OPEN PIPE`, `CONS`, `SCRN`, `ERR` in the statement and in the function form (`Open Pipe(cmd For Input As #p)`); `OPEN LPT` and `OPEN COM` name a printer and a serial port this runtime does not drive — they fail with fbc's codes (2 and 1) and create no file, and `OPEN CONS` without `FOR` fails with 1 (5 October 2026, divergence 667). |
 | `OPEN COM` | ✗ | Binds a file number to a communications port. **Not implemented**: the parser's device branch knows only `CONS`/`SCRN`/`ERR`, so `COM` is read as an ordinary word and its (empty) value becomes the filename; `IsReservedDeviceName` then refuses the string form outright. |
 | `OPEN CONS` | ✓ | Binds a file number to the standard input and output streams. |
 | `OPEN ERR` | ✓ | Binds a file number to the standard input and error streams. |
@@ -3186,7 +3186,7 @@ End Function
 | `OPEN PIPE` | ✗ | Binds a file number to the input and output streams of a process. **Not implemented**: the parser does not know `PIPE` at all, and the line is a syntax error. |
 | `OPEN SCRN` | ✓ | Binds a file number directly to the console. |
 | `CLOSE` | ✓ | Unbinds a file number from a file or device. ⚠️ The **statement** only: `CLOSE #n` and the bare `CLOSE` (all channels). The FUNCTION form `Close(n)`, which answers an error code, is not implemented — see *Declared unsupported*. |
-| `RESET` | ✓ | Unbinds all active file numbers (closes every open handle; alias of DCLEAR). |
+| `RESET` | ✓ | Unbinds all active file numbers (closes every open handle; alias of DCLEAR). `RESET(streamno)` re-attaches standard input (0) or output (1) to the console and closes nothing; headless there is no console to return to (5 October 2026, divergence 646). |
 | `INPUT (File Mode)` | ✓ | Text data can be read from the file. |
 | `OUTPUT` | ✓ | `OPEN "f" FOR OUTPUT AS #n` opens the file for writing (truncating). |
 | `APPEND` | ✓ | Text data is added to the end of a file when output. |
@@ -3460,8 +3460,8 @@ End Function
 
 | Keyword | Status | Description |
 |---|---|---|
-| `INPUT` | ✓ | Reads values from the keyboard buffer. ⭐ In the FreeBASIC dialect it reads ONE line per statement and splits it at the commas with the same field rule as `INPUT #` (leading blanks dropped, trailing kept, quotes); what a statement does not consume waits for the next one, and with a redirected standard input neither the prompt nor `? ` is written (7 September 2026, net `console_input_check.sh`). |
-| `LINE INPUT` | ✓ | `LINE INPUT [;][prompt;]var` reads a whole line from the console; `LINE INPUT #n, s` from a file (commas not split). |
+| `INPUT` | ✓ | Reads values from the keyboard buffer. ⭐ In the FreeBASIC dialect it reads ONE line per statement and splits it at the commas with the same field rule as `INPUT #` (leading blanks dropped, trailing kept, quotes); what a statement does not consume waits for the next one, and with a redirected standard input neither the prompt nor `? ` is written (7 September 2026, net `console_input_check.sh`). The destination may be any variable reference — an array element, a field, `*p` — and is stored as an assignment stores it (5 October 2026, divergence 664); a leading `;` (`Input ; "prompt", v`) is accepted. |
+| `LINE INPUT` | ✓ | `LINE INPUT [;][prompt;]var [, maxlength]` reads a whole line from the console, commas included (until 5 October 2026 it split the line at the first comma, divergence 664); the prompt may be any string expression, and `*pz, maxlength` keeps at most `maxlength - 1` characters in the buffer. `LINE INPUT #n, s` reads from a file (commas not split). 🕳️ **Divergence 668**: on a terminal fbc writes `prompt? ` after a `;`, here `prompt`. |
 | `INPUT()` | ✓ | `INPUT(n)` — reads n characters from the keyboard, unechoed. The INPUT *statement* is unaffected: it is parsed at statement level and never reaches the expression parser. |
 | `WINPUT()` | ✓ | `WINPUT(n)` — reads n wide characters from the keyboard, unechoed. Extended keys are not read. (FreeBASIC itself does not read wide characters from the console.) |
 
@@ -3505,19 +3505,19 @@ End Function
 
 | Keyword | Status | Description |
 |---|---|---|
-| `GET (GRAPHICS)` | ✓ | `GET (x1,y1)-(x2,y2), dst` captures a screen rectangle into image surface `dst` (via IGraphicsBackend; headless-testable). Array-buffer destination deferred. |
+| `GET (GRAPHICS)` | ✓ | `GET [STEP](x1,y1)-[STEP](x2,y2), dst` captures a screen rectangle into image surface `dst` (via IGraphicsBackend; headless-testable). The first `STEP` is relative to the current graphics point, the second to the first corner; `dst` takes the rectangle's size, as fbc rewrites the buffer's header (5 October 2026, divergence 665). Array-buffer destination deferred. |
 | `IMAGECREATE` | ✓ | `IMAGECREATE(w,h[,color])` allocates a truecolor image surface and answers a **pointer to its FB.IMAGE header** (8 Sep 2026 - it used to answer the bare table index). The header is the 32 bytes FreeBASIC puts in front of an image's pixels, so `img->width`, `img->height`, `img->bpp` and `img + SizeOf(FB.IMAGE)` all read what fbc reads, and `IMAGEINFO`'s pixel pointer walks the picture. ⭐ The bare index still works everywhere a handle is taken (`PUT`, `GET`, `SETTARGET`, `IMAGEDESTROY`, `IMAGEINFO`), so programs written before this keep running. ⚠️ An IMAGE surface is still created at 32bpp — `IMAGECREATE`'s `bpp` argument is taken and ignored — while the SCREEN now honours its depth (see `SCREENRES`). `SCREENLIST(d)` still answers 0. Declared divergence. |
 | `IMAGEDESTROY` | ✓ | `IMAGEDESTROY handle` frees an image surface (the id slot is reused by a later IMAGECREATE). |
 | `IMAGECONVERTROW` | ✗ | Converts a row of pixels in an image buffer to a different color depth. |
 | `IMAGEINFO` | ✓ | `IMAGEINFO handle, w [, h [, bpp [, pitch]]]` writes the surface's width, height, **bytes per pixel** and **row pitch in bytes** into the variables given (8 Sep 2026: bpp and pitch used to answer 0, which is a NUMBER and not an error - a pitch of 0 makes every row land on the first). Every surface here is 32bpp, so bpp is always 4, as fbc reports it. ⚠️ fbc's sixth argument, the POINTER to the pixels, answers 0: an image surface is a table entry here, not a block of addressable memory. Declared divergence. Also accepted as the function form `IMAGEINFO(...)`, which answers 0 for a valid image. |
-| `BLOAD` | ✓ | Creates an image buffer from a file. |
-| `BSAVE` | ✓ | Saves an image buffer to a file. |
+| `BLOAD` | ✗ | Creates an image buffer from a file. 🕳️ **Divergence 663**: not implemented in the FreeBASIC dialect — the statement stops the program at run time and the function form `BLoad(f, img)` is refused. |
+| `BSAVE` | ✗ | Saves an image buffer to a file. 🕳️ **Divergence 663**: not implemented in the FreeBASIC dialect (see `BLOAD`). |
 
 #### Blitting Image Buffers
 
 | Keyword | Status | Description |
 |---|---|---|
-| `PUT (GRAPHICS)` | ✓ | `PUT (x,y), src [, mode]` blits image surface `src` onto the screen at (x,y). Modes: PSET/PRESET, TRANS (magenta key), ALPHA, ADD, AND, OR, XOR (CUSTOM falls back to PSET). Array-buffer source deferred. |
+| `PUT (GRAPHICS)` | ✓ | `PUT [STEP](x,y), src [, mode]` blits image surface `src` onto the screen at (x,y); `STEP` is relative to the current graphics point, and the corner becomes the current graphics point, as in fbc (5 October 2026, divergence 665). Modes: PSET/PRESET, TRANS (magenta key), ALPHA, ADD, AND, OR, XOR (CUSTOM falls back to PSET). Array-buffer source deferred. |
 | `ADD` | ✓ | Saturated addition of the source and target components. |
 | `ALPHA` | ✓ | Blend using the image buffer's alpha channel (per-pixel). The uniform-transparency-level form (`PUT ...,ALPHA,level`) is deferred. |
 | `AND (Graphics Put)` | ✓ | Combine the source and target components using a bitwise And |

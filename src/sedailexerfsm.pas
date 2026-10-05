@@ -1606,8 +1606,19 @@ begin
   end;
   if HasLetter then
   begin
-    if not IsBaseDigit(PeekChar(1), Base) then Exit;   // need at least one valid digit -> else it's '&'
-    TokenBufferAdd(Ch); AdvanceChar;   // consume the base letter
+    // ⭐ DIVERGENZE 646 - "&b", "&o", "&h" with NO digit are fbc's literal 0, with a warning (warnings/lex-numlit-fb:
+    // "const c02 = &b"), when the letter ends the word. Left as the '&' operator, the letter became a second
+    // statement. A letter that goes on ("&bar") is not touched. MODERN only: v7 has no '&' operator.
+    if (not IsBaseDigit(PeekChar(1), Base)) and (not FLexerOptions.HasLineNumbers) and
+       not (PeekChar(1) in ['A'..'Z', 'a'..'z', '0'..'9', '_']) then
+    begin
+      TokenBufferAdd(Ch); AdvanceChar;   // consume the base letter: the value stays 0
+    end
+    else
+    begin
+      if not IsBaseDigit(PeekChar(1), Base) then Exit;   // need at least one valid digit -> else it's '&'
+      TokenBufferAdd(Ch); AdvanceChar;   // consume the base letter
+    end;
   end;
   Val := 0;
   while IsBaseDigit(GetCurrentChar, Base) do
@@ -2168,13 +2179,9 @@ begin
         FPendingLong32Unsigned := True;
       end;
     end
-    else if C in ['S', 's', 'B', 'b'] then
-    begin
-      AdvanceChar;                                                            // US / UB: narrow
-      FPendingUnsigned64Suffix := False;
-    end
-    else if C in ['I', 'i'] then
-      AdvanceChar;                                                            // UI: UInteger, 64-bit here
+    // ⛔ DIVERGENZE 315 · 322 · 646 - "US", "UB", "UI" are NOT suffixes in fbc (measured: "7ui" is "error 3: Expected
+    // End-of-Line, found 'i'"); its grammar knows u, l, ll, ul, ull. The letter after the U is left to the parser, whose
+    // end-of-statement rule refuses it as fbc does. Reading them used to accept a literal fbc rejects.
   end
   else if (C = 'L') or (C = 'l') then
   begin
