@@ -242,6 +242,8 @@ const
   // temporary a ByRef argument receives. The VM stacks it on the context and FramePop releases it - before this every
   // such cell was allocated per call and never given back (DIVERGENZE 458). Outside any frame it is not stacked.
   RAWALLOC_FRAME_CELL = 4;
+  // ⭐ ...and a frame cell that is an FBSTRING DESCRIPTOR (phase 5): the local String's bytes are freed with the cell.
+  RAWALLOC_STRDESC = 8;
 
   { ⭐ A POINTER THAT CAME FROM OUTSIDE (DIVERGENZE 183). Everything above is a VM-internal offset - no
     machine address is ever handed to a BASIC program - but a C function RETURNS one, and the program
@@ -285,6 +287,12 @@ const
     byte is the VM's true (-1). Written: the VM's nonzero value becomes 1. As RTC_I8 a true written through a
     "Boolean Ptr" or a "ByRef ... As Boolean" put 255 in the byte (fbc: 1), and a 1 that C wrote read back as 1, not -1. }
   RTC_BOOL = 12;
+
+  { ⭐ PHASE 5 OF THE POINTER MODEL: bit 1 of the Immediate of ssaRefLoadString / ssaRefStoreString (bit 0 is "wide").
+    The pointee is a variable-length STRING, so in the fb memory mode a machine address there is an FBSTRING descriptor
+    (SedaiFbString), not text. The SSA sets it from the declared pointee type: the same opcode also serves "*zp" of a
+    ZString Ptr, whose address IS text, and the VM cannot tell the two apart from the value. }
+  REFSTR_DESC = 2;
 
   { The width of ONE wide character in the byte IMAGE of a WSTRING - the raw-heap buffer an @-taken
     "WString * n" is backed with, what "Clear w, 0, SizeOf(w)" writes over, and what a UByte or UShort
@@ -991,6 +999,10 @@ type
       "@a(i)" is a machine address, "*zp", "zp[16]" and C read the bytes. 0 for every other array. .basc v9, second facts
       byte bit 2, then the Integer. }
     FixStrBytes: Integer;
+    { Phase 5 of the pointer model: an array of (variable-length) String whose elements are FBSTRING descriptors in the
+      fb memory mode - "@a(i)" is the descriptor's machine address, "StrPtr(a(i))" its bytes. .basc v10, second facts
+      byte bit 3. }
+    FbStr: Boolean;
   end;
 
   TSSAProgram = class
@@ -1064,6 +1076,7 @@ type
     procedure SetArrayElemWidth(ArrayIdx, Width: Integer; Signed: Boolean);  // packed storage for a narrow type
     procedure SetArrayElemIsPtr(ArrayIdx: Integer);                          // its elements are pointers (257 B)
     procedure SetArrayAddrNative(ArrayIdx: Integer);                         // "@a(i)" is a machine address in fb (phase 2.3)
+    procedure SetArrayFbStr(ArrayIdx: Integer);                               // String elements are FBSTRING descriptors (phase 5)
     procedure SetArrayFixStrBytes(ArrayIdx, N: Integer);                     // a "ZString * n" array is n-byte cells (615)
     procedure SetArrayBarePtr(ArrayIdx: Integer);                            // its elements are bare machine addresses (545)
     procedure SetArrayPrivate(ArrayIdx: Integer);    // mark: proc-local, needs one storage PER THREAD
@@ -2114,6 +2127,13 @@ procedure TSSAProgram.SetArrayAddrNative(ArrayIdx: Integer);
 begin
   if (ArrayIdx < 0) or (ArrayIdx >= FNextArrayIndex) then Exit;
   FArrays[ArrayIdx].AddrNative := True;
+end;
+
+procedure TSSAProgram.SetArrayFbStr(ArrayIdx: Integer);
+// Phase 5 - see TSSAArrayInfo.FbStr.
+begin
+  if (ArrayIdx < 0) or (ArrayIdx >= FNextArrayIndex) then Exit;
+  FArrays[ArrayIdx].FbStr := True;
 end;
 
 procedure TSSAProgram.SetArrayFixStrBytes(ArrayIdx, N: Integer);

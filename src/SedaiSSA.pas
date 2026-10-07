@@ -67,6 +67,12 @@ type
     IterType: string;           // T, or '' when this is not a type-driven loop
     IterHasStep: Boolean;       // the source wrote STEP, so the one-argument operators are used
     IterExitLabel: string;      // the block that holds the "Operator Next" exit branch (the call splits CondLabel)
+    // The temporaries the head built - the counter itself when it IS one, the limit, the step - live as long as the
+    // LOOP, not the head statement: destroyed in the exit block. ⛔ Flushed at the end of the head they emptied the
+    // String fields the loop was still reading (phase 5.3 gave such a type its implicit destructor: udt/step-char-iterator
+    // looped for ever). SB_ITER_TEMPS=0 is the A/B.
+    IterTempRegs: array of Integer;
+    IterTempTypes: array of string;
     CounterScoped: Boolean;     // "For i As T": the counter got a scope frame of its own, popped at NEXT
     // ...and what the counter's NAME meant in the flat width / print-form maps BEFORE the head wrote
     // over it (-1 = it had no entry). Those maps are keyed by bare name and outlive the scope frame,
@@ -397,6 +403,7 @@ type
     FEarlyConstVals: TStringList;  // DIVERGENZE 392: module CONST / ENUM member values known BEFORE RegisterUDTs
     FLayoutFold: Integer;          // ...read by TryFoldConstIntExpr only while a layout bound is being folded
     FVarEnumType: TStringList;           // "DIM AS <enum> v" variable (UPPER) -> its enum type name (UPPER): same, for a variable operand
+    FVarStrNames: TStringList;           // phase 5: names DIM'd as a variable-length STRING (scalar or array), program-wide
     FFixedStrNames: TStringList;         // names DIM'd as a FIXED-LENGTH ZSTRING/WSTRING ("ZString * n").
                                          // Collected before the @-taken pass so STRPTR/SADD of one can be
                                          // treated as the address-taking it is - see CollectFixedStrNames.
@@ -572,6 +579,7 @@ type
     FRecNativeRecArrays: Boolean;        // phase 3 (exclusions): an inline array of native records
     FRecNativeZStr: Boolean;             // phase 3 (exclusions): a ZString * n field outside a union
     FRecNativeFixStr: Boolean;           // phase 3 (exclusions): a String * n field
+    FRecNativeStr: Boolean;              // phase 5.3: a variable-length String field is an FBSTRING descriptor in the image
     FBoolArrays: Boolean;                // DIVERGENZE 493: a Boolean array is packed at one byte holding C's 0/1
     FNativeRecAsking: TStringList;       // phase 3.2: the types NativeRecordType is answering right now (a list's own pointer)
     // Phase 2.1a: the program's entry block, and where in it a raw module cell's allocation is hoisted (HoistToEntry) -
@@ -980,11 +988,19 @@ type
     procedure EmitRecordBlockDelete(const FirstHandle: TSSAValue; const TypeName: string);   // Delete[] of a New T[n] block
     procedure EmitNativeImageCopy(const DstAddr, SrcAddr: TSSAValue; Bytes: Int64);   // phase 3.6: a native record copy
     function NativeImageBytes(UDTIdx: Integer): Int64;   // phase 3.7: the C size of a native record
+    function NativeStrFieldsOn: Boolean;                                         // phase 5.3: String fields as FBSTRING
+    function IsVarLenStrField(UDTIdx, FieldIdx: Integer): Boolean;               // phase 5.3: a variable-length String field
+    procedure CollectNativeStrOffsets(UDTIdx: Integer; Base: Int64; var Offs: TInt64Array; Depth: Integer = 0);
+    function NativeTypeHasStrings(const TypeName: string): Boolean;              // phase 5.3: a descriptor anywhere in the image
+    function TypeHeldInArrayMember(const TypeName: string): Boolean;             // phase 5.3: some type has "m(..) As T"
+    procedure EmitNativeStrFieldsClear(const Addr: TSSAValue; UDTIdx: Integer);  // phase 5.3: the implicit destructor
+    function NativeStrFieldAddr(const Handle: TSSAValue; UDTIdx, FieldIdx: Integer; out Addr: TSSAValue): Boolean;
     procedure EmitRecordBlockCtorDtor(const FirstHandle, CountVal: TSSAValue;
                                       const TypeName: string; Construct: Boolean);  // init each of N records  // alloc nested records
     procedure EmitRecordArrayInit(ArrayIdx, UDTIdx: Integer);  // per-element EmitRecordInit over a DIM'd array-of-UDT
     function SplitRecordVar(const S: string; out VName, TName: string; out IsArray: Boolean): Boolean;
     procedure EmitRecordVarDestruction(const VName, TName: string; IsArray: Boolean);
+    procedure EmitRedimShrinkDtors(ArrayIdx: Integer; const TypeName: string; const LbVal, UbReg: TSSAValue);
     function EmitRecordArrayCount(ArrayIdx: Integer; RankHint: Integer = 0): TSSAValue;   // the flat element count, at run time
     procedure EmitRecordArrayConstructFrom(ArrayIdx: Integer; const TypeName: string; const FromReg: TSSAValue;
                                            RankHint: Integer = 0);
@@ -1040,6 +1056,7 @@ type
     procedure ScanTopLevelLabels(Node: TASTNode; var Depth: Integer);      // recursive worker for the above
     procedure EmitExitLoopCleanup;                       // M8: unwind blocks down to the loop body (EXIT FOR/DO)
     procedure EmitExitLoopCleanupN(LoopLevels: Integer); // multi-level EXIT/CONTINUE (Exit For, For)
+    procedure EmitIterLoopTemps(LoopIdx: Integer);       // destroy an iterator For's head temporaries (678)
     function FindEnclosingLoop(Kind: TLoopKind; Levels: Integer; out LoopIdx, AllDepth: Integer): Boolean;
     procedure CollectSharedVars(Node: TASTNode);        // M6: gather DIM SHARED scalars + assign slots
     procedure CollectStaticMembers(Node: TASTNode);     // OOP: gather TYPE static member vars, back each with a shared global
@@ -1163,6 +1180,8 @@ type
     function AddrParamBank(const Name: string): TSSARegisterType;               // pointee bank of an address param
     function IsRefVar(const Name: string): Boolean;                             // BYREF reference variable (auto-deref)?
     function RefVarAddrValue(const Name: string): TSSAValue;                    // the address a reference carries (its home if Shared, 270)
+    function StrRefImm(Wide: Boolean; const PointeeType: string): TSSAValue;    // phase 5: REFSTR_DESC for a STRING pointee
+    function RefVarDeclType(const Name: string): string;                       // a reference's declared type ('' if none)
     function RefVarIsWide(const Name: string): Boolean;                         // a reference to a WSTRING: read/written as wide cells
     function RefVarNarrowCode(const Name: string): Integer;                     // ...its raw width code, 0 = full width (DIVERGENZE 256)
     function RefVarBank(const Name: string): TSSARegisterType;                  // pointee bank of a reference variable
@@ -1191,6 +1210,7 @@ type
     function IsImageCreateExpr(Node: TASTNode): Boolean;                        // Node = IMAGECREATE(...)?
     function IsArrayDescPtrCall(Node: TASTNode): Boolean;                       // Node = FBC.ArrayDescriptorPtr(...)?
     function RawPtrExprName(Node: TASTNode): string;                            // raw pointer var of a raw ptr expr (p, p±n), else ''
+    function RawUDTCastSum(Node: TASTNode): Boolean;                            // Cast(<ptr>, u) ± n, u a raw UDT pointer
     function IsStrDataPtrExpr(Node: TASTNode): Boolean;                         // SADD(s)/STRPTR(s), and that ± an offset
     function IsStringConstName(const Name: string): Boolean;                    // a declared STRING constant?
     function RawPtrExprPointee(Node: TASTNode): string;                         // scalar pointee of a raw FIELD ptr expr (obj.field, @obj.field[i]), else ''
@@ -1215,6 +1235,7 @@ type
     function AddrLocalBank(const Name: string): TSSARegisterType;               // bank of an @-taken local
     function AddrLocalHandle(const Name: string): TSSAValue;                    // its per-frame record/raw-address handle (hidden var)
     function AddrLocalType(const Name: string): string;                         // declared type of an @-taken local/param
+    function IsFbStrLocal(const Name: string): Boolean;                         // phase 5: @-taken local String in an FBSTRING cell
     function IsRawAddrLocal(const Name: string): Boolean;                       // @-taken NON-string scalar local/param -> raw byte slot
     function IsCharBufName(const Name: string): Boolean;       // an @-taken ZString/WString buffer, either scope
     function ZStringBufElemBytes(const Name: string): Int64;   // one CELL of such a buffer, in bytes
@@ -1361,6 +1382,9 @@ type
     function TypeNameWidthCode(const TypeName: string): Integer;
     procedure NoteArrayAddrNative(ArrayIdx: Integer; ET: TSSARegisterType; const ElemTypeName: string);
     procedure NoteArrayFixStr(ArrayIdx: Integer; const ElemTypeName: string; FixLen: Integer);   // 615: "ZString * n" cells
+    procedure NoteArrayFbStr(ArrayIdx: Integer; ET: TSSARegisterType; const ElemTypeName: string; FixLen: Integer;
+                             const NameU: string);                                        // phase 5: FBSTRING descriptors
+    function ArrayIsFbStr(ArrayIdx: Integer): Boolean;                          // phase 5: elements are FBSTRING descriptors
     function ArrayAddrIsNative(ArrayIdx: Integer): Boolean;
     function NarrowRefArg(const Pointee: string): TSSAValue;
     function FloatRefArg(const Pointee: string): TSSAValue;   // phase 2.6: a Single pointee's width
@@ -1623,6 +1647,7 @@ type
     function DerefedZStringIndexBase(BaseNode: TASTNode): string;   // "(*p)" over a ZSTRING/WSTRING pointer? (no emit)
     function DerefZStringByteAddr(BaseNode, IdxNode: TASTNode; out Addr: TSSAValue;
                                   out ElemBytes: Integer): Boolean;  // "(*p)[i]" on a ZSTRING/WSTRING pointer
+    function FbStrDescAddr(SNode: TASTNode; out Addr: TSSAValue): Boolean;      // phase 5: the FBSTRING descriptor of a String
     function RawZStringBufAddr(SNode: TASTNode; out Addr: TSSAValue): Boolean;   // byte address of an @-taken "ZSTRING * n"
     function RawElemArrayName(Node: TASTNode): string;                   // ...asked without FProgram: safe in the pre-scan
     function IsRawElemArrayAccess(Node: TASTNode): Boolean;             // "a(i)" whose element holds a RAW address
@@ -2084,6 +2109,8 @@ begin
   // (EmitNativeFieldInit) and fb_memcopy into a field (the raw block copy). =0 is the A/B.
   FRecNativeZStr := GetEnvironmentVariable('SB_RECNATIVE_ZSTR') <> '0';
   FRecNativeFixStr := GetEnvironmentVariable('SB_RECNATIVE_FIXSTR') <> '0';   // phase 3: ON; =0 keeps such types managed (A/B)
+  FRecNativeStr := (GetEnvironmentVariable('SB_RECNATIVE_STR') <> '0') and
+                   (GetEnvironmentVariable('SB_FBSTR') <> '0');                  // phase 5.3: ON; =0 keeps such types managed (A/B)
   FBoolArrays := GetEnvironmentVariable('SB_BOOL_ARRAYS') <> '0';                        // DIVERGENZE 493: =0 is the A/B
   FProgram := nil;
   FCurrentBlock := nil;
@@ -2220,6 +2247,7 @@ begin
   FVarEnumType := TIndexedStringList.Create;
   FVarEnumType.CaseSensitive := False;
   FFixedStrNames := TIndexedStringList.Create;
+  FVarStrNames := TIndexedStringList.Create;
   FFixedStrNames.CaseSensitive := False;
   FVarDeclTypeName := TIndexedStringList.Create;
   FVarDeclTypeName.CaseSensitive := False;
@@ -2436,6 +2464,7 @@ begin
   FEarlyConstVals.Free;
   FVarEnumType.Free;
   FFixedStrNames.Free;
+  FVarStrNames.Free;
   FVarDeclTypeName.Free;
   FPreFixedStrCap.Free;
   FLexVarTypes.Free;
@@ -4609,6 +4638,9 @@ begin
           EmitInstruction(ssaStrSAdd, Result, EnsureStringRegister(TempVal), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end;
       end
+      else if IsFbStrLocal(VarToStr(Node.Value)) then
+        // ⭐ Phase 5: "@s" of a local String in the fb mode is its FBSTRING cell's machine address.
+        Result := EnsureIntRegister(AddrLocalHandle(VarToStr(Node.Value)))
       else if IsAddrLocal(VarToStr(Node.Value)) then
       begin
         // @local STRING: a record-field pointer into this frame's backing record (slot 0) — distinct per call.
@@ -5225,7 +5257,7 @@ begin
       case FuncRetType of
         srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), FloatRefArg(DerefedType(Node.GetChild(0))));
         srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone),    // width (538)
-                     MakeSSAConstInt(Ord((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and (Pos('WSTRING', UpperFast(DerefedType(Node.GetChild(0)))) > 0))));
+                     StrRefImm((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and (Pos('WSTRING', UpperFast(DerefedType(Node.GetChild(0)))) > 0), DerefedType(Node.GetChild(0))));
       else
         // ⭐ ...AND THE READ CARRIES ITS OWN WIDTH. Over a PACKED array the elements are contiguous
         // bytes, so "*Cast(ULong Ptr, @a(0))" must take FOUR of them side by side - which the VM can
@@ -5474,7 +5506,7 @@ begin
         case FuncRetType of
           srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), FloatRefArg(AddrParamType(VarName)));
           srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone),    // width (538)
-                       MakeSSAConstInt(Ord((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and (Pos('WSTRING', UpperFast(AddrParamType(VarName))) > 0))));
+                       StrRefImm((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and (Pos('WSTRING', UpperFast(AddrParamType(VarName))) > 0), AddrParamType(VarName)));
         else
           EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), NarrowRefArg(AddrParamType(VarName)));
         end;
@@ -5512,7 +5544,7 @@ begin
         case FuncRetType of
           srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone),
-                                     MakeSSAConstInt(Ord(RefVarIsWide(VarName))));
+                                     StrRefImm(RefVarIsWide(VarName), RefVarDeclType(VarName)));
         else
           EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         end;
@@ -5533,6 +5565,9 @@ begin
           else
             EmitInstruction(ssaRawLoadInt, Result, EnsureIntRegister(AddrLocalHandle(VarName)), MakeSSAValue(svkNone), MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(VarName))));
           end
+        else if IsFbStrLocal(VarName) then   // phase 5: the FBSTRING cell
+          EmitInstruction(ssaRefLoadString, Result, EnsureIntRegister(AddrLocalHandle(VarName)), MakeSSAValue(svkNone),
+                          MakeSSAConstInt(REFSTR_DESC))
         else   // STRING keeps the managed record handle
         begin
           EmitInstruction(ssaRecordLoadString, Result, AddrLocalHandle(VarName), MakeSSAValue(svkNone), MakeSSAConstInt(0));
@@ -10340,6 +10375,15 @@ begin
             Result := EnsureIntRegister(ArgValue);
             Exit;
           end;
+          // ⭐ Phase 5: a String that lives in an FBSTRING descriptor - its OWN bytes, the descriptor's data field (0 while
+          // it has none, as under fbc). C writing there writes the string.
+          if FbStrDescAddr(Node.GetChild(1).GetChild(0), ArgValue) then
+          begin
+            Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaRawLoadInt, Result, EnsureIntRegister(ArgValue), MakeSSAValue(svkNone),
+                            MakeSSAConstInt(RTC_PTR64));
+            Exit;
+          end;
           ProcessStringExpression(Node.GetChild(1).GetChild(0), ArgValue);
           ArgReg := EnsureStringRegister(ArgValue);
           Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -11247,7 +11291,7 @@ begin
           case FuncRetType of
             srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, Left, MakeSSAValue(svkNone), FloatRefArg(PointeeTypeOf(ArrName)));
             srtString: EmitInstruction(ssaRefLoadString, Result, Left, MakeSSAValue(svkNone),    // width (538)
-                         MakeSSAConstInt(Ord((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and (Pos('WSTRING', UpperFast(PointeeTypeOf(ArrName))) > 0))));
+                         StrRefImm((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and (Pos('WSTRING', UpperFast(PointeeTypeOf(ArrName))) > 0), PointeeTypeOf(ArrName)));
           else
             EmitInstruction(ssaRefLoadInt, Result, Left, MakeSSAValue(svkNone),
                             NarrowRefArg(PointeeTypeOf(ArrName)));   // phase 2.3: an address has no array to ask the width
@@ -12067,7 +12111,7 @@ begin
       srtFloat:  begin ExprValue := EnsureFloatRegister(ExprValue);  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone)); end;
       srtString: begin ExprValue := EnsureStringRegister(ExprValue);
                    EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue,
-                                   MakeSSAConstInt(Ord(RefVarIsWide(VarName)))); end;
+                                   StrRefImm(RefVarIsWide(VarName), RefVarDeclType(VarName))); end;
     else
       ExprValue := EnsureIntRegister(ExprValue);
       EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
@@ -12158,6 +12202,9 @@ begin
         EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(VarName)), ExprValue, MakeSSAConstInt(RawTypeCodeOfPointee(AddrLocalType(VarName))));
       end;
     end
+    else if IsFbStrLocal(VarName) then   // phase 5: the FBSTRING cell
+      EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(VarName)),
+                      EnsureStringRegister(ExprValue), MakeSSAConstInt(REFSTR_DESC))
     else   // STRING keeps the managed record handle
     begin
       ExprValue := EnsureStringRegister(ExprValue);
@@ -12319,7 +12366,7 @@ begin
     // ...written at the pointee's own width in the fb mode, the twin of the read (phase 3).
     case AddrParamBank(VarName) of
       srtFloat:  begin ExprValue := EnsureFloatRegister(ExprValue);  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, ExprValue, FloatRefArg(AddrParamType(VarName))); end;
-      srtString: begin ExprValue := EnsureStringRegister(ExprValue); EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone)); end;
+      srtString: begin ExprValue := EnsureStringRegister(ExprValue); EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, StrRefImm(False, AddrParamType(VarName))); end;
     else
       ExprValue := EnsureIntRegister(ExprValue);
       EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, ExprValue, NarrowRefArg(AddrParamType(VarName)));
@@ -12762,7 +12809,7 @@ begin
     srtString:
       begin
         ExprValue := EnsureStringRegister(ExprValue);
-        EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+        EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, StrRefImm(False, DerefedType(VarNode.GetChild(0))));
       end;
   else
     ExprValue := EnsureIntRegister(ExprValue);
@@ -12838,7 +12885,7 @@ begin
       srtString:
         begin
           ExprValue := EnsureStringRegister(ExprValue);
-          EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+          EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, StrRefImm(False, ByrefRetPointeeType(VarName)));
         end;
     else
       ExprValue := EnsureIntRegister(ExprValue);
@@ -12925,7 +12972,7 @@ begin
     else
       case DerefBank of
         srtFloat:  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), VarReg, EnsureFloatRegister(ExprValue), FloatRefArg(DstRecType));
-        srtString: EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, EnsureStringRegister(ExprValue), MakeSSAValue(svkNone));
+        srtString: EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, EnsureStringRegister(ExprValue), StrRefImm(False, DstRecType));
       else
         EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), VarReg, EnsureIntRegister(ExprValue), NarrowRefArg(DstRecType));
       end;
@@ -13026,7 +13073,7 @@ begin
       srtString:
         begin
           ExprValue := EnsureStringRegister(ExprValue);
-          EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, MakeSSAValue(svkNone));
+          EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), VarReg, ExprValue, StrRefImm(False, DstRecType));
         end;
     else
       ExprValue := EnsureIntRegister(ExprValue);
@@ -15532,7 +15579,16 @@ begin
         // @x is a real byte pointer and a pointer of a DIFFERENT bank can reinterpret x's bytes (type-punning
         // -- e.g. a Single's IEEE754 bits through an Integer Ptr). The record model kept int/float in
         // separate stores and could not reinterpret. (String scalars still use a record: no raw string.)
-        if RecTypeName = 'STRING' then
+        // ⭐ Phase 5, fb memory mode: a local String with "@" is an FBSTRING descriptor in a native frame cell - "@s" its
+        // machine address, a "String Ptr" through it the same string, its bytes freed with the frame (RAWALLOC_STRDESC).
+        if IsFbStrLocal(UpperFast(ArrName)) then
+        begin
+          RecHandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+          EmitInstruction(ssaLoadConstInt, RecHandleVal, MakeSSAConstInt(24), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+          EmitInstruction(ssaRawAlloc, AddrLocalHandle(UpperFast(ArrName)), RecHandleVal, MakeSSAValue(svkNone),
+                          MakeSSAConstInt(RAWALLOC_FRAME_CELL or RAWALLOC_NATIVE_SLOT or RAWALLOC_STRDESC));
+        end
+        else if RecTypeName = 'STRING' then
         begin
           RecHandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
           EmitInstruction(ssaRecordNew, RecHandleVal, MakeSSAConstInt(0), MakeSSAConstInt(0), MakeSSAConstInt(1));
@@ -16275,6 +16331,8 @@ begin
       NoteArrayElemStorage(ArrayIdx, ElementType, ArrElemTypeName);
     NoteArrayAddrNative(ArrayIdx, ElementType, ArrElemTypeName);   // phase 2.3
     NoteArrayFixStr(ArrayIdx, ArrElemTypeName, StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0));   // 615
+    NoteArrayFbStr(ArrayIdx, ElementType, ArrElemTypeName, StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0),
+                   UpperFast(ArrName));   // phase 5
       NoteArrayShape(DeclArrName, True);                 // "Dim x()" / "Dim x(Any)": dynamic, by shape
       // ⭐ ...and here the two spellings PART. Both register one runtime-sized dimension, but
       // "Dim a(Any)" STATED that there is one of them and the bare "Dim a()" did not - which is what
@@ -16296,6 +16354,20 @@ begin
         SetLength(DimInstr.PhiSources, 1);
         DimInstr.PhiSources[0].Value := IdxReg;
         DimInstr.PhiSources[0].FromBlock := nil;
+      end;
+      // ⛔ ...and a DYNAMIC array of records declared in a BLOCK is torn down when the block closes, like the sized one
+      // below: "For ... : Dim a() As T : ReDim a(1) ... : Next" ran no destructor per iteration where fbc runs one per
+      // element (both memory modes), and with phase 5.3 a String field leaked its bytes every iteration. The frame and
+      // the module collectors already knew the shape ("|A"); the block registration is made here, at the lowering.
+      if (RecArrUDTIdx >= 0) and (GetEnvironmentVariable('SB_BLOCK_DYNARR_DTOR') <> '0') then
+      begin
+        BlkIdx := InnermostBlockFrameIdx;
+        if BlkIdx >= 0 then
+        begin
+          FScopeStack[BlkIdx].Dtors.Add(UpperFast(ArrName) + '|' + FUDTs[RecArrUDTIdx].Name + '|A');
+          if FBlockHandledVars.IndexOf(BlockHandledKey(FCurrentProcName, ArrName)) < 0 then
+            FBlockHandledVars.Add(BlockHandledKey(FCurrentProcName, ArrName));
+        end;
       end;
       Continue;
     end;
@@ -16490,6 +16562,8 @@ begin
     NoteArrayElemStorage(ArrayIdx, ElementType, ArrElemTypeName);
     NoteArrayAddrNative(ArrayIdx, ElementType, ArrElemTypeName);   // phase 2.3
     NoteArrayFixStr(ArrayIdx, ArrElemTypeName, StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0));   // 615
+    NoteArrayFbStr(ArrayIdx, ElementType, ArrElemTypeName, StrToIntDef(ArrayDeclNode.Attributes.Values['FIXEDLEN'], 0),
+                   UpperFast(ArrName));   // phase 5
     // Subscripts make it FIXED - unless this DIM is the one ProcessRedim synthesizes for a "ReDim" of a
     // name never declared, which is a dynamic array however it is written.
     // ⛔ ...OR ONE OF THE SUBSCRIPTS IS "Any", WHICH *IS* THE WORD FOR DYNAMIC. "Dim b(Any, Any)" reaches
@@ -17244,7 +17318,7 @@ begin
     // ⭐ DIVERGENZE 485: an array of OBJECTS. Without PRESERVE the old elements are destroyed - last to first, as fbc does -
     // before anything is resized; with PRESERVE the count before the resize says which elements are new. Both are read
     // here, BEFORE the bounds are pushed: a destructor is a call, and nothing may run between a push and its commit.
-    // 🕳️ A PRESERVE that SHRINKS the array does not destroy the elements it drops (fbc does).
+    // ⭐ A PRESERVE that SHRINKS a one-dimensional array destroys the elements it drops, last first (fbc) - see the 1-D arm.
     OldCountReg := MakeSSAValue(svkNone);
     ElemUdtName := ArrayRecordTypeOf(ArrName);
     if (ElemUdtName <> '') and (FindUDT(ElemUdtName) >= 0) then
@@ -17263,12 +17337,27 @@ begin
       // Immediate layout: bit0 = preserve, bit1 = has explicit lb, bits8+ = lb.
       DimChild := DimsNode.GetChild(0);
       LbImm := 0;
+      // ⭐ Both bounds are evaluated FIRST, before anything is pushed: a PRESERVE that SHRINKS an array of objects destroys
+      // the elements it drops (fbc), and a destructor is a call - nothing may run between a push and its commit.
+      LbVal := MakeSSAValue(svkNone);
       if DimChild.NodeType = antDimRange then
       begin
         if TryConstFoldArrayBound(DimChild.GetChild(0), FoldedLb) then
           LbVal := MakeSSAConstInt(FoldedLb)
         else
           ProcessExpression(DimChild.GetChild(0), LbVal);
+        DimExpr := DimChild.GetChild(1);
+      end
+      else
+        DimExpr := DimChild;
+      ProcessExpression(DimExpr, UbValue);
+      UbReg := EnsureIntRegister(UbValue);
+      if (PreserveFlag <> 0) and (ElemUdtName <> '') and (FindUDT(ElemUdtName) >= 0) and
+         ((ResolveMethodLabel(ElemUdtName, 'DESTRUCTOR') <> '') or NativeTypeHasStrings(ElemUdtName)) and
+         (GetEnvironmentVariable('SB_REDIM_SHRINK_DTOR') <> '0') then
+        EmitRedimShrinkDtors(ArrayIdx, ElemUdtName, LbVal, UbReg);
+      if DimChild.NodeType = antDimRange then
+      begin
         if (LbVal.Kind = svkConstInt) and (LbVal.ConstInt >= 0) then
           LbImm := 2 or (LbVal.ConstInt shl 8)
         else if (LbVal.Kind = svkConstFloat) and (LbVal.ConstFloat >= 0) then
@@ -17278,12 +17367,7 @@ begin
           // not fit the immediate: push the value with the LB flag so bcArrayRedim reads it at run time.
           EmitInstruction(ssaArrayRedimPush, MakeSSAValue(svkNone), EnsureIntRegister(LbVal),
                           MakeSSAValue(svkNone), MakeSSAConstInt(1));
-        DimExpr := DimChild.GetChild(1);
-      end
-      else
-        DimExpr := DimChild;
-      ProcessExpression(DimExpr, UbValue);
-      UbReg := EnsureIntRegister(UbValue);
+      end;
       EmitInstruction(ssaArrayRedim, MakeSSAValue(svkNone),
                       MakeSSAArrayRef(ArrayIdx, FProgram.GetArray(ArrayIdx).ElementType),
                       UbReg, MakeSSAConstInt(PreserveFlag or LbImm));
@@ -19692,6 +19776,48 @@ begin
   Result := True;
 end;
 
+function TSSAGenerator.FbStrDescAddr(SNode: TASTNode; out Addr: TSSAValue): Boolean;
+// Phase 5 of the pointer model: True, with the descriptor's machine address emitted, when SNode names a String that lives
+// in an FBSTRING descriptor - a module String with "@" (its one-element home) or an element of such an array.
+var
+  idx, ai, U, F: Integer;
+  TName: string;
+begin
+  Result := False;
+  Addr := MakeSSAValue(svkNone);
+  if (SNode = nil) or not FNativeMemory then Exit;
+  if (SNode.NodeType = antIdentifier) and IsFbStrLocal(VarToStr(SNode.Value)) then
+  begin
+    Addr := EnsureIntRegister(AddrLocalHandle(VarToStr(SNode.Value)));
+    Exit(True);
+  end;
+  if (SNode.NodeType = antIdentifier) and IsSharedScalar(VarToStr(SNode.Value)) then
+  begin
+    idx := FSharedScalarArr.IndexOf(UpperFast(VarToStr(SNode.Value)));
+    if (idx < 0) or not ArrayIsFbStr(Integer(PtrInt(FSharedScalarArr.Objects[idx]))) then Exit;
+    Addr := EmitVarAddress(VarToStr(SNode.Value));
+    Exit(True);
+  end;
+  if (SNode.NodeType = antArrayAccess) and (SNode.ChildCount >= 2) and
+     (SNode.GetChild(0).NodeType = antIdentifier) then
+  begin
+    ai := ArrayIndexOf(VarToStr(SNode.GetChild(0).Value));
+    if (ai < 0) or not ArrayIsFbStr(ai) then Exit;
+    EmitArrayElementAddress(SNode, Addr);
+    Exit(True);
+  end;
+  // ⭐ Phase 5.3: ...and a String FIELD of a record whose image is C bytes - the descriptor at the field's offset.
+  if (SNode.NodeType = antMemberAccess) and (SNode.ChildCount >= 1) and NativeStrFieldsOn then
+  begin
+    TName := ObjectTypeName(SNode.GetChild(0));
+    U := FindUDT(UpperFast(TName));
+    if U < 0 then Exit;
+    F := UDTFieldIndex(U, VarToStr(SNode.Value));
+    if (F < 0) or not IsVarLenStrField(U, F) or not NativeRecordType(FUDTs[U].Name) then Exit;
+    Result := TryRawUDTFieldAddress(SNode, Addr);
+  end;
+end;
+
 function TSSAGenerator.RawZStringBufAddr(SNode: TASTNode; out Addr: TSSAValue): Boolean;
 // The BYTE ADDRESS of a "ZSTRING * n" whose address has been taken, either as a module scalar or as a
 // local. Such a buffer keeps its characters in RAW BYTES - that is the whole point of having taken its
@@ -19843,7 +19969,7 @@ function TSSAGenerator.TryLRSetRecord(DstNode, SrcNode: TASTNode): Boolean;
 // Array and nested-record members are left alone rather than guessed at: overlaying them would
 // mean sharing or fabricating storage, and no FB program in the corpus does this.
 var
-  DstHandle, SrcHandle, Tmp: TSSAValue;
+  DstHandle, SrcHandle, Tmp, StrAddr: TSSAValue;
   DstType, SrcType: string;
   DstIdx, SrcIdx, i: Integer;
   DField, SField: TUDTField;
@@ -19873,8 +19999,15 @@ begin
       if (SField.Bank = DField.Bank) and (not SField.IsArray) and (SField.NestedType = '') then
       begin
         Tmp := MakeSSARegister(DField.Bank, FProgram.AllocRegister(DField.Bank));
-        EmitInstruction(LoadOp, Tmp, SrcHandle, MakeSSAValue(svkNone), MakeSSAConstInt(SField.Slot));
-        EmitInstruction(StoreOp, MakeSSAValue(svkNone), DstHandle, Tmp, MakeSSAConstInt(DField.Slot));
+        // Phase 5.3: a String field of a NATIVE record is its descriptor, on either side.
+        if (LoadOp = ssaRecordLoadString) and NativeStrFieldAddr(SrcHandle, SrcIdx, i, StrAddr) then
+          EmitInstruction(ssaRefLoadString, Tmp, StrAddr, MakeSSAValue(svkNone), MakeSSAConstInt(REFSTR_DESC))
+        else
+          EmitInstruction(LoadOp, Tmp, SrcHandle, MakeSSAValue(svkNone), MakeSSAConstInt(SField.Slot));
+        if (StoreOp = ssaRecordStoreString) and NativeStrFieldAddr(DstHandle, DstIdx, i, StrAddr) then
+          EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), StrAddr, Tmp, MakeSSAConstInt(REFSTR_DESC))
+        else
+          EmitInstruction(StoreOp, MakeSSAValue(svkNone), DstHandle, Tmp, MakeSSAConstInt(DField.Slot));
         Copied := True;
       end;
     end;
@@ -19887,7 +20020,10 @@ begin
         srtFloat: EmitInstruction(ssaLoadConstFloat, Tmp, MakeSSAConstFloat(0.0), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
         else      EmitInstruction(ssaLoadConstString, Tmp, MakeSSAConstString(''), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end;
-      EmitInstruction(StoreOp, MakeSSAValue(svkNone), DstHandle, Tmp, MakeSSAConstInt(DField.Slot));
+      if (StoreOp = ssaRecordStoreString) and NativeStrFieldAddr(DstHandle, DstIdx, i, StrAddr) then
+        EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), StrAddr, Tmp, MakeSSAConstInt(REFSTR_DESC))
+      else
+        EmitInstruction(StoreOp, MakeSSAValue(svkNone), DstHandle, Tmp, MakeSSAConstInt(DField.Slot));
     end;
   end;
   Result := True;
@@ -20183,6 +20319,11 @@ var
   LoopInfo: TLoopInfo;
   HasStep: Boolean;
   NArgs: Integer;
+  TempDepth, k: Integer;
+  IterIsVar: Boolean;
+  KeepRegs: array of Integer;
+  KeepTypes: array of string;
+  BlkKey: string;
 
   // "For i As T = start To limit": each bound is CONVERTED to T - which is what makes
   // "For i As T = 10 To 1 Step -1" mean anything, since 10, 1 and -1 are ordinary numbers the type's
@@ -20211,6 +20352,7 @@ var
 
 begin
   Result := False;
+  IterIsVar := False;
   VarName := '';
   if (Node.ChildCount >= 1) and (Node.GetChild(0).NodeType = antIdentifier) then
     VarName := Node.GetChild(0).ValueUpper;
@@ -20243,6 +20385,7 @@ begin
   HasStep := Node.ChildCount > 3;
   if HasStep then NArgs := 1 else NArgs := 0;
 
+  TempDepth := FResultTemps.Count;
   IterH := MakeBound(Node.GetChild(1));
   // ⛔ A COUNTER THE HEAD DID NOT DECLARE IS AN EXISTING VARIABLE, AND THE LOOP MUST WRITE INTO IT.
   // Both spellings came through here and both got a FRESH declaration plus an aliasing CopyInt, which
@@ -20274,9 +20417,25 @@ begin
     DeclareVariableTyped(VarName, srtInt);              // the loop variable IS the iterator instance
     VarReg := EnsureIntRegister(GetOrAllocateVariable(VarName));
     EmitInstruction(ssaCopyInt, VarReg, IterH, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+    IterIsVar := True;
   end;
   CondH := MakeBound(Node.GetChild(2));
   if HasStep then StepH := MakeBound(Node.GetChild(3)) else StepH := MakeSSAValue(svkNone);
+  // the loop's own temporaries leave the head statement's list (see TLoopInfo.IterTempRegs)
+  SetLength(KeepRegs, 0);
+  SetLength(KeepTypes, 0);
+  if GetEnvironmentVariable('SB_ITER_TEMPS') <> '0' then
+    for k := FResultTemps.Count - 1 downto TempDepth do
+      if ((IterIsVar and (IterH.Kind = svkRegister) and (PtrInt(FResultTemps.Objects[k]) = IterH.RegIndex)) or
+          ((CondH.Kind = svkRegister) and (PtrInt(FResultTemps.Objects[k]) = CondH.RegIndex)) or
+          ((StepH.Kind = svkRegister) and (PtrInt(FResultTemps.Objects[k]) = StepH.RegIndex))) then
+      begin
+        SetLength(KeepRegs, Length(KeepRegs) + 1);
+        SetLength(KeepTypes, Length(KeepTypes) + 1);
+        KeepRegs[High(KeepRegs)] := PtrInt(FResultTemps.Objects[k]);
+        KeepTypes[High(KeepTypes)] := FResultTemps[k];
+        FResultTemps.Delete(k);
+      end;
 
   EmitIterOperatorCall(IterOperatorLabel(TypeName, kFOR, NArgs), VarReg, StepH, MakeSSAValue(svkNone));
 
@@ -20300,6 +20459,8 @@ begin
   LoopInfo.IterType := TypeName;
   LoopInfo.IterHasStep := HasStep;
   LoopInfo.IterExitLabel := '';
+  LoopInfo.IterTempRegs := KeepRegs;
+  LoopInfo.IterTempTypes := KeepTypes;
   SetLength(FLoopStack, Length(FLoopStack) + 1);
   FLoopStack[High(FLoopStack)] := LoopInfo;
 
@@ -20332,6 +20493,16 @@ begin
   CondBlock.AddSuccessor(BodyBlock);
   BodyBlock.AddPredecessor(CondBlock);
   BlockScopeEnter(True);
+  // ⭐ DIVERGENZE 679 - "For i As T" declares i AS A T for this loop, per DECLARATION: the body read the bare-name map,
+  // which keeps the FIRST registration, so a later "For i As U" saw i as the earlier T ("type T has no such field",
+  // or an access violation in strict). Filed under the body frame, as a block Dim files its record type.
+  // SB_ITER_DECLTYPE=0 is the A/B.
+  if (UpperFast(Node.Attributes.Values['VARTYPE']) <> '') and (VarName <> '') and
+     (GetEnvironmentVariable('SB_ITER_DECLTYPE') <> '0') then
+  begin
+    BlkKey := BlockArrayMangle(FScopeStack[High(FScopeStack)].Serial, UpperFast(VarName));
+    if FBlockDeclRecs.IndexOfName(BlkKey) < 0 then FBlockDeclRecs.Add(BlkKey + '=' + TypeName);
+  end;
 end;
 
 procedure TSSAGenerator.ProcessForLoop(Node: TASTNode);
@@ -21207,6 +21378,7 @@ procedure TSSAGenerator.ProcessNext(Node: TASTNode);
 var
   LoopInfo: TLoopInfo;
   RemainingNext: Integer;
+  k: Integer;
   NewVarReg: Integer;
   TempReg: Integer;
   TempVal: TSSAValue;
@@ -21274,6 +21446,8 @@ begin
       EndBlock.AddPredecessor(CondBlock);
     end;
     FCurrentBlock := EndBlock;
+    for k := 0 to High(LoopInfo.IterTempRegs) do   // most recent first, as FlushResultTemps does
+      EmitDestructorCall(MakeSSARegister(srtInt, LoopInfo.IterTempRegs[k]), LoopInfo.IterTempTypes[k]);
     Exit;
   end;
 
@@ -28468,7 +28642,7 @@ begin
     // The immediate carries the WIDTH of the pointee, which only a RAW address needs: text there is a C
     // string and a WSTRING one is wide cells. A packed address ignores it.
     srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone),
-                               MakeSSAConstInt(Ord(Pos('WSTRING', ByrefRetPointeeType(Lbl)) > 0)));
+                               StrRefImm(Pos('WSTRING', ByrefRetPointeeType(Lbl)) > 0, ByrefRetPointeeType(Lbl)));
   else         EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), NarrowRefArg(ByrefRetPointeeType(Lbl)));
   end;
 end;
@@ -28492,7 +28666,7 @@ begin
   case Bank of
     srtFloat:  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), AddrVal, EnsureFloatRegister(Val), FloatRefArg(ByrefRetPointeeType(Lbl)));
     srtString: EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), AddrVal, EnsureStringRegister(Val),
-                               MakeSSAConstInt(Ord(Pos('WSTRING', ByrefRetPointeeType(Lbl)) > 0)));
+                               StrRefImm(Pos('WSTRING', ByrefRetPointeeType(Lbl)) > 0, ByrefRetPointeeType(Lbl)));
   else         EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), AddrVal, EnsureIntRegister(Val), NarrowRefArg(ByrefRetPointeeType(Lbl)));
   end;
 end;
@@ -29028,9 +29202,12 @@ begin
       // ⭐ A NESTED RECORD member is laid out INLINE here too (DIVERGENZE 193) - this walk is the one
       // that lays a type OVER RAW MEMORY, where inline is the only reading that can be right. It
       // declines only when the nested type itself has no reproducible layout.
+      // ⭐ Phase 5.3: ...except, in the fb memory mode, a variable-length String: fbc's 24-byte FBSTRING descriptor IS its
+      // image there (data, len, size), and the raw path reads and writes it as one (REFSTR_DESC).
       with FUDTs[UDTIdx].Fields[i] do
         if ((NestedType <> '') and not NestedMemberShape(NestedType, False, Sz2, Al2)) or
-           ((Bank = srtString) and (StrCapacity <= 0)) then Exit;
+           ((Bank = srtString) and (StrCapacity <= 0) and
+            not (NativeStrFieldsOn and IsVarLenStrField(UDTIdx, i))) then Exit;
       UDTFieldCShape(UDTIdx, i, Sz, Al);
     end;
     if (FUDTs[UDTIdx].FieldAlign > 0) and (Al > FUDTs[UDTIdx].FieldAlign) then
@@ -30181,7 +30358,11 @@ begin
     // is its declared width. Read as n bytes, "h.p->name" on a ZString * 16 answered "module name" plus
     // five NULs - length 16 where fbc says 11 (DIVERGENZE 387, found the moment string fields reached
     // this path through a C-written pointer).
-    if F.IsZString then
+    // ⭐ Phase 5.3: a variable-length String is fbc's FBSTRING descriptor at the offset - its bytes are where data points.
+    if NativeStrFieldsOn and IsVarLenStrField(UDTIdx, FieldIdx) then
+      EmitInstruction(ssaRefLoadString, Value, EnsureIntRegister(AddrVal), MakeSSAValue(svkNone),
+                      MakeSSAConstInt(REFSTR_DESC))
+    else if F.IsZString then
       EmitInstruction(ssaRawLoadZStr, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(0))
     else if F.IsWString then
       EmitInstruction(ssaRawLoadZStr, Value, AddrVal, MakeSSAValue(svkNone), MakeSSAConstInt(1))
@@ -30270,6 +30451,13 @@ var
 begin
   F := FUDTs[UDTIdx].Fields[FieldIdx];
   UDTFieldCShape(UDTIdx, FieldIdx, Sz, Al);
+  // ⭐ Phase 5.3: a variable-length String field is written through its FBSTRING descriptor (FbStrSet: fbc's growth rule).
+  if NativeStrFieldsOn and IsVarLenStrField(UDTIdx, FieldIdx) then
+  begin
+    EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), EnsureIntRegister(AddrVal), EnsureStringRegister(ExprVal),
+                    MakeSSAConstInt(REFSTR_DESC));
+    Exit;
+  end;
   if F.Bank = srtString then
   begin
     // ⛔ A "ZString * n" keeps n-1 characters - the nth byte is the terminator - and ends at its first NUL, the rule the
@@ -37120,6 +37308,10 @@ begin
   // "77 0 0 0 61 ..." where fbc reads "77 61 ...". A VM name still counts characters - EmitManagedPtrStep tells the two
   // apart at run time. Only in fb: strict keeps the plain step it had. SB_WPTR_STEP=0 is the A/B knob.
   if (P = 'WSTRING') and FNativeMemory and (GetEnvironmentVariable('SB_WPTR_STEP') <> '0') then Exit(WIDE_CELL_BYTES);
+  // ⭐ Phase 5: a STRING pointer in the fb mode holds the machine address of an FBSTRING descriptor (an element of a
+  // descriptor array), and the next one is FBSTR_BYTES on: "p += 1" over "@a(0)" read garbage one byte in. A VM name still
+  // counts elements - EmitManagedPtrStep tells the two apart at run time, as for WSTRING above.
+  if (P = 'STRING') and FNativeMemory and (GetEnvironmentVariable('SB_FBSTR') <> '0') then Exit(24);   // SedaiFbString.FBSTR_BYTES
   if (P = 'STRING') or (P = 'ZSTRING') or (P = 'WSTRING') then Exit;
   if P = 'ANY' then Exit(1);
   if (Length(P) > 4) and (Copy(P, Length(P) - 3, 4) = ' PTR') then Exit(8);
@@ -43602,6 +43794,9 @@ begin
   // ⭐ ...and a type with FIELD INITIALISERS has an implicit constructor in fbc: "New T[n]" runs them on every element.
   // Answered no, the block went raw and nothing ran - every element read 0 (and in strict "p[i]" was no record at all).
   if (not Result) and (Idx >= 0) and TypeHasFieldDefaults(Idx, 0) then Result := True;
+  // ⭐ Phase 5.3: ...and a String field, which now HAS a C image in the fb mode: fbc gives the type an implicit
+  // constructor and destructor, which is the question asked here (its count in front of "New T[n]" included).
+  if (not Result) and (Idx >= 0) and NativeTypeHasStrings(FUDTs[Idx].Name) then Result := True;
 end;
 
 function TSSAGenerator.TypeHasFieldDefaults(UDTIdx, Depth: Integer): Boolean;
@@ -43638,6 +43833,139 @@ begin
   Result := 0;
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   if not UDTCLayoutRaw(UDTIdx, Offsets, Result) then Result := FUDTs[UDTIdx].LiveBytes;
+end;
+
+function TSSAGenerator.NativeStrFieldsOn: Boolean;
+// Phase 5.3 of the pointer model: in the fb memory mode a record's variable-length String field is fbc's 24-byte FBSTRING
+// descriptor inside the record's C image - "@r.s - @r" is its offset, C sorting the records moves the strings with them,
+// and the type is native like any other. SB_RECNATIVE_STR=0 (or SB_FBSTR=0) keeps such types managed: the A/B.
+begin
+  Result := FNativeMemory and FRecNativeKnob and FRecNativeStr;
+end;
+
+function TSSAGenerator.IsVarLenStrField(UDTIdx, FieldIdx: Integer): Boolean;
+begin
+  Result := False;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) or (FieldIdx < 0) or (FieldIdx > High(FUDTs[UDTIdx].Fields)) then Exit;
+  with FUDTs[UDTIdx].Fields[FieldIdx] do
+    Result := (Bank = srtString) and (StrCapacity <= 0) and (not IsZString) and (not IsWString) and (not IsArray) and
+              (NestedType = '') and (BitWidth = 0);
+end;
+
+function TSSAGenerator.NativeTypeHasStrings(const TypeName: string): Boolean;
+// Structural: does an image of this type hold an FBSTRING descriptor anywhere - a String field of its own, or one inside a
+// record member held by value? (An inline array of such records is not native yet, see NativeRecordTypeCore.)
+  function Rec(U, Depth: Integer): Boolean;
+  var
+    i: Integer;
+  begin
+    Result := False;
+    if (U < 0) or (Depth > 16) then Exit;
+    for i := 0 to High(FUDTs[U].Fields) do
+    begin
+      if IsVarLenStrField(U, i) then Exit(True);
+      if (not FUDTs[U].Fields[i].IsArray) and (FUDTs[U].Fields[i].NestedType <> '') and
+         Rec(FindUDT(UpperFast(FUDTs[U].Fields[i].NestedType)), Depth + 1) then Exit(True);
+    end;
+  end;
+begin
+  Result := NativeStrFieldsOn and Rec(FindUDT(UpperFast(TypeName)), 0);
+end;
+
+function TSSAGenerator.TypeHeldInArrayMember(const TypeName: string): Boolean;
+// Does any type hold TypeName - or a type that nests it by value - as the element of an ARRAY member?
+  function Held(const T: string; Depth: Integer): Boolean;
+  var
+    k, i: Integer;
+  begin
+    Result := False;
+    if Depth > 16 then Exit;
+    for k := 0 to High(FUDTs) do
+      for i := 0 to High(FUDTs[k].Fields) do
+        with FUDTs[k].Fields[i] do
+        begin
+          if IsArray and SameText(ArrayElemType, T) then Exit(True);
+          if (not IsArray) and SameText(NestedType, T) and Held(FUDTs[k].Name, Depth + 1) then Exit(True);
+        end;
+  end;
+begin
+  Result := Held(UpperFast(TypeName), 0);
+end;
+
+procedure TSSAGenerator.CollectNativeStrOffsets(UDTIdx: Integer; Base: Int64; var Offs: TInt64Array; Depth: Integer);
+// The byte offsets of every FBSTRING descriptor in a native image, nested record members included (phase 5.3).
+var
+  Lay: TInt64Array;
+  Tot: Int64;
+  i: Integer;
+begin
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) or (Depth > 16) then Exit;
+  if not UDTCLayoutRaw(UDTIdx, Lay, Tot) then Exit;
+  for i := 0 to High(FUDTs[UDTIdx].Fields) do
+  begin
+    if i > High(Lay) then Break;
+    if IsVarLenStrField(UDTIdx, i) then
+    begin
+      SetLength(Offs, Length(Offs) + 1);
+      Offs[High(Offs)] := Base + Lay[i];
+    end
+    else if (not FUDTs[UDTIdx].Fields[i].IsArray) and (FUDTs[UDTIdx].Fields[i].NestedType <> '') then
+      CollectNativeStrOffsets(FindUDT(UpperFast(FUDTs[UDTIdx].Fields[i].NestedType)), Base + Lay[i], Offs, Depth + 1);
+  end;
+end;
+
+function TSSAGenerator.NativeStrFieldAddr(const Handle: TSSAValue; UDTIdx, FieldIdx: Integer; out Addr: TSSAValue): Boolean;
+// Phase 5.3: the FBSTRING descriptor of a String field of a NATIVE record whose address is Handle - for the managed roads
+// (a member of a call result, a store by slot) that would otherwise hand the VM a slot for an image (RecordLoadString on an
+// address: "A native record has no record storage").
+var
+  Lay: TInt64Array;
+  Tot: Int64;
+begin
+  Result := False;
+  Addr := MakeSSAValue(svkNone);
+  if not NativeStrFieldsOn then Exit;
+  if not IsVarLenStrField(UDTIdx, FieldIdx) then Exit;
+  if not NativeRecordType(FUDTs[UDTIdx].Name) then Exit;
+  if (not UDTCLayoutRaw(UDTIdx, Lay, Tot)) or (FieldIdx > High(Lay)) then Exit;
+  Addr := EnsureIntRegister(Handle);
+  if Lay[FieldIdx] <> 0 then
+  begin
+    Addr := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, Addr, EnsureIntRegister(Handle), EnsureIntRegister(MakeSSAConstInt(Lay[FieldIdx])),
+                    MakeSSAValue(svkNone));
+  end;
+  Result := True;
+end;
+
+procedure TSSAGenerator.EmitNativeStrFieldsClear(const Addr: TSSAValue; UDTIdx: Integer);
+// fbc's implicit destructor of a type with String fields: each descriptor's bytes freed and its three fields zeroed - an
+// empty store through the descriptor is exactly FbStrClear. The type's OWN fields only: a nested member's are cleared by
+// the destructor walk, which visits it (EmitDestructorCall).
+var
+  Lay: TInt64Array;
+  Tot: Int64;
+  i: Integer;
+  A, E: TSSAValue;
+begin
+  if not NativeStrFieldsOn then Exit;
+  if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
+  if not NativeRecordType(FUDTs[UDTIdx].Name) then Exit;
+  if not UDTCLayoutRaw(UDTIdx, Lay, Tot) then Exit;
+  E := MakeSSAValue(svkNone);
+  for i := High(FUDTs[UDTIdx].Fields) downto 0 do
+    if (i <= High(Lay)) and IsVarLenStrField(UDTIdx, i) then
+    begin
+      if E.Kind = svkNone then E := EnsureStringRegister(MakeSSAConstString(''));
+      A := EnsureIntRegister(Addr);
+      if Lay[i] <> 0 then
+      begin
+        A := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+        EmitInstruction(ssaAddInt, A, EnsureIntRegister(Addr), EnsureIntRegister(MakeSSAConstInt(Lay[i])),
+                        MakeSSAValue(svkNone));
+      end;
+      EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), A, E, MakeSSAConstInt(REFSTR_DESC));
+    end;
 end;
 
 procedure TSSAGenerator.RecNativeStamp(OpCode: TSSAOpCode; var Src1, Src2, Src3: TSSAValue);
@@ -43757,6 +44085,10 @@ begin
   for k := 0 to FStaticMemberProcs.Count - 1 do
     if SameText(Copy(FStaticMemberProcs[k], 1, Length(T) + 1), T + '.') then Exit;
   if not UDTCLayoutRaw(Idx, Offsets, Total) then Exit(No('no C layout'));
+  // ⛔ Phase 5.3: a type with String fields that some type holds in an ARRAY MEMBER stays managed - the member's elements
+  // are copied by bytes (ArrayCopyRecords) and are not destroyed with their container, so the descriptors would be shared
+  // and leak (m331). Teaching those two roads is the rest of 5.4.
+  if NativeTypeHasStrings(T) and TypeHeldInArrayMember(T) then Exit(No('String fields, held in an array member'));
   // ⛔ ...and every BIT FIELD must have been placed by that walk (FRawBitUnit), or the raw path would read it at bit 0:
   // a shape the walk does not record stays managed (phase 3; the whole-type union was one, udt/type3 of the manual).
   for i := 0 to High(FUDTs[Idx].Fields) do
@@ -43779,7 +44111,9 @@ begin
                                         (FUDTs[Idx].IsUnion or FRecNativeZStr)) and
                                    // ...and a "String * n" (n characters, space-padded, then a NUL) since the raw store pads it too
                                    not (FRecNativeFixStr and (not IsZString) and (not IsWString) and (StrCapacity > 0) and
-                                        not IsArray)) or
+                                        not IsArray) and
+                                   // ...and (phase 5.3) a variable-length String, an FBSTRING descriptor in the image
+                                   not (NativeStrFieldsOn and IsVarLenStrField(Idx, i))) or
            ((BitWidth > 0) and not FRecNativeBits) or (IsBoolean and not FRecNativeBool) or IsCvaList or ((DefaultExpr <> nil) and not (FRecNativeDefaults and (NestedType = '') and not IsArray)) then Exit(No('field ' + Name + ': string/bits/boolean/va/default'));
         // A PROCEDURE field: the raw store picks the overload of "@fun" from the field's signature since phase 3.7, as the
         // managed store does (m708). SB_RECNATIVE_PROCFIELDS=0 keeps such types managed (A/B).
@@ -43794,7 +44128,8 @@ begin
              // phase 3: an INLINE array of NATIVE records (glib's GValue.data, fbc's FBARRAY.dimTB) - its elements are C bytes
              (FRecNativeRecArrays and (ArrayElemType <> '') and InlineArray and
               (InlineArrayDims(Idx, i, Lbs, Ubs) = 1) and
-              (not UDTBlockIsManaged(ArrayElemType)) and NativeRecordType(ArrayElemType)) or
+              (not UDTBlockIsManaged(ArrayElemType)) and NativeRecordType(ArrayElemType) and
+              not NativeTypeHasStrings(ArrayElemType)) or   // phase 5.3: no element-wise copy/destruction there yet
              ((ArrayElemType = '') and
                             (InlineArray or (FRecNativeProcFields and (ArrayElemPtrPointee <> '') and
                                              UDTFieldArrayShape(Idx, i, ACnt, AEB, True) and
@@ -44076,6 +44411,37 @@ begin
   Result := True;
 end;
 
+procedure TSSAGenerator.EmitRedimShrinkDtors(ArrayIdx: Integer; const TypeName: string; const LbVal, UbReg: TSSAValue);
+// "ReDim Preserve a(lb To ub)" on a one-dimensional array of objects: the elements past the new count are destroyed, last
+// first, before the storage shrinks - fbc does ("d 2" for a(2) dropped by ReDim Preserve a(1)), and with phase 5.3 a String
+// field leaked its bytes. New count = ub - lb + 1 (lb the stated one, or the array's own), clamped at 0; the loop from there
+// to the old count is empty when the array grows.
+var
+  Lb, NewCnt, Sgn, Neg: TSSAValue;
+begin
+  if LbVal.Kind <> svkNone then
+    Lb := EnsureIntRegister(LbVal)
+  else
+  begin
+    Lb := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaArrayLBound, Lb, MakeSSAArrayRef(ArrayIdx, srtInt), EnsureIntRegister(MakeSSAConstInt(0)),
+                    MakeSSAValue(svkNone));
+  end;
+  NewCnt := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaSubInt, NewCnt, EnsureIntRegister(UbReg), Lb, MakeSSAValue(svkNone));
+  Sgn := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaAddInt, Sgn, NewCnt, EnsureIntRegister(MakeSSAConstInt(1)), MakeSSAValue(svkNone));
+  NewCnt := Sgn;
+  // max(n, 0) = n - (n and (n sar 63))
+  Sgn := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaShr, Sgn, NewCnt, EnsureIntRegister(MakeSSAConstInt(63)), MakeSSAValue(svkNone));
+  Neg := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaBitwiseAnd, Neg, NewCnt, Sgn, MakeSSAValue(svkNone));
+  Sgn := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+  EmitInstruction(ssaSubInt, Sgn, NewCnt, Neg, MakeSSAValue(svkNone));
+  EmitRecordArrayConstructCore(ArrayIdx, TypeName, 0, True, Sgn, 1);
+end;
+
 procedure TSSAGenerator.EmitRecordVarDestruction(const VName, TName: string; IsArray: Boolean);
 // Destroy one record variable of a scope that is ending: a scalar through its handle, an ARRAY through
 // every one of its elements.
@@ -44112,8 +44478,9 @@ procedure TSSAGenerator.EmitRecordArrayInit(ArrayIdx, UDTIdx: Integer);
 var
   ArrayRef, One, Acc, DimReg, Ub, Lb, Diff, Cnt, NewAcc: TSSAValue;
   CmpReg, HandleVal, CounterVar, ProbeVal, GuardStr, GuardFlt: TSSAValue;
-  d, DimCount, i, GuardSlot: Integer;
+  d, DimCount, i, GuardSlot, GuardFld: Integer;
   GuardBank: TSSARegisterType;
+  GuardAddr: TSSAValue;
   CounterName, CondLabel, BodyLabel, InitLabel, IncrLabel, EndLabel: string;
   PrevBlock, CondBlock, BodyBlock, InitBlock, IncrBlock, EndBlock: TSSABasicBlock;
 begin
@@ -44122,6 +44489,7 @@ begin
   // Slot of the first field that EmitRecordInit populates (member array or nested UDT) -- used as the
   // "already inited?" probe.
   GuardSlot := -1;
+  GuardFld := -1;
   GuardBank := srtInt;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
     // ⛔ ...never a member that LIVES in our bytes (DIVERGENZE 226): its slot is DATA, which a program may
@@ -44142,6 +44510,7 @@ begin
       begin
         GuardSlot := FUDTs[UDTIdx].Fields[i].Slot;
         GuardBank := FUDTs[UDTIdx].Fields[i].Bank;
+        GuardFld := i;
         Break;
       end;
   if GuardSlot < 0 then Exit;
@@ -44206,6 +44575,9 @@ begin
       begin
         // A string slot is "still empty" by its LENGTH: the slot holds the text, not a handle.
         GuardStr := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+        if NativeStrFieldAddr(HandleVal, UDTIdx, GuardFld, GuardAddr) then   // phase 5.3: the descriptor in the image
+          EmitInstruction(ssaRefLoadString, GuardStr, GuardAddr, MakeSSAValue(svkNone), MakeSSAConstInt(REFSTR_DESC))
+        else
         EmitInstruction(ssaRecordLoadString, GuardStr, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(GuardSlot));
         EmitInstruction(ssaStrLen, ProbeVal, GuardStr, MakeSSAValue(svkNone), MakeSSAValue(svkNone));
       end;
@@ -44316,7 +44688,8 @@ begin
   // this whole shape. One loop, two methods.
   if RunDtor then
   begin
-    if ResolveMethodLabel(TypeName, 'DESTRUCTOR') = '' then Exit;
+    // ...and (phase 5.3) a native type with String fields: fbc's IMPLICIT destructor frees its descriptors' bytes.
+    if (ResolveMethodLabel(TypeName, 'DESTRUCTOR') = '') and not NativeTypeHasStrings(TypeName) then Exit;
   end
   else if (ResolveConstructorLabel(TypeName, '') = '') and (FindCtorWithDefaults(TypeName, 0) = '') then Exit;
   ArrayRef := MakeSSAArrayRef(ArrayIdx, srtInt);
@@ -44356,6 +44729,13 @@ begin
     // (count - 1) - (counter - From).
     IdxVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaAddInt, IdxVal, Acc, EnsureIntRegister(MakeSSAConstInt(FromFlatIndex - 1)), MakeSSAValue(svkNone));
+    // ...from a flat index known only at run time (a REDIM PRESERVE that shrinks: the elements it drops, last first).
+    if FromReg.Kind <> svkNone then
+    begin
+      Last := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaAddInt, Last, IdxVal, EnsureIntRegister(FromReg), MakeSSAValue(svkNone));
+      IdxVal := Last;
+    end;
     Last := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
     EmitInstruction(ssaSubInt, Last, IdxVal, EnsureIntRegister(GetOrAllocateVariable(CounterName)), MakeSSAValue(svkNone));
     EmitInstruction(ssaArrayLoad, HandleVal, ArrayRef, Last, MakeSSAValue(svkNone));
@@ -44395,7 +44775,7 @@ procedure TSSAGenerator.EmitBraceArrayMemberInit(const HandleVal: TSSAValue; UDT
 // stored nothing and the member array read back zeros.
 var
   j: Integer;
-  ArgVal, ArrHandle: TSSAValue;
+  ArgVal, ArrHandle, ElemH: TSSAValue;
 begin
   if (UDTIdx < 0) or (BraceNode = nil) then Exit;
   // ⛔ A brace list belongs to an ARRAY member and to nothing else - fbc says "Expected array" when the
@@ -44428,6 +44808,18 @@ begin
   for j := 0 to BraceNode.ChildCount - 1 do
   begin
     ProcessExpression(BraceNode.GetChild(j), ArgVal);
+    // ⭐ Phase 5.3: an element of a type with String fields is COPIED into the element's own image - storing the value's
+    // address made the element share a temporary ("U1("zero")") that its implicit destructor frees at the end of the
+    // statement, and every element read back empty (m1175d).
+    if (FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemType <> '') and
+       NativeTypeHasStrings(FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemType) and
+       NativeRecordType(FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemType) then
+    begin
+      ElemH := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+      EmitInstruction(ssaArrayLoadIndInt, ElemH, ArrHandle, EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
+      EmitRecordCopy(ElemH, EnsureIntRegister(ArgVal), FindUDT(UpperFast(FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemType)));
+      Continue;
+    end;
     case FUDTs[UDTIdx].Fields[FieldIdx].ArrayElemBank of
       srtFloat:  EmitInstruction(ssaArrayStoreIndFloat, EnsureFloatRegister(ArgVal), ArrHandle,
                    EnsureIntRegister(MakeSSAConstInt(j)), MakeSSAValue(svkNone));
@@ -45013,6 +45405,8 @@ begin
     else
       EmitCallSubLabel(ProcedureLabelName(Lbl));
   end;
+  // 1b) phase 5.3: the implicit part - a native image's own String descriptors are freed after the body ran.
+  EmitNativeStrFieldsClear(HandleVal, UDTIdx);
   // 2) then destroy nested-UDT members, reverse declaration order (inherited fields included — they
   //    are part of FUDTs[UDTIdx].Fields via the prefix layout, so a single pass covers the whole object).
   if UDTIdx >= 0 then
@@ -45467,7 +45861,7 @@ begin
           srtFloat:  EmitInstruction(ssaRefStoreFloat, MakeSSAValue(svkNone), RefVarAddrValue(ArgExpr.ValueUpper),
                                      GetOrAllocateVariable(TmpName), MakeSSAValue(svkNone));
           srtString: EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), RefVarAddrValue(ArgExpr.ValueUpper),
-                                     GetOrAllocateVariable(TmpName), MakeSSAValue(svkNone));
+                                     GetOrAllocateVariable(TmpName), StrRefImm(False, RefVarDeclType(ArgExpr.ValueUpper)));
         else         EmitInstruction(ssaRefStoreInt, MakeSSAValue(svkNone), RefVarAddrValue(ArgExpr.ValueUpper),
                                      GetOrAllocateVariable(TmpName), MakeSSAValue(svkNone));
         end;
@@ -45488,7 +45882,11 @@ begin
       // where fbc prints 1007, in silence. Phase 2 of the pointer model sends every @-taken numeric module scalar
       // there in the fb mode, so the same-bank case broke too. Stored through the ordinary assignment, which
       // knows the home and the width - the same road the array-element branch below already takes.
-      else if IsRawModuleScalar(ArgExpr.ValueUpper) or IsRawAddrLocal(ArgExpr.ValueUpper) then
+      // ⭐ Phase 5 - ...and an @-taken local STRING the same way: its home is a frame cell (fb) or a one-field record
+      // (strict), never the register, so "byr(u)" left u as it was in BOTH modes - fbc prints "u?", this printed "u".
+      else if IsRawModuleScalar(ArgExpr.ValueUpper) or IsRawAddrLocal(ArgExpr.ValueUpper) or
+              ((RT = srtString) and IsAddrLocal(ArgExpr.ValueUpper) and (RawZStringBufBytes(ArgExpr.ValueUpper) <= 0) and
+               (GetEnvironmentVariable('SB_ADDRSTR_WRITEBACK') <> '0')) then
       begin
         case RT of
           srtInt:    TmpName := '__BRWTMP%';
@@ -45749,6 +46147,10 @@ function TSSAGenerator.TypeNeedsDestruction(const TypeName: string): Boolean;
     if ResolveMethodLabel(T, 'DESTRUCTOR') <> '' then Exit(True);
     UDTIdx := FindUDT(UpperFast(T));
     if UDTIdx < 0 then Exit;
+    // ⭐ Phase 5.3: a native type with a String field has fbc's IMPLICIT destructor - its descriptors' bytes are freed.
+    if NativeStrFieldsOn then
+      for i := 0 to High(FUDTs[UDTIdx].Fields) do
+        if IsVarLenStrField(UDTIdx, i) and NativeRecordType(T) then Exit(True);
     for i := 0 to High(FUDTs[UDTIdx].Fields) do
       if (FUDTs[UDTIdx].Fields[i].NestedType <> '') and
          Rec(FUDTs[UDTIdx].Fields[i].NestedType, Depth + 1) then
@@ -45982,8 +46384,24 @@ begin
       begin
         Inc(seen);
         if seen >= LoopLevels then Break;
+        // ...a loop this exit LEAVES without reaching its end: an iterator For's head temporaries die here (678).
+        // The target loop is not left this way - its own exit block destroys them.
+        EmitIterLoopTemps(High(FLoopStack) - seen + 1);
       end;
     end;
+end;
+
+procedure TSSAGenerator.EmitIterLoopTemps(LoopIdx: Integer);
+// DIVERGENZE 678: the temporaries an iterator For's head built (counter, limit, step) live as long as the loop, so a
+// path that leaves it - its own end, "Exit Do, Do" through it, Exit Sub, Return, a Goto out - destroys them, most recent
+// first. fbc's compound/for_UDT_counter3 counts three destructors for "Exit Do, Do" out of a For with a Step.
+var
+  i: Integer;
+begin
+  if (LoopIdx < 0) or (LoopIdx > High(FLoopStack)) then Exit;
+  for i := 0 to High(FLoopStack[LoopIdx].IterTempRegs) do
+    EmitDestructorCall(MakeSSARegister(srtInt, FLoopStack[LoopIdx].IterTempRegs[i]),
+                       FLoopStack[LoopIdx].IterTempTypes[i]);
 end;
 
 function TSSAGenerator.FindEnclosingLoop(Kind: TLoopKind; Levels: Integer;
@@ -46069,11 +46487,19 @@ procedure TSSAGenerator.EmitAllBlockScopesCleanup;
 // RETURN), unwind every active block scope innermost-first, before the frame destructors. The scopes
 // are NOT dropped (this is one CFG path; the blocks' own normal ends still emit cleanup on the other).
 var
-  k: Integer;
+  k, seen: Integer;
 begin
+  seen := 0;
   for k := High(FScopeStack) downto 0 do
     if FScopeStack[k].Kind = skBlock then
+    begin
       EmitBlockScopeCleanup(k);
+      if FScopeStack[k].IsLoopBody then
+      begin
+        Inc(seen);
+        EmitIterLoopTemps(High(FLoopStack) - seen + 1);   // every loop is left (678)
+      end;
+    end;
 end;
 
 procedure TSSAGenerator.ScanTopLevelLabels(Node: TASTNode; var Depth: Integer);
@@ -46334,6 +46760,9 @@ begin
             ElemBank := TypeNameToBank(TypeNameU, VNameU);
           ai := FProgram.DeclareArray(VNameU, ElemBank, [1]);   // 1-element global array, same name
           if DeclTypeIsPointer(TypeNameU) then FProgram.SetArrayElemIsPtr(ai);   // it holds a pointer (257 B)
+          // Phase 5: a module String with "@s" lives in an FBSTRING descriptor, "@s" its address (NoteArrayFbStr).
+          if Decl.Attributes.Values['BYREF'] <> '1' then
+            NoteArrayFbStr(ai, ElemBank, TypeNameU, StrToIntDef(Decl.Attributes.Values['FIXEDLEN'], 0), VNameU);
           FSharedScalarArr.AddObject(VNameU, TObject(PtrInt(ai)));
           // ...and if the value was folded, remember WHICH array backs it: DropUnreadConstArrays asks
           // whether anything in the emitted code ever reads it.
@@ -47678,6 +48107,29 @@ begin
     VNameU := Node.GetChild(1).GetChild(0).ValueUpper;
     if (FFixedStrNames.IndexOf(VNameU) >= 0) and (Dict.IndexOf(VNameU) < 0) then Dict.Add(VNameU);
   end;
+  // ⭐ PHASE 5 OF THE POINTER MODEL (518): in the fb memory mode "StrPtr(s)" of a VARIABLE-length String is its own bytes,
+  // as under fbc - so s needs the home an "@s" gives it (an FBSTRING descriptor: NoteArrayFbStr, IsFbStrLocal), and
+  // StrPtr reads the descriptor's data field. Before, it was a fresh read-only COPY per call: C writing through it
+  // ("memset(StrPtr(s), 66, 3)", a buffer filled by an API) never reached the string. An element "StrPtr(a(i))" homes
+  // the array. SB_FBSTR=0 is the A/B knob.
+  if FNativeMemory and (Node.NodeType = antArrayAccess) and (Node.ChildCount >= 2) and
+     (Node.GetChild(0).NodeType = antIdentifier) and
+     ((Node.GetChild(0).ValueUpper = kSTRPTR) or (Node.GetChild(0).ValueUpper = kSADD)) and
+     (Node.GetChild(1).ChildCount >= 1) and (GetEnvironmentVariable('SB_FBSTR') <> '0') then
+  begin
+    // ⚠️ A scalar is asked against the declared Strings (FVarStrNames); an ELEMENT names an array, whose element type
+    // NoteArrayFbStr checks itself at its declaration - and an array's Dim does not read the way a scalar's does.
+    VNameU := '';
+    if (Node.GetChild(1).GetChild(0).NodeType = antIdentifier) and
+       (FVarStrNames.IndexOf(Node.GetChild(1).GetChild(0).ValueUpper) >= 0) then
+      VNameU := Node.GetChild(1).GetChild(0).ValueUpper
+    else if (Node.GetChild(1).GetChild(0).NodeType = antArrayAccess) and
+            (Node.GetChild(1).GetChild(0).ChildCount >= 2) and
+            (Node.GetChild(1).GetChild(0).GetChild(0).NodeType = antIdentifier) then
+      VNameU := Node.GetChild(1).GetChild(0).GetChild(0).ValueUpper;
+    if (VNameU <> '') and (FFixedStrNames.IndexOf(VNameU) < 0) and (Dict.IndexOf(VNameU) < 0) then
+      Dict.Add(VNameU);
+  end;
   // ⛔⛔ AND THE **ByRef** POSITIONS OF fb_Mem*/Clear ARE THE SAME CASE. They take the address
   // of the lvalue they name, exactly as VARPTR does, so that variable must be backed with
   // stable storage - and if it is not registered HERE, the "@name" synthesized during SSA
@@ -48597,7 +49049,14 @@ begin
         if ((T = 'ZSTRING') or (T = 'WSTRING')) and
            (FFixedStrNames.IndexOf(D.GetChild(0).ValueUpper) < 0) then
           FFixedStrNames.Add(D.GetChild(0).ValueUpper);
-      end;
+      end
+      // Phase 5: ...and every name declared a variable-length STRING, which "StrPtr(name)" gives a home in the fb mode.
+      else if (D.NodeType = antArrayDecl) and (D.ChildCount >= 2) and
+              (D.GetChild(0).NodeType = antIdentifier) and (D.GetChild(1).NodeType = antIdentifier) and
+              (StrToIntDef(D.Attributes.Values['FIXEDLEN'], 0) <= 0) and
+              (UpperFast(CanonicalType(D.GetChild(1).ValueUpper)) = 'STRING') and
+              (FVarStrNames.IndexOf(D.GetChild(0).ValueUpper) < 0) then
+        FVarStrNames.Add(D.GetChild(0).ValueUpper);
     end;
   for i := 0 to Node.ChildCount - 1 do CollectFixedStrNames(Node.GetChild(i));
 end;
@@ -48751,6 +49210,7 @@ begin
   WFixed := nil;
   try
     FFixedStrNames.Clear;
+    FVarStrNames.Clear;
     CollectFixedStrNames(Node);       // which names are fixed-length character BUFFERS
     CollectDimVarBanks(Node, Dict);   // collect @-taken names + pointee types
     // The @ half on its own, taken BEFORE the enrichments below add names for other reasons: it is what
@@ -49133,6 +49593,34 @@ begin
     Result := EnsureIntRegister(GetOrAllocateVariable(UpperFast(Name)));
 end;
 
+function TSSAGenerator.StrRefImm(Wide: Boolean; const PointeeType: string): TSSAValue;
+// The Immediate of a ssaRefLoadString / ssaRefStoreString: bit 0 "the pointee is a WSTRING", and - phase 5 of the pointer
+// model, fb memory mode - bit 1 (REFSTR_DESC) "the pointee is a variable-length STRING", so that a machine address there
+// is read and written as fbc's FBSTRING descriptor. Only the DECLARED pointee can say it: the same opcode serves "*zp".
+var
+  Imm: Int64;
+begin
+  Imm := Ord(Wide);
+  if FNativeMemory and (UpperFast(CanonicalType(Trim(PointeeType))) = 'STRING') and
+     (GetEnvironmentVariable('SB_FBSTR') <> '0') then
+    Imm := Imm or REFSTR_DESC;
+  Result := MakeSSAConstInt(Imm);
+end;
+
+function TSSAGenerator.RefVarDeclType(const Name: string): string;
+// The declared type of a reference ("Dim ByRef r As T = v"), with the same scope rule as RefVarIsWide.
+var
+  BlkKey: string;
+  idx: Integer;
+begin
+  Result := '';
+  if BlockDeclaredHere(Name, BlkKey) then
+    idx := FRefVars.IndexOfName(BlkKey)
+  else
+    idx := FRefVars.IndexOfName(UpperFast(Name));
+  if idx >= 0 then Result := UpperFast(FRefVars.ValueFromIndex[idx]);
+end;
+
 function TSSAGenerator.RefVarIsWide(const Name: string): Boolean;
 // Is this reference's declared type a WSTRING? Then its target is WIDE cells, and the string load/store
 // through it has to say so (the immediate ssaRefLoadString/ssaRefStoreString already read, as the BYREF-
@@ -49399,6 +49887,8 @@ var
   PtrVal, IntVal, SzVal, Scaled: TSSAValue;
   sz: Int64;
   IsDiff, Descended: Boolean;
+  CastNode: TASTNode;
+  CastU: string;
 begin
   // Decide which child is the raw pointer (left for +/-, or right only for +). ⭐ A SADD/STRPTR call
   // is a raw pointer with no NAME, so the side test asks both questions - and the scale then has to
@@ -49458,6 +49948,19 @@ begin
   end
   else
     sz := RawElemSizeOfPointee(StrDataPtrPointee(PtrSide));
+  // ⭐ DIVERGENZE 675 - "Cast(ULong Ptr, a + 8) - Cast(ULong Ptr, a)" counts ULONGS, as fbc does (2): the stride is the
+  // CAST's pointee, not that of the raw name under it - an Any Ptr there divided by one (8), and "Cast(ULong Ptr, a) + 1"
+  // stepped one byte. A cast to an unresolved type (TypeOf) keeps the name's. SB_CAST_STRIDE=0 is the A/B.
+  CastU := '';
+  CastNode := BareSide;   // through "+"/"-": in "Cast(UByte Ptr, lw) + 4 - Cast(UByte Ptr, lw)" the cast is one level down
+  while (CastNode <> nil) and (CastNode.NodeType = antParentheses) and (CastNode.ChildCount >= 1) do
+    CastNode := CastNode.GetChild(0);
+  if (CastNode <> nil) and (CastNode.NodeType = antCast) and (GetEnvironmentVariable('SB_CAST_STRIDE') <> '0') then
+  begin
+    CastU := UpperFast(CanonicalType(Trim(CastNode.ValueUpper)));
+    if (Length(CastU) > 4) and (Copy(CastU, Length(CastU) - 3, 4) = ' PTR') and (Copy(CastU, 1, 6) <> 'TYPEOF') then
+      sz := RawChainElemBytes(Trim(Copy(CastU, 1, Length(CastU) - 4)));
+  end;
   if IsDiff then
   begin
     Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
@@ -49487,6 +49990,37 @@ begin
     EmitInstruction(ssaSubInt, Result, PtrVal, IntVal, MakeSSAValue(svkNone))
   else
     EmitInstruction(ssaAddInt, Result, PtrVal, IntVal, MakeSSAValue(svkNone));
+end;
+
+function TSSAGenerator.RawUDTCastSum(Node: TASTNode): Boolean;
+// "Cast(T Ptr, u) + n" / "- n" / "n + Cast(T Ptr, u)", u an identifier in the raw UDT-pointer registry (FRawUDTPtrs): a byte
+// address into the same raw memory u points at. Only for marking the variable that receives it - RawPtrExprName answers a
+// NAME its callers read an element type from, and a UDT pointer's would be the record's.
+var
+  k: Integer;
+  C: TASTNode;
+  TU: string;
+begin
+  Result := False;
+  if (Node = nil) or (GetEnvironmentVariable('SB_CAST_RAWUDT') = '0') then Exit;
+  while (Node.NodeType = antParentheses) and (Node.ChildCount >= 1) do Node := Node.GetChild(0);
+  if not ((Node.NodeType = antBinaryOp) and (Node.ChildCount >= 2) and Assigned(Node.Token) and
+          ((Node.Token.TokenType = ttOpAdd) or (Node.Token.TokenType = ttOpSub))) then Exit;
+  for k := 0 to 1 do
+  begin
+    if (k = 1) and (Node.Token.TokenType = ttOpSub) then Exit;
+    C := Node.GetChild(k);
+    while (C.NodeType = antParentheses) and (C.ChildCount >= 1) do C := C.GetChild(0);
+    if (C.NodeType = antCast) and (C.ChildCount >= 1) then
+    begin
+      TU := UpperFast(CanonicalType(C.ValueUpper));
+      if (Length(TU) >= 4) and (Copy(TU, Length(TU) - 3, 4) = ' PTR') and
+         (C.GetChild(0).NodeType = antIdentifier) and (RawUDTPtrType(VarToStr(C.GetChild(0).Value)) <> '') then
+        Exit(True);
+    end
+    else if RawUDTCastSum(C) then
+      Exit(True);
+  end;
 end;
 
 function TSSAGenerator.RawPtrExprName(Node: TASTNode): string;
@@ -49951,6 +50485,10 @@ begin
   // A "String Ptr" steps by SizeOf(String) - fbc's descriptor width, 24 bytes - so p[i] names the
   // i-th cell. Left to the scalar ladder it stepped by 8 and the cells overlapped.
   if SameText(PointeeType, 'STRING') then Exit(24);
+  // ⭐ An ANY pointer steps one BYTE, as in fbc ("Allocate(64) + 32" is 32 bytes on). The ladder below answered the
+  // default 8 for it, so every raw Any Ptr - Allocate, ImageCreate, a C pointer, and a parameter the rawness reached -
+  // stepped eight bytes per unit while a VM name stepped one (DIVERGENZE 674). SB_ANYPTR_STEP=0 is the A/B.
+  if SameText(Trim(PointeeType), 'ANY') and (GetEnvironmentVariable('SB_ANYPTR_STEP') <> '0') then Exit(1);
   case RawTypeCodeOfPointee(PointeeType) of
     RTC_I8, RTC_U8, RTC_BOOL: Result := 1;
     RTC_I16, RTC_U16: Result := 2;
@@ -50935,7 +51473,7 @@ function TSSAGenerator.TryEmitManagedRecordClear(ArgsNode: TASTNode): Boolean;
 //   · nested-UDT and member-array fields keep their instances: their slots hold HANDLES, and zeroing
 //     one leaks the instance and leaves "rec.member(i)" dereferencing 0.
 var
-  Handle, ZeroI, ZeroF, ZeroS: TSSAValue;
+  Handle, ZeroI, ZeroF, ZeroS, StrAddr: TSSAValue;
   TypeName: string;
   UDTIdx, i: Integer;
   ValNode: TASTNode;
@@ -50982,6 +51520,10 @@ begin
             ZeroS := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
             EmitInstruction(ssaLoadConstString, ZeroS, MakeSSAConstString(''), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
           end;
+          // Phase 5.3: a String field of a NATIVE record is its descriptor - emptied through it (its bytes freed).
+          if NativeStrFieldAddr(Handle, UDTIdx, i, StrAddr) then
+            EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), StrAddr, ZeroS, MakeSSAConstInt(REFSTR_DESC))
+          else
           EmitInstruction(ssaRecordStoreString, MakeSSAValue(svkNone), Handle, ZeroS,
                           MakeSSAConstInt(FUDTs[UDTIdx].Fields[i].Slot));
         end;
@@ -51652,6 +52194,11 @@ var
     end
     else if RawPtrExprName(Rhs) <> '' then
       MarkRaw(TargetU)   // p = q, p = q + n, p = q - n, p = (q): q raw
+    // ⭐ ...and "p = Cast(Any Ptr, img) + n" where img is a UDT pointer over raw memory - the other registry, as in 377:
+    // "Dim As ULong Ptr px = Cast(Any Ptr, img) + SizeOf(fb.Image)" stepped ONE where fbc steps four in strict (phase
+    // 5.5, probe g01). SB_CAST_RAWUDT=0 is the A/B, as for the plain cast.
+    else if RawUDTCastSum(Rhs) then
+      MarkRaw(TargetU)
     else if IsRawPtrCellExpr(Rhs) then
       MarkRaw(TargetU)   // p = q[i] where q is a raw pointer-to-pointer: the cell holds a raw pointer
     // ⭐⭐ p = a->b WHERE b IS A POINTER FIELD OF A STRUCT C OWNS. The UDT-pointee branch above has had
@@ -52684,6 +53231,21 @@ begin
   if m = '' then m := UpperFast(Name);
   idx := FAddrLocalVars.IndexOfName(m);
   if idx >= 0 then Result := UpperFast(FAddrLocalVars.ValueFromIndex[idx]);
+end;
+
+function TSSAGenerator.IsFbStrLocal(const Name: string): Boolean;
+// Phase 5 of the pointer model, fb memory mode: an @-taken local (variable-length) String, which lives in an FBSTRING
+// descriptor in a native frame cell instead of a one-field record. SB_FBSTR=0 is the A/B knob.
+begin
+  // ⛔ Not a ByRef WString/ZString parameter: FAddrLocalVars files it as STRING too (FWZParams says which it is).
+  Result := FNativeMemory and IsAddrLocal(Name) and (AddrLocalType(Name) = 'STRING') and
+            (FWZParams.Values[UpperFast(Name)] = '') and
+            // ⛔ ...and not inside a BYREF function: "Function f(ByVal s As String) ByRef As String : Return s" hands the
+            // caller the address of s, fbc's one exemption to error 272 (m750). A frame cell is freed - bytes and all - at
+            // the return; the record cell outlives it, as it always has.
+            not FCurrentProcByrefRet and
+            (StrCapOf(FFixedLenVars, Name, 0) <= 0) and (RawZStringBufBytes(Name) <= 0) and
+            (GetEnvironmentVariable('SB_FBSTR') <> '0');
 end;
 
 function TSSAGenerator.IsRawAddrLocal(const Name: string): Boolean;
@@ -54692,8 +55254,8 @@ begin
       // Any Ptr, came down this managed road and read NARROW bytes - "i" where fbc prints the wide "i!". The raw
       // road (a direct C call's result) always passed it. SB_REF_WIDE=0 is the A/B.
       srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone),
-                                 MakeSSAConstInt(Ord((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and
-                                                     (Pos('WSTRING', UpperFast(Pointee)) > 0))));
+                                 StrRefImm((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and
+                                           (Pos('WSTRING', UpperFast(Pointee)) > 0), Pointee));
     else
       EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), NarrowRefArg(Pointee));
     end;
@@ -54771,6 +55333,9 @@ begin
   // argument was handed a TEMPORARY cell: "Dim pd As Double Ptr = @x : bump(x)" left x as it was, in silence.
   if IsRawModuleScalar(Name) then
     Exit(RawModuleAddrReg(Name));
+  // ⭐ Phase 5: ...unless it is an FBSTRING cell, whose handle IS the descriptor's machine address.
+  if IsFbStrLocal(Name) then
+    Exit(EnsureIntRegister(AddrLocalHandle(Name)));
   // ...and a STRING one is a record cell: its address is a record-field pointer at slot 0, again the
   // same thing "@s" emits.
   if IsAddrLocal(Name) then
@@ -54782,7 +55347,11 @@ begin
   end;
   idx := FSharedScalarArr.IndexOf(UpperFast(Name));
   Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
-  if idx >= 0 then
+  // ⭐ Phase 5: a module String in an FBSTRING descriptor - its address is the descriptor's (NoteArrayFbStr).
+  if (idx >= 0) and ArrayIsFbStr(Integer(PtrInt(FSharedScalarArr.Objects[idx]))) then
+    EmitInstruction(ssaArrayElemAddr, Result, MakeSSAArrayRef(Integer(PtrInt(FSharedScalarArr.Objects[idx])), srtInt),
+                    EnsureIntRegister(MakeSSAConstInt(0)), MakeSSAConstInt(0))
+  else if idx >= 0 then
     EmitInstruction(ssaLoadConstInt, Result,
                     MakeSSAConstInt((Int64(PtrInt(FSharedScalarArr.Objects[idx])) + 1) shl POINTER_ARRAY_SHIFT),
                     MakeSSAValue(svkNone), MakeSSAValue(svkNone))
@@ -55137,8 +55706,18 @@ procedure TSSAGenerator.EmitRecordCopy(const DestHandle, SrcHandle: TSSAValue; U
 var
   i, NestedUDT, Slot, d, ArrDims: Integer;
   Bank: TSSARegisterType;
-  Tmp, DNest, SNest, DimReg, BndReg: TSSAValue;
+  Tmp, DNest, SNest, DimReg, BndReg, Empty, Zero: TSSAValue;
   LoadOp, StoreOp: TSSAOpCode;
+  StrOffs: TInt64Array;
+  StrVals: array of TSSAValue;
+
+  function AtOfs(const Base: TSSAValue; Ofs: Int64): TSSAValue;
+  begin
+    Result := EnsureIntRegister(Base);
+    if Ofs = 0 then Exit;
+    Result := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+    EmitInstruction(ssaAddInt, Result, EnsureIntRegister(Base), EnsureIntRegister(MakeSSAConstInt(Ofs)), MakeSSAValue(svkNone));
+  end;
 begin
   if (UDTIdx < 0) or (UDTIdx > High(FUDTs)) then Exit;
   // ⭐ Phase 3.6: a NATIVE type is one C image with no subtype to slice and nothing outside the bytes, and both values are
@@ -55146,7 +55725,37 @@ begin
   // Record* ops, which leave the C hot loop on an address (26 M exits on job/tests/bench/oop_vec3.bas).
   if NativeRecordType(FUDTs[UDTIdx].Name) then
   begin
+    // ⭐ Phase 5.3: ...and a String descriptor in it is a DEEP copy, as fbc's implicit Let does: the source's texts are read
+    // first (the two may be the same record), the destination's freed, the image copied, then each descriptor the copy
+    // shares with the source is zeroed and written again from the text read - its own bytes.
+    StrOffs := nil;
+    if NativeStrFieldsOn then CollectNativeStrOffsets(UDTIdx, 0, StrOffs);
+    if Length(StrOffs) = 0 then
+    begin
+      EmitNativeImageCopy(DestHandle, SrcHandle, NativeImageBytes(UDTIdx));
+      Exit;
+    end;
+    SetLength(StrVals, Length(StrOffs));
+    Empty := EnsureStringRegister(MakeSSAConstString(''));
+    Zero := EnsureIntRegister(MakeSSAConstInt(0));
+    for d := 0 to High(StrOffs) do
+    begin
+      StrVals[d] := MakeSSARegister(srtString, FProgram.AllocRegister(srtString));
+      EmitInstruction(ssaRefLoadString, StrVals[d], AtOfs(SrcHandle, StrOffs[d]), MakeSSAValue(svkNone),
+                      MakeSSAConstInt(REFSTR_DESC));
+    end;
+    for d := 0 to High(StrOffs) do
+      EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), AtOfs(DestHandle, StrOffs[d]), Empty,
+                      MakeSSAConstInt(REFSTR_DESC));
     EmitNativeImageCopy(DestHandle, SrcHandle, NativeImageBytes(UDTIdx));
+    for d := 0 to High(StrOffs) do
+    begin
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AtOfs(DestHandle, StrOffs[d]), Zero, MakeSSAConstInt(RTC_I64));
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AtOfs(DestHandle, StrOffs[d] + 8), Zero, MakeSSAConstInt(RTC_I64));
+      EmitInstruction(ssaRawStoreInt, MakeSSAValue(svkNone), AtOfs(DestHandle, StrOffs[d] + 16), Zero, MakeSSAConstInt(RTC_I64));
+      EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), AtOfs(DestHandle, StrOffs[d]), StrVals[d],
+                      MakeSSAConstInt(REFSTR_DESC));
+    end;
     Exit;
   end;
   for i := 0 to High(FUDTs[UDTIdx].Fields) do
@@ -55713,8 +56322,8 @@ begin
     case RetRT of
       srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), FloatRefArg(RetPart));
       srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone),    // ...its width (538)
-                                 MakeSSAConstInt(Ord((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and
-                                                     (Pos('WSTRING', UpperFast(RetPart)) > 0))));
+                                 StrRefImm((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and
+                                           (Pos('WSTRING', UpperFast(RetPart)) > 0), RetPart));
     else         EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), NarrowRefArg(RetPart));
     end;
     Exit;
@@ -55795,8 +56404,9 @@ begin
     case FuncRetType of
       srtFloat:  EmitInstruction(ssaRefLoadFloat, Result, AddrVal, MakeSSAValue(svkNone), FloatRefArg(ByrefRetPointeeType(Name)));
       srtString: EmitInstruction(ssaRefLoadString, Result, AddrVal, MakeSSAValue(svkNone),    // ...its width (538)
-                                 MakeSSAConstInt(Ord((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and
-                                                     (Pos('WSTRING', UpperFast(ByrefRetPointeeType(Name))) > 0))));
+                                 StrRefImm((GetEnvironmentVariable('SB_REF_WIDE') <> '0') and
+                                           (Pos('WSTRING', UpperFast(ByrefRetPointeeType(Name))) > 0),
+                                           ByrefRetPointeeType(Name)));
     else
       EmitInstruction(ssaRefLoadInt, Result, AddrVal, MakeSSAValue(svkNone), NarrowRefArg(ByrefRetPointeeType(Name)));
     end;
@@ -58321,7 +58931,7 @@ var
   EnumProbe: TSSAValue;   // DIVERGENZE 655: is the base a variable visible here?
   UDTIdx, Slot, QualIdx: Integer;
   Bank: TSSARegisterType;
-  HandleVal, DestVal, TempV: TSSAValue;
+  HandleVal, DestVal, TempV, NStrAddr: TSSAValue;
   Op: TSSAOpCode;
   AccNode, ThisObj: TASTNode;
 begin
@@ -58504,6 +59114,14 @@ begin
     srtString: Op := ssaRecordLoadString;
   else
     Op := ssaRecordLoadInt;
+  end;
+  // ⭐ Phase 5.3: a String field of a NATIVE record is its descriptor in the image.
+  if (Op = ssaRecordLoadString) and
+     NativeStrFieldAddr(HandleVal, UDTIdx, UDTFieldIndex(UDTIdx, VarToStr(Node.Value)), NStrAddr) then
+  begin
+    EmitInstruction(ssaRefLoadString, DestVal, NStrAddr, MakeSSAValue(svkNone), MakeSSAConstInt(REFSTR_DESC));
+    Result := DestVal;
+    Exit;
   end;
   EmitInstruction(Op, DestVal, HandleVal, MakeSSAValue(svkNone), MakeSSAConstInt(Slot));
   // ⭐ DIVERGENZE 594 - ...and a POINTER field that holds what C reads (576) holds a MACHINE address: the typed raw read
@@ -58977,6 +59595,11 @@ begin
   end;
   // ⭐ DIVERGENZE 561: a PROCEDURE field written through the managed road is the machine address too.
   if Op = ssaRecordStoreInt then ExprVal := FieldValueForC(UDTIdx, BitIdx, ExprVal);
+  if (Op = ssaRecordStoreString) and NativeStrFieldAddr(HandleVal, UDTIdx, BitIdx, NestDstH) then   // phase 5.3
+  begin
+    EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), NestDstH, ExprVal, MakeSSAConstInt(REFSTR_DESC));
+    Exit;
+  end;
   EmitInstruction(Op, MakeSSAValue(svkNone), HandleVal, ExprVal, MakeSSAConstInt(Slot));
 end;
 
@@ -61432,6 +62055,38 @@ begin
   FProgram.SetArrayAddrNative(ArrayIdx);
 end;
 
+procedure TSSAGenerator.NoteArrayFbStr(ArrayIdx: Integer; ET: TSSARegisterType; const ElemTypeName: string;
+                                       FixLen: Integer; const NameU: string);
+// ⭐ PHASE 5 OF THE POINTER MODEL (6 Oct 2026): in the fb memory mode a (variable-length) String array whose ADDRESS the
+// program takes - "@a(i)", or the one-element home of a module String with "@s" - keeps its elements as fbc does, as
+// 24-byte FBSTRING descriptors (SedaiFbString): "@a(i)" is the descriptor's machine address (bcArrayElemAddr), and a
+// "String Ptr" read or written through it, by BASIC or by C, reaches the same bytes. Before, "@s" was the packed VM name
+// 0x100000000, which C could keep and hand back but nothing could dereference (DIVERGENZE 641), and "@a(1) - @a(0)" was 1.
+// ⚠️ Only arrays whose address is taken: a descriptor is read by COPYING its bytes, where a managed element is shared by
+// reference, so the rest keep StringData. strict keeps the managed array. SB_FBSTR=0 is the A/B knob.
+var
+  k, Old: Integer;
+begin
+  if not FNativeMemory or (ArrayIdx < 0) or (FixLen > 0) or (ET <> srtString) then Exit;
+  if UpperFast(CanonicalType(Trim(ElemTypeName))) <> 'STRING' then Exit;
+  if FAtTakenOnly.IndexOf(NameU) < 0 then Exit;
+  if GetEnvironmentVariable('SB_FBSTR') = '0' then Exit;
+  FProgram.SetArrayFbStr(ArrayIdx);
+  if ArrayIdx >= Length(FAddrNativeArrays) then
+  begin
+    Old := Length(FAddrNativeArrays);
+    SetLength(FAddrNativeArrays, ArrayIdx + 64);
+    for k := Old to High(FAddrNativeArrays) do FAddrNativeArrays[k] := False;
+  end;
+  FAddrNativeArrays[ArrayIdx] := True;
+  FProgram.SetArrayAddrNative(ArrayIdx);
+end;
+
+function TSSAGenerator.ArrayIsFbStr(ArrayIdx: Integer): Boolean;
+begin
+  Result := FNativeMemory and (ArrayIdx >= 0) and FProgram.GetArray(ArrayIdx).FbStr;
+end;
+
 function TSSAGenerator.ArrayAddrIsNative(ArrayIdx: Integer): Boolean;
 begin
   Result := FNativeMemory and (ArrayIdx >= 0) and (ArrayIdx < Length(FAddrNativeArrays)) and
@@ -62397,7 +63052,17 @@ begin
           // where it already was. Written as "RT = srtString" this took the record branch as well and
           // wstring/write.bas went from CUFAIL to CUERR in the same run - the terna saying so
           // immediately. IsRawAddrLocal draws the line the same way, on AddrLocalType.
-          if AddrLocalType(ParamNodeJ.ValueUpper) = 'STRING' then
+          // ⭐ Phase 5, fb memory mode: an FBSTRING cell, as a local Dim gets (IsFbStrLocal) - "@s" is the descriptor.
+          if IsFbStrLocal(ParamNodeJ.ValueUpper) then
+          begin
+            RecHandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
+            EmitInstruction(ssaLoadConstInt, RecHandleVal, MakeSSAConstInt(24), MakeSSAValue(svkNone), MakeSSAValue(svkNone));
+            EmitInstruction(ssaRawAlloc, AddrLocalHandle(ParamNodeJ.ValueUpper), RecHandleVal, MakeSSAValue(svkNone),
+                            MakeSSAConstInt(RAWALLOC_FRAME_CELL or RAWALLOC_NATIVE_SLOT or RAWALLOC_STRDESC));
+            EmitInstruction(ssaRefStoreString, MakeSSAValue(svkNone), EnsureIntRegister(AddrLocalHandle(ParamNodeJ.ValueUpper)),
+                            EnsureStringRegister(ParamReg), MakeSSAConstInt(REFSTR_DESC));
+          end
+          else if AddrLocalType(ParamNodeJ.ValueUpper) = 'STRING' then
           begin
             RecHandleVal := MakeSSARegister(srtInt, FProgram.AllocRegister(srtInt));
             EmitInstruction(ssaRecordNew, RecHandleVal, MakeSSAConstInt(0), MakeSSAConstInt(0), MakeSSAConstInt(1));

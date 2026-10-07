@@ -46,7 +46,7 @@ uses
   SedaiConsoleBehavior, SedaiConsoleState, SedaiDebugger, SedaiExecutorErrors,
   SedaiMemoryMapper, SedaiSpriteTypes, SedaiExecutionContext, SedaiDrawQueue,
   SedaiGraphicsBackend, SedaiInputState, SedaiOpcodeTable, SedaiOpcodeBanks,
-  SedaiJit, SedaiAot, SedaiCpuInfo, SedaiBigInt, SedaiInputFields,
+  SedaiJit, SedaiAot, SedaiCpuInfo, SedaiBigInt, SedaiInputFields, SedaiFbString,
   // ⭐ Il FORMATO di una dichiarazione esterna, non un provider: questa unit «non nomina nessun
   // provider» per sua stessa nota, quindi il core puo' dipenderne. Serve nell'INTERFACCIA perche' i
   // metodi delle chiusure (DIVERGENZE 218) parlano di TForeignKind.
@@ -241,6 +241,15 @@ type
     // The FB.IMAGE header handed back for an offset below 32 in the image-pointer region. Per VM, not
     // per surface: it is filled from the surface at every read, so it is never stale.
     FImgHeaderBuf: array[0..RAWPTR_IMG_HDR_SIZE - 1] of Byte;
+    { ⭐ PHASE 5.5 (fb memory mode): an IMAGECREATE image IS a libc block, as under fbc - the 32-byte FB.IMAGE header,
+      then the pixels at the padded pitch - and the surface draws straight into it. Indexed by surface handle: the block
+      and its size (a GET may re-shape the image inside it). FImgLast* is the last address ImgHandleOf resolved.
+      SB_IMG_NATIVE=0 is the A/B: the image-surface region of before. }
+    FImgBlocks: array of PByte;
+    FImgBlockCap: array of PtrUInt;
+    FImgNative: Boolean;
+    FImgLastAddr: PtrUInt;
+    FImgLastHandle: Integer;
     { ⭐ And the same idea for fbc's ARRAY DESCRIPTOR: the 240 bytes `FBC.ArrayDescriptorPtr` hands
       back, filled from the array's storage at EVERY read, so a `ReDim` or an `Erase` between the call
       and the read cannot leave it stale. See RAWPTR_REGION_ADESC and BuildArrayDescriptor.
@@ -916,6 +925,8 @@ type
     function ArrDescCount(const A: TArrayStorage): Int64;  // the count the COMPILED engines see
     function ArrDescField(const A: TArrayStorage; Field: Integer): Int64;  // ...and the two element bases
     function ImgHandleOf(V: Int64): Integer;   // an image is named by pointer OR by index
+    procedure ImgShape(Handle: Integer);        // pitch, block and header of an IMAGECREATE surface (phase 5.5)
+    function ImgBlockOf(Handle: Integer): PByte;
     // ⭐ FFI (DIVERGENZE 183). ONE implementation, called from BOTH dispatchers: RunTemplate.inc and
     // ExecuteInstruction are the two arms this VM keeps having to hold in step, and a foreign call is
     // exactly the kind of work where a second copy would drift. The table is built on first use, from
@@ -2424,6 +2435,7 @@ begin
     SetLength(FArrays[i].IntData, 0);
     SetLength(FArrays[i].FloatData, 0);
     SetLength(FArrays[i].StringData, 0);
+    ArrFbStrFreeRange(FArrays[i], 0, MaxInt);   // phase 5: FBSTRING descriptors own libc bytes
     SetLength(FArrays[i].ByteData, 0);
     FArrays[i].TotalSize := 0;
   end;
@@ -6432,7 +6444,12 @@ begin
   else
     Result := RawAlloc(PtrUInt(ByteCount));
   // ⭐ phase 2.1b: a cell of the running frame is stacked, and FramePop gives it back (DIVERGENZE 458)
-  if (Imm and RAWALLOC_FRAME_CELL) <> 0 then PushFrameCell(Ctx, Result);
+  // ...and an FBSTRING cell is stacked with bit 1 set (a libc address is 16-byte aligned), so the pop frees its bytes first.
+  if (Imm and RAWALLOC_FRAME_CELL) <> 0 then
+  begin
+    if ((Imm and RAWALLOC_STRDESC) <> 0) and (Result <> 0) then PushFrameCell(Ctx, Result or 2)
+    else PushFrameCell(Ctx, Result);
+  end;
 end;
 
 procedure TBytecodeVM.PushFrameCell(Ctx: TExecutionContext; Cell: Int64);
@@ -6597,6 +6614,13 @@ begin
         SetLength(Ctx.RecPool, Ctx.RecPoolTop + 256);
       Ctx.RecPool[Ctx.RecPoolTop] := Ctx.FrameCells[Ctx.FrameCellTop] and not Int64(1);
       Inc(Ctx.RecPoolTop);
+    end
+    else
+    if (Ctx.FrameCells[Ctx.FrameCellTop] and 2) <> 0 then
+    begin
+      // ⭐ Phase 5: a local String's FBSTRING cell - its bytes go first, then the cell.
+      FbStrClear(PFbStr(PtrUInt(Ctx.FrameCells[Ctx.FrameCellTop] and not (FGNPTR_TAG or 2))));
+      NativeFree(Ctx.FrameCells[Ctx.FrameCellTop] and not Int64(2), FBoundsCheck);
     end
     else
     if FNativeMemory then NativeFree(Ctx.FrameCells[Ctx.FrameCellTop], FBoundsCheck)   // noted only under --bounds-check
@@ -6796,11 +6820,85 @@ function TBytecodeVM.ImgHandleOf(V: Int64): Integer;
 // holds the bare table INDEX, and PUT/GET/IMAGEDESTROY/IMAGEINFO are given whichever the program has.
 // ⇒ Decode when it carries the tag, pass through when it does not. Retrocompatible by construction,
 // and there is no ambiguity: a tagged value has bit 62 set and an index never will.
+var
+  A: PtrUInt;
+  i: Integer;
 begin
+  // ⭐ Phase 5.5: in the fb memory mode an image is the machine address of its block. Asked first, by the same test
+  // RawAddr asks (C's mark set, the VM's raw tag clear). An address that names no image is no surface.
+  if (V > 0) and ((V and RAWPTR_TAG) = 0) and ((V and FGNPTR_TAG) <> 0) then
+  begin
+    A := PtrUInt(V and not FGNPTR_TAG);
+    if (A = FImgLastAddr) and (FImgLastHandle > 0) and (FImgLastHandle <= High(FImgBlocks)) and
+       (PtrUInt(FImgBlocks[FImgLastHandle]) = A) then
+      Exit(FImgLastHandle);
+    for i := 1 to High(FImgBlocks) do
+      if PtrUInt(FImgBlocks[i]) = A then
+      begin
+        FImgLastAddr := A;
+        FImgLastHandle := i;
+        Exit(i);
+      end;
+    Exit(GFX_INVALID_SURFACE);
+  end;
   if (V and RAWPTR_TAG) <> 0 then
     Result := Integer((V shr RAWPTR_IMG_OFS_BITS) and $FFFFF)
   else
     Result := Integer(V);
+end;
+
+function TBytecodeVM.ImgBlockOf(Handle: Integer): PByte;
+begin
+  if (Handle >= 1) and (Handle <= High(FImgBlocks)) then Result := FImgBlocks[Handle] else Result := nil;
+end;
+
+procedure TBytecodeVM.ImgShape(Handle: Integer);
+// The pitch fbc gives an image row - its bytes rounded up to 16 - and, in the fb memory mode, the block that holds it:
+// header first, pixels after, the surface drawing into the block. Called when IMAGECREATE makes the surface and when a
+// GET re-shapes it (DIVERGENZE 646: fbc rewrites the header in the SAME buffer). ⚠️ A GET larger than the block would
+// write past it under fbc; here the surface keeps its own pixels and the header still tells the new size.
+var
+  W, H, Pitch: Integer;
+  Need: PtrUInt;
+  Blk: PByte;
+  Addr: Int64;
+begin
+  if not Assigned(FGraphics) or (Handle < 1) then Exit;
+  W := FGraphics.SurfaceWidth(Handle);
+  H := FGraphics.SurfaceHeight(Handle);
+  if (W <= 0) or (H <= 0) then Exit;
+  Pitch := (W * 4 + 15) and not 15;
+  if not (FNativeMemory and FImgNative) then
+  begin
+    FGraphics.SetSurfaceImageBuffer(Handle, nil, Pitch div 4);
+    Exit;
+  end;
+  Need := PtrUInt(RAWPTR_IMG_HDR_SIZE) + PtrUInt(Pitch) * PtrUInt(H);
+  if Handle > High(FImgBlocks) then
+  begin
+    SetLength(FImgBlocks, Handle + 1);
+    SetLength(FImgBlockCap, Handle + 1);
+  end;
+  Blk := FImgBlocks[Handle];
+  if Blk = nil then
+  begin
+    Addr := NativeAlloc(Need);
+    if Addr = 0 then begin FGraphics.SetSurfaceImageBuffer(Handle, nil, Pitch div 4); Exit; end;
+    Blk := PByte(PtrUInt(Addr and not FGNPTR_TAG));
+    FImgBlocks[Handle] := Blk;
+    FImgBlockCap[Handle] := Need;
+  end;
+  // fbgfx.bi's IMAGE: type(u32) bpp(s32) width(u32) height(u32) pitch(u32), then 12 reserved bytes. bpp is BYTES.
+  FillChar(Blk^, RAWPTR_IMG_HDR_SIZE, 0);
+  PLongWord(Blk)^ := 7;                              // fbc's PUT_HEADER_NEW
+  PLongInt(Blk + 4)^ := 4;
+  PLongWord(Blk + 8)^ := LongWord(W);
+  PLongWord(Blk + 12)^ := LongWord(H);
+  PLongWord(Blk + 16)^ := LongWord(Pitch);
+  if Need <= FImgBlockCap[Handle] then
+    FGraphics.SetSurfaceImageBuffer(Handle, Blk + RAWPTR_IMG_HDR_SIZE, Pitch div 4)
+  else
+    FGraphics.SetSurfaceImageBuffer(Handle, nil, Pitch div 4);
 end;
 
 procedure TBytecodeVM.BuildArrayDescriptor(Slot, LogicalId: Integer);
@@ -6987,7 +7085,7 @@ begin
       PLongInt(@FImgHeaderBuf[4])^   := 4;                                       // bytes per pixel
       PLongWord(@FImgHeaderBuf[8])^  := LongWord(FGraphics.SurfaceWidth(ImgHandle));
       PLongWord(@FImgHeaderBuf[12])^ := LongWord(FGraphics.SurfaceHeight(ImgHandle));
-      PLongWord(@FImgHeaderBuf[16])^ := LongWord(FGraphics.SurfaceWidth(ImgHandle) * 4);
+      PLongWord(@FImgHeaderBuf[16])^ := LongWord((FGraphics.SurfaceWidth(ImgHandle) * 4 + 15) and not 15);
       Result := Pointer(@FImgHeaderBuf[ofs]);
       Exit;
     end;
@@ -8071,6 +8169,10 @@ function TBytecodeVM.RawStrCellGet(RawPtr: Int64): string;
 var
   Idx: Int64;
 begin
+  // ⭐ Phase 5: in the fb memory mode a machine address there is fbc's own FBSTRING descriptor - "@s" of a String,
+  // "@a(i)" of a String array, a block C or Allocate handed over - and the characters are its bytes.
+  if FNativeMemory and (RawPtr > 0) and ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) then
+    Exit(FbStrGet(PFbStr(RawAddr(RawPtr, FBSTR_BYTES))));
   Idx := PInt64(RawAddr(RawPtr, 8))^;
   if (Idx > 0) and (Idx <= High(FRawStrCells)) then Result := FRawStrCells[Idx] else Result := '';
 end;
@@ -8084,6 +8186,11 @@ var
   Idx: Int64;
   P: PInt64;
 begin
+  if FNativeMemory and (RawPtr > 0) and ((RawPtr and RAWPTR_TAG) = 0) and ((RawPtr and FGNPTR_TAG) <> 0) then
+  begin
+    FbStrSet(PFbStr(RawAddr(RawPtr, FBSTR_BYTES, True)), S);   // phase 5, see RawStrCellGet
+    Exit;
+  end;
   P := PInt64(RawAddr(RawPtr, 8, True));
   Idx := P^;
   if (Idx <= 0) or (Idx > High(FRawStrCells)) then
@@ -10601,6 +10708,7 @@ begin
   FProgram := Program_;
   SetLength(FLitSAdd, 0);   // DIVERGENZE 593: literal addresses are by POOL INDEX, and a new program has a new pool
   FNativeMemory := Assigned(Program_) and Program_.NativeMemory;   // decided when it was compiled
+  FImgNative := SysUtils.GetEnvironmentVariable('SB_IMG_NATIVE') <> '0';
   RewritePackedArrayOps;   // phase 2.5: before EnsureDenseOps builds the per-PC index and the JIT reads the bytecode
 
   // Does anything in this program read the terminal's modelled screen back? Only SCREEN(row, col) and
@@ -13972,6 +14080,9 @@ begin
               if FArrays[ArrayIdx].FixStrBytes > 0 then
                 Move(MidRepl[1], FArrays[ArrayIdx].ByteData[LinearIdx * Integer(FArrays[ArrayIdx].FixStrBytes) + CharPos - 1],
                      CharVal2)
+              // Phase 5: an FBSTRING descriptor's bytes, written in place - fbc's MID statement keeps the buffer.
+              else if ArrIsFbStr(FArrays[ArrayIdx]) then
+                Move(MidRepl[1], PFbStr(@FArrays[ArrayIdx].ByteData[LinearIdx * FBSTR_BYTES])^.Data[CharPos - 1], CharVal2)
               else
               begin
                 UniqueString(FArrays[ArrayIdx].StringData[LinearIdx]);
@@ -16151,6 +16262,7 @@ begin
         SetLength(FArrays[i].IntData, 0);
         SetLength(FArrays[i].FloatData, 0);
         SetLength(FArrays[i].StringData, 0);
+        ArrFbStrFreeRange(FArrays[i], 0, MaxInt);   // phase 5
         SetLength(FArrays[i].ByteData, 0);
         SetLength(FArrays[i].Dimensions, 0);
         SetLength(FArrays[i].LowerBounds, 0);
@@ -18494,6 +18606,7 @@ begin
     SetLength(FArrays[ArrayIdx].IntData, 0);
     SetLength(FArrays[ArrayIdx].FloatData, 0);
     SetLength(FArrays[ArrayIdx].StringData, 0);
+    ArrFbStrFreeRange(FArrays[ArrayIdx], 0, MaxInt);   // phase 5
     SetLength(FArrays[ArrayIdx].ByteData, 0);
     for d := 0 to High(FArrays[ArrayIdx].Dimensions) do
       FArrays[ArrayIdx].Dimensions[d] := 0;        // UBound(d) = LowerBound(d) + 0 - 1 = -1
@@ -18524,6 +18637,8 @@ begin
          if Length(FArrays[ArrayIdx].ByteData) > 0 then
            FillChar(FArrays[ArrayIdx].ByteData[0], Length(FArrays[ArrayIdx].ByteData), 0);
        end
+       else if ArrIsFbStr(FArrays[ArrayIdx]) then   // phase 5: every descriptor emptied, its bytes freed
+         for k := 0 to ArrStrCount(FArrays[ArrayIdx]) - 1 do ArrStrPut(FArrays[ArrayIdx], k, '')
        else
          for k := 0 to High(FArrays[ArrayIdx].StringData) do FArrays[ArrayIdx].StringData[k] := '';
   end;
@@ -18602,6 +18717,8 @@ begin
          else if Length(FArrays[ArrayIdx].ByteData) > 0 then
            FillChar(FArrays[ArrayIdx].ByteData[0], Length(FArrays[ArrayIdx].ByteData), 0);
        end
+       else if ArrIsFbStr(FArrays[ArrayIdx]) then   // phase 5: FBSTRING descriptors
+         FbStrArrayResize(FArrays[ArrayIdx], NewSize, Preserve)
        else
        begin
          SetLength(FArrays[ArrayIdx].StringData, NewSize);
@@ -18699,6 +18816,8 @@ begin
          else if Length(FArrays[ArrayIdx].ByteData) > 0 then
            FillChar(FArrays[ArrayIdx].ByteData[0], Length(FArrays[ArrayIdx].ByteData), 0);
        end
+       else if ArrIsFbStr(FArrays[ArrayIdx]) then   // phase 5: FBSTRING descriptors
+         FbStrArrayResize(FArrays[ArrayIdx], NewSize, Preserve)
        else
        begin
          SetLength(FArrays[ArrayIdx].StringData, NewSize);
@@ -18767,6 +18886,7 @@ begin
   A.IntData     := nil;
   A.FloatData   := nil;
   A.StringData  := nil;
+  ArrFbStrFreeRange(A, 0, MaxInt);   // phase 5: an FBSTRING array's bytes are libc's (skipped while the bank is shared)
   A.ByteData    := nil;   // the packed bank is managed like the other three
 end;
 
@@ -18843,6 +18963,7 @@ begin
   SetLength(A.IntData, 0);
   SetLength(A.FloatData, 0);
   SetLength(A.StringData, 0);
+  ArrFbStrFreeRange(A, 0, MaxInt);   // phase 5
   SetLength(A.ByteData, 0);
   A.ElemWidth := 0;
   A.ElemSigned := False;
@@ -18976,6 +19097,7 @@ begin
         // ⛔ IntData stays EMPTY for such an array, and that is deliberate rather than incidental: it
         // is how the JIT/AOT descriptor comes out with a null pointer and a zero count, which is what
         // takes the compiled engines out on their own (they deopt when the bounds test fails).
+        ArrFbStrFreeRange(FArrays[ArrayIdx], 0, MaxInt);   // phase 5: a re-DIM of an FBSTRING array frees its bytes
         FArrays[ArrayIdx].ElemWidth := ArrInfo.ElemWidth;
         FArrays[ArrayIdx].ElemSigned := ArrInfo.ElemSigned;
         FArrays[ArrayIdx].FixStrBytes := 0;   // DIVERGENZE 615: set below, for a "ZString * n" array only
@@ -19012,6 +19134,16 @@ begin
               FArrays[ArrayIdx].FixStrBytes := LongWord(ArrInfo.FixStrBytes);
               SetLength(FArrays[ArrayIdx].StringData, 0);
               SetLength(FArrays[ArrayIdx].ByteData, ProdDims * ArrInfo.FixStrBytes);
+              if Length(FArrays[ArrayIdx].ByteData) > 0 then
+                FillChar(FArrays[ArrayIdx].ByteData[0], Length(FArrays[ArrayIdx].ByteData), 0);
+            end
+            // ⭐ Phase 5: an array of String whose elements the program can address is a block of FBSTRING descriptors,
+            // zeroed - fbc's empty string. SB_FBSTR=0 is the A/B (read by the SSA, which then never asks).
+            else if FNativeMemory and ArrInfo.FbStr then
+            begin
+              FArrays[ArrayIdx].ElemWidth := FBSTR_BYTES;
+              SetLength(FArrays[ArrayIdx].StringData, 0);
+              SetLength(FArrays[ArrayIdx].ByteData, ProdDims * FBSTR_BYTES);
               if Length(FArrays[ArrayIdx].ByteData) > 0 then
                 FillChar(FArrays[ArrayIdx].ByteData[0], Length(FArrays[ArrayIdx].ByteData), 0);
             end
@@ -19333,8 +19465,12 @@ begin
           // written "Operator = *This.p" over a CAllocate'd ZString hands back a correctly tagged raw
           // address, and this decoded it as a packed array pointer: "Null or invalid pointer
           // dereference, address 4611686018427387944". Text at a raw address is a C string.
+          // ⭐ Phase 5: a STRING pointee at a machine address is fbc's descriptor - "*p" of a String Ptr.
+          else if FNativeMemory and ((Instr.Immediate and REFSTR_DESC) <> 0) and (PtrAddr > 0) and
+                  ((PtrAddr and RAWPTR_TAG) = 0) and ((PtrAddr and FGNPTR_TAG) <> 0) then
+            Ctx.StringRegs[Instr.Dest] := FbStrGet(PFbStr(RawAddr(PtrAddr, FBSTR_BYTES)))
           else if (PtrAddr and (RAWPTR_TAG or FGNPTR_TAG)) <> 0 then   // FGNPTR: DIVERGENZE 239
-            Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(PtrAddr, Instr.Immediate = 1)
+            Ctx.StringRegs[Instr.Dest] := RawLoadZStrVal(PtrAddr, (Instr.Immediate and 1) = 1)
           else
           begin
             ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
@@ -19430,8 +19566,11 @@ begin
           end
           // The raw-address kind - see the note in bcRefLoadString above. The WRITE half needs it too,
           // or LSET on such a UDT reads its buffer and then stores into a nonexistent array.
+          else if FNativeMemory and ((Instr.Immediate and REFSTR_DESC) <> 0) and (PtrAddr > 0) and
+                  ((PtrAddr and RAWPTR_TAG) = 0) and ((PtrAddr and FGNPTR_TAG) <> 0) then
+            FbStrSet(PFbStr(RawAddr(PtrAddr, FBSTR_BYTES, True)), Ctx.StringRegs[Instr.Src2])   // phase 5
           else if (PtrAddr and (RAWPTR_TAG or FGNPTR_TAG)) <> 0 then   // FGNPTR: DIVERGENZE 239
-            RawStoreZStrVal(PtrAddr, Ctx.StringRegs[Instr.Src2], Instr.Immediate = 1)
+            RawStoreZStrVal(PtrAddr, Ctx.StringRegs[Instr.Src2], (Instr.Immediate and 1) = 1)
           else
           begin
             ArrayIdx := MapArrDyn(Ctx, (PtrAddr shr POINTER_ARRAY_SHIFT) - 1); if GPackedDiag then PackedDiagNote({$I %LINENUM%}, FNativeMemory);
@@ -19743,6 +19882,8 @@ begin
               // instruction to the interpreter, which reads the physical width.
               if (Ctx.ArrayBindStack[I].ArgId >= 0) and (Ctx.ArrayBindStack[I].ArgId <= High(FArrays)) and
                  (FArrays[Ctx.ArrayBindStack[I].ArgId].ElemWidth > 0) and
+                 // Phase 5: a String array's descriptors are reached only through ArrStrGet/Put, never by width.
+                 not ArrIsFbStr(FArrays[Ctx.ArrayBindStack[I].ArgId]) and
                  (Ctx.ArrayBindStack[I].ParamId < FProgram.GetArrayCount) and
                  (FProgram.GetArray(Ctx.ArrayBindStack[I].ParamId).ElemWidth <>
                   FArrays[Ctx.ArrayBindStack[I].ArgId].ElemWidth) then
@@ -19992,6 +20133,7 @@ begin
           if (DestArr >= 1) and (DestArr <= High(FArrays)) and
              (PtrAddr >= 1) and (PtrAddr <= High(FArrays)) then
           begin
+            ArrFbStrFreeRange(FArrays[DestArr], 0, MaxInt);   // phase 5: the destination's own bytes go first
             FArrays[DestArr].ElementType := FArrays[PtrAddr].ElementType;
             FArrays[DestArr].DimCount    := FArrays[PtrAddr].DimCount;
             FArrays[DestArr].TotalSize   := FArrays[PtrAddr].TotalSize;
@@ -20004,6 +20146,11 @@ begin
             FArrays[DestArr].ElemSigned  := FArrays[PtrAddr].ElemSigned;
             FArrays[DestArr].ByteData    := Copy(FArrays[PtrAddr].ByteData);
             FArrays[DestArr].FixStrBytes := FArrays[PtrAddr].FixStrBytes;   // DIVERGENZE 615
+            // Phase 5: the copied descriptors still name the SOURCE's bytes - each gets bytes of its own.
+            if ArrIsFbStr(FArrays[DestArr]) then
+              for LinearIdx := 0 to ArrStrCount(FArrays[DestArr]) - 1 do
+                FbStrDupInto(PFbStr(@FArrays[DestArr].ByteData[LinearIdx * FBSTR_BYTES]),
+                             PFbStr(@FArrays[PtrAddr].ByteData[LinearIdx * FBSTR_BYTES]));
           end;
         end;
       48: // bcArrayCopyRecords - value-copy an array-of-UDT member element-wise (independent element records)
@@ -21357,11 +21504,15 @@ begin
       begin
         ImgHandle := FGraphics.CreateSurface(Ctx.IntRegs[Instr.Src1], Ctx.IntRegs[Instr.Src2],
                                              UInt32(Ctx.IntRegs[Instr.Immediate]));
+        if ImgHandle > 0 then ImgShape(ImgHandle);
         // ⭐ A POINTER, not the bare index: FreeBASIC's IMAGECREATE answers an FB.IMAGE PTR and code
         // reads the header and the pixels through it. Offset 0 is the start of the header, so
         // "img->width" and "img + SizeOf(FB.IMAGE)" both land where they should. A failed creation
         // stays GFX_INVALID_SURFACE, untagged, so "If img = 0" and the old comparisons still work.
-        if ImgHandle > 0 then
+        // ⭐ Phase 5.5: ...and in the fb memory mode the pointer is the block's machine address, as fbc's.
+        if (ImgHandle > 0) and (ImgBlockOf(ImgHandle) <> nil) then
+          Ctx.IntRegs[Instr.Dest] := Int64(PtrUInt(ImgBlockOf(ImgHandle))) or FGNPTR_TAG
+        else if ImgHandle > 0 then
           Ctx.IntRegs[Instr.Dest] := RAWPTR_TAG or RAWPTR_REGION_IMG or
                                      ((Int64(ImgHandle) and $FFFFF) shl RAWPTR_IMG_OFS_BITS)
         else
@@ -21371,7 +21522,18 @@ begin
         Ctx.IntRegs[Instr.Dest] := GFX_INVALID_SURFACE;
     37: // bcGfxImageDestroy - IMAGEDESTROY handle
       if Assigned(FGraphics) then
-        FGraphics.DestroySurface(ImgHandleOf(Ctx.IntRegs[Instr.Src1]));
+      begin
+        ImgHandle := ImgHandleOf(Ctx.IntRegs[Instr.Src1]);
+        FGraphics.DestroySurface(ImgHandle);
+        // the block goes back to libc AFTER the surface that drew into it is gone
+        if ImgBlockOf(ImgHandle) <> nil then
+        begin
+          NativeFree(Int64(PtrUInt(FImgBlocks[ImgHandle])) or FGNPTR_TAG);
+          FImgBlocks[ImgHandle] := nil;
+          FImgBlockCap[ImgHandle] := 0;
+          if FImgLastHandle = ImgHandle then FImgLastHandle := 0;
+        end;
+      end;
     38: // bcGfxImageInfo - __IMGINFO(handle, which): width (0) / height (1) / bpp (2) / pitch (3)
       // ⛔ bpp AND pitch WERE MISSING, and a program that asked for them got 0 - not an error, a
       // NUMBER, which is the kind of answer that propagates. fbc's IMAGEINFO takes up to six
@@ -21386,12 +21548,16 @@ begin
           0: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceWidth(ImgHandleOf(Ctx.IntRegs[Instr.Src1]));
           1: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceHeight(ImgHandleOf(Ctx.IntRegs[Instr.Src1]));
           2: Ctx.IntRegs[Instr.Dest] := 4;      // bytes per pixel, always 32bpp here
-          3: Ctx.IntRegs[Instr.Dest] := FGraphics.SurfaceWidth(ImgHandleOf(Ctx.IntRegs[Instr.Src1])) * 4;
+          // the padded pitch fbc gives an image row (phase 5.5): bytes rounded up to 16
+          3: Ctx.IntRegs[Instr.Dest] := (FGraphics.SurfaceWidth(ImgHandleOf(Ctx.IntRegs[Instr.Src1])) * 4 + 15) and not 15;
           // ⭐ 4: the POINTER TO THE PIXELS, which is what an image is FOR - walking its rows. It names
           // the image-surface region (RAWPTR_REGION_IMG) at the offset where the pixels begin, i.e.
           // just past the 32-byte FB.IMAGE header, so "p32[i]" steps through the picture and
           // "img + SizeOf(FB.IMAGE)" lands on the same byte.
-          4: if Ctx.IntRegs[Instr.Src1] <> 0 then
+          4: if ImgBlockOf(ImgHandleOf(Ctx.IntRegs[Instr.Src1])) <> nil then
+               Ctx.IntRegs[Instr.Dest] := Int64(PtrUInt(ImgBlockOf(ImgHandleOf(Ctx.IntRegs[Instr.Src1])) +
+                                                         RAWPTR_IMG_HDR_SIZE)) or FGNPTR_TAG
+             else if Ctx.IntRegs[Instr.Src1] <> 0 then
                Ctx.IntRegs[Instr.Dest] := RAWPTR_TAG or RAWPTR_REGION_IMG or
                  ((Int64(ImgHandleOf(Ctx.IntRegs[Instr.Src1])) and $FFFFF) shl RAWPTR_IMG_OFS_BITS) or
                  RAWPTR_IMG_HDR_SIZE
@@ -21422,7 +21588,10 @@ begin
         // ⭐ DIVERGENZE 646 - the image TAKES the rectangle's size: fbc writes the buffer's header (width, height, pitch)
         // from the rectangle, so a 20x20 buffer filled by a 10x10 GET reports 10x10 and PUTs 10x10. It kept its size.
         if (DrawMode <> GFX_SCREEN_SURFACE) and (DrawMode > 0) then
+        begin
           FGraphics.ResizeSurface(DrawMode, GetX2 - GetX1 + 1, GetY2 - GetY1 + 1);
+          ImgShape(DrawMode);   // the padded pitch, and in fb the header and pixels in the image's own block
+        end;
         for GetSy := 0 to (GetY2 - GetY1) do
           for GetSx := 0 to (GetX2 - GetX1) do
             FGraphics.SetPixel(DrawMode, GetSx, GetSy,

@@ -64,6 +64,15 @@ type
     FGraphicsBufferSize: Integer;
     FColorBufferSize: Integer;
     FClassicBuffers: array[gm40ColText..gm80x50Mixed] of TClassicModeBuffer;
+    { ⭐ AN IMAGE'S ROW IS ITS PITCH, NOT ITS WIDTH (phase 5.5 of the pointer model). fbc pads an image row to 16 bytes
+      ("ImageCreate(5, 2)" has a pitch of 32), and a program walks the pixels with that pitch. 0 = the row is Width
+      pixels, which is every surface but an IMAGECREATE one. Only the RGBA buffer follows it: the colour buffer is
+      CLASSIC's, and an image never has one. }
+    FStride: Integer;
+    // The RGBA buffer belongs to someone else - in the fb memory mode an image's pixels live in the libc block
+    // IMAGECREATE answered, just past its FB.IMAGE header - so it is never freed here.
+    FExternalRGB: Boolean;
+
     FCurrentClassicMode: TGraphicMode;
     FIsClassicMode: Boolean;
     FState: TGraphicsState;
@@ -147,6 +156,11 @@ type
     procedure SetPixelRGBA(X, Y: Integer; RGBA: UInt32); inline;
     function GetPixelRGBA(X, Y: Integer): UInt32; inline;
 
+    // An image's row pitch in PIXELS, and where its pixels live: Buf = nil keeps them here, re-allocated at that pitch;
+    // otherwise Buf (StridePixels * Height * 4 bytes, owned by the caller) becomes the RGBA buffer. The picture is kept.
+    procedure UseImageBuffer(Buf: PByte; StridePixels: Integer);
+    function RowPixels: Integer; inline;
+
     procedure SetCurrentMode(Mode: TGraphicMode);
     procedure SetSplitLine(Line: Integer);
 
@@ -211,7 +225,7 @@ begin
   // (in classic mode, they point to FClassicBuffers which are freed below)
   if not FIsClassicMode then
   begin
-    if Assigned(FGraphicsBuffer) then FreeMem(FGraphicsBuffer);
+    if Assigned(FGraphicsBuffer) and not FExternalRGB then FreeMem(FGraphicsBuffer);
     if Assigned(FColorBuffer) then FreeMem(FColorBuffer);
   end;
 
@@ -447,11 +461,13 @@ begin
     // Only free if previous mode was NOT a classic mode (to avoid freeing persistent buffers)
     if not WasClassicMode then
     begin
-      if Assigned(FGraphicsBuffer) then FreeMem(FGraphicsBuffer);
+      if Assigned(FGraphicsBuffer) and not FExternalRGB then FreeMem(FGraphicsBuffer);
       if Assigned(FColorBuffer) then FreeMem(FColorBuffer);
     end;
     // Reset pointers - classic mode buffers remain in FClassicBuffers array
     FGraphicsBuffer := nil;
+    FExternalRGB := False;
+    FStride := 0;
     FColorBuffer := nil;
 
     FState.Width := Width;
@@ -1091,7 +1107,7 @@ begin
   end;
 
   // Save in RGB buffer
-  Offset := (Y * FState.Width + X) * 4;
+  Offset := (Y * RowPixels + X) * 4;
   RGBA := PUInt32(FGraphicsBuffer + Offset);
   RGBA^ := RGB;
 end;
@@ -1113,7 +1129,7 @@ begin
   end;
 
   // Converts to RGB via palette and saves
-  Offset := (Y * FState.Width + X) * 4;
+  Offset := (Y * RowPixels + X) * 4;
   RGBA := PUInt32(FGraphicsBuffer + Offset);
   RGBA^ := FPalette[PaletteIndex];
 end;
@@ -1127,7 +1143,7 @@ begin
   if not ValidateCoordinates(X, Y) then
     Exit;
 
-  Offset := (Y * FState.Width + X) * 4;
+  Offset := (Y * RowPixels + X) * 4;
   RGBA := PUInt32(FGraphicsBuffer + Offset);
   Result := RGBA^;
 end;
@@ -1150,6 +1166,42 @@ begin
     // Converts RGB to closest palette index
     Result := RGBToPaletteIndex(GetPixel(X, Y));
   end;
+end;
+
+function TGraphicsMemory.RowPixels: Integer;
+begin
+  if FStride > 0 then Result := FStride else Result := FState.Width;
+end;
+
+procedure TGraphicsMemory.UseImageBuffer(Buf: PByte; StridePixels: Integer);
+var
+  NewBuf: PByte;
+  NewSize, y, Row, OldRow: Integer;
+begin
+  if FIsClassicMode or (StridePixels < FState.Width) or (FState.Height <= 0) then Exit;
+  NewSize := StridePixels * FState.Height * 4;
+  if Buf = nil then
+  begin
+    GetMem(NewBuf, NewSize);
+    FillChar(NewBuf^, NewSize, 0);
+  end
+  else
+    NewBuf := Buf;
+  if NewBuf = FGraphicsBuffer then begin FStride := StridePixels; FGraphicsBufferSize := NewSize; Exit; end;
+  // the picture moves with the buffer, row by row: the two pitches may differ
+  if Assigned(FGraphicsBuffer) then
+  begin
+    OldRow := RowPixels * 4;
+    Row := FState.Width * 4;
+    for y := 0 to FState.Height - 1 do
+      if y * OldRow + Row <= FGraphicsBufferSize then
+        Move((FGraphicsBuffer + y * OldRow)^, (NewBuf + y * StridePixels * 4)^, Row);
+    if not FExternalRGB then FreeMem(FGraphicsBuffer);
+  end;
+  FGraphicsBuffer := NewBuf;
+  FGraphicsBufferSize := NewSize;
+  FStride := StridePixels;
+  FExternalRGB := Buf <> nil;
 end;
 
 procedure TGraphicsMemory.SetPixelRGBA(X, Y: Integer; RGBA: UInt32);

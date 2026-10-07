@@ -326,6 +326,7 @@ type
     function  GBImageMem(Surface: TGfxSurface): TGraphicsMemory;   // image memory for a surface id, nil if invalid
     function  GBCreateSurface(W, H: Integer; Fill: TGfxColor): TGfxSurface;
     procedure GBResizeSurface(Surface: TGfxSurface; W, H: Integer);
+    procedure GBSetSurfaceImageBuffer(Surface: TGfxSurface; Buf: PByte; StridePixels: Integer);
     procedure GBDestroySurface(Surface: TGfxSurface);
     function  GBSurfaceWidth(Surface: TGfxSurface): Integer;
     function  GBSurfaceHeight(Surface: TGfxSurface): Integer;
@@ -361,6 +362,7 @@ type
     function  IGraphicsBackend.ScreenSurface = GBScreenSurface;
     function  IGraphicsBackend.CreateSurface = GBCreateSurface;
     procedure IGraphicsBackend.ResizeSurface = GBResizeSurface;
+    procedure IGraphicsBackend.SetSurfaceImageBuffer = GBSetSurfaceImageBuffer;
     procedure IGraphicsBackend.DestroySurface = GBDestroySurface;
     function  IGraphicsBackend.SurfaceWidth = GBSurfaceWidth;
     function  IGraphicsBackend.SurfaceHeight = GBSurfaceHeight;
@@ -3923,6 +3925,12 @@ begin
   if Img.Depth <> Old.Depth then Img.SetDepth(Old.Depth);
   FImageSurfaces[Surface - 1] := Img;
   Old.Free;
+end;
+
+procedure TVideoController.GBSetSurfaceImageBuffer(Surface: TGfxSurface; Buf: PByte; StridePixels: Integer);
+begin
+  if (Surface >= 1) and (Surface <= Length(FImageSurfaces)) and Assigned(FImageSurfaces[Surface - 1]) then
+    FImageSurfaces[Surface - 1].UseImageBuffer(Buf, StridePixels);
 end;
 
 procedure TVideoController.GBDestroySurface(Surface: TGfxSurface);

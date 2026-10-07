@@ -30,7 +30,7 @@ interface
 uses
   // Only for TLimbs, the limb vector a BigInt value holds. SedaiBigInt depends on
   // nothing of ours, so this cannot close a cycle.
-  SysUtils, SedaiBigInt;
+  SysUtils, SedaiBigInt, SedaiFbString;
 
 { TExecutionContext — the per-thread-of-control execution state of the bytecode VM.
 
@@ -132,7 +132,7 @@ type
       IntData stays empty for it. The two are never both populated: one storage, one truth.
       ⚠️ Signedness is NOT here: it belongs to the read, not to the storage, and the element accessors
       take it from the array's declared type. }
-    ElemWidth: Byte;              // 0 = 8 bytes in IntData; 1, 2 or 4 = packed in ByteData
+    ElemWidth: Byte;              // 0 = 8 bytes in IntData; 1, 2 or 4 = packed in ByteData; 24 on a STRING array = FBSTRING descriptors in ByteData (phase 5, ArrIsFbStr)
     ElemSigned: Boolean;          // a narrow element sign-extends on read when its type is signed
     ByteData: array of Byte;      // populated only when ElemWidth > 0
     { ⭐ THE TWO FACTS `FBC.ArrayDescriptorPtr` NEEDS AND NOTHING ELSE RECORDED (12 Sep 2026). The
@@ -556,22 +556,74 @@ procedure FixStrSet(var A: TArrayStorage; Idx: Integer; const S: string);
 function ArrStrGet(const A: TArrayStorage; Idx: Integer): string; inline;
 procedure ArrStrPut(var A: TArrayStorage; Idx: Integer; const S: string); inline;
 function ArrStrCount(const A: TArrayStorage): Integer; inline;
+// Phase 5 of the pointer model: a String array whose elements are FBSTRING descriptors (ElemWidth = FBSTR_BYTES, in
+// ByteData) - see SedaiFbString. ArrFbStrFreeRange frees the bytes of elements FromIdx..ToIdx.
+function ArrIsFbStr(const A: TArrayStorage): Boolean;
+procedure ArrFbStrFreeRange(var A: TArrayStorage; FromIdx, ToIdx: Integer);
+procedure FbStrArrayResize(var A: TArrayStorage; NewCount: Integer; Preserve: Boolean);
 
 implementation
 
 function ArrStrGet(const A: TArrayStorage; Idx: Integer): string;
 begin
-  if A.FixStrBytes > 0 then Result := FixStrGet(A, Idx) else Result := A.StringData[Idx];
+  if A.FixStrBytes > 0 then Result := FixStrGet(A, Idx)
+  else if A.ElemWidth = FBSTR_BYTES then Result := FbStrGet(PFbStr(@A.ByteData[Idx * FBSTR_BYTES]))
+  else Result := A.StringData[Idx];
 end;
 
 procedure ArrStrPut(var A: TArrayStorage; Idx: Integer; const S: string);
 begin
-  if A.FixStrBytes > 0 then FixStrSet(A, Idx, S) else A.StringData[Idx] := S;
+  if A.FixStrBytes > 0 then FixStrSet(A, Idx, S)
+  else if A.ElemWidth = FBSTR_BYTES then FbStrSet(PFbStr(@A.ByteData[Idx * FBSTR_BYTES]), S)
+  else A.StringData[Idx] := S;
 end;
 
 function ArrStrCount(const A: TArrayStorage): Integer;
 begin
-  if A.FixStrBytes > 0 then Result := Length(A.ByteData) div Integer(A.FixStrBytes) else Result := Length(A.StringData);
+  if A.FixStrBytes > 0 then Result := Length(A.ByteData) div Integer(A.FixStrBytes)
+  else if A.ElemWidth = FBSTR_BYTES then Result := Length(A.ByteData) div FBSTR_BYTES
+  else Result := Length(A.StringData);
+end;
+
+function ArrIsFbStr(const A: TArrayStorage): Boolean;
+begin
+  Result := (A.ElementType = 2) and (A.ElemWidth = FBSTR_BYTES) and (A.FixStrBytes = 0);
+end;
+
+procedure FbStrArrayResize(var A: TArrayStorage; NewCount: Integer; Preserve: Boolean);
+// REDIM of an FBSTRING array: the dropped elements' bytes are freed, the new ones are empty descriptors (zeroes), and
+// without PRESERVE every element starts empty. The block may MOVE, as fbc's does.
+var
+  OldCount: Integer;
+begin
+  OldCount := Length(A.ByteData) div FBSTR_BYTES;
+  if Preserve then
+    ArrFbStrFreeRange(A, NewCount, OldCount - 1)
+  else
+    ArrFbStrFreeRange(A, 0, OldCount - 1);
+  SetLength(A.ByteData, NewCount * FBSTR_BYTES);
+  if Preserve then
+  begin
+    if NewCount > OldCount then
+      FillChar(A.ByteData[OldCount * FBSTR_BYTES], (NewCount - OldCount) * FBSTR_BYTES, 0);
+  end
+  else if NewCount > 0 then
+    FillChar(A.ByteData[0], NewCount * FBSTR_BYTES, 0);
+end;
+
+procedure ArrFbStrFreeRange(var A: TArrayStorage; FromIdx, ToIdx: Integer);
+// Phase 5: the descriptors' BYTES are libc's, so dropping or shrinking such an array has to free them - the managed
+// StringData of every other array is finalised by FPC on its own.
+var
+  k: Integer;
+begin
+  if not ArrIsFbStr(A) or (Length(A.ByteData) = 0) then Exit;
+  // ⛔ Not while another storage record still names the same ByteData (an alias, a suspended invocation's save): the
+  // bytes are THAT array's too. FPC keeps the dynamic array's reference count just before its data.
+  if PPtrInt(PByte(Pointer(A.ByteData)) - 2 * SizeOf(PtrInt))^ > 1 then Exit;
+  if ToIdx > Length(A.ByteData) div FBSTR_BYTES - 1 then ToIdx := Length(A.ByteData) div FBSTR_BYTES - 1;
+  for k := FromIdx to ToIdx do
+    FbStrClear(PFbStr(@A.ByteData[k * FBSTR_BYTES]));
 end;
 
 function FixStrGet(const A: TArrayStorage; Idx: Integer): string;

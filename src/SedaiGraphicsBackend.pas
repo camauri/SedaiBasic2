@@ -65,6 +65,10 @@ type
     // GET into an existing image gives it the RECTANGLE's size, as fbc rewrites the buffer's header (DIVERGENZE 646).
     // Same id, same depth, contents undefined until the copy.
     procedure ResizeSurface(Surface: TGfxSurface; W, H: Integer);
+    { ⭐ PHASE 5.5: an IMAGECREATE surface's row pitch in pixels (fbc pads a row to 16 bytes) and where its pixels
+      live - Buf = nil keeps them in the backend, otherwise Buf (owned by the caller: in the fb memory mode the libc block
+      IMAGECREATE answers, past its header) is the buffer every primitive draws into. }
+    procedure SetSurfaceImageBuffer(Surface: TGfxSurface; Buf: PByte; StridePixels: Integer);
     function  SurfaceWidth(Surface: TGfxSurface): Integer;
     function  SurfaceHeight(Surface: TGfxSurface): Integer;
     { ⭐ The surface's pixel DEPTH in fbc's terms (1/2/4/8/16/32) and the bytes one pixel occupies at
@@ -147,6 +151,10 @@ type
     // GET into an existing image gives it the RECTANGLE's size, as fbc rewrites the buffer's header (DIVERGENZE 646).
     // Same id, same depth, contents undefined until the copy.
     procedure ResizeSurface(Surface: TGfxSurface; W, H: Integer);
+    { ⭐ PHASE 5.5: an IMAGECREATE surface's row pitch in pixels (fbc pads a row to 16 bytes) and where its pixels
+      live - Buf = nil keeps them in the backend, otherwise Buf (owned by the caller: in the fb memory mode the libc block
+      IMAGECREATE answers, past its header) is the buffer every primitive draws into. }
+    procedure SetSurfaceImageBuffer(Surface: TGfxSurface; Buf: PByte; StridePixels: Integer);
     function  SurfaceWidth(Surface: TGfxSurface): Integer;
     function  SurfaceHeight(Surface: TGfxSurface): Integer;
     { ⭐ The surface's pixel DEPTH in fbc's terms (1/2/4/8/16/32) and the bytes one pixel occupies at
@@ -225,6 +233,7 @@ begin
   if M.ClipActive then Exit;                                    // the store would land unclipped
   if M.State.PaletteMode and M.State.PaletteEnabled then Exit;  // a nearest-index SEARCH, plus a
                                                                 // second buffer to write
+  if M.RowPixels <> M.State.Width then Exit;                    // a padded image row: the arm steps by the width
   Base := M.GraphicsBuffer; W := M.State.Width; H := M.State.Height;
   Result := (W > 0) and (H > 0);
 end;
@@ -343,6 +352,12 @@ begin
   if Img.Depth <> Old.Depth then Img.SetDepth(Old.Depth);
   FImages[Surface - 1] := Img;
   Old.Free;
+end;
+
+procedure TSoftwareGraphicsBackend.SetSurfaceImageBuffer(Surface: TGfxSurface; Buf: PByte; StridePixels: Integer);
+begin
+  if (Surface >= 1) and (Surface <= Length(FImages)) and Assigned(FImages[Surface - 1]) then
+    FImages[Surface - 1].UseImageBuffer(Buf, StridePixels);
 end;
 
 function TSoftwareGraphicsBackend.SurfaceWidth(Surface: TGfxSurface): Integer;

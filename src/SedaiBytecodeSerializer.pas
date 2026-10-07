@@ -103,7 +103,10 @@ const
   // older VM refuse such a file by name instead. A v7 file is read unchanged: nothing in it carries the bits.
   // v9 (24 Sep 2026): an array of "ZString * n" in the fb mode is n-byte cells (DIVERGENZE 615): the second facts byte's
   // bit 2 says so, and the Integer n follows. A v8 file has no such array and is read unchanged.
-  BASC_VERSION = 9;
+  // v10 (6 Oct 2026): phase 5 of the pointer model - a String array of FBSTRING descriptors (second facts byte bit 3), and
+  // the String-pointer immediate bit (REFSTR_DESC) its loads and stores carry. A MEANING an older VM would misread as text,
+  // hence the bump. A v9 file is read unchanged.
+  BASC_VERSION = 10;
 
   // Flags
   BASC_FLAG_DEBUG_INFO = $0001;  // Contains source line mapping (always included)
@@ -361,6 +364,7 @@ begin
       if ArrInfo.AddrNative then RegType := RegType or 1;
       if ArrInfo.BarePtr then RegType := RegType or 2;      // bit 1: bare pointers (DIVERGENZE 545)
       if ArrInfo.FixStrBytes > 0 then RegType := RegType or 4;   // bit 2: "ZString * n" cells, n follows (v9, 615)
+      if ArrInfo.FbStr then RegType := RegType or 8;            // bit 3: FBSTRING descriptors (v10, phase 5)
       Stream.WriteBuffer(RegType, SizeOf(RegType));
       if ArrInfo.FixStrBytes > 0 then Stream.WriteBuffer(ArrInfo.FixStrBytes, SizeOf(ArrInfo.FixStrBytes));
     except
@@ -558,11 +562,13 @@ begin
       ArrInfo.AddrNative := False;
       ArrInfo.BarePtr := False;
       ArrInfo.FixStrBytes := 0;
+      ArrInfo.FbStr := False;
       if Header.Version >= 7 then
       begin
         Stream.ReadBuffer(RegType, SizeOf(RegType));
         ArrInfo.AddrNative := (RegType and 1) <> 0;
         ArrInfo.BarePtr := (RegType and 2) <> 0;
+        ArrInfo.FbStr := (Header.Version >= 10) and ((RegType and 8) <> 0);   // written above, in the same change
         if (Header.Version >= 9) and ((RegType and 4) <> 0) then
           Stream.ReadBuffer(ArrInfo.FixStrBytes, SizeOf(ArrInfo.FixStrBytes));   // written above, in the same change
       end;
